@@ -1,6 +1,7 @@
 # Installed Packages
 
 ```bash
-npm install react-icons --save
+npm i react-icons --save
 
+npm i -D daisyui@latest
 ```
