@@ -4,7 +4,7 @@ import Link from "next/link";
 
 export default function AreaHome() {
   return (
-    <AreaTemplate isEven={true} sectionId={"area-intr"}>
+    <AreaTemplate isEven={false} sectionId={"area-intr"}>
       <div>
         <h1>
           <div className="flex flex-col items-center mt-10">
@@ -19,7 +19,7 @@ export default function AreaHome() {
           </span>
         </div>
 
-        <div className="flex space-x-3 pt-5">
+        <div className="flex space-x-3 pt-5 pb-10">
           <div>
             <Image
               src="/home/home-parts-01.png"
@@ -38,21 +38,23 @@ export default function AreaHome() {
               height={344}
             />
           </div>
-          <div className="relative">
-            <div className="absolute top-0 left-0">
-              <Link href="#area-system-development">
-                <button className="px-18 py-5 rounded-2xl bg-rose-500 text-white text-xl font-semibold">
-                  もっと詳しく
-                </button>
-              </Link>
+          <div>
+            <div className="relative">
+              <div className="absolute top-0 left-0">
+                <Link href="#area-system-development">
+                  <button className="px-18 py-5 rounded-2xl bg-rose-500 text-white text-xl font-semibold">
+                    もっと詳しく
+                  </button>
+                </Link>
+              </div>
+              <Image
+                src="/home/home-parts-03.png"
+                alt="home-03"
+                className="dark:invert"
+                width={488}
+                height={344}
+              />
             </div>
-            <Image
-              src="/home/home-parts-03.png"
-              alt="home-03"
-              className="dark:invert"
-              width={488}
-              height={344}
-            />
           </div>
         </div>
       </div>
