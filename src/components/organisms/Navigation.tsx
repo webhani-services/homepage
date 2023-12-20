@@ -1,4 +1,5 @@
 import Image from "next/image";
+import Link from "next/link";
 
 // interface Props {
 //   users: IUser[];
@@ -14,8 +15,11 @@ interface Menu {
 }
 // export default function UserList({ users }: Props) {
 const menuData: Menu[] = [
-  { name: "ホーム", link: "#" },
-  { name: "お問い合わせ", link: "#" },
+  { name: "ホーム", link: "#area-intro" },
+  { name: "システム開発", link: "#area-system-development" },
+  { name: "コンサルタント", link: "#area-consultant" },
+  { name: "リクルート", link: "#area-recruit" },
+  { name: "お問い合わせ", link: "#area-inquire" },
   // {
   //   name: "Parent",
   //   children: [
@@ -46,7 +50,7 @@ export default function Navigation() {
       } else {
         return (
           <li key={idx}>
-            <a>{menu.name}</a>
+            <Link href={menu.link!}>{menu.name}</Link>
           </li>
         );
       }
@@ -54,7 +58,7 @@ export default function Navigation() {
   };
 
   return (
-    <div className="navbar bg-base-100 py-3">
+    <div className="navbar bg-base-100 py-3 fixed top-0 left-0 w-full z-30">
       <div className="navbar-start">
         <div className="dropdown">
           <div tabIndex={0} role="button" className="btn btn-ghost lg:hidden">
