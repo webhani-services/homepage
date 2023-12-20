@@ -1,7 +1,9 @@
+import AreaTemplate from "../templates/AreaTemplate";
+
 export default function AreaHome() {
   return (
-    <section id="area-intro" className="bg-rose-400 w-screen h-144">
+    <AreaTemplate isEven={false} sectionId={"area-intr"}>
       <h1>ホーム</h1>
-    </section>
+    </AreaTemplate>
   );
 }

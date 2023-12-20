@@ -1,7 +1,9 @@
+import AreaTemplate from "../templates/AreaTemplate";
+
 export default function AreaRecruit() {
   return (
-    <section id="area-recruit" className="bg-blue-100 w-screen h-144">
+    <AreaTemplate isEven={true} sectionId={"area-recruit"}>
       <h1>リクルート</h1>
-    </section>
+    </AreaTemplate>
   );
 }

@@ -1,7 +1,9 @@
+import AreaTemplate from "../templates/AreaTemplate";
+
 export default function AreaInquire() {
   return (
-    <section id="area-inquire" className="bg-rose-400 w-screen h-144">
+    <AreaTemplate isEven={false} sectionId={"area-inquire"}>
       <h1>お問い合わせ</h1>
-    </section>
+    </AreaTemplate>
   );
 }

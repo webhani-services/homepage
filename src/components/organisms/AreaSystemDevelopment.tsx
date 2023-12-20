@@ -1,10 +1,9 @@
+import AreaTemplate from "../templates/AreaTemplate";
+
 export default function AreaSystemDevelopment() {
   return (
-    <section
-      id="area-system-development"
-      className="bg-blue-100 w-screen h-144"
-    >
+    <AreaTemplate isEven={true} sectionId={"area-system-development"}>
       <h1>システム開発</h1>
-    </section>
+    </AreaTemplate>
   );
 }
