@@ -2,7 +2,7 @@ import AreaTemplate from "../templates/AreaTemplate";
 
 export default function AreaSystemDevelopment() {
   return (
-    <AreaTemplate isEven={true} sectionId={"area-system-development"}>
+    <AreaTemplate isEven={false} sectionId={"area-system-development"}>
       <div className="flex flex-col items-center pt-12">
         <h2 className="text-4xl align-center">システム開発</h2>
         <hr className="border-4 my-3 border-rose-500 w-12 rounded" />
