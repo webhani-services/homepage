@@ -1,5 +1,12 @@
 # nextjs docker template
 
+## Environment
+
+| ITEM   | Version |
+| ------ | ------- |
+| node   | 20.10.0 |
+| nextjs | 14.0.3  |
+
 ## Setup Dev evn
 
 - [Setup Dev env](docs/dev.md)
@@ -11,3 +18,8 @@
 ### Library
 
 - [ngrok](https://ngrok.com/)
+- [lineicons](https://lineicons.com/icons/)
+
+### Github
+
+- [react-icons](https://react-icons.github.io/react-icons/)
