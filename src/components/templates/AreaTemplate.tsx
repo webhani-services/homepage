@@ -12,7 +12,7 @@ export default function AreaTemplate({
   return (
     <section
       id={sectionId}
-      className={(isEven ? "bg-blue-100" : "bg-rose-400") + " w-screen h-144"}
+      className={(isEven ? "bg-white" : "bg-rose-400") + " w-screen h-144 px-5"}
     >
       {children}
     </section>
