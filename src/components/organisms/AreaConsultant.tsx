@@ -11,7 +11,7 @@ export default function AreaConsultant() {
             最適なウェブ開発戦略をご提案。ニーズに合わせたカスタムソリューションでビジネスの成功を支援。最新技術の導入やセキュリティ対策にも力を入れ、お客様のオンラインプレゼンスを最大化します。エキスパートのコンサルティングで、効果的かつ効率的なウェブソリューションを構築し、競争力を向上させましょう
           </p>
           <div className="pt-20">
-            <button className="px-18 py-5 rounded-2xl border-2 border-rose-500 bg-white text-rose-500 text-xl font-semibold">
+            <button className="px-18 py-5 rounded-2xl border-2 border-rose-500 bg-white text-rose-500 hover:border-rose-500 hover:text-white hover:bg-rose-500 text-xl font-semibold">
               無料で相談する
             </button>
           </div>
