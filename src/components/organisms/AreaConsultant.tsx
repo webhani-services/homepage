@@ -4,7 +4,7 @@ import Image from "next/image";
 export default function AreaConsultant() {
   return (
     <AreaTemplate isEven={false} sectionId={"area-consultant"}>
-      <div className="grid grid-cols-3 pt-10 px-10 gap-6 xl:gap-16 pb-12">
+      <div className="grid grid-cols-3 pt-10 px-10 gap-6 xl:gap-16 pb-12 sm:px-10 lg:px-20 xl:px-40 2xl:px-56 py-6 sm:py-8 lg:py-12 xl:py-16">
         <div className="col-span-2">
           <h2 className="text-4xl">コンサールタント</h2>
           <p className="text-xl pt-6">
