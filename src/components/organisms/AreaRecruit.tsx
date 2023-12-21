@@ -1,6 +1,4 @@
-import AreaTemplate from "../templates/AreaTemplate";
-import Link from "next/link";
-import Image from "next/image";
+import AreaTemplate from "@/components/templates/AreaTemplate";
 
 const menuData = [
   {

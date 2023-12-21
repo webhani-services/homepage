@@ -1,4 +1,4 @@
-import AreaTemplate from "../templates/AreaTemplate";
+import AreaTemplate from "@/components/templates/AreaTemplate";
 import Image from "next/image";
 
 export default function AreaConsultant() {
