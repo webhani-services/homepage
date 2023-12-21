@@ -1,6 +1,6 @@
 import AreaConsultant from "@/components/organisms/AreaConsultant";
 import AreaHome from "@/components/organisms/AreaHome";
-import AreaInquire from "@/components/organisms/AreaInquire";
+import AreaContact from "@/components/organisms/AreaContact";
 import AreaRecruit from "@/components/organisms/AreaRecruit";
 import AreaSystemDevelopment from "@/components/organisms/AreaSystemDevelopment";
 
@@ -11,7 +11,7 @@ export default function Home() {
       <AreaSystemDevelopment />
       <AreaConsultant />
       <AreaRecruit />
-      <AreaInquire />
+      <AreaContact />
     </div>
   );
 }

@@ -1,6 +1,4 @@
-import AreaTemplate from "../templates/AreaTemplate";
-import Link from "next/link";
-import Image from "next/image";
+import AreaTemplate from "@/components/templates/AreaTemplate";
 
 const menuData = [
   {
@@ -54,7 +52,7 @@ export default function AreaRecruit() {
     <AreaTemplate isEven={true} sectionId={"area-recruit"}>
       <div className="py-6">
         <div className="flex flex-col items-center">
-          <h2 className="text-4xl">リクルート</h2>
+          <h2 className="text-4xl text-white">リクルート</h2>
           <hr className="border-4 my-3 border-white w-12 rounded mb-10" />
         </div>
 
