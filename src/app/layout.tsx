@@ -2,8 +2,14 @@ import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import "./globals.css";
 import Navigation from "@/components/organisms/Navigation";
+import { Noto_Sans_JP } from "next/font/google";
 
-const inter = Inter({ subsets: ["latin"] });
+// 使用したいフォントの設定
+const noto = Noto_Sans_JP({
+  weight: ["400", "500", "700"],
+  subsets: ["latin"],
+  variable: "--font-noto-sans-jp",
+});
 
 export const metadata: Metadata = {
   title: "Create Next App",
@@ -17,7 +23,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body className="{inter.className}">
+      <body className={`${noto.className}`}>
         <Navigation />
         <main className="mt-22">{children}</main>
       </body>

@@ -23,3 +23,7 @@
 ### Github
 
 - [react-icons](https://react-icons.github.io/react-icons/)
+
+### favorite templates
+
+- [Vesperr](https://bootstrapmade.com/demo/Vesperr/)

@@ -4,8 +4,8 @@ import Image from "next/image";
 export default function AreaConsultant() {
   return (
     <AreaTemplate isEven={false} sectionId={"area-consultant"}>
-      <div className="grid grid-flow-col pt-10 px-10 gap-6 pb-12">
-        <div>
+      <div className="grid grid-cols-3 pt-10 px-10 gap-6 xl:gap-16 pb-12">
+        <div className="col-span-2">
           <h2 className="text-4xl">コンサールタント</h2>
           <p className="text-xl pt-6">
             最適なウェブ開発戦略をご提案。ニーズに合わせたカスタムソリューションでビジネスの成功を支援。最新技術の導入やセキュリティ対策にも力を入れ、お客様のオンラインプレゼンスを最大化します。エキスパートのコンサルティングで、効果的かつ効率的なウェブソリューションを構築し、競争力を向上させましょう
@@ -23,6 +23,10 @@ export default function AreaConsultant() {
             className="dark:invert"
             width={518}
             height={450}
+            style={{
+              width: "100%",
+              height: "auto",
+            }}
           />
         </div>
       </div>

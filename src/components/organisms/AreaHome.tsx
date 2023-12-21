@@ -5,7 +5,7 @@ import Link from "next/link";
 export default function AreaHome() {
   return (
     <AreaTemplate isEven={false} sectionId={"area-intr"}>
-      <div>
+      <div className="sm:px-10 lg:px-20 xl:px-40 2xl:px-56">
         <h1>
           <div className="flex flex-col items-center mt-10">
             <div className="text-5xl">アイデアからウェブの現実まで、</div>
@@ -42,7 +42,7 @@ export default function AreaHome() {
             <div className="relative">
               <div className="absolute top-0 left-0">
                 <Link href="#area-system-development">
-                  <button className="px-3 py-1 sm:px-14 sm:py-3 lg:px-18 lg:py-5 xl:px-20 xl:py-5 rounded-2xl bg-rose-500 text-white hover:bg-white hover:border-2 hover:border-rose-500 hover:text-rose-500 text-sm sm:text-sm lg:text-lg xl:text-xl font-semibold">
+                  <button className="px-3 py-1 sm:px-12 sm:py-3 lg:px-14 lg:py-5 xl:px-14 xl:py-4 2xl:px-18 2xl:py-6 rounded-2xl bg-rose-500 text-white hover:bg-white hover:border-2 hover:border-rose-500 hover:text-rose-500 text-sm sm:text-sm lg:text-lg xl:text-xl font-semibold">
                     もっと詳しく
                   </button>
                 </Link>

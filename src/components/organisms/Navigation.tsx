@@ -19,7 +19,7 @@ const menuData: Menu[] = [
   { name: "システム開発", link: "#area-system-development" },
   { name: "コンサルタント", link: "#area-consultant" },
   { name: "リクルート", link: "#area-recruit" },
-  { name: "お問い合わせ", link: "#area-inquire" },
+  { name: "お問い合わせ", link: "#area-contact" },
   // {
   //   name: "Parent",
   //   children: [
