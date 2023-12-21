@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
 import "./globals.css";
 import Navigation from "@/components/organisms/Navigation";
 import { Noto_Sans_JP } from "next/font/google";
+import Footer from "@/components/organisms/Footer";
 
 // 使用したいフォントの設定
 const noto = Noto_Sans_JP({
@@ -26,6 +26,7 @@ export default function RootLayout({
       <body className={`${noto.className}`}>
         <Navigation />
         <main className="mt-22">{children}</main>
+        <Footer />
       </body>
     </html>
   );
