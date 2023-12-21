@@ -42,7 +42,7 @@ export default function AreaHome() {
             <div className="relative">
               <div className="absolute top-0 left-0">
                 <Link href="#area-system-development">
-                  <button className="px-3 py-1 sm:px-14 sm:py-3 lg:px-18 lg:py-5 xl:px-20 xl:py-5 rounded-2xl bg-rose-500 text-white text-sm sm:text-sm lg:text-lg xl:text-xl font-semibold">
+                  <button className="px-3 py-1 sm:px-14 sm:py-3 lg:px-18 lg:py-5 xl:px-20 xl:py-5 rounded-2xl bg-rose-500 text-white hover:bg-white hover:border-2 hover:border-rose-500 hover:text-rose-500 text-sm sm:text-sm lg:text-lg xl:text-xl font-semibold">
                     もっと詳しく
                   </button>
                 </Link>
