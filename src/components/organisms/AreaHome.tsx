@@ -13,7 +13,7 @@ export default function AreaHome() {
           </div>
         </h1>
 
-        <div className="flex items-center mt-10 px-32">
+        <div className="flex items-center mt-10 md:px-32">
           <span className="text-2xl">
             アイデアからウェブの現実まで、創造性と技術で先駆的な一歩。未知の領域を切り拓き、ユーザー体験の革新を牽引します。
           </span>
@@ -42,7 +42,7 @@ export default function AreaHome() {
             <div className="relative">
               <div className="absolute top-0 left-0">
                 <Link href="#area-system-development">
-                  <button className="px-3 py-1 sm:px-12 sm:py-3 lg:px-14 lg:py-5 xl:px-14 xl:py-4 2xl:px-18 2xl:py-6 rounded-2xl bg-rose-500 text-white hover:bg-white hover:border-2 hover:border-rose-500 hover:text-rose-500 text-sm sm:text-sm lg:text-lg xl:text-xl font-semibold">
+                  <button className="px-1 py-1 sm:px-12 sm:py-3 lg:px-14 lg:py-5 xl:px-14 xl:py-4 2xl:px-18 2xl:py-6 rounded-2xl bg-rose-500 text-white hover:bg-white hover:border-2 hover:border-rose-500 hover:text-rose-500 text-sm sm:text-sm lg:text-lg xl:text-xl font-semibold">
                     もっと詳しく
                   </button>
                 </Link>
