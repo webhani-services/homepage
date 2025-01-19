@@ -31,3 +31,18 @@ docker-compose up
 ```
 
 - Access to `http://localhost:3000`
+
+## Update Packages
+
+```bash
+# Install
+npm install -g npm-check-updates
+
+# Check upgradable packages
+ncu
+
+# Upgrade packages
+ncu -u
+npm install
+
+```
