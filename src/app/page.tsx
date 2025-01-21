@@ -1,16 +1,16 @@
-import AreaConsultant from "@/components/organisms/AreaConsultant";
-import AreaHome from "@/components/organisms/AreaHome";
+import AreaHero from "@/components/organisms/AreaHero";
+import AreaServices from "@/components/organisms/AreaServices";
+import AreaAbout from "@/components/organisms/AreaAbout";
+import AreaWorks from "@/components/organisms/AreaWorks";
 import AreaContact from "@/components/organisms/AreaContact";
-import AreaRecruit from "@/components/organisms/AreaRecruit";
-import AreaSystemDevelopment from "@/components/organisms/AreaSystemDevelopment";
 
 export default function Home() {
   return (
-    <div className="flex min-h-screen flex-col items-center justify-between">
-      <AreaHome />
-      <AreaSystemDevelopment />
-      <AreaConsultant />
-      <AreaRecruit />
+    <div className="flex min-h-screen flex-col">
+      <AreaHero />
+      <AreaServices />
+      <AreaAbout />
+      <AreaWorks />
       <AreaContact />
     </div>
   );
