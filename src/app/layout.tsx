@@ -1,10 +1,12 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import Navigation from "@/components/organisms/Navigation";
-import { Noto_Sans_JP } from "next/font/google";
+import { Noto_Sans_JP, Inter } from "next/font/google";
 import Footer from "@/components/organisms/Footer";
 
 // 使用したいフォントの設定
+const inter = Inter({ subsets: ["latin"] });
+
 const noto = Noto_Sans_JP({
   weight: ["400", "500", "700"],
   subsets: ["latin"],
@@ -12,8 +14,8 @@ const noto = Noto_Sans_JP({
 });
 
 export const metadata: Metadata = {
-  title: "Webhani",
-  description: "Webhani inc.",
+  title: "webhani Inc. | システム開発・ITコンサルティング",
+  description: "革新的なITソリューションを提供する株式会社webhani",
 };
 
 export default function RootLayout({
@@ -22,10 +24,10 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
-      <body className={`${noto.className}`}>
+    <html lang="ja">
+      <body className={`${noto.className} ${inter.className}`}>
         <Navigation />
-        <main className="mt-22">{children}</main>
+        <main>{children}</main>
         <Footer />
       </body>
     </html>
