@@ -1,108 +1,133 @@
 import { NextResponse } from "next/server";
-import nodemailer from "nodemailer";
-import { SESClient } from "@aws-sdk/client-ses";
-
-type ContactData = {
-  name: string;
-  email: string;
-  message: string;
-};
+import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
 
 // SES クライアントの初期化
-const sesClient = new SESClient({
-  region: process.env.AWS_REGION,
+const ses = new SESClient({
+  region: process.env.AWS_REGION || "ap-northeast-1",
   credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
   },
 });
 
 export async function POST(request: Request) {
   try {
-    const data: ContactData = await request.json();
-    const { name, email, message } = data;
+    const { name, email, message } = await request.json();
 
-    // Create Nodemailer transporter using AWS SES
-    const transporter = nodemailer.createTransport({
-      SES: { ses: sesClient, aws: { SendRawEmail: true } },
-    });
+    // HTMLメールテンプレート
+    const htmlBody = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      font-family: 'Helvetica Neue', Arial, sans-serif;
+      line-height: 1.6;
+      color: #333;
+    }
+    .container {
+      max-width: 600px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    .header {
+      background-color: #f8f9fa;
+      padding: 20px;
+      border-radius: 5px;
+      margin-bottom: 20px;
+    }
+    .content {
+      background-color: #ffffff;
+      padding: 20px;
+      border-radius: 5px;
+      border: 1px solid #e9ecef;
+    }
+    .field {
+      margin-bottom: 15px;
+    }
+    .field-label {
+      font-weight: bold;
+      color: #495057;
+    }
+    .message-content {
+      white-space: pre-wrap;
+      background-color: #f8f9fa;
+      padding: 15px;
+      border-radius: 5px;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h2>新しいお問い合わせが届きました</h2>
+    </div>
+    <div class="content">
+      <div class="field">
+        <div class="field-label">お名前:</div>
+        <div>${name}</div>
+      </div>
+      <div class="field">
+        <div class="field-label">メールアドレス:</div>
+        <div>${email}</div>
+      </div>
+      <div class="field">
+        <div class="field-label">お問い合わせ内容:</div>
+        <div class="message-content">${message}</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+    `;
 
-    // Email content
-    const mailOptions = {
-      from: process.env.AWS_SES_FROM_EMAIL,
-      to: email,
-      subject: "【お問い合わせ】自動返信メール",
-      text: `
-        ${name} 様
+    // プレーンテキスト版（HTMLメールをサポートしないクライアント用）
+    const textBody = `
+新しいお問い合わせ
 
-        お問い合わせありがとうございます。
-        以下の内容で承りました。
+お名前: ${name}
+メールアドレス: ${email}
 
-        ━━━━━━━━━━━━━━━━━━━━━━━━
-        ■お名前
-        ${name}
+お問い合わせ内容:
+${message}
+    `;
 
-        ■メールアドレス
-        ${email}
-
-        ■お問い合わせ内容
-        ${message}
-        ━━━━━━━━━━━━━━━━━━━━━━━━
-
-        内容を確認の上、担当者より回答させていただきます。
-        しばらくお待ちくださいますようお願いいたします。
-
-        ※このメールは自動送信されています。
-        ※このメールに返信いただいても回答できません。
-
-        ━━━━━━━━━━━━━━━━━━━━━━━━
-        株式会社 Webhani
-        URL: https://www.webhani.com/
-        ━━━━━━━━━━━━━━━━━━━━━━━━
-      `,
-      html: `
-        <div style="font-family: sans-serif;">
-          <p>${name} 様</p>
-          <p>お問い合わせありがとうございます。<br>以下の内容で承りました。</p>
-
-          <div style="margin: 20px 0; padding: 20px; background-color: #f5f5f5;">
-            <p><strong>■お名前</strong><br>${name}</p>
-            <p><strong>■メールアドレス</strong><br>${email}</p>
-            <p><strong>■お問い合わせ内容</strong><br>${message.replace(
-              /\n/g,
-              "<br>"
-            )}</p>
-          </div>
-
-          <p>内容を確認の上、担当者より回答させていただきます。<br>
-          しばらくお待ちくださいますようお願いいたします。</p>
-
-          <p style="color: #666;">
-            ※このメールは自動送信されています。<br>
-            ※このメールに返信いただいても回答できません。
-          </p>
-
-          <hr style="border: none; border-top: 1px solid #ccc; margin: 20px 0;">
-
-          <div style="color: #666;">
-            株式会社 Webhani<br>
-            URL: <a href="https://www.webhani.com/">https://www.webhani.com/</a>
-          </div>
-        </div>
-      `,
+    const params = {
+      Source: email,
+      Destination: {
+        ToAddresses: [process.env.AWS_SES_TO_EMAIL || 'contact@webhani.com'],
+      },
+      Message: {
+        Subject: {
+          Data: `[お問い合わせ] ${name}様からのメッセージ`,
+          Charset: "UTF-8",
+        },
+        Body: {
+          Text: {
+            Data: textBody,
+            Charset: "UTF-8",
+          },
+          Html: {
+            Data: htmlBody,
+            Charset: "UTF-8",
+          },
+        },
+      },
     };
 
-    // Send email
-    await transporter.sendMail(mailOptions);
+    const command = new SendEmailCommand(params);
+    await ses.send(command);
 
     return NextResponse.json(
-      { message: "メールを送信しました" },
+      { message: "お問い合わせを送信しました。" },
       { status: 200 }
     );
   } catch (error) {
-    console.error("Email sending error:", error);
+    console.error("Error sending email:", error);
     return NextResponse.json(
-      { message: "メール送信に失敗しました" },
+      { error: "エラーが発生しました。もう一度お試しください。" },
       { status: 500 }
     );
   }

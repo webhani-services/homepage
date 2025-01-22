@@ -1,5 +1,12 @@
 "use client";
 import React, { useState } from "react";
+import { useForm } from "react-hook-form";
+
+type FormInputs = {
+  name: string;
+  email: string;
+  message: string;
+};
 
 export default function AreaContact() {
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -8,17 +15,15 @@ export default function AreaContact() {
     message: string;
   }>({ type: null, message: "" });
 
-  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
+  const {
+    register,
+    handleSubmit,
+    reset,
+    formState: { errors },
+  } = useForm<FormInputs>();
+
+  const onSubmit = async (data: FormInputs) => {
     setIsSubmitting(true);
-
-    const formData = new FormData(e.currentTarget);
-    const data = {
-      name: formData.get("name") as string,
-      email: formData.get("email") as string,
-      message: formData.get("message") as string,
-    };
-
     try {
       const response = await fetch("/api/contact", {
         method: "POST",
@@ -34,7 +39,7 @@ export default function AreaContact() {
         type: "success",
         message: "お問い合わせを送信しました。",
       });
-      e.currentTarget.reset();
+      reset();
     } catch (error) {
       setSubmitStatus({
         type: "error",
@@ -65,7 +70,7 @@ export default function AreaContact() {
           </div>
         )}
 
-        <form className="space-y-6 fade-in" onSubmit={handleSubmit}>
+        <form className="space-y-6 fade-in" onSubmit={handleSubmit(onSubmit)}>
           <div>
             <label
               htmlFor="name"
@@ -74,10 +79,10 @@ export default function AreaContact() {
               お名前
             </label>
             <input
+              {...register("name", { required: true })}
               type="text"
               id="name"
               className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent"
-              required
             />
           </div>
 
@@ -89,10 +94,13 @@ export default function AreaContact() {
               メールアドレス
             </label>
             <input
+              {...register("email", {
+                required: true,
+                pattern: /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i,
+              })}
               type="email"
               id="email"
               className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent"
-              required
             />
           </div>
 
@@ -104,10 +112,10 @@ export default function AreaContact() {
               お問い合わせ内容
             </label>
             <textarea
+              {...register("message", { required: true })}
               id="message"
               rows={6}
               className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent"
-              required
             ></textarea>
           </div>
 
