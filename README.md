@@ -27,3 +27,18 @@
 ### favorite templates
 
 - [Vesperr](https://bootstrapmade.com/demo/Vesperr/)
+
+## package 更新方法
+
+```bash
+npm install -g npm-check-updates
+
+# 更新可能なパッケージを確認
+ncu
+
+# package.json の依存関係を最新版に更新
+ncu -u
+
+# 実際にパッケージをインストール
+npm install
+```

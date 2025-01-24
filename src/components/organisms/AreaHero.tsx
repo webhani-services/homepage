@@ -1,3 +1,4 @@
+"use client";
 import Image from "next/image";
 
 export default function AreaHero() {
@@ -31,6 +32,11 @@ export default function AreaHero() {
           お客様のデジタル変革をトータルサポート
         </p>
         <button
+          onClick={() => {
+            document.getElementById("contact")?.scrollIntoView({
+              behavior: "smooth",
+            });
+          }}
           className="bg-yellow-300 hover:bg-yellow-400 text-gray-900 font-medium
           py-3 px-12 rounded-lg transition-all duration-300 shadow-sm hover:shadow-md fade-in"
           style={{ animationDelay: "0.4s" }}

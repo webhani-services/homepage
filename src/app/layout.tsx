@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
-import "./globals.css";
 import Navigation from "@/components/organisms/Navigation";
 import { Noto_Sans_JP, Inter } from "next/font/google";
 import Footer from "@/components/organisms/Footer";
+import "./globals.css";
 
 // 使用したいフォントの設定
 const inter = Inter({ subsets: ["latin"] });
