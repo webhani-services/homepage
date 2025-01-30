@@ -95,9 +95,10 @@ ${message}
     `;
 
     const params = {
-      Source: email,
+      Source: [process.env.AWS_SES_TO_EMAIL || "contact@webhani.com"],
+      ReplyToAddresses: [email],
       Destination: {
-        ToAddresses: [process.env.AWS_SES_TO_EMAIL || 'contact@webhani.com'],
+        ToAddresses: [process.env.AWS_SES_TO_EMAIL || "contact@webhani.com"],
       },
       Message: {
         Subject: {
