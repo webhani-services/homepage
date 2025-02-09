@@ -40,7 +40,7 @@ const services = [
 
 export default function AreaServices() {
   return (
-    <section id="services" className="section-padding bg-gray-50">
+    <section id="services" className="section-padding">
       <div className="max-w-7xl mx-auto">
         <h2 className="heading-primary text-center">サービス</h2>
         <p className="paragraph text-center mb-12">

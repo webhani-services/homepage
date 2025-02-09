@@ -2,7 +2,7 @@ import Image from "next/image";
 
 export default function AreaAbout() {
   return (
-    <section id="corporate-philosophy" className="section-padding">
+    <section id="corporate-philosophy" className="section-padding bg-gray-50">
       <div className="max-w-7xl mx-auto">
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center">
           <div className="fade-in">

@@ -2,10 +2,7 @@ import Image from "next/image";
 
 export default function AreaAbout() {
   return (
-    <section
-      id="about"
-      className="section-padding bg-gradient-to-b from-yellow-50 to-white"
-    >
+    <section id="about" className="section-padding">
       <div className="max-w-7xl mx-auto px-4 sm:px-6">
         <div className="text-center mb-16">
           <h2 className="text-4xl font-bold">企業情報</h2>
@@ -13,15 +10,14 @@ export default function AreaAbout() {
 
         <div className="relative">
           {/* 背景デコレーション */}
-          <div className="hidden lg:block absolute -left-4 top-1/2 -translate-y-1/2 w-24 h-full">
-            <div className="h-full w-[1px] bg-gradient-to-b from-transparent via-yellow-200 to-transparent"></div>
-          </div>
+
+          <div className="h-full w-[1px] bg-gradient-to-b from-transparent via-yellow-200 to-transparent"></div>
 
           {/* メインコンテンツ */}
-          <div className="bg-white rounded-2xl shadow-xl overflow-hidden">
+          <div className="bg-white rounded-2xl overflow-hidden">
             <div className="grid grid-cols-1 lg:grid-cols-3">
               {/* 左側：基本情報 */}
-              <div className="lg:col-span-1 p-8 lg:border-r border-gray-100 bg-yellow-50/50">
+              <div className="lg:col-span-1 p-8 lg:border-r border-gray-100 ">
                 <h3 className="font-bold text-xl mb-6 text-gray-900 flex items-center">
                   <span className="w-1 h-6 bg-yellow-400 mr-3"></span>
                   基本情報
