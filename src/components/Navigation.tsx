@@ -6,6 +6,7 @@ import Image from "next/image";
 import DesktopMenu from "./navigation/DesktopMenu";
 import MobileMenu from "./navigation/MobileMenu";
 import DarkModeToggle from "./navigation/DarkModeToggle";
+import LanguageToggle from "./navigation/LanguageToggle";
 
 // ナビゲーションで使用するデータを定義
 const navigationData = {
@@ -150,7 +151,10 @@ export default function Navigation() {
               setActiveDropdown={setActiveDropdown}
               isDark={isDark}
             />
-            <DarkModeToggle isDark={isDark} onToggle={handleToggleDarkMode} />
+            <div className="flex items-center space-x-4">
+              <LanguageToggle />
+              <DarkModeToggle isDark={isDark} onToggle={handleToggleDarkMode} />
+            </div>
           </div>
 
           {/* モバイルメニューボタン */}

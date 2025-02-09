@@ -1,9 +1,13 @@
 import { getRequestConfig } from "next-intl/server";
+import { cookies } from "next/headers";
 
 export default getRequestConfig(async () => {
-  // Provide a static locale, fetch a user setting,
-  // read from `cookies()`, `headers()`, etc.
-  const locale = "ja";
+  // cookieから言語設定を読み取る
+  const cookieStore = await cookies();
+  const localeCookie = cookieStore.get("NEXT_LOCALE");
+
+  // デフォルトは日本語
+  const locale = localeCookie?.value || "ja";
 
   return {
     locale,
