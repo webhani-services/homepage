@@ -4,55 +4,68 @@ import { useState, useEffect } from "react";
 import Link from "next/link";
 import Image from "next/image";
 
-const navigation = [
-  {
-    name: "サービス",
-    href: "#services",
-    children: [
-      { name: "Webアプリケーション開発", href: "#web-development" },
-      { name: "ITコンサルティング", href: "#consulting" },
-      { name: "IT教育", href: "#education" },
-      { name: "デジタルコンテンツ開発", href: "#digital-content" },
-      { name: "受託開発", href: "#outsourcing" },
-    ],
+// ナビゲーションで使用するデータを定義
+const navigationData = {
+  logo: {
+    src: "/images/logo/full-logo-transparent.svg",
+    alt: "webhani Inc.",
+    width: 200,
+    height: 60,
   },
-  { name: "企業理念", href: "#corporate-philosophy" },
-  { name: "企業情報", href: "#about" },
-  { name: "実績", href: "#works" },
-  { name: "お問い合わせ", href: "#contact" },
-];
+  menuItems: [
+    {
+      name: "サービス",
+      href: "#services",
+      children: [
+        { name: "Webアプリケーション開発", href: "#web-development" },
+        { name: "ITコンサルティング", href: "#consulting" },
+        { name: "IT教育", href: "#education" },
+        { name: "デジタルコンテンツ開発", href: "#digital-content" },
+        { name: "受託開発", href: "#outsourcing" },
+      ],
+    },
+    { name: "企業理念", href: "#corporate-philosophy" },
+    { name: "企業情報", href: "#about" },
+    { name: "実績", href: "#works" },
+    { name: "お問い合わせ", href: "#contact" },
+  ],
+};
+
+// ユーティリティ関数
+const navigationUtils = {
+  getScrolledStyle: (isScrolled: boolean) => ({
+    background: isScrolled ? "bg-yellow-300" : "bg-yellow-300/95",
+    additionalClasses: isScrolled ? "shadow-md" : "",
+  }),
+};
 
 export default function Navigation() {
   const [isOpen, setIsOpen] = useState(false);
   const [activeDropdown, setActiveDropdown] = useState<string | null>(null);
   const [isScrolled, setIsScrolled] = useState(false);
 
-  // スクロール監視の追加
   useEffect(() => {
     const handleScroll = () => {
-      const scrollPosition = window.scrollY;
-      setIsScrolled(scrollPosition > 0);
+      setIsScrolled(window.scrollY > 0);
     };
 
     window.addEventListener("scroll", handleScroll);
     return () => window.removeEventListener("scroll", handleScroll);
   }, []);
 
+  const { background, additionalClasses } =
+    navigationUtils.getScrolledStyle(isScrolled);
+
   return (
     <nav
-      className={`fixed w-full z-50 transition-all duration-300 backdrop-blur-sm ${
-        isScrolled ? "bg-yellow-300 shadow-md" : "bg-yellow-300/95"
-      }`}
+      className={`fixed w-full z-50 transition-all duration-300 backdrop-blur-sm ${background} ${additionalClasses}`}
     >
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex justify-between h-16">
           <div className="flex-shrink-0 flex items-center">
             <Link href="/" className="flex items-center">
               <Image
-                src="/images/logo/full-logo-transparent.svg"
-                alt="webhani Inc."
-                width={200}
-                height={60}
+                {...navigationData.logo}
                 priority
                 className="bg-transparent"
                 style={{
@@ -65,7 +78,7 @@ export default function Navigation() {
 
           {/* デスクトップメニュー */}
           <div className="hidden md:flex md:items-center md:space-x-8">
-            {navigation.map((item) => (
+            {navigationData.menuItems.map((item) => (
               <div key={item.name} className="relative group">
                 <Link
                   href={item.href}
@@ -144,7 +157,7 @@ export default function Navigation() {
       {isOpen && (
         <div className="md:hidden">
           <div className="px-2 pt-2 pb-3 space-y-1 sm:px-3 bg-white shadow-lg">
-            {navigation.map((item) => (
+            {navigationData.menuItems.map((item) => (
               <div key={item.name}>
                 <Link
                   href={item.href}
