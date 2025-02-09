@@ -9,10 +9,6 @@ export default function AreaAbout() {
         </div>
 
         <div className="relative">
-          {/* 背景デコレーション */}
-
-          <div className="h-full w-[1px] bg-gradient-to-b from-transparent via-yellow-200 to-transparent"></div>
-
           {/* メインコンテンツ */}
           <div className="bg-white rounded-2xl overflow-hidden">
             <div className="grid grid-cols-1 lg:grid-cols-3">
