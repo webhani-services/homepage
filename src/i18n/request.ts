@@ -7,7 +7,7 @@ export default getRequestConfig(async () => {
   const localeCookie = cookieStore.get("NEXT_LOCALE");
 
   // デフォルトは日本語
-  const locale = localeCookie?.value || "ja";
+  const locale = localeCookie?.value || "en";
 
   return {
     locale,
