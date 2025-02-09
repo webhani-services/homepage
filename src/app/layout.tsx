@@ -1,4 +1,5 @@
-import type { Metadata } from "next";
+"use client";
+
 import Navigation from "@/components/organisms/Navigation";
 import { Noto_Sans_JP, Inter } from "next/font/google";
 import Footer from "@/components/organisms/Footer";
@@ -14,11 +15,6 @@ const noto = Noto_Sans_JP({
   variable: "--font-noto-sans-jp",
 });
 
-export const metadata: Metadata = {
-  title: "webhani Inc. | システム開発・ITコンサルティング",
-  description: "革新的なITソリューションを提供する株式会社webhani",
-};
-
 export default function RootLayout({
   children,
 }: {
@@ -27,7 +23,7 @@ export default function RootLayout({
   return (
     <html lang="ja" suppressHydrationWarning>
       <body className={`${noto.className} ${inter.className}`}>
-        <ThemeProvider>
+        <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
           <Navigation />
           <main>{children}</main>
           <Footer />
