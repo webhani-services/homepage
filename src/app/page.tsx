@@ -9,10 +9,15 @@ export default function Home() {
   return (
     <div className="flex min-h-screen flex-col">
       <AreaHero />
-      <AreaServices />
-      <AreaCorporatePhilosophy />
+      {/* 会社概要 */}
       <AreaAbout />
+      {/* 企業理念 */}
+      <AreaCorporatePhilosophy />
+      {/* サービス */}
+      <AreaServices />
+      {/* 作品 */}
       <AreaWorks />
+      {/* お問い合わせ */}
       <AreaContact />
     </div>
   );

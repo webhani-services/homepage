@@ -7,6 +7,8 @@ import { useTheme } from "next-themes";
 import { MdLightMode, MdDarkMode, MdBrightness6 } from "react-icons/md";
 
 const navigation = [
+  { name: "企業情報", href: "#about" },
+  { name: "企業理念", href: "#corporate-philosophy" },
   {
     name: "サービス",
     href: "#services",
@@ -18,8 +20,6 @@ const navigation = [
       { name: "受託開発", href: "#outsourcing" },
     ],
   },
-  { name: "企業理念", href: "#corporate-philosophy" },
-  { name: "企業情報", href: "#about" },
   { name: "実績", href: "#works" },
   { name: "お問い合わせ", href: "#contact" },
 ];
