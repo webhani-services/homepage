@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
-import Navigation from "@/components/organisms/Navigation";
+import Navigation from "@/components/Navigation";
 import { Noto_Sans_JP, Inter } from "next/font/google";
-import Footer from "@/components/organisms/Footer";
+import Footer from "@/components/Footer";
 import "./globals.css";
 
 // 使用したいフォントの設定
