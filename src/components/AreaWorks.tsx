@@ -21,7 +21,11 @@ const WORKS_DATA = [
 type WorkCardProps = {
   work: (typeof WORKS_DATA)[number];
   index: number;
-  t: ReturnType<typeof useTranslations>;
+  t: (
+    key:
+      | `works.items.${(typeof WORKS_DATA)[number]["id"]}.title`
+      | `works.items.${(typeof WORKS_DATA)[number]["id"]}.category`
+  ) => string;
 };
 
 const WorkCard = ({ work, index, t }: WorkCardProps) => (
