@@ -1,9 +1,9 @@
-import AreaHero from "@/components/organisms/AreaHero";
-import AreaServices from "@/components/organisms/AreaServices";
-import AreaAbout from "@/components/organisms/AreaAbout";
-import AreaWorks from "@/components/organisms/AreaWorks";
-import AreaContact from "@/components/organisms/AreaContact";
-import AreaCorporatePhilosophy from "@/components/organisms/AreaCorporatePhilosophy";
+import AreaHero from "@/components/AreaHero";
+import AreaServices from "@/components/AreaServices";
+import AreaAbout from "@/components/AreaAbout";
+import AreaWorks from "@/components/AreaWorks";
+import AreaContact from "@/components/AreaContact";
+import AreaCorporatePhilosophy from "@/components/AreaCorporatePhilosophy";
 
 export default function Home() {
   return (
