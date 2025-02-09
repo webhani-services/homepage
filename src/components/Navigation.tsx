@@ -25,20 +25,20 @@ const navigationData = {
   },
   menuItems: [
     {
-      name: "サービス",
+      nameKey: "services",
       href: "#services",
       children: [
-        { name: "Webアプリケーション開発", href: "#web-development" },
-        { name: "ITコンサルティング", href: "#consulting" },
-        { name: "IT教育", href: "#education" },
-        { name: "デジタルコンテンツ開発", href: "#digital-content" },
-        { name: "受託開発", href: "#outsourcing" },
+        { nameKey: "webDevelopment", href: "#web-development" },
+        { nameKey: "consulting", href: "#consulting" },
+        { nameKey: "education", href: "#education" },
+        { nameKey: "digitalContent", href: "#digital-content" },
+        { nameKey: "outsourcing", href: "#outsourcing" },
       ],
     },
-    { name: "企業理念", href: "#corporate-philosophy" },
-    { name: "企業情報", href: "#about" },
-    { name: "実績", href: "#works" },
-    { name: "お問い合わせ", href: "#contact" },
+    { nameKey: "philosophy", href: "#corporate-philosophy" },
+    { nameKey: "about", href: "#about" },
+    { nameKey: "works", href: "#works" },
+    { nameKey: "contact", href: "#contact" },
   ],
 };
 

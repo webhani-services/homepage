@@ -1,10 +1,10 @@
 export type NavigationItem = {
-  name: string;
+  nameKey: string;
   href: string;
   children?: NavigationChild[];
 };
 
 export type NavigationChild = {
-  name: string;
+  nameKey: string;
   href: string;
 };
