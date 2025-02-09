@@ -24,7 +24,7 @@ const useScrollPosition = () => {
 };
 
 export default function Navigation() {
-  const { theme } = useTheme();
+  const { theme, setTheme } = useTheme();
   const [isOpen, setIsOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
   const isScrolled = useScrollPosition();
@@ -34,10 +34,26 @@ export default function Navigation() {
   }, []);
 
   if (!mounted) {
-    return <InitialNavigation />;
+    return (
+      <nav className="fixed w-full z-50 transition-all duration-300 backdrop-blur-sm bg-transparent">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex justify-between h-16">
+            <div className="flex-shrink-0 flex items-center">
+              <div className="w-[200px] h-[60px]" />
+            </div>
+          </div>
+        </div>
+      </nav>
+    );
   }
 
-  const navBackgroundClass = getNavigationBackgroundClass(isScrolled, theme);
+  const navBackgroundClass = isScrolled
+    ? theme === "dark"
+      ? "bg-black/95 shadow-md"
+      : "bg-yellow-300/95 shadow-md"
+    : theme === "dark"
+    ? "bg-black/80"
+    : "bg-yellow-300/80";
 
   return (
     <nav
@@ -62,18 +78,6 @@ export default function Navigation() {
     </nav>
   );
 }
-
-const InitialNavigation = () => (
-  <nav className="fixed w-full z-50 transition-all duration-300 backdrop-blur-sm bg-yellow-300/95">
-    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-      <div className="flex justify-between h-16">
-        <div className="flex-shrink-0 flex items-center">
-          <div className="w-[200px] h-[60px]" />
-        </div>
-      </div>
-    </div>
-  </nav>
-);
 
 const Logo = ({ theme }: { theme: string | undefined }) => (
   <div className="flex-shrink-0 flex items-center">
@@ -153,13 +157,3 @@ const CloseIcon = () => (
     />
   </svg>
 );
-
-const getNavigationBackgroundClass = (
-  isScrolled: boolean,
-  theme: string | undefined
-) => {
-  if (isScrolled) {
-    return theme === "dark" ? "bg-black shadow-md" : "bg-yellow-300 shadow-md";
-  }
-  return theme === "dark" ? "bg-black/95" : "bg-yellow-300/95";
-};
