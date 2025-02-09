@@ -97,7 +97,7 @@ export default function AreaAbout() {
   return (
     <section
       id="about"
-      className="section-padding dark:bg-black dark:text-yellow-300"
+      className="section-padding bg-white dark:bg-black dark:text-yellow-300"
     >
       <div className="max-w-7xl mx-auto px-4 sm:px-6">
         <div className="text-center mb-16">
