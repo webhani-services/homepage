@@ -52,7 +52,7 @@ export default function AreaServices() {
             <div
               key={service.title}
               id={service.id}
-              className="bg-white p-6 rounded-xl shadow-lg hover:shadow-xl transition-shadow duration-300 fade-in"
+              className="bg-white p-8 rounded-xl shadow-sm hover:shadow-lg transform hover:-translate-y-1 transition-all duration-300 fade-in"
               style={{ animationDelay: `${index * 0.2}s` }}
             >
               <div className="w-16 h-16 mb-4 mx-auto">

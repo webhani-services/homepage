@@ -34,7 +34,7 @@ export default function AreaWorks() {
               className="group relative overflow-hidden rounded-lg fade-in"
               style={{ animationDelay: `${index * 0.2}s` }}
             >
-              <div className="relative h-64">
+              <div className="relative h-72 lg:h-80">
                 <Image
                   src={work.image}
                   alt={work.title}

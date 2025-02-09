@@ -16,6 +16,7 @@ const navigation = [
       { name: "受託開発", href: "#outsourcing" },
     ],
   },
+  { name: "企業理念", href: "#corporate-philosophy" },
   { name: "企業情報", href: "#about" },
   { name: "実績", href: "#works" },
   { name: "お問い合わせ", href: "#contact" },
@@ -39,10 +40,8 @@ export default function Navigation() {
 
   return (
     <nav
-      className={`fixed w-full z-50 transition-all duration-300 ${
-        isScrolled
-          ? "bg-yellow-300 shadow-md"
-          : "bg-yellow-300/95 backdrop-blur-sm"
+      className={`fixed w-full z-50 transition-all duration-300 backdrop-blur-sm ${
+        isScrolled ? "bg-yellow-300 shadow-md" : "bg-yellow-300/95"
       }`}
     >
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
