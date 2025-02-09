@@ -1,5 +1,5 @@
 "use client";
-import React, { useState } from "react";
+import React from "react";
 import { useForm } from "react-hook-form";
 
 type FormInputs = {
@@ -8,9 +8,10 @@ type FormInputs = {
   message: string;
 };
 
-export default function AreaContact() {
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [submitStatus, setSubmitStatus] = useState<{
+// カスタムフックでフォームのロジックを分離
+const useContactForm = () => {
+  const [isSubmitting, setIsSubmitting] = React.useState(false);
+  const [submitStatus, setSubmitStatus] = React.useState<{
     type: "success" | "error" | null;
     message: string;
   }>({ type: null, message: "" });
@@ -49,6 +50,21 @@ export default function AreaContact() {
       setIsSubmitting(false);
     }
   };
+
+  return {
+    register,
+    handleSubmit,
+    onSubmit,
+    isSubmitting,
+    submitStatus,
+    errors,
+  };
+};
+
+// プレゼンテーショナルコンポーネント
+export default function AreaContact() {
+  const { register, handleSubmit, onSubmit, isSubmitting, submitStatus } =
+    useContactForm();
 
   return (
     <section id="contact" className="section-padding bg-white">

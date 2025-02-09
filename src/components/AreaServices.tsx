@@ -1,6 +1,14 @@
 import Image from "next/image";
 
-const services = [
+// サービスデータを別の定数として分離
+type Service = {
+  title: string;
+  description: string;
+  icon: string;
+  id: string;
+};
+
+const SERVICE_DATA: Service[] = [
   {
     title: "Webアプリケーション開発",
     description:
@@ -38,9 +46,33 @@ const services = [
   },
 ];
 
+// サービスカードのコンポーネントを分離
+type ServiceCardProps = {
+  service: Service;
+  index: number;
+};
+
+const ServiceCard = ({ service, index }: ServiceCardProps) => (
+  <div
+    key={service.title}
+    id={service.id}
+    className="bg-white p-8 rounded-xl shadow-sm hover:shadow-lg transform hover:-translate-y-1 transition-all duration-300 fade-in"
+    style={{ animationDelay: `${index * 0.2}s` }}
+  >
+    <div className="w-16 h-16 mb-4 mx-auto">
+      <Image src={service.icon} alt={service.title} width={64} height={64} />
+    </div>
+    <h3 className="text-xl font-bold text-gray-900 mb-3 text-center">
+      {service.title}
+    </h3>
+    <p className="text-gray-600 text-center">{service.description}</p>
+  </div>
+);
+
+// メインコンポーネント
 export default function AreaServices() {
   return (
-    <section id="services" className="section-padding bg-gray-50">
+    <section id="services" className="section-padding">
       <div className="max-w-7xl mx-auto">
         <h2 className="heading-primary text-center">サービス</h2>
         <p className="paragraph text-center mb-12">
@@ -48,26 +80,8 @@ export default function AreaServices() {
         </p>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-          {services.map((service, index) => (
-            <div
-              key={service.title}
-              id={service.id}
-              className="bg-white p-8 rounded-xl shadow-sm hover:shadow-lg transform hover:-translate-y-1 transition-all duration-300 fade-in"
-              style={{ animationDelay: `${index * 0.2}s` }}
-            >
-              <div className="w-16 h-16 mb-4 mx-auto">
-                <Image
-                  src={service.icon}
-                  alt={service.title}
-                  width={64}
-                  height={64}
-                />
-              </div>
-              <h3 className="text-xl font-bold text-gray-900 mb-3 text-center">
-                {service.title}
-              </h3>
-              <p className="text-gray-600 text-center">{service.description}</p>
-            </div>
+          {SERVICE_DATA.map((service, index) => (
+            <ServiceCard key={service.id} service={service} index={index} />
           ))}
         </div>
       </div>
