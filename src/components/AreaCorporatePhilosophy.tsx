@@ -26,25 +26,34 @@ const philosophyData = {
 
 export default function AreaCorporatePhilosophy() {
   return (
-    <section id="corporate-philosophy" className="section-padding bg-gray-50">
+    <section
+      id="corporate-philosophy"
+      className="section-padding bg-gray-50 dark:bg-black"
+    >
       <div className="max-w-7xl mx-auto">
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center">
           <div className="fade-in">
-            <h2 className="heading-primary">{philosophyData.title}</h2>
-            <p className="paragraph mb-6">{philosophyData.description}</p>
+            <h2 className="heading-primary dark:text-yellow-300">
+              {philosophyData.title}
+            </h2>
+            <p className="paragraph dark:text-gray-400 mb-6">
+              {philosophyData.description}
+            </p>
             <div className="space-y-4">
               {philosophyData.principles.map((principle) => (
                 <div key={principle.id} className="flex items-start">
-                  <div className="flex-shrink-0 w-12 h-12 bg-yellow-300 rounded-full flex items-center justify-center">
-                    <span className="text-gray-900 font-bold">
+                  <div className="flex-shrink-0 w-12 h-12 bg-yellow-300 dark:bg-yellow-600 rounded-full flex items-center justify-center">
+                    <span className="text-gray-900 dark:text-gray-100 font-bold">
                       {principle.id}
                     </span>
                   </div>
                   <div className="ml-4">
-                    <h3 className="text-xl font-bold mb-2">
+                    <h3 className="text-xl font-bold mb-2 dark:text-yellow-300">
                       {principle.title}
                     </h3>
-                    <p className="text-gray-600">{principle.description}</p>
+                    <p className="text-gray-600 dark:text-gray-400">
+                      {principle.description}
+                    </p>
                   </div>
                 </div>
               ))}
