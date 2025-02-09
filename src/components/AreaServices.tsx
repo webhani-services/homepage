@@ -69,7 +69,7 @@ export default function AreaServices() {
   const t = useTranslations();
 
   return (
-    <section id="services" className="section-padding dark:bg-black">
+    <section id="services" className="section-padding bg-white dark:bg-black">
       <div className="max-w-7xl mx-auto">
         <h2 className="heading-primary text-center dark:text-yellow-300">
           {t("areaServices.title")}
