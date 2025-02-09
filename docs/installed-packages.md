@@ -10,4 +10,6 @@ npm install nodemailer @types/nodemailer
 npm install @aws-sdk/client-s3 @aws-sdk/client-ses
 
 npm install react-hook-form
+
+npm install next-intl
 ```

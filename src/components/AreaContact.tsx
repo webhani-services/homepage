@@ -1,6 +1,7 @@
 "use client";
 import React from "react";
 import { useForm } from "react-hook-form";
+import { useTranslations } from "next-intl";
 
 type FormInputs = {
   name: string;
@@ -10,6 +11,7 @@ type FormInputs = {
 
 // カスタムフックでフォームのロジックを分離
 const useContactForm = () => {
+  const t = useTranslations("contact.form");
   const [isSubmitting, setIsSubmitting] = React.useState(false);
   const [submitStatus, setSubmitStatus] = React.useState<{
     type: "success" | "error" | null;
@@ -34,17 +36,17 @@ const useContactForm = () => {
         body: JSON.stringify(data),
       });
 
-      if (!response.ok) throw new Error("送信に失敗しました");
+      if (!response.ok) throw new Error(t("error"));
 
       setSubmitStatus({
         type: "success",
-        message: "お問い合わせを送信しました。",
+        message: t("success"),
       });
       reset();
     } catch (error) {
       setSubmitStatus({
         type: "error",
-        message: "エラーが発生しました。もう一度お試しください。",
+        message: t("error"),
       });
     } finally {
       setIsSubmitting(false);
@@ -63,6 +65,7 @@ const useContactForm = () => {
 
 // プレゼンテーショナルコンポーネント
 export default function AreaContact() {
+  const t = useTranslations("contact");
   const { register, handleSubmit, onSubmit, isSubmitting, submitStatus } =
     useContactForm();
 
@@ -70,10 +73,10 @@ export default function AreaContact() {
     <section id="contact" className="section-padding bg-white dark:bg-black">
       <div className="max-w-3xl mx-auto">
         <h2 className="heading-primary text-center dark:text-yellow-300">
-          お問い合わせ
+          {t("title")}
         </h2>
         <p className="paragraph text-center mb-12 dark:text-gray-400">
-          ご質問やご相談がございましたら、お気軽にお問い合わせください
+          {t("description")}
         </p>
 
         {submitStatus.type && (
@@ -94,7 +97,7 @@ export default function AreaContact() {
               htmlFor="name"
               className="block text-gray-700 dark:text-yellow-300 font-medium mb-2"
             >
-              お名前
+              {t("form.name")}
             </label>
             <input
               {...register("name", { required: true })}
@@ -112,7 +115,7 @@ export default function AreaContact() {
               htmlFor="email"
               className="block text-gray-700 dark:text-yellow-300 font-medium mb-2"
             >
-              メールアドレス
+              {t("form.email")}
             </label>
             <input
               {...register("email", {
@@ -133,7 +136,7 @@ export default function AreaContact() {
               htmlFor="message"
               className="block text-gray-700 dark:text-yellow-300 font-medium mb-2"
             >
-              お問い合わせ内容
+              {t("form.message")}
             </label>
             <textarea
               {...register("message", { required: true })}
@@ -155,7 +158,7 @@ export default function AreaContact() {
               text-gray-900 dark:text-black font-medium rounded-lg transition-all duration-300
               shadow-sm hover:shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {isSubmitting ? "送信中..." : "送信する"}
+              {isSubmitting ? t("form.submitting") : t("form.submit")}
             </button>
           </div>
         </form>

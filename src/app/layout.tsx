@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import Navigation from "@/components/Navigation";
 import { Noto_Sans_JP, Inter } from "next/font/google";
+import { NextIntlClientProvider } from "next-intl";
+import { getLocale, getMessages } from "next-intl/server";
 import Footer from "@/components/Footer";
 import "./globals.css";
 
@@ -18,17 +20,21 @@ export const metadata: Metadata = {
   description: "革新的なITソリューションを提供する株式会社webhani",
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  const locale = await getLocale();
+  const messages = await getMessages();
   return (
     <html lang="ja">
       <body className={`${noto.className} ${inter.className}`}>
-        <Navigation />
-        <main>{children}</main>
-        <Footer />
+        <NextIntlClientProvider messages={messages}>
+          <Navigation />
+          <main>{children}</main>
+          <Footer />
+        </NextIntlClientProvider>
       </body>
     </html>
   );
