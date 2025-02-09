@@ -1,28 +1,16 @@
 "use client";
 import React, { useState } from "react";
-import { useForm } from "react-hook-form";
-
-type FormInputs = {
-  name: string;
-  email: string;
-  message: string;
-};
+import { FormInputs, SubmitStatus } from "@/types/contact";
+import { ContactForm } from "./area-contact/ContactForm";
 
 export default function AreaContact() {
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [submitStatus, setSubmitStatus] = useState<{
-    type: "success" | "error" | null;
-    message: string;
-  }>({ type: null, message: "" });
+  const [submitStatus, setSubmitStatus] = useState<SubmitStatus>({
+    type: null,
+    message: "",
+  });
 
-  const {
-    register,
-    handleSubmit,
-    reset,
-    formState: { errors },
-  } = useForm<FormInputs>();
-
-  const onSubmit = async (data: FormInputs) => {
+  const handleSubmit = async (data: FormInputs) => {
     setIsSubmitting(true);
     try {
       const response = await fetch("/api/contact", {
@@ -39,7 +27,6 @@ export default function AreaContact() {
         type: "success",
         message: "お問い合わせを送信しました。",
       });
-      reset();
     } catch (error) {
       setSubmitStatus({
         type: "error",
@@ -70,67 +57,7 @@ export default function AreaContact() {
           </div>
         )}
 
-        <form className="space-y-6 fade-in" onSubmit={handleSubmit(onSubmit)}>
-          <div>
-            <label
-              htmlFor="name"
-              className="block text-gray-700 font-medium mb-2"
-            >
-              お名前
-            </label>
-            <input
-              {...register("name", { required: true })}
-              type="text"
-              id="name"
-              className="w-full px-5 py-3 border border-gray-200 rounded-lg focus:ring-2 focus:ring-yellow-300 focus:border-transparent transition-all duration-300"
-            />
-          </div>
-
-          <div>
-            <label
-              htmlFor="email"
-              className="block text-gray-700 font-medium mb-2"
-            >
-              メールアドレス
-            </label>
-            <input
-              {...register("email", {
-                required: true,
-                pattern: /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i,
-              })}
-              type="email"
-              id="email"
-              className="w-full px-5 py-3 border border-gray-200 rounded-lg focus:ring-2 focus:ring-yellow-300 focus:border-transparent transition-all duration-300"
-            />
-          </div>
-
-          <div>
-            <label
-              htmlFor="message"
-              className="block text-gray-700 font-medium mb-2"
-            >
-              お問い合わせ内容
-            </label>
-            <textarea
-              {...register("message", { required: true })}
-              id="message"
-              rows={6}
-              className="w-full px-5 py-3 border border-gray-200 rounded-lg focus:ring-2 focus:ring-yellow-300 focus:border-transparent transition-all duration-300"
-            ></textarea>
-          </div>
-
-          <div className="text-center">
-            <button
-              type="submit"
-              disabled={isSubmitting}
-              className="w-full md:w-auto md:px-12 py-3 bg-yellow-300 hover:bg-yellow-400
-              text-gray-900 font-medium rounded-lg transition-all duration-300
-              shadow-sm hover:shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {isSubmitting ? "送信中..." : "送信する"}
-            </button>
-          </div>
-        </form>
+        <ContactForm onSubmit={handleSubmit} isSubmitting={isSubmitting} />
       </div>
     </section>
   );
