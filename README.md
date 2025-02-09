@@ -5,7 +5,7 @@
 | ITEM   | Version |
 | ------ | ------- |
 | node   | 20.10.0 |
-| nextjs | 14.0.3  |
+| nextjs | 15.1.6  |
 
 ## Setup Dev evn
 
