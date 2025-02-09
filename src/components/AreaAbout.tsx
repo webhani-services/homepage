@@ -1,4 +1,5 @@
 import Image from "next/image";
+import { useTranslations } from "next-intl";
 
 // 基本情報データ
 const companyInfo = {
@@ -9,94 +10,90 @@ const companyInfo = {
 
 // 事業内容データ
 const services = [
-  {
-    title: "Webアプリケーション開発",
-    description: "最新技術を活用した高品質なWeb開発",
-  },
-  {
-    title: "システムコンサルティング",
-    description: "お客様のビジネスに最適なソリューション提案",
-  },
-  {
-    title: "ITインフラ構築・運用",
-    description: "安定性と拡張性を重視したインフラ設計",
-  },
-  {
-    title: "IT教育",
-    description: "次世代のIT人材育成をサポート",
-  },
-  {
-    title: "デジタルコンテンツ開発",
-    description: "魅力的なデジタルコンテンツの制作",
-  },
-  {
-    title: "受託開発",
-    description: "要件定義から運用まで一貫したサポート",
-  },
+  "webDev",
+  "consulting",
+  "infrastructure",
+  "education",
+  "digitalContent",
+  "outsourcing",
 ] as const;
 
 // 基本情報コンポーネント
-const CompanyBasicInfo = () => (
-  <div className="lg:col-span-1 p-8 lg:border-r border-gray-100 dark:border-gray-800">
-    <h3 className="font-bold mb-6 text-gray-900 dark:text-gray-100 flex items-center">
-      <span className="w-1 h-6 bg-yellow-400 mr-3"></span>
-      <span className="text-3xl dark:text-yellow-300">基本情報</span>
-    </h3>
-    <dl className="space-y-6">
-      <div>
-        <dt className="text-sm font-medium text-gray-500 dark:text-gray-400 mb-1">
-          社名
-        </dt>
-        <dd className="text-gray-900 dark:text-yellow-300">
-          {companyInfo.name}
-        </dd>
-      </div>
-      <div>
-        <dt className="text-sm font-medium text-gray-500 dark:text-gray-400 mb-1">
-          設立日
-        </dt>
-        <dd className="text-gray-900 dark:text-yellow-300">
-          {companyInfo.establishedDate}
-        </dd>
-      </div>
-      <div>
-        <dt className="text-sm font-medium text-gray-500 dark:text-gray-400 mb-1">
-          代表者
-        </dt>
-        <dd className="text-gray-900 dark:text-yellow-300">
-          {companyInfo.representative}
-        </dd>
-      </div>
-    </dl>
-  </div>
-);
+const CompanyBasicInfo = () => {
+  const t = useTranslations("about");
+
+  return (
+    <div className="lg:col-span-1 p-8 lg:border-r border-gray-100 dark:border-gray-800">
+      <h3 className="font-bold mb-6 text-gray-900 dark:text-gray-100 flex items-center">
+        <span className="w-1 h-6 bg-yellow-400 mr-3"></span>
+        <span className="text-3xl dark:text-yellow-300">
+          {t("basicInfo.title")}
+        </span>
+      </h3>
+      <dl className="space-y-6">
+        <div>
+          <dt className="text-sm font-medium text-gray-500 dark:text-gray-400 mb-1">
+            {t("basicInfo.companyName")}
+          </dt>
+          <dd className="text-gray-900 dark:text-yellow-300">
+            {companyInfo.name}
+          </dd>
+        </div>
+        <div>
+          <dt className="text-sm font-medium text-gray-500 dark:text-gray-400 mb-1">
+            {t("basicInfo.established")}
+          </dt>
+          <dd className="text-gray-900 dark:text-yellow-300">
+            {companyInfo.establishedDate}
+          </dd>
+        </div>
+        <div>
+          <dt className="text-sm font-medium text-gray-500 dark:text-gray-400 mb-1">
+            {t("basicInfo.representative")}
+          </dt>
+          <dd className="text-gray-900 dark:text-yellow-300">
+            {companyInfo.representative}
+          </dd>
+        </div>
+      </dl>
+    </div>
+  );
+};
 
 // 事業内容コンポーネント
-const ServiceList = () => (
-  <div className="lg:col-span-2 p-8 bg-white dark:bg-black">
-    <h3 className="font-bold text-xl mb-6 text-gray-900 dark:text-gray-100 flex items-center">
-      <span className="w-1 h-6 bg-yellow-400 mr-3"></span>
-      <span className="text-3xl dark:text-yellow-300">事業内容</span>
-    </h3>
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-      {services.map((service, index) => (
-        <div
-          key={index}
-          className="p-4 rounded-lg border border-gray-100 dark:border-gray-800 hover:border-yellow-200 dark:hover:border-yellow-900 hover:bg-yellow-50/50 dark:hover:bg-yellow-900/20 transition-colors duration-300"
-        >
-          <h4 className="font-medium text-gray-900 dark:text-yellow-300 mb-2">
-            {service.title}
-          </h4>
-          <p className="text-sm text-gray-600 dark:text-gray-400">
-            {service.description}
-          </p>
-        </div>
-      ))}
+const ServiceList = () => {
+  const t = useTranslations("about");
+
+  return (
+    <div className="lg:col-span-2 p-8 bg-white dark:bg-black">
+      <h3 className="font-bold text-xl mb-6 text-gray-900 dark:text-gray-100 flex items-center">
+        <span className="w-1 h-6 bg-yellow-400 mr-3"></span>
+        <span className="text-3xl dark:text-yellow-300">
+          {t("services.title")}
+        </span>
+      </h3>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        {services.map((service) => (
+          <div
+            key={service}
+            className="p-4 rounded-lg border border-gray-100 dark:border-gray-800 hover:border-yellow-200 dark:hover:border-yellow-900 hover:bg-yellow-50/50 dark:hover:bg-yellow-900/20 transition-colors duration-300"
+          >
+            <h4 className="font-medium text-gray-900 dark:text-yellow-300 mb-2">
+              {t(`services.items.${service}.title`)}
+            </h4>
+            <p className="text-sm text-gray-600 dark:text-gray-400">
+              {t(`services.items.${service}.description`)}
+            </p>
+          </div>
+        ))}
+      </div>
     </div>
-  </div>
-);
+  );
+};
 
 export default function AreaAbout() {
+  const t = useTranslations("about");
+
   return (
     <section
       id="about"
@@ -105,7 +102,7 @@ export default function AreaAbout() {
       <div className="max-w-7xl mx-auto px-4 sm:px-6">
         <div className="text-center mb-16">
           <h2 className="text-4xl font-bold text-gray-900 dark:text-yellow-300">
-            企業情報
+            {t("title")}
           </h2>
         </div>
 

@@ -1,30 +1,21 @@
 import Image from "next/image";
+import { useTranslations } from "next-intl";
 
-// 企業理念のデータを定義
-const philosophyData = {
-  title: "企業理念",
-  description:
-    "私たちは、テクノロジーの力で社会に貢献し、お客様とともに新しい価値を創造することを目指しています。",
-  principles: [
-    {
-      id: "01",
-      title: "技術革新",
-      description:
-        "最新技術を積極的に取り入れ、革新的なソリューションを提供します。",
-    },
-    {
-      id: "02",
-      title: "品質重視",
-      description: "高品質なサービスの提供を通じて、お客様の信頼を獲得します。",
-    },
-  ],
-  image: {
-    src: "/images/about/team.jpg",
-    alt: "Our Team",
+// 企業理念の原則データを定義
+const principles = [
+  {
+    id: "01",
+    key: "innovation",
   },
-};
+  {
+    id: "02",
+    key: "quality",
+  },
+];
 
 export default function AreaCorporatePhilosophy() {
+  const t = useTranslations("philosophy");
+
   return (
     <section
       id="corporate-philosophy"
@@ -34,13 +25,13 @@ export default function AreaCorporatePhilosophy() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center">
           <div className="fade-in">
             <h2 className="heading-primary dark:text-yellow-300">
-              {philosophyData.title}
+              {t("title")}
             </h2>
             <p className="paragraph dark:text-gray-400 mb-6">
-              {philosophyData.description}
+              {t("description")}
             </p>
             <div className="space-y-4">
-              {philosophyData.principles.map((principle) => (
+              {principles.map((principle) => (
                 <div key={principle.id} className="flex items-start">
                   <div className="flex-shrink-0 w-12 h-12 bg-yellow-300 dark:bg-yellow-600 rounded-full flex items-center justify-center">
                     <span className="text-gray-900 dark:text-gray-100 font-bold">
@@ -49,10 +40,10 @@ export default function AreaCorporatePhilosophy() {
                   </div>
                   <div className="ml-4">
                     <h3 className="text-xl font-bold mb-2 dark:text-yellow-300">
-                      {principle.title}
+                      {t(`principles.${principle.key}.title`)}
                     </h3>
                     <p className="text-gray-600 dark:text-gray-400">
-                      {principle.description}
+                      {t(`principles.${principle.key}.description`)}
                     </p>
                   </div>
                 </div>
@@ -65,8 +56,8 @@ export default function AreaCorporatePhilosophy() {
             style={{ animationDelay: "0.2s" }}
           >
             <Image
-              src={philosophyData.image.src}
-              alt={philosophyData.image.alt}
+              src="/images/about/team.jpg"
+              alt={t("image.alt")}
               fill
               className="object-cover rounded-lg"
             />

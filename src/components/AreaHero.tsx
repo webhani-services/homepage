@@ -1,29 +1,20 @@
 "use client";
 import Image from "next/image";
-
-// ヒーローセクションのデータ
-const heroData = {
-  backgroundImage: {
-    src: "/images/hero-bg.jpg",
-    alt: "Hero background",
-  },
-  title: "革新的なITソリューションで\nビジネスの未来を創造する",
-  subtitle:
-    "システム開発からITコンサルティングまで\nお客様のデジタル変革をトータルサポート",
-  button: {
-    text: "お問い合わせ",
-    targetId: "contact",
-  },
-};
+import { useTranslations } from "next-intl";
 
 export default function AreaHero() {
+  const t = useTranslations("hero");
+
+  // 背景画像のパスは変更されないのでここで定義
+  const backgroundImageSrc = "/images/hero-bg.jpg";
+
   return (
     <section className="relative h-screen min-h-[600px] flex items-center justify-center overflow-hidden">
       {/* 背景画像 */}
       <div className="absolute inset-0 z-0">
         <Image
-          src={heroData.backgroundImage.src}
-          alt={heroData.backgroundImage.alt}
+          src={backgroundImageSrc}
+          alt={t("backgroundImage.alt")}
           fill
           className="object-cover"
           priority
@@ -34,27 +25,31 @@ export default function AreaHero() {
       {/* コンテンツ */}
       <div className="relative z-10 text-center text-white px-4">
         <h1 className="text-4xl md:text-6xl font-bold mb-6 fade-in">
-          {heroData.title.split("\n").map((line, i) => (
-            <span key={i}>
-              {line}
-              {i < heroData.title.split("\n").length - 1 && <br />}
-            </span>
-          ))}
+          {t("title")
+            .split("\n")
+            .map((line, i) => (
+              <span key={i}>
+                {line}
+                {i < t("title").split("\n").length - 1 && <br />}
+              </span>
+            ))}
         </h1>
         <p
           className="text-xl md:text-2xl mb-8 fade-in"
           style={{ animationDelay: "0.2s" }}
         >
-          {heroData.subtitle.split("\n").map((line, i) => (
-            <span key={i}>
-              {line}
-              {i < heroData.subtitle.split("\n").length - 1 && <br />}
-            </span>
-          ))}
+          {t("subtitle")
+            .split("\n")
+            .map((line, i) => (
+              <span key={i}>
+                {line}
+                {i < t("subtitle").split("\n").length - 1 && <br />}
+              </span>
+            ))}
         </p>
         <button
           onClick={() => {
-            document.getElementById(heroData.button.targetId)?.scrollIntoView({
+            document.getElementById("contact")?.scrollIntoView({
               behavior: "smooth",
             });
           }}
@@ -62,7 +57,7 @@ export default function AreaHero() {
           py-3 px-12 rounded-lg transition-all duration-300 shadow-sm hover:shadow-md fade-in"
           style={{ animationDelay: "0.4s" }}
         >
-          {heroData.button.text}
+          {t("button")}
         </button>
       </div>
 
