@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Navigation from "@/components/organisms/Navigation";
 import { Noto_Sans_JP, Inter } from "next/font/google";
 import Footer from "@/components/organisms/Footer";
+import { ThemeProvider } from "next-themes";
 import "./globals.css";
 
 // 使用したいフォントの設定
@@ -24,11 +25,13 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="ja">
+    <html lang="ja" suppressHydrationWarning>
       <body className={`${noto.className} ${inter.className}`}>
-        <Navigation />
-        <main>{children}</main>
-        <Footer />
+        <ThemeProvider>
+          <Navigation />
+          <main>{children}</main>
+          <Footer />
+        </ThemeProvider>
       </body>
     </html>
   );

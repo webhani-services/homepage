@@ -1,8 +1,10 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
 import Image from "next/image";
+import { useTheme } from "next-themes";
+import { MdLightMode, MdDarkMode, MdBrightness6 } from "react-icons/md";
 
 const navigation = [
   {
@@ -23,9 +25,13 @@ const navigation = [
 ];
 
 export default function Navigation() {
+  const { theme, setTheme } = useTheme();
+
   const [isOpen, setIsOpen] = useState(false);
   const [activeDropdown, setActiveDropdown] = useState<string | null>(null);
   const [isScrolled, setIsScrolled] = useState(false);
+  const [isThemeMenuOpen, setIsThemeMenuOpen] = useState(false);
+  const themeMenuRef = useRef<HTMLDivElement>(null);
 
   // スクロール監視の追加
   useEffect(() => {
@@ -36,6 +42,20 @@ export default function Navigation() {
 
     window.addEventListener("scroll", handleScroll);
     return () => window.removeEventListener("scroll", handleScroll);
+  }, []);
+
+  // クリックアウトサイドの処理を追加
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (
+        themeMenuRef.current &&
+        !themeMenuRef.current.contains(event.target as Node)
+      ) {
+        setIsThemeMenuOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
   return (
@@ -94,6 +114,73 @@ export default function Navigation() {
                 )}
               </div>
             ))}
+
+            {/* テーマ切り替えボタン - デスクトップ */}
+            <div className="relative" ref={themeMenuRef}>
+              <button
+                onClick={() => setIsThemeMenuOpen(!isThemeMenuOpen)}
+                className="p-2 rounded-md text-gray-700 hover:text-yellow-600 transition-colors duration-200"
+                aria-label="テーマ設定"
+              >
+                {theme === "dark" ? (
+                  <MdDarkMode className="w-5 h-5" />
+                ) : theme === "light" ? (
+                  <MdLightMode className="w-5 h-5" />
+                ) : (
+                  <MdBrightness6 className="w-5 h-5" />
+                )}
+              </button>
+
+              {isThemeMenuOpen && (
+                <div className="absolute right-0 mt-2 w-40 bg-white rounded-md shadow-lg py-1">
+                  <button
+                    onClick={() => {
+                      setTheme("system");
+                      setIsThemeMenuOpen(false);
+                    }}
+                    className={`w-full text-left px-4 py-2 text-sm hover:bg-yellow-50 transition-colors duration-200
+                      ${
+                        theme === "system" ? "text-yellow-600" : "text-gray-700"
+                      }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <MdBrightness6 className="w-5 h-5" />
+                      <span>System theme</span>
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setTheme("light");
+                      setIsThemeMenuOpen(false);
+                    }}
+                    className={`w-full text-left px-4 py-2 text-sm hover:bg-yellow-50 transition-colors duration-200
+                      ${
+                        theme === "light" ? "text-yellow-600" : "text-gray-700"
+                      }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <MdLightMode className="w-5 h-5" />
+                      <span>Light theme</span>
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setTheme("dark");
+                      setIsThemeMenuOpen(false);
+                    }}
+                    className={`w-full text-left px-4 py-2 text-sm hover:bg-yellow-50 transition-colors duration-200
+                      ${
+                        theme === "dark" ? "text-yellow-600" : "text-gray-700"
+                      }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <MdDarkMode className="w-5 h-5" />
+                      <span>Dark theme</span>
+                    </div>
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
 
           {/* モバイルメニューボタン */}
@@ -173,6 +260,34 @@ export default function Navigation() {
                 )}
               </div>
             ))}
+
+            {/* テーマ切り替えボタン - モバイル */}
+            <div className="flex items-center justify-start gap-2 px-3 py-2">
+              <button
+                onClick={() => setTheme("light")}
+                className={`flex items-center gap-2 px-3 py-2 rounded-md text-base font-medium hover:bg-yellow-50 transition-colors duration-200
+                  ${theme === "light" ? "text-yellow-600" : "text-gray-700"}`}
+              >
+                <MdLightMode className="w-5 h-5" />
+                <span>ライト</span>
+              </button>
+              <button
+                onClick={() => setTheme("dark")}
+                className={`flex items-center gap-2 px-3 py-2 rounded-md text-base font-medium hover:bg-yellow-50 transition-colors duration-200
+                  ${theme === "dark" ? "text-yellow-600" : "text-gray-700"}`}
+              >
+                <MdDarkMode className="w-5 h-5" />
+                <span>ダーク</span>
+              </button>
+              <button
+                onClick={() => setTheme("system")}
+                className={`flex items-center gap-2 px-3 py-2 rounded-md text-base font-medium hover:bg-yellow-50 transition-colors duration-200
+                  ${theme === "system" ? "text-yellow-600" : "text-gray-700"}`}
+              >
+                <MdBrightness6 className="w-5 h-5" />
+                <span>自動</span>
+              </button>
+            </div>
           </div>
         </div>
       )}
