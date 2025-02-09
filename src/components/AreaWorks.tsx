@@ -39,8 +39,12 @@ const WorkCard = ({ work, index }: WorkCardProps) => (
       />
       <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
         <div className="flex flex-col items-center justify-center h-full text-white">
-          <span className="text-sm font-medium mb-2">{work.category}</span>
-          <h3 className="text-xl font-bold text-center px-4">{work.title}</h3>
+          <span className="text-sm font-medium mb-2 text-yellow-300">
+            {work.category}
+          </span>
+          <h3 className="text-xl font-bold text-center px-4 text-gray-100">
+            {work.title}
+          </h3>
         </div>
       </div>
     </div>
@@ -50,10 +54,12 @@ const WorkCard = ({ work, index }: WorkCardProps) => (
 // メインコンポーネント
 export default function AreaWorks() {
   return (
-    <section id="works" className="section-padding bg-gray-50">
+    <section id="works" className="section-padding bg-gray-50 dark:bg-black">
       <div className="max-w-7xl mx-auto">
-        <h2 className="heading-primary text-center">実績</h2>
-        <p className="paragraph text-center mb-12">
+        <h2 className="heading-primary text-center dark:text-yellow-300">
+          実績
+        </h2>
+        <p className="paragraph text-center mb-12 dark:text-gray-400">
           お客様のビジネスの成功を支えた実績をご紹介します
         </p>
 

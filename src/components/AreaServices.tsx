@@ -56,26 +56,30 @@ const ServiceCard = ({ service, index }: ServiceCardProps) => (
   <div
     key={service.title}
     id={service.id}
-    className="bg-white p-8 rounded-xl shadow-sm hover:shadow-lg transform hover:-translate-y-1 transition-all duration-300 fade-in"
+    className="bg-white dark:bg-black p-8 rounded-xl shadow-sm hover:shadow-lg transform hover:-translate-y-1 transition-all duration-300 fade-in dark:shadow-gray-800"
     style={{ animationDelay: `${index * 0.2}s` }}
   >
     <div className="w-16 h-16 mb-4 mx-auto">
       <Image src={service.icon} alt={service.title} width={64} height={64} />
     </div>
-    <h3 className="text-xl font-bold text-gray-900 mb-3 text-center">
+    <h3 className="text-xl font-bold text-gray-900 dark:text-yellow-300 mb-3 text-center">
       {service.title}
     </h3>
-    <p className="text-gray-600 text-center">{service.description}</p>
+    <p className="text-gray-600 dark:text-gray-400 text-center">
+      {service.description}
+    </p>
   </div>
 );
 
 // メインコンポーネント
 export default function AreaServices() {
   return (
-    <section id="services" className="section-padding">
+    <section id="services" className="section-padding dark:bg-black">
       <div className="max-w-7xl mx-auto">
-        <h2 className="heading-primary text-center">サービス</h2>
-        <p className="paragraph text-center mb-12">
+        <h2 className="heading-primary text-center dark:text-yellow-300">
+          サービス
+        </h2>
+        <p className="paragraph text-center mb-12 dark:text-gray-400">
           お客様のビジネスの成長を支援する多様なサービスを提供しています
         </p>
 

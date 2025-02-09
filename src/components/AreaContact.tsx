@@ -67,10 +67,12 @@ export default function AreaContact() {
     useContactForm();
 
   return (
-    <section id="contact" className="section-padding bg-white">
+    <section id="contact" className="section-padding bg-white dark:bg-black">
       <div className="max-w-3xl mx-auto">
-        <h2 className="heading-primary text-center">お問い合わせ</h2>
-        <p className="paragraph text-center mb-12">
+        <h2 className="heading-primary text-center dark:text-yellow-300">
+          お問い合わせ
+        </h2>
+        <p className="paragraph text-center mb-12 dark:text-gray-400">
           ご質問やご相談がございましたら、お気軽にお問い合わせください
         </p>
 
@@ -78,8 +80,8 @@ export default function AreaContact() {
           <div
             className={`mb-6 p-4 rounded ${
               submitStatus.type === "success"
-                ? "bg-green-100 text-green-700"
-                : "bg-red-100 text-red-700"
+                ? "bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300"
+                : "bg-red-100 dark:bg-red-900 text-red-700 dark:text-red-300"
             }`}
           >
             {submitStatus.message}
@@ -90,7 +92,7 @@ export default function AreaContact() {
           <div>
             <label
               htmlFor="name"
-              className="block text-gray-700 font-medium mb-2"
+              className="block text-gray-700 dark:text-yellow-300 font-medium mb-2"
             >
               お名前
             </label>
@@ -98,14 +100,17 @@ export default function AreaContact() {
               {...register("name", { required: true })}
               type="text"
               id="name"
-              className="w-full px-5 py-3 border border-gray-200 rounded-lg focus:ring-2 focus:ring-yellow-300 focus:border-transparent transition-all duration-300"
+              className="w-full px-5 py-3 border border-gray-200 dark:border-gray-700 rounded-lg
+              focus:ring-2 focus:ring-yellow-300 dark:focus:ring-yellow-600 focus:border-transparent
+              transition-all duration-300 bg-white dark:bg-gray-800
+              text-gray-900 dark:text-gray-100"
             />
           </div>
 
           <div>
             <label
               htmlFor="email"
-              className="block text-gray-700 font-medium mb-2"
+              className="block text-gray-700 dark:text-yellow-300 font-medium mb-2"
             >
               メールアドレス
             </label>
@@ -116,14 +121,17 @@ export default function AreaContact() {
               })}
               type="email"
               id="email"
-              className="w-full px-5 py-3 border border-gray-200 rounded-lg focus:ring-2 focus:ring-yellow-300 focus:border-transparent transition-all duration-300"
+              className="w-full px-5 py-3 border border-gray-200 dark:border-gray-700 rounded-lg
+              focus:ring-2 focus:ring-yellow-300 dark:focus:ring-yellow-600 focus:border-transparent
+              transition-all duration-300 bg-white dark:bg-gray-800
+              text-gray-900 dark:text-gray-100"
             />
           </div>
 
           <div>
             <label
               htmlFor="message"
-              className="block text-gray-700 font-medium mb-2"
+              className="block text-gray-700 dark:text-yellow-300 font-medium mb-2"
             >
               お問い合わせ内容
             </label>
@@ -131,7 +139,10 @@ export default function AreaContact() {
               {...register("message", { required: true })}
               id="message"
               rows={6}
-              className="w-full px-5 py-3 border border-gray-200 rounded-lg focus:ring-2 focus:ring-yellow-300 focus:border-transparent transition-all duration-300"
+              className="w-full px-5 py-3 border border-gray-200 dark:border-gray-700 rounded-lg
+              focus:ring-2 focus:ring-yellow-300 dark:focus:ring-yellow-600 focus:border-transparent
+              transition-all duration-300 bg-white dark:bg-gray-800
+              text-gray-900 dark:text-gray-100"
             ></textarea>
           </div>
 
@@ -140,7 +151,8 @@ export default function AreaContact() {
               type="submit"
               disabled={isSubmitting}
               className="w-full md:w-auto md:px-12 py-3 bg-yellow-300 hover:bg-yellow-400
-              text-gray-900 font-medium rounded-lg transition-all duration-300
+              dark:bg-yellow-400 dark:hover:bg-yellow-500
+              text-gray-900 dark:text-black font-medium rounded-lg transition-all duration-300
               shadow-sm hover:shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {isSubmitting ? "送信中..." : "送信する"}
