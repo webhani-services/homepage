@@ -1,12 +1,4 @@
-import Image from "next/image";
 import { useTranslations } from "next-intl";
-
-// 基本情報データ
-const companyInfo = {
-  name: "株式会社 Webhani",
-  establishedDate: "2016年1月1日",
-  representative: "金 容暈",
-};
 
 // 事業内容データ
 const services = [
@@ -21,6 +13,12 @@ const services = [
 // 基本情報コンポーネント
 const CompanyBasicInfo = () => {
   const t = useTranslations("about");
+
+  const companyInfo = {
+    name: t("basicInfo.companyNameValue"),
+    establishedDate: t("basicInfo.establishedValue"),
+    representative: t("basicInfo.representativeValue"),
+  };
 
   return (
     <div className="lg:col-span-1 p-8 lg:border-r border-gray-100 dark:border-gray-800">
