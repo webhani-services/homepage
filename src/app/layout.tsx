@@ -29,6 +29,23 @@ export default async function RootLayout({
   const messages = await getMessages();
   return (
     <html lang="ja">
+      <head>
+        {/* Google Analytics */}
+        <script
+          async
+          src="https://www.googletagmanager.com/gtag/js?id=G-M9E2FH8EK1"
+        ></script>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              window.dataLayer = window.dataLayer || [];
+              function gtag(){dataLayer.push(arguments);}
+              gtag('js', new Date());
+              gtag('config', 'G-M9E2FH8EK1');
+            `,
+          }}
+        />
+      </head>
       <body className={`${noto.className} ${inter.className}`}>
         <NextIntlClientProvider messages={messages}>
           <Navigation />
