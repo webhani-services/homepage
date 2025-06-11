@@ -34,6 +34,7 @@ const navigationData = {
         { nameKey: "education", href: "#education" },
         { nameKey: "digitalContent", href: "#digital-content" },
         { nameKey: "outsourcing", href: "#outsourcing" },
+        { nameKey: "llmServices", href: "#llm-services" },
       ],
     },
     { nameKey: "philosophy", href: "#corporate-philosophy" },

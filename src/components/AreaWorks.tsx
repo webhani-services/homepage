@@ -15,6 +15,10 @@ const WORKS_DATA = [
     id: "businessSystem",
     image: "/images/works/system.jpg",
   },
+  {
+    id: "aiChatbot",
+    image: "/images/works/ai-chatbot.jpg",
+  },
 ] as const;
 
 // WorkCardコンポーネントを作成して表示ロジックを分離
