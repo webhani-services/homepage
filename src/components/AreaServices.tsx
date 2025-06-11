@@ -30,6 +30,10 @@ const SERVICE_IDS = [
     icon: "/images/services/outsourcing.svg",
     id: "outsourcing",
   },
+  {
+    icon: "/images/services/llm-ai.svg",
+    id: "llmServices",
+  },
 ];
 
 // サービスカードのコンポーネントを分離
