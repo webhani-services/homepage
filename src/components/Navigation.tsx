@@ -48,9 +48,9 @@ const navigationData = {
 const navigationUtils = {
   getScrolledStyle: (isScrolled: boolean) => ({
     background: isScrolled
-      ? "bg-yellow-300 dark:bg-black"
-      : "bg-yellow-300/95 dark:bg-black",
-    additionalClasses: isScrolled ? "shadow-md" : "",
+      ? "bg-white/95 dark:bg-[#0f0f0f]/95"
+      : "bg-white/80 dark:bg-[#0f0f0f]/80",
+    additionalClasses: isScrolled ? "shadow-sm shadow-black/5" : "",
   }),
 
   // ダークモード切り替え用の関数を追加
@@ -162,7 +162,7 @@ export default function Navigation() {
           <div className="flex items-center md:hidden">
             <button
               type="button"
-              className="inline-flex items-center justify-center p-2 rounded-md text-gray-800 dark:text-yellow-300 hover:text-yellow-600 dark:hover:text-yellow-400"
+              className="inline-flex items-center justify-center p-2 rounded-md text-gray-700 dark:text-gray-300 hover:text-amber-600 dark:hover:text-amber-400"
               onClick={() => setIsOpen(!isOpen)}
             >
               <span className="sr-only">メニューを開く</span>

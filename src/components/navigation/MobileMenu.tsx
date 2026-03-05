@@ -24,14 +24,14 @@ export default function MobileMenu({
 
   return (
     <div className="md:hidden">
-      <div className="px-2 pt-2 pb-3 space-y-1 sm:px-3 bg-white dark:bg-black shadow-lg">
+      <div className="px-2 pt-2 pb-3 space-y-1 sm:px-3 bg-white dark:bg-[#1a1a1a] shadow-lg border-t border-gray-100 dark:border-gray-800">
         {/* メインメニュー */}
         <div className="border-b border-gray-200 dark:border-gray-800 pb-2 mb-2">
           {items.map((item) => (
             <div key={item.nameKey}>
               <Link
                 href={item.href}
-                className="block px-3 py-2 rounded-md text-base font-medium text-gray-800 dark:text-yellow-300 hover:bg-yellow-100 hover:text-yellow-600 dark:hover:bg-yellow-900/30 dark:hover:text-yellow-400 transition-colors duration-200"
+                className="block px-3 py-2 rounded-md text-base font-medium text-gray-700 dark:text-gray-300 hover:bg-amber-50 hover:text-amber-600 dark:hover:bg-amber-900/20 dark:hover:text-amber-400 transition-colors duration-200"
                 onClick={() => {
                   if (!item.children) {
                     setIsOpen(false);
@@ -46,7 +46,7 @@ export default function MobileMenu({
                     <Link
                       key={child.nameKey}
                       href={child.href}
-                      className="block px-3 py-2 text-sm text-gray-700 dark:text-yellow-300 hover:bg-yellow-100 hover:text-yellow-600 dark:hover:bg-yellow-900/30 dark:hover:text-yellow-400 transition-colors duration-200"
+                      className="block px-3 py-2 text-sm text-gray-600 dark:text-gray-400 hover:bg-amber-50 hover:text-amber-600 dark:hover:bg-amber-900/20 dark:hover:text-amber-400 transition-colors duration-200"
                       onClick={() => setIsOpen(false)}
                     >
                       {t(child.nameKey)}
