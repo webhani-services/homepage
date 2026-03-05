@@ -31,8 +31,8 @@ export default function LanguageToggle() {
           className={`px-2 text-sm transition-colors duration-200
             ${
               currentLocale === lang.code
-                ? "text-yellow-500 dark:text-yellow-300 font-bold"
-                : "text-gray-600 hover:text-yellow-500 dark:text-gray-400 dark:hover:text-yellow-300"
+                ? "text-amber-600 dark:text-amber-400 font-bold"
+                : "text-gray-500 hover:text-amber-600 dark:text-gray-500 dark:hover:text-amber-400"
             }`}
         >
           {lang.label}

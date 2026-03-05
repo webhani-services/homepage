@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
+import { z } from "zod";
 
 // SES クライアントの初期化
 const ses = new SESClient({
@@ -10,9 +11,32 @@ const ses = new SESClient({
   },
 });
 
+const contactSchema = z.object({
+  name: z.string().min(1).max(200),
+  email: z.string().email().max(254),
+  message: z.string().min(1).max(5000),
+});
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 export async function POST(request: Request) {
   try {
-    const { name, email, message } = await request.json();
+    const body = await request.json();
+    const result = contactSchema.safeParse(body);
+    if (!result.success) {
+      return NextResponse.json(
+        { error: "入力内容に不備があります。" },
+        { status: 400 }
+      );
+    }
+    const { name, email, message } = result.data;
 
     // HTMLメールテンプレート
     const htmlBody = `
@@ -67,15 +91,15 @@ export async function POST(request: Request) {
     <div class="content">
       <div class="field">
         <div class="field-label">お名前:</div>
-        <div>${name}</div>
+        <div>${escapeHtml(name)}</div>
       </div>
       <div class="field">
         <div class="field-label">メールアドレス:</div>
-        <div>${email}</div>
+        <div>${escapeHtml(email)}</div>
       </div>
       <div class="field">
         <div class="field-label">お問い合わせ内容:</div>
-        <div class="message-content">${message}</div>
+        <div class="message-content">${escapeHtml(message)}</div>
       </div>
     </div>
   </div>

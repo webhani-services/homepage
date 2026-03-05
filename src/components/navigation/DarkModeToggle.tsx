@@ -13,7 +13,7 @@ export default function DarkModeToggle({ isDark, onToggle }: Props) {
     <div className="flex items-center">
       <button
         onClick={onToggle}
-        className="ml-4 p-2 rounded-md text-gray-800 dark:text-yellow-300 hover:bg-yellow-100 hover:text-yellow-600 dark:hover:bg-yellow-900/30 dark:hover:text-yellow-400 transition-colors duration-200"
+        className="ml-4 p-2 rounded-lg text-gray-600 dark:text-gray-400 hover:bg-amber-50 hover:text-amber-600 dark:hover:bg-amber-900/20 dark:hover:text-amber-400 transition-colors duration-200"
         aria-label={t("darkModeToggle")}
       >
         {isDark ? <MoonIcon /> : <SunIcon />}

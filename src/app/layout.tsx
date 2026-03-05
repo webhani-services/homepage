@@ -1,13 +1,17 @@
 import type { Metadata } from "next";
+import Script from "next/script";
 import Navigation from "@/components/Navigation";
-import { Noto_Sans_JP, Inter } from "next/font/google";
+import { Noto_Sans_JP, DM_Sans } from "next/font/google";
 import { NextIntlClientProvider } from "next-intl";
 import { getLocale, getMessages } from "next-intl/server";
 import Footer from "@/components/Footer";
 import "./globals.css";
 
-// 使用したいフォントの設定
-const inter = Inter({ subsets: ["latin"] });
+const dmSans = DM_Sans({
+  subsets: ["latin"],
+  weight: ["400", "500", "700"],
+  variable: "--font-dm-sans",
+});
 
 const noto = Noto_Sans_JP({
   weight: ["400", "500", "700"],
@@ -28,25 +32,21 @@ export default async function RootLayout({
   const locale = await getLocale();
   const messages = await getMessages();
   return (
-    <html lang="ja">
-      <head>
-        {/* Google Analytics */}
-        <script
-          async
+    <html lang={locale}>
+      <head />
+      <body className={`${noto.className} ${dmSans.variable}`}>
+        <Script
           src="https://www.googletagmanager.com/gtag/js?id=G-M9E2FH8EK1"
-        ></script>
-        <script
-          dangerouslySetInnerHTML={{
-            __html: `
-              window.dataLayer = window.dataLayer || [];
-              function gtag(){dataLayer.push(arguments);}
-              gtag('js', new Date());
-              gtag('config', 'G-M9E2FH8EK1');
-            `,
-          }}
+          strategy="afterInteractive"
         />
-      </head>
-      <body className={`${noto.className} ${inter.className}`}>
+        <Script id="google-analytics" strategy="afterInteractive">
+          {`
+            window.dataLayer = window.dataLayer || [];
+            function gtag(){dataLayer.push(arguments);}
+            gtag('js', new Date());
+            gtag('config', 'G-M9E2FH8EK1');
+          `}
+        </Script>
         <NextIntlClientProvider messages={messages}>
           <Navigation />
           <main>{children}</main>
