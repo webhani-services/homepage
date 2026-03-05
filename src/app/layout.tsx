@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Script from "next/script";
 import Navigation from "@/components/Navigation";
 import { Noto_Sans_JP, DM_Sans } from "next/font/google";
 import { NextIntlClientProvider } from "next-intl";
@@ -32,24 +33,20 @@ export default async function RootLayout({
   const messages = await getMessages();
   return (
     <html lang={locale}>
-      <head>
-        {/* Google Analytics */}
-        <script
-          async
-          src="https://www.googletagmanager.com/gtag/js?id=G-M9E2FH8EK1"
-        ></script>
-        <script
-          dangerouslySetInnerHTML={{
-            __html: `
-              window.dataLayer = window.dataLayer || [];
-              function gtag(){dataLayer.push(arguments);}
-              gtag('js', new Date());
-              gtag('config', 'G-M9E2FH8EK1');
-            `,
-          }}
-        />
-      </head>
+      <head />
       <body className={`${noto.className} ${dmSans.variable}`}>
+        <Script
+          src="https://www.googletagmanager.com/gtag/js?id=G-M9E2FH8EK1"
+          strategy="afterInteractive"
+        />
+        <Script id="google-analytics" strategy="afterInteractive">
+          {`
+            window.dataLayer = window.dataLayer || [];
+            function gtag(){dataLayer.push(arguments);}
+            gtag('js', new Date());
+            gtag('config', 'G-M9E2FH8EK1');
+          `}
+        </Script>
         <NextIntlClientProvider messages={messages}>
           <Navigation />
           <main>{children}</main>

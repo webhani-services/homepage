@@ -57,6 +57,7 @@ export default function AreaCorporatePhilosophy() {
               src="/images/about/team.jpg"
               alt={t("image.alt")}
               fill
+              sizes="(max-width: 1024px) 100vw, 50vw"
               className="object-cover rounded-2xl"
             />
           </div>

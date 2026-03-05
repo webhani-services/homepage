@@ -15,6 +15,7 @@ export default function AreaHero() {
           src={backgroundImageSrc}
           alt={t("backgroundImage.alt")}
           fill
+          sizes="100vw"
           className="object-cover scale-105"
           priority
         />
