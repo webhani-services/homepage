@@ -34,10 +34,10 @@ export default function AreaHero() {
             style={{ animationDelay: "0.15s" }}>
           {t("title")
             .split("\n")
-            .map((line, i) => (
+            .map((line, i, arr) => (
               <span key={i}>
                 {line}
-                {i < t("title").split("\n").length - 1 && <br />}
+                {i < arr.length - 1 && <br />}
               </span>
             ))}
         </h1>
@@ -47,10 +47,10 @@ export default function AreaHero() {
         >
           {t("subtitle")
             .split("\n")
-            .map((line, i) => (
+            .map((line, i, arr) => (
               <span key={i}>
                 {line}
-                {i < t("subtitle").split("\n").length - 1 && <br />}
+                {i < arr.length - 1 && <br />}
               </span>
             ))}
         </p>

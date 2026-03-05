@@ -150,7 +150,6 @@ export default function Navigation() {
               items={navigationData.menuItems}
               activeDropdown={activeDropdown}
               setActiveDropdown={setActiveDropdown}
-              isDark={isDark}
             />
             <div className="flex items-center space-x-4">
               <LanguageToggle />

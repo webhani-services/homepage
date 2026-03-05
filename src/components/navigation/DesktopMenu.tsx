@@ -6,14 +6,12 @@ type Props = {
   items: NavigationItem[];
   activeDropdown: string | null;
   setActiveDropdown: (name: string | null) => void;
-  isDark: boolean;
 };
 
 export default function DesktopMenu({
   items,
   activeDropdown,
   setActiveDropdown,
-  isDark,
 }: Props) {
   const t = useTranslations("navigation");
 

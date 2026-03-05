@@ -56,7 +56,7 @@ const inputClassName = `w-full px-5 py-3.5 border border-gray-200 dark:border-gr
 
 export default function AreaContact() {
   const t = useTranslations("contact");
-  const { register, handleSubmit, onSubmit, isSubmitting, submitStatus } =
+  const { register, handleSubmit, onSubmit, isSubmitting, submitStatus, errors } =
     useContactForm();
   const revealRef = useScrollReveal();
 
@@ -98,6 +98,9 @@ export default function AreaContact() {
               id="name"
               className={inputClassName}
             />
+            {errors.name && (
+              <p className="mt-1.5 text-sm text-red-600 dark:text-red-400">{t("form.nameRequired")}</p>
+            )}
           </div>
 
           <div>
@@ -113,6 +116,9 @@ export default function AreaContact() {
               id="email"
               className={inputClassName}
             />
+            {errors.email && (
+              <p className="mt-1.5 text-sm text-red-600 dark:text-red-400">{t("form.emailRequired")}</p>
+            )}
           </div>
 
           <div>
@@ -125,6 +131,9 @@ export default function AreaContact() {
               rows={6}
               className={inputClassName + " resize-none"}
             ></textarea>
+            {errors.message && (
+              <p className="mt-1.5 text-sm text-red-600 dark:text-red-400">{t("form.messageRequired")}</p>
+            )}
           </div>
 
           <div className="pt-2">
