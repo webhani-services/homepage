@@ -11,8 +11,18 @@
 - **로그 확인**: `docker compose logs -f app`
 - **재빌드**: `docker compose up --build` (Dockerfile 변경 시)
 
+### Docker 주요 명령어
+- **패키지 업데이트**: `package.json` 수정 후 `docker compose up -d --build` (Dockerfile 내 `npm install` 재실행)
+- **package-lock.json 동기화**: `docker cp dev_webhani_hp_app:/var/www/package-lock.json ./package-lock.json`
+- **볼륨 초기화** (node_modules 문제 시): `docker compose down -v && docker compose up -d --build`
+- **컨테이너 내 명령 실행**: `docker exec dev_webhani_hp_app <command>`
+
 ### 로컬 직접 실행 (대체)
 - `npm run dev` → `http://localhost:8000`
+
+### 주의사항
+- `node_modules`는 Docker 익명 볼륨으로 관리됨 — 호스트의 node_modules와 분리
+- 패키지 변경 후 `next: not found` 에러 발생 시 `docker compose down -v` 후 재빌드
 
 ## Tech Stack
 - **Framework**: Next.js 16 + React 19 + TypeScript
