@@ -65,3 +65,4 @@ public/images/     # 정적 이미지 (hero, services SVG, works, logos)
 - 번역키: `useTranslations("섹션명")`으로 접근
 - 다크모드: `class` 기반 토글 (`dark:` 접두사)
 - 이미지: `next/image` Image 컴포넌트 사용 필수
+- 새로운 기능 추가 시: `docs/spec-and-task/[YYYYMMDD]-[feature-name]/specification.md` 와 `task.md` 를 작성하여 사양과 태스크를 관리한다
