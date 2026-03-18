@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import matter from "gray-matter";
+import { LOCALES } from "@/lib/constants";
 
 const CONTENT_DIR = path.join(process.cwd(), "content/blog");
 
@@ -60,8 +61,7 @@ export function getPostBySlug(
 }
 
 export function getAllSlugs(): { locale: string; slug: string }[] {
-  const locales = ["ja", "en", "ko"];
-  return locales.flatMap((locale) =>
+  return LOCALES.flatMap((locale) =>
     getPosts(locale).map((post) => ({
       locale,
       slug: post.frontmatter.slug,

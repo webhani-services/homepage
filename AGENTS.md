@@ -34,6 +34,23 @@ When adding a new feature, create a specification and task file under `docs/spec
 
 Example: `docs/spec-and-task/20260318-blog/specification.md`, `docs/spec-and-task/20260318-blog/task.md`
 
+## Image Optimization
+
+`public/images/` 에 새 Image를 추가할 때 반드시 `sharp-cli`로 압축한 후 Commit해야 합니다:
+
+```bash
+# Hero/Background (Full Width)
+npx sharp-cli -i public/images/<file>.jpg -o public/images/ -q 75 resize 1920
+
+# Content Image (Half Width)
+npx sharp-cli -i public/images/<file>.jpg -o public/images/ -q 80 resize 1200
+
+# Thumbnail/Card
+npx sharp-cli -i public/images/<file>.jpg -o public/images/ -q 80 resize 800
+```
+
+목표 File Size: Hero ~200-300KB, Content ~100-200KB, Thumbnail ~50-100KB.
+
 ## Commit & Pull Request Guidelines
 
 Recent history uses short, imperative commit messages such as `add CI workflow and dependabot configuration` and `fix Navigation hydration and remove unused import`. Keep commits focused and descriptive. PRs should explain the user-visible change, note config or environment updates, link the relevant issue when available, and include screenshots for UI changes. Mention the verification steps you ran in the PR body.

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import Link from "next/link";
 import Image from "next/image";
 import DesktopMenu from "./navigation/DesktopMenu";
@@ -49,12 +49,11 @@ const navigationData = {
 const navigationUtils = {
   getScrolledStyle: (isScrolled: boolean) => ({
     background: isScrolled
-      ? "bg-white/95 dark:bg-[#0f0f0f]/95"
-      : "bg-white/80 dark:bg-[#0f0f0f]/80",
+      ? "bg-white/95 dark:bg-[var(--dark-bg)]/95"
+      : "bg-white/80 dark:bg-[var(--dark-bg)]/80",
     additionalClasses: isScrolled ? "shadow-sm shadow-black/5" : "",
   }),
 
-  // ダークモード切り替え用の関数を追加
   toggleDarkMode: () => {
     if (document.documentElement.classList.contains("dark")) {
       document.documentElement.classList.remove("dark");
@@ -62,16 +61,6 @@ const navigationUtils = {
     } else {
       document.documentElement.classList.add("dark");
       localStorage.theme = "dark";
-    }
-  },
-
-  // システムの設定に従う
-  useSystemTheme: () => {
-    localStorage.removeItem("theme");
-    if (window.matchMedia("(prefers-color-scheme: dark)").matches) {
-      document.documentElement.classList.add("dark");
-    } else {
-      document.documentElement.classList.remove("dark");
     }
   },
 };
@@ -123,8 +112,10 @@ export default function Navigation() {
     return () => window.removeEventListener("scroll", handleScroll);
   }, []);
 
-  const { background, additionalClasses } =
-    navigationUtils.getScrolledStyle(isScrolled);
+  const { background, additionalClasses } = useMemo(
+    () => navigationUtils.getScrolledStyle(isScrolled),
+    [isScrolled]
+  );
 
   const handleToggleDarkMode = () => {
     navigationUtils.toggleDarkMode();

@@ -130,6 +130,55 @@ Claude Code 내에서 아래 Command를 사용하면, API Key 없이 Blog 기사
 | `published` | 표시       | 표시        | 공개       |
 | `private`   | 비표시     | 비표시      | Archive    |
 
+## Image 최적화
+
+`public/images/` 에 새로운 Image를 추가할 때, 반드시 아래 Command로 압축 후 Commit 하세요. 최적화하지 않은 대용량 Image는 Core Web Vitals (LCP, FCP)에 큰 악영향을 줍니다.
+
+```bash
+# Hero/Background Image (Full Width) — 1920px, Quality 75
+npx sharp-cli -i public/images/hero-bg.jpg -o public/images/ -q 75 resize 1920
+
+# Content Image (Half Width) — 1200px, Quality 80
+npx sharp-cli -i public/images/about/team.jpg -o public/images/about/ -q 80 resize 1200
+
+# 일반 사용법
+npx sharp-cli -i <입력 경로> -o <출력 Directory> -q <Quality 1-100> resize <Width>
+```
+
+### Image 가이드라인
+
+| 용도 | 권장 Width | Quality | 목표 File Size |
+|------|-----------|---------|---------------|
+| Hero/Background (Full Width) | 1920px | 75 | ~200-300KB |
+| Content Image (Half Width) | 1200px | 80 | ~100-200KB |
+| Thumbnail/Card | 800px | 80 | ~50-100KB |
+| Logo/Icon | 원본 유지 | - | SVG 권장 |
+
+> **참고**: `next.config.mjs` 에서 AVIF/WebP 자동 변환이 설정되어 있으므로, JPEG로 저장해도 Browser에는 최적 Format으로 제공됩니다.
+
+## Security Headers
+
+`next.config.mjs` 에 아래 Security Header가 설정되어 있습니다:
+
+| Header | 값 | 목적 |
+|--------|---|------|
+| `X-Frame-Options` | `DENY` | Clickjacking 방지 |
+| `X-Content-Type-Options` | `nosniff` | MIME Sniffing 방지 |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | Referrer 정보 누출 제한 |
+| `Permissions-Policy` | Camera, Mic, Geo 비활성화 | Browser API 제한 |
+| `Strict-Transport-Security` | 2년, Preload | HTTPS 강제 |
+| `Content-Security-Policy` | Self + Google Analytics Allowlist | XSS/Injection 방지 |
+
+## Contact API Security
+
+`src/app/api/contact/route.ts` 에 적용된 보안 조치:
+
+- **Rate Limiting**: IP당 1분에 5회 제한
+- **Request Size 제한**: 10KB 초과 Request 거부
+- **Email Subject Sanitization**: Control Character 제거 및 길이 제한
+- **환경변수 Validation**: 필수 AWS 환경변수 미설정 시 Error Log 출력
+- **Error Logging**: Production에서 Error Object 전체 노출 방지 (`error.message` 만 기록)
+
 ## Package 업데이트 방법
 
 ```bash

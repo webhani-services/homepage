@@ -1,12 +1,11 @@
 import type { MetadataRoute } from "next";
 import { getPosts } from "@/lib/blog";
+import { LOCALES } from "@/lib/constants";
 
 const BASE_URL = "https://webhani.com";
 
 export default function sitemap(): MetadataRoute.Sitemap {
-  const locales = ["ja", "en", "ko"];
-
-  const blogEntries = locales.flatMap((locale) =>
+  const blogEntries = LOCALES.flatMap((locale) =>
     getPosts(locale).map((post) => ({
       url: `${BASE_URL}/blog/${post.frontmatter.slug}`,
       lastModified: new Date(
