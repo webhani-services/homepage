@@ -1,0 +1,159 @@
+---
+title: "TypeScript 6.0 RC: What strict by Default and the using Keyword Mean for Your Codebase"
+description: "TypeScript 6.0 RC introduces strict mode as the default, stable using/await using for resource management, and improved conditional type inference. Here's what changes and how to migrate cleanly."
+date: "2026-03-19"
+status: "published"
+tags: ["TypeScript", "Next.js", "React", "Frontend", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-6-rc-new-features-2026"
+---
+
+Microsoft released the Release Candidate for TypeScript 6.0, calling it "a unique release" — the final version built on the current JavaScript specification before a significant architectural shift. That framing matters: 6.0 is the cleanup release. It closes out a chapter of incremental spec alignment before TypeScript moves toward native Type Stripping support and tighter runtime integration.
+
+Here's what's actually changing and how to approach migration.
+
+## strict by Default
+
+The most impactful breaking change: `strict` is now enabled by default. If your `tsconfig.json` doesn't explicitly set `strict: false`, upgrading to 6.0 will immediately surface previously-hidden type errors.
+
+```json
+// Previously you had to opt in. Now this is implicit:
+{
+  "compilerOptions": {
+    "strict": true,
+    "strictNullChecks": true,
+    "noImplicitAny": true,
+    "strictFunctionTypes": true,
+    "strictPropertyInitialization": true
+  }
+}
+```
+
+For teams with large codebases that never fully adopted `strict`, the migration path is incremental:
+
+```bash
+# Step 1: audit the damage
+npx tsc --noEmit 2>&1 | grep "error TS" | cut -d'(' -f1 | sort | uniq -c | sort -rn | head -20
+
+# Step 2: pin current behavior while you migrate
+# Add "strict": false to tsconfig.json temporarily
+# Then enable flags one at a time:
+# noImplicitAny → strictNullChecks → strictFunctionTypes → strict: true
+```
+
+Don't try to fix everything at once. Categorize errors by type, prioritize the ones in hot paths, and track progress with `tsc --noEmit` in CI.
+
+## Stable using and await using
+
+The ECMAScript Explicit Resource Management proposal lands as a stable feature in TypeScript 6.0. The `using` keyword binds a resource to the current scope and calls `Symbol.dispose` automatically when the scope exits — even on thrown exceptions.
+
+```typescript
+// Before: manual cleanup with try/finally
+async function exportReport(id: string) {
+  const conn = await pool.connect();
+  try {
+    const data = await conn.query("SELECT * FROM reports WHERE id = $1", [id]);
+    return formatReport(data.rows[0]);
+  } finally {
+    conn.release();
+  }
+}
+
+// After: scope-based cleanup with await using
+async function exportReport(id: string) {
+  await using conn = await pool.connect();
+  // conn.release() (via Symbol.asyncDispose) runs automatically on exit
+  const data = await conn.query("SELECT * FROM reports WHERE id = $1", [id]);
+  return formatReport(data.rows[0]);
+}
+```
+
+Any class that implements `Symbol.dispose` or `Symbol.asyncDispose` works with `using`. This is particularly useful in test environments:
+
+```typescript
+class MockServer {
+  private server: http.Server;
+
+  constructor(handler: http.RequestListener) {
+    this.server = http.createServer(handler);
+    this.server.listen(0); // random available port
+  }
+
+  get port() {
+    return (this.server.address() as net.AddressInfo).port;
+  }
+
+  [Symbol.dispose]() {
+    this.server.close();
+  }
+}
+
+test("returns 200 for valid requests", () => {
+  using mock = new MockServer(myHandler);
+  const res = await fetch(`http://localhost:${mock.port}/api/health`);
+  expect(res.status).toBe(200);
+  // server closes automatically — no afterEach needed
+});
+```
+
+## Improved Conditional Type Inference
+
+TypeScript 6.0 improves inference in deeply nested conditional types, which matters most for library authors and teams building typed utilities around ORMs or API clients.
+
+```typescript
+// Recursive mapped types now infer more accurately
+type DeepPartial<T> = T extends object
+  ? T extends Function
+    ? T
+    : { [K in keyof T]?: DeepPartial<T[K]> }
+  : T;
+
+// Previously this could produce unexpected `any` in deep paths
+// 6.0 tracks type identity through multiple levels of conditional evaluation
+type PartialConfig = DeepPartial<{
+  server: { host: string; port: number; tls: { cert: string; key: string } };
+  db: { primary: { url: string }; replicas: { url: string }[] };
+}>;
+```
+
+If you've ever worked around inference failures with `as unknown as T` casts in utility types, some of those workarounds may become unnecessary.
+
+## Next.js 16 Integration
+
+Next.js 16 already ships with TypeScript 6.0 RC support. The async Request APIs introduced in 16 align well with 6.0's type improvements:
+
+```typescript
+// app/products/[id]/page.tsx
+type Props = {
+  params: Promise<{ id: string }>;
+  searchParams: Promise<{ variant?: string }>;
+};
+
+export default async function ProductPage({ params, searchParams }: Props) {
+  const { id } = await params;
+  const { variant } = await searchParams;
+
+  const product = await getProduct(id, variant);
+  if (!product) notFound();
+
+  return <ProductDetail product={product} />;
+}
+
+// Typed routes catch broken links at compile time
+import { Link } from "next/link";
+<Link href="/products/[id]" as={`/products/${product.id}`} />
+```
+
+React Compiler 1.0, stable in Next.js 16, benefits from the stricter type information 6.0 provides — particularly for memoization decisions based on prop stability.
+
+## Migration Checklist
+
+1. Run `tsc --noEmit` and quantify the error count before upgrading
+2. Update all `@types/*` packages — many have been updated for 6.0 compatibility
+3. Set `"strict": false` temporarily to decouple the TypeScript upgrade from the `strict` migration
+4. Enable flags incrementally: `noImplicitAny` → `strictNullChecks` → `strict: true`
+5. Replace `try/finally` resource cleanup patterns with `using` / `await using` where applicable
+6. Add `tsc --noEmit` to your CI pipeline if it isn't there already
+
+TypeScript 6.0 is a consolidation release. The strict-by-default change is the most visible disruption, but for teams already running strict, the upgrade is largely additive. The `using` keyword in particular is worth adopting proactively — it removes an entire category of resource leak bugs with minimal code change.
