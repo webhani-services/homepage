@@ -1,17 +1,17 @@
-# nextjs docker template
+# Webhani Homepage
 
-## Environment
+## 환경
 
-| ITEM   | Version |
+| 항목   | Version |
 | ------ | ------- |
-| node   | 20.10.0 |
-| nextjs | 15.1.6  |
+| Node   | >= 22   |
+| Next.js | 16     |
 
-## Setup Dev evn
+## 개발 환경 Setup
 
-- [Setup Dev env](docs/dev.md)
+- [개발 환경 Setup](docs/dev.md)
 
-## Links
+## 참고 Link
 
 - [Create Nextjs project](docs/init-project.md)
 
@@ -24,123 +24,123 @@
 
 - [react-icons](https://react-icons.github.io/react-icons/)
 
-### favorite templates
+### Template 참고
 
 - [Vesperr](https://bootstrapmade.com/demo/Vesperr/)
 
 ## Blog
 
-MDX ファイルベースのブログ機能。`content/blog/{locale}/{slug}.mdx` にコンテンツを配置します。
+MDX File 기반의 Blog 기능. `content/blog/{locale}/{slug}.mdx` 에 Content를 배치합니다.
 
-### ブログ記事の自動生成
+### Blog 기사 자동 생성
 
-LLM を使って技術ブログ記事を自動生成できます。生成された記事は `status: "draft"` で保存されます。
+LLM을 사용하여 기술 Blog 기사를 자동 생성할 수 있습니다. 생성된 기사는 `status: "draft"` 로 저장됩니다.
 
 ```bash
-# 基本的な使い方（デフォルト: Anthropic Claude）
+# 기본 사용법 (Default: Anthropic Claude)
 npm run generate-blog -- -t "Next.js Server Actions"
 
-# プロバイダーを指定
+# Provider 지정
 npm run generate-blog -- -t "React 19 features" -p openai
 npm run generate-blog -- -t "Docker tips" -p gemini
 
-# モデルを指定
+# Model 지정
 npm run generate-blog -- -t "AWS Lambda" -p anthropic -m claude-haiku-4-5-20251001
 
-# 生成対象の言語を指定（デフォルト: ja,en,ko）
+# 생성 대상 언어 지정 (Default: ja,en,ko)
 npm run generate-blog -- -t "TypeScript 5.x" -l "ja,en"
 
-# ファイル保存せずにプレビュー
-npm run generate-blog -- -t "Kubernetes入門" --dry-run
+# File 저장 없이 Preview
+npm run generate-blog -- -t "Kubernetes 입문" --dry-run
 ```
 
-### 対応プロバイダー
+### 지원 Provider
 
-| Provider | 環境変数 | デフォルトモデル | パッケージ |
-|----------|----------|------------------|------------|
-| `anthropic` (デフォルト) | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` | `@anthropic-ai/sdk` (インストール済み) |
+| Provider | 환경변수 | Default Model | Package |
+|----------|----------|---------------|---------|
+| `anthropic` (Default) | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` | `@anthropic-ai/sdk` (설치 완료) |
 | `openai` | `OPENAI_API_KEY` | `gpt-4o` | `npm install openai` |
 | `gemini` | `GEMINI_API_KEY` | `gemini-2.5-flash` | `npm install @google/generative-ai` |
 
-環境変数 `LLM_PROVIDER` と `LLM_MODEL` でデフォルト値を変更できます。
+환경변수 `LLM_PROVIDER` 와 `LLM_MODEL` 로 Default 값을 변경할 수 있습니다.
 
-### ユーザー原稿を LLM で仕上げる
+### User 원고를 LLM 으로 다듬기
 
-ユーザーが書いた原稿（下書き）を LLM が校正・翻訳し、3言語の MDX ファイルを生成します。
+User가 작성한 원고(초안)를 LLM이 교정・번역하여 3개 언어의 MDX File을 생성합니다.
 
 ```bash
-# 基本的な使い方
+# 기본 사용법
 npm run polish-blog -- -f drafts/my-article.md
 
-# カスタムスラグを指定
+# Custom Slug 지정
 npm run polish-blog -- -f drafts/my-article.md -s "my-custom-slug"
 
-# タグを手動指定
+# Tag 수동 지정
 npm run polish-blog -- -f drafts/my-article.md --tags "React,TypeScript,Next.js"
 
-# プレビュー（ファイル保存なし）
+# Preview (File 저장 없음)
 npm run polish-blog -- -f drafts/my-article.md --dry-run
 ```
 
-### 最新ニュースからブログ記事を自動生成
+### 최신 News 로부터 Blog 기사 자동 생성
 
-Hacker News と Dev.to から最新の技術ニュースを取得し、LLM が Top 3 を選定（うち1件は LLM/AI 関連必須）して会社ブログ記事を生成します。
+Hacker News 와 Dev.to 에서 최신 기술 News 를 취득하고, LLM이 Top 3를 선정(이 중 1건은 LLM/AI 관련 필수)하여 회사 Blog 기사를 생성합니다.
 
 ```bash
-# 基本的な使い方（Top 3 記事を生成）
+# 기본 사용법 (Top 3 기사 생성)
 npm run daily-blog
 
-# 生成記事数を変更
+# 생성 기사 수 변경
 npm run daily-blog -- -c 5
 
-# トピック選定のみ（記事生成なし）
+# Topic 선정만 (기사 생성 없음)
 npm run daily-blog -- --dry-run
 
-# プロバイダー指定
+# Provider 지정
 npm run daily-blog -- -p gemini
 ```
 
-### Claude Code で直接生成（API キー不要）
+### Claude Code 에서 직접 생성 (API Key 불필요)
 
-Claude Code 内で以下のコマンドを使うと、API キー不要でブログ記事を生成できます。
+Claude Code 내에서 아래 Command를 사용하면, API Key 없이 Blog 기사를 생성할 수 있습니다.
 
 ```bash
-# トピック指定で生成
-/project:generate-blog Next.js Server Actions の活用方法
+# Topic 지정 생성
+/project:generate-blog Next.js Server Actions 활용 방법
 
-# ユーザー原稿を校正・翻訳
+# User 원고 교정・번역
 /project:polish-blog drafts/my-article.md
 
-# 最新ニュースから自動生成（Top 3 選定、うち1つは LLM/AI 関連）
+# 최신 News 기반 자동 생성 (Top 3 선정, 이 중 1건은 LLM/AI 관련)
 /project:daily-blog
 ```
 
-### ブログ記事の公開フロー
+### Blog 기사 공개 Flow
 
-1. `npm run generate-blog -- -t "トピック"` で記事を生成（`status: "draft"`）
-2. `content/blog/{locale}/` に生成された MDX ファイルを確認・編集
-3. frontmatter の `status` を `"published"` に変更
-4. コミット & デプロイ
+1. `npm run generate-blog -- -t "Topic"` 으로 기사 생성 (`status: "draft"`)
+2. `content/blog/{locale}/` 에 생성된 MDX File 확인・편집
+3. Frontmatter 의 `status` 를 `"published"` 로 변경
+4. Commit & Deploy
 
 ### Status
 
-| Status | Production | Development | 用途 |
-|--------|-----------|-------------|------|
-| `draft` | 非表示 | 表示 | 作成中 |
-| `published` | 表示 | 表示 | 公開 |
-| `private` | 非表示 | 非表示 | アーカイブ |
+| Status      | Production | Development | 용도       |
+|-------------|------------|-------------|------------|
+| `draft`     | 비표시     | 표시        | 작성 중    |
+| `published` | 표시       | 표시        | 공개       |
+| `private`   | 비표시     | 비표시      | Archive    |
 
-## package 更新方法
+## Package 업데이트 방법
 
 ```bash
 npm install -g npm-check-updates
 
-# 更新可能なパッケージを確認
+# 업데이트 가능한 Package 확인
 ncu
 
-# package.json の依存関係を最新版に更新
+# package.json 의 Dependency를 최신 버전으로 업데이트
 ncu -u
 
-# 実際にパッケージをインストール
+# 실제 Package Install
 npm install
 ```
