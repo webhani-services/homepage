@@ -112,7 +112,7 @@ claude -p "$(cat <<'PROMPT'
    - `.claude/commands/daily-blog.md` の指示に従うこと
    - 各 Topic につき ja/en/ko の 3 Locale で生成 (計9ファイル)
    - 保存先: `content/blog/{locale}/{slug}.mdx`
-   - status は "draft" で保存
+   - status は "published" で保存
 
 4. 生成完了後、以下の git 操作を実行してください:
    - `master` Branch から新しい Branch を作成: `blog/daily-{YYYY-MM-DD}` (今日の日付を使用)
