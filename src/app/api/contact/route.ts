@@ -2,15 +2,60 @@ import { NextResponse } from "next/server";
 import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
 import { z } from "zod";
 
+// --- Environment validation ---
+const requiredEnvVars = [
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_REGION",
+  "AWS_SES_TO_EMAIL",
+] as const;
+
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    console.error(`Missing required environment variable: ${envVar}`);
+  }
+}
+
 // SES クライアントの初期化
 const ses = new SESClient({
   region: process.env.AWS_REGION || "ap-northeast-1",
   credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
   },
 });
 
+// --- Rate limiter ---
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = 5;
+const MAX_REQUEST_BODY_SIZE = 10_000; // 10KB
+
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+
+function isRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+
+  if (!entry || now > entry.resetTime) {
+    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW_MS });
+    return false;
+  }
+
+  entry.count++;
+  return entry.count > RATE_LIMIT_MAX_REQUESTS;
+}
+
+// Periodic cleanup to prevent memory leak
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of Array.from(rateLimitMap)) {
+    if (now > entry.resetTime) {
+      rateLimitMap.delete(ip);
+    }
+  }
+}, RATE_LIMIT_WINDOW_MS);
+
+// --- Validation ---
 const contactSchema = z.object({
   name: z.string().min(1).max(200),
   email: z.string().email().max(254),
@@ -26,8 +71,32 @@ function escapeHtml(str: string): string {
     .replace(/'/g, "&#039;");
 }
 
+/** Strip control characters and limit length for safe use in email subject */
+function sanitizeForSubject(str: string): string {
+  return str.replace(/[\r\n\t\x00-\x1f]/g, "").slice(0, 100);
+}
+
 export async function POST(request: Request) {
   try {
+    // Rate limiting
+    const forwarded = request.headers.get("x-forwarded-for");
+    const ip = forwarded?.split(",")[0]?.trim() || "unknown";
+    if (isRateLimited(ip)) {
+      return NextResponse.json(
+        { error: "リクエストが多すぎます。しばらく経ってからお試しください。" },
+        { status: 429 }
+      );
+    }
+
+    // Request body size check
+    const contentLength = request.headers.get("content-length");
+    if (contentLength && parseInt(contentLength, 10) > MAX_REQUEST_BODY_SIZE) {
+      return NextResponse.json(
+        { error: "リクエストが大きすぎます。" },
+        { status: 413 }
+      );
+    }
+
     const body = await request.json();
     const result = contactSchema.safeParse(body);
     if (!result.success) {
@@ -118,15 +187,26 @@ export async function POST(request: Request) {
 ${message}
     `;
 
+    const toEmail = process.env.AWS_SES_TO_EMAIL;
+    if (!toEmail) {
+      console.error("AWS_SES_TO_EMAIL is not configured");
+      return NextResponse.json(
+        { error: "エラーが発生しました。もう一度お試しください。" },
+        { status: 500 }
+      );
+    }
+
+    const sanitizedName = sanitizeForSubject(name);
+
     const params = {
-      Source: process.env.AWS_SES_TO_EMAIL || "contact@webhani.com",
+      Source: toEmail,
       ReplyToAddresses: [email],
       Destination: {
-        ToAddresses: [process.env.AWS_SES_TO_EMAIL || "contact@webhani.com"],
+        ToAddresses: [toEmail],
       },
       Message: {
         Subject: {
-          Data: `[お問い合わせ] ${name}様からのメッセージ`,
+          Data: `[お問い合わせ] ${sanitizedName}様からのメッセージ`,
           Charset: "UTF-8",
         },
         Body: {
@@ -150,7 +230,10 @@ ${message}
       { status: 200 }
     );
   } catch (error) {
-    console.error("Error sending email:", error);
+    console.error(
+      "Error sending email:",
+      error instanceof Error ? error.message : "Unknown error"
+    );
     return NextResponse.json(
       { error: "エラーが発生しました。もう一度お試しください。" },
       { status: 500 }
