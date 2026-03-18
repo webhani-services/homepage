@@ -1,0 +1,116 @@
+---
+title: "React Compiler 1.0: The End of Manual Memoization"
+description: "React Compiler 1.0 is stable and ships with Next.js 16. Here's what it actually does, how to adopt it incrementally, and whether you should still write useMemo."
+date: "2026-03-18"
+status: "draft"
+tags: ["React", "Performance", "React Compiler", "Next.js", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "react-compiler-automatic-memoization"
+---
+
+Since React Compiler 1.0 went stable in October 2025, manual memoization has been moving from best practice to legacy pattern. Next.js 16 ships with built-in support — just add `reactCompiler: true` to your config — and Meta has reported up to 12% faster initial loads and 2.5x faster interactions in production apps like the Meta Quest Store.
+
+This post covers what the compiler actually does, how to adopt it in existing projects, and when you still need `useMemo` and `useCallback`.
+
+## The Problem React Compiler Solves
+
+React re-renders a component and all its descendants whenever state or props change. Even if a child component's props haven't changed, it re-renders along with the parent. Developers have historically reached for `useMemo`, `useCallback`, and `React.memo` to short-circuit this:
+
+```tsx
+// The old way — boilerplate that obscures the actual logic
+const sortedItems = useMemo(() => [...items].sort(compareFn), [items]);
+const handleDelete = useCallback((id: string) => removeItem(id), [removeItem]);
+const MemoizedCard = React.memo(ItemCard);
+```
+
+React Compiler eliminates this pattern at the build step. It statically analyzes your components, determines which values and functions are safe to cache between renders, and injects the memoization automatically.
+
+## Setting Up the Compiler
+
+### Next.js 16
+
+One line in `next.config.ts`:
+
+```ts
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  reactCompiler: true,
+};
+
+export default nextConfig;
+```
+
+### Vite / Babel Projects
+
+```bash
+npm install -D babel-plugin-react-compiler
+```
+
+```json
+{
+  "plugins": ["babel-plugin-react-compiler"]
+}
+```
+
+### Opt-in per component
+
+For large codebases, enable the compiler incrementally using the `"use memo"` directive:
+
+```tsx
+"use memo";
+
+export function ProductList({ items }: { items: Item[] }) {
+  const filtered = items.filter((item) => item.inStock);
+  return <ul>{filtered.map((item) => <li key={item.id}>{item.name}</li>)}</ul>;
+}
+```
+
+## What Happens to Existing useMemo and useCallback?
+
+The compiler respects existing manual memoization — it won't remove or conflict with hooks you've already written. The React team's guidance for new code: let the compiler handle it. Manual hooks remain useful in a few specific cases:
+
+- **Precise cache lifetime control** — when you need a value to persist in a way the compiler can't infer
+- **Library compatibility** — some third-party hooks the compiler can't analyze
+- **Effect ordering** — when you need to guarantee computation order relative to side effects
+
+For typical application code — sorting lists, filtering data, formatting display values — the compiler handles it correctly.
+
+## Compiler Compliance: Rules of React
+
+The compiler only optimizes code that follows the Rules of React. If a component mutates values it reads, or reads from mutable external state without going through the React model, the compiler skips that component.
+
+This is where the ESLint plugin becomes important:
+
+```bash
+npm install -D eslint-plugin-react-compiler
+```
+
+```json
+{
+  "plugins": ["react-compiler"],
+  "rules": {
+    "react-compiler/react-compiler": "error"
+  }
+}
+```
+
+Add the lint rule first, fix violations, then enable the compiler. This is the safest upgrade path for existing projects.
+
+## Verifying the Impact
+
+React DevTools Profiler shows exactly which components are skipping re-renders thanks to the compiler. Pair it with `why-did-you-render` in development:
+
+```tsx
+if (process.env.NODE_ENV === "development") {
+  const { default: wdyr } = await import("@welldone-software/why-did-you-render");
+  wdyr(React, { trackAllPureComponents: true });
+}
+```
+
+## Takeaways
+
+React Compiler 1.0 shifts performance optimization from runtime boilerplate to build-time analysis. The migration path is low-risk: run the lint plugin, fix violations, flip the config switch. You don't need to delete existing `useMemo` calls on day one.
+
+The practical outcome is less cognitive overhead per component. Instead of thinking "should I memoize this?", write the straightforward logic and trust the compiler to handle the rest.

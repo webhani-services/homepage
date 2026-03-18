@@ -1,0 +1,183 @@
+---
+title: "TypeScript 6.0 RC: 변경 사항과 프로젝트 준비 방법"
+description: "TypeScript 6.0 RC가 공개됐습니다. Strict 모드 기본 활성화, ES Module 기본값 변경, 그리고 Go 기반 TypeScript 7 컴파일러가 예고됐습니다. 프로젝트에 미치는 영향과 준비 방법을 정리합니다."
+date: "2026-03-18"
+status: "draft"
+tags: ["TypeScript", "Developer Tools", "JavaScript", "Frontend", "Go"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-6-rc-go-rewrite"
+---
+
+2026년 3월, TypeScript 6.0 RC가 공개됐습니다. 화려한 기능 추가보다는 기술 부채 해소, 표준화, 레거시 설정 Deprecation에 초점을 맞춘 릴리스입니다. Go 언어로 컴파일러를 재작성하여 10배 속도 향상을 약속하는 TypeScript 7로 가기 위한 정리 단계로 볼 수 있습니다.
+
+이 글에서는 실제 프로젝트 설정에 영향을 주는 변경 사항, 지금 정리해야 할 Deprecated 옵션, 그리고 Go 기반 미래가 실무적으로 어떤 의미인지를 정리합니다.
+
+## TypeScript 6.0의 주요 변경 사항
+
+### Strict 모드가 기본값으로
+
+신규 프로젝트에서 `"strict": true`가 자동으로 적용됩니다. `tsc --init`으로 생성하는 `tsconfig.json`에 별도 설정 없이도 Strict 모드가 활성화됩니다.
+
+```jsonc
+// TypeScript 6.0이 생성하는 tsconfig — strict가 암묵적으로 적용됨
+{
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler"
+  }
+}
+```
+
+기존 프로젝트는 영향을 받지 않습니다. 현재 `tsconfig.json` 설정이 우선합니다. 주의가 필요한 경우는 스캐폴딩 도구나 내부 프로젝트 템플릿입니다. 새 `tsconfig.json`을 자동 생성하는 템플릿을 관리 중이라면, Strict 모드 on/off를 명시적으로 표기하도록 업데이트하세요.
+
+### ES Module이 기본값으로
+
+`module` 기본값이 `commonjs`에서 `esnext`로, `moduleResolution`은 `bundler`로 변경됩니다.
+
+```jsonc
+// TypeScript 5.x 기본값 (현재 대부분의 프로젝트)
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node"
+  }
+}
+```
+
+```jsonc
+// TypeScript 6.0 신규 프로젝트 기본값
+{
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler"
+  }
+}
+```
+
+Node.js + CommonJS 환경의 프로젝트는 `"module": "commonjs"`를 명시적으로 지정해야 합니다. 백엔드 Node.js 프로젝트에서 가장 흔하게 영향을 받는 부분입니다.
+
+### Deprecated된 설정들
+
+TypeScript 6.0에서 다음 옵션들이 Deprecated 처리됩니다:
+
+| Deprecated | 대체 방법 |
+|---|---|
+| `"target": "es5"` | `"target": "esnext"` 또는 `"es2022"` |
+| `"module": "amd"` / `"umd"` | Webpack, Vite, esbuild 등 번들러에서 처리 |
+| `"baseUrl"` | `"paths"` 옵션으로 통일 |
+| `"outFile"` | 번들링은 번들러에 위임 |
+
+```jsonc
+// 변경 전 (TypeScript 6.0에서 Deprecation 경고 발생)
+{
+  "compilerOptions": {
+    "target": "es5",
+    "baseUrl": "./src",
+    "outFile": "./dist/bundle.js"
+  }
+}
+
+// 변경 후
+{
+  "compilerOptions": {
+    "target": "esnext",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+```
+
+### RegExp Escaping과 DOM Iterable 개선
+
+TypeScript 6.0은 ECMAScript Stage 4로 확정된 `RegExp.escape()` 메서드에 대한 타입 지원을 추가합니다:
+
+```ts
+const userInput = "search.query+term";
+const safePattern = new RegExp(RegExp.escape(userInput));
+// 이전에는 any 타입이거나 타입 오류였던 부분이 올바르게 타입 추론됨
+```
+
+DOM Iterable 지원도 개선됩니다. `NodeList`와 `HTMLCollection`이 스프레드 문법과 `for...of`에서 올바르게 동작합니다:
+
+```ts
+// TypeScript 6.0부터 타입 오류 없음
+const inputs = document.querySelectorAll("input");
+const inputArray = [...inputs]; // HTMLInputElement[]로 정확하게 추론
+inputs.forEach((input) => console.log(input.value)); // 캐스팅 없이 동작
+```
+
+## Go 기반 TypeScript 7의 의미
+
+TypeScript 6.0이 "다리 역할"이라고 표현되는 이유는 TypeScript 7 때문입니다. Microsoft는 Go 언어로 TypeScript 컴파일러를 재작성하는 프로젝트를 진행 중이며, 현재 대규모 프로젝트에서 **10배 속도 향상**을 달성했다고 보고하고 있습니다.
+
+실무적으로 어떤 변화가 오는가:
+
+- 현재 15~30초 걸리는 대형 프로젝트의 `tsc --noEmit`이 1~3초로 단축될 수 있음
+- CI 타입 체크 파이프라인의 병목이 사라짐
+- 대규모 Monorepo에서 IDE 타입 추론 응답 시간이 크게 향상됨
+
+TypeScript 7은 2026년 하반기 이후를 목표로 합니다. 현재로서는 TypeScript 6.0 RC의 변경 사항을 정리하는 것이 실질적인 준비입니다. TypeScript 6.0을 깔끔하게 마이그레이션하면 TypeScript 7로의 전환도 수월해집니다.
+
+## 준비 방법
+
+### 1단계: RC로 테스트
+
+```bash
+npm install -D typescript@rc
+
+# 새로운 오류와 Deprecation 경고 확인
+npx tsc --noEmit 2>&1 | tee ts6-rc-output.txt
+```
+
+정식 릴리스 전에 발생하는 오류를 파악하고 마이그레이션 계획을 세워두세요.
+
+### 2단계: Deprecated 설정 점검
+
+```bash
+# tsconfig 파일에서 Deprecated 옵션 찾기
+grep -rE '"target":\s*"es5"|"module":\s*"(amd|umd)"|"baseUrl"|"outFile"' tsconfig*.json
+```
+
+### 3단계: Strict 모드 활성화 검토
+
+현재 Strict 모드를 사용하지 않는 프로젝트라면, TypeScript 6.0이 활성화를 고려할 좋은 시점입니다. 안전한 접근은 개별 플래그를 단계적으로 켜는 것입니다:
+
+```jsonc
+{
+  "compilerOptions": {
+    // Strict 개별 플래그를 하나씩 활성화
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "strictFunctionTypes": true
+    // 각각 수정 후 다음 플래그 추가
+  }
+}
+```
+
+### 4단계: Subpath Import 활용
+
+TypeScript 6.0은 Node.js Subpath Import를 네이티브로 지원합니다. 일부 프로젝트에서 `paths` 설정을 대체할 수 있습니다:
+
+```json
+// package.json
+{
+  "imports": {
+    "#utils/*": "./src/utils/*.js",
+    "#components/*": "./src/components/*.js"
+  }
+}
+```
+
+```ts
+// TypeScript의 네이티브 모듈 해석으로 동작
+import { formatDate } from "#utils/date";
+```
+
+## 정리
+
+TypeScript 6.0은 10년에 걸쳐 축적된 기본값과 레거시 패턴을 정리하는 유지보수 릴리스입니다. 가장 시급한 실천 사항은 Deprecated 설정 옵션 제거, Node.js 프로젝트에서 `"module": "commonjs"` 명시, 그리고 미뤄왔던 Strict 모드 마이그레이션 시작입니다.
+
+Go 기반 재작성인 TypeScript 7은 2026년의 큰 뉴스이지만, 지금 당장 행동할 사항은 아닙니다. TypeScript 6.0을 깔끔하게 마이그레이션하는 것이 그 준비입니다. RC가 나온 지금이 프로젝트의 TypeScript 설정을 점검하기 좋은 타이밍입니다.

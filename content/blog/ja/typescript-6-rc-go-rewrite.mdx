@@ -1,0 +1,161 @@
+---
+title: "TypeScript 6.0 RC が示す Go 化への道筋と現場への影響"
+description: "TypeScript 6.0 RC が公開されました。Strict モードのデフォルト化、ES モジュール標準化、そして TypeScript 7 で控える Go 製コンパイラへの移行を実務目線で整理します。"
+date: "2026-03-18"
+status: "draft"
+tags: ["TypeScript", "Developer Tools", "JavaScript", "Frontend", "Go"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-6-rc-go-rewrite"
+---
+
+2026 年 3 月、TypeScript 6.0 RC が公開されました。機能追加よりも「負債の解消と標準化」に重きを置いたリリースで、その先に控える TypeScript 7（Go 製コンパイラによる 10 倍高速化）への橋渡し的な位置づけです。
+
+本記事では、TypeScript 6.0 RC の主な変更点が現場のプロジェクトにどう影響するかを整理し、移行の準備として今からやっておくべきことをまとめます。
+
+## 主な変更点
+
+### 1. Strict モードのデフォルト化
+
+これが最も影響の大きい変更です。新規プロジェクトでは `tsconfig.json` に `"strict": true` が自動で設定されます。
+
+```jsonc
+// TypeScript 6.0 以降の新規プロジェクト — strict は自動でオン
+{
+  "compilerOptions": {
+    // "strict": true — 明示不要になった
+    "target": "esnext",
+    "module": "esnext"
+  }
+}
+```
+
+既存プロジェクトへの影響は限定的です。`tsconfig.json` に既存の設定がある場合はそちらが優先されます。ただし、チームの新規プロジェクトテンプレートや scaffolding ツールを使う際は注意が必要で、想定外に strict が有効になるケースがあります。
+
+### 2. モジュール解決のデフォルトが ES Modules に
+
+`module` と `moduleResolution` のデフォルトが `esnext` に変わります。
+
+```jsonc
+// 以前のデフォルト (TypeScript 5.x)
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node"
+  }
+}
+```
+
+```jsonc
+// TypeScript 6.0 以降のデフォルト
+{
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler"
+  }
+}
+```
+
+Node.js で CommonJS を使い続けているプロジェクトは、`tsconfig.json` で明示的に `"module": "commonjs"` を指定する必要があります。多くのバックエンドプロジェクトが対応が必要になるポイントです。
+
+### 3. 非推奨となった設定とターゲット
+
+TypeScript 6.0 で以下が deprecated になりました:
+
+- `"target": "es5"` — ES5 ターゲットのサポート廃止
+- `"module": "amd"` / `"umd"` — 旧モジュール形式
+- `"baseUrl"` — パスエイリアスは `"paths"` で統一
+- `"outFile"` — バンドルは Webpack / Vite / esbuild に委ねる設計へ
+
+```jsonc
+// 移行前 (要変更)
+{
+  "compilerOptions": {
+    "target": "es5",
+    "baseUrl": "./src"
+  }
+}
+
+// 移行後
+{
+  "compilerOptions": {
+    "target": "esnext",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+```
+
+### 4. RegExp Escaping と DOM 型の改善
+
+ECMAScript の Stage 4 に昇格した RegExp Escaping proposal が正式サポートされます:
+
+```ts
+// RegExp.escape() が型安全に使えるようになる
+const userInput = "hello.world";
+const pattern = new RegExp(RegExp.escape(userInput));
+// これまでは型エラーまたは any になっていた箇所が正確に型付けされる
+```
+
+また、DOM の `Iterable` サポートが改善され、`NodeList` や `HTMLCollection` を `for...of` や スプレッド構文で扱う際の型エラーが解消されます。
+
+```ts
+// TypeScript 6.0 から型エラーなし
+const buttons = document.querySelectorAll("button");
+const buttonArray = [...buttons]; // NodeList を正しく Iterable として扱える
+```
+
+## TypeScript 7 と Go 製コンパイラ
+
+TypeScript 6.0 が「橋渡し」と表現される理由は、その先に TypeScript 7 があるからです。Microsoft は Go 言語で TypeScript コンパイラを書き直すプロジェクトを進めており、現時点で **10 倍の速度改善** を達成したと報告しています。
+
+Go 製コンパイラが成熟すれば、大規模プロジェクトでの型チェックが数秒から数百ミリ秒に短縮されます。現在 CI でボトルネックになっている `tsc --noEmit` の実行時間が劇的に改善される可能性があります。
+
+ただし TypeScript 7 は 2026 年後半以降の見込みで、現時点では TypeScript 6.0 RC への対応を優先するのが実務的な判断です。
+
+## 移行の優先度と手順
+
+### 今すぐやること
+
+```bash
+# TypeScript 6.0 Beta/RC を試験的にインストール
+npm install -D typescript@rc
+
+# 型エラーの状況を確認
+npx tsc --noEmit 2>&1 | head -50
+```
+
+エラーが出た箇所を記録し、本番リリース前に対応計画を立てます。
+
+### tsconfig.json の棚卸し
+
+deprecated になった設定を特定して修正します:
+
+```bash
+# deprecated オプションを検索
+grep -E '"target":\s*"es5"|"module":\s*"amd"|"baseUrl"' tsconfig.json
+```
+
+### strict 対応の確認
+
+もし既存プロジェクトで `strict` が無効だった場合、TypeScript 6.0 に上げたタイミングで有効化を検討するチャンスです:
+
+```jsonc
+{
+  "compilerOptions": {
+    "strict": true,
+    // strict の個別フラグを段階的に有効化する場合
+    "noImplicitAny": true,
+    "strictNullChecks": true
+  }
+}
+```
+
+段階的に有効化したい場合は、個別フラグから始めるのが安全です。
+
+## まとめ
+
+TypeScript 6.0 RC は派手な機能追加ではありませんが、プロジェクトの tsconfig を見直す良い機会です。Strict モードのデフォルト化と ES Modules への移行は、現代的な TypeScript プロジェクトの標準的な形に揃えるための変更で、長期的には保守コストを下げます。
+
+TypeScript 7 の Go 製コンパイラはまだ先の話ですが、TypeScript 6.0 で deprecated になった設定を今のうちに整理しておくことで、将来の移行コストを最小化できます。RC が出た今が、プロジェクトの TypeScript 設定を棚卸しするちょうど良いタイミングです。

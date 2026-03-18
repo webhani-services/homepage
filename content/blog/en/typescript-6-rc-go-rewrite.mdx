@@ -1,0 +1,183 @@
+---
+title: "TypeScript 6.0 RC: What Changes and How to Prepare"
+description: "TypeScript 6.0 RC is out. Strict mode is now on by default, ES modules are the new default, and the Go-based TypeScript 7 compiler is on the horizon. Here's what that means for your project."
+date: "2026-03-18"
+status: "draft"
+tags: ["TypeScript", "Developer Tools", "JavaScript", "Frontend", "Go"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-6-rc-go-rewrite"
+---
+
+TypeScript 6.0 RC landed in March 2026. It's not a feature-heavy release — the focus is on debt reduction, standards alignment, and deprecating legacy configurations. Think of it as the cleanup pass before TypeScript 7, which brings a Go-based compiler rewrite promising a 10x speedup on large projects.
+
+This post covers the changes that will actually affect your project configuration, what to deprecate now, and what the Go-based future means in practical terms.
+
+## Key Changes in TypeScript 6.0
+
+### Strict Mode Is Now the Default
+
+New projects get `"strict": true` out of the box. If you're creating a project with `tsc --init`, the generated `tsconfig.json` will have strict mode enabled without you having to add it manually.
+
+```jsonc
+// TypeScript 6.0 generated tsconfig — strict is implicit for new projects
+{
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler"
+  }
+}
+```
+
+Existing projects are not affected — your current `tsconfig.json` settings take precedence. The practical risk is in scaffolding tools and project templates that generate a fresh `tsconfig.json`. If you maintain internal templates, update them to be explicit about whether strict mode is on or off.
+
+### ES Modules Are Now the Default
+
+The default for `module` changes from `commonjs` to `esnext`, and `moduleResolution` defaults to `bundler`.
+
+```jsonc
+// TypeScript 5.x defaults (what you probably have now)
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node"
+  }
+}
+```
+
+```jsonc
+// TypeScript 6.0 defaults for new projects
+{
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler"
+  }
+}
+```
+
+If your project runs on Node.js with CommonJS, add `"module": "commonjs"` explicitly. Backend Node.js projects are the most common case where this matters.
+
+### Deprecated Configurations
+
+The following options are deprecated in TypeScript 6.0 and will produce warnings:
+
+| Deprecated | Replacement |
+|---|---|
+| `"target": "es5"` | `"target": "esnext"` or `"es2022"` |
+| `"module": "amd"` / `"umd"` | Handled by bundlers (Webpack, Vite, esbuild) |
+| `"baseUrl"` | Use `"paths"` instead |
+| `"outFile"` | Delegate bundling to your bundler |
+
+```jsonc
+// Before (produces deprecation warnings in TypeScript 6.0)
+{
+  "compilerOptions": {
+    "target": "es5",
+    "baseUrl": "./src",
+    "outFile": "./dist/bundle.js"
+  }
+}
+
+// After
+{
+  "compilerOptions": {
+    "target": "esnext",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+```
+
+### RegExp Escaping and DOM Iterable Improvements
+
+TypeScript 6.0 adds type support for the `RegExp.escape()` method (ECMAScript Stage 4):
+
+```ts
+const userInput = "search.query+term";
+const safePattern = new RegExp(RegExp.escape(userInput));
+// Previously typed as `any` or caused a type error — now correctly typed
+```
+
+DOM Iterable support is also improved. `NodeList` and `HTMLCollection` now work correctly with spread syntax and `for...of`:
+
+```ts
+// No more type errors in TypeScript 6.0
+const inputs = document.querySelectorAll("input");
+const inputArray = [...inputs]; // Correctly typed as HTMLInputElement[]
+inputs.forEach((input) => console.log(input.value)); // Works without cast
+```
+
+## The Go-Based TypeScript 7
+
+TypeScript 6.0 is explicitly positioned as a bridge to TypeScript 7, where the compiler itself is being rewritten in Go. Microsoft has reported a 10x speed improvement in early benchmarks on large codebases.
+
+What this means practically:
+
+- `tsc --noEmit` on a large project that currently takes 15–30 seconds could drop to 1–3 seconds
+- CI type-checking pipelines become a non-issue
+- IDE response times for type inference in large monorepos improve dramatically
+
+TypeScript 7 is targeted for late 2026. For now, the migration path is: clean up deprecated TypeScript 6 configs, and you'll be well-positioned for the TypeScript 7 upgrade.
+
+## How to Prepare
+
+### Step 1: Test with the RC
+
+```bash
+npm install -D typescript@rc
+
+# Check for new errors and deprecation warnings
+npx tsc --noEmit 2>&1 | tee ts6-rc-output.txt
+```
+
+Document any errors before the stable release so you have a migration plan ready.
+
+### Step 2: Audit deprecated configurations
+
+```bash
+# Find deprecated options in your tsconfig files
+grep -rE '"target":\s*"es5"|"module":\s*"(amd|umd)"|"baseUrl"|"outFile"' tsconfig*.json
+```
+
+### Step 3: Decide on strict mode
+
+If your project doesn't currently use strict mode, TypeScript 6.0 is a natural moment to evaluate enabling it. The safest approach is incremental:
+
+```jsonc
+{
+  "compilerOptions": {
+    // Enable individual strict flags one at a time
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "strictFunctionTypes": true
+    // Add more as you fix each one
+  }
+}
+```
+
+### Step 4: Update subpath imports
+
+TypeScript 6.0 adds native support for Node.js subpath imports, which reduces the need for `paths` workarounds in some setups:
+
+```json
+// package.json
+{
+  "imports": {
+    "#utils/*": "./src/utils/*.js",
+    "#components/*": "./src/components/*.js"
+  }
+}
+```
+
+```ts
+// Now works with TypeScript's native module resolution
+import { formatDate } from "#utils/date";
+```
+
+## Takeaways
+
+TypeScript 6.0 is a maintenance release that cleans up 10 years of accumulated defaults and deprecated patterns. The most actionable items are: remove deprecated config options, confirm your Node.js projects explicitly set `"module": "commonjs"`, and if you've been putting off strict mode, use this release as the moment to start the migration.
+
+The Go-based rewrite in TypeScript 7 is the headline for 2026, but it's not something you need to act on now. Getting to TypeScript 6.0 cleanly is the preparation.

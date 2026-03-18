@@ -1,0 +1,108 @@
+---
+title: "React Compiler 1.0 が変えた Memoization の常識"
+description: "React Compiler 1.0 の Stable 化により、useMemo・useCallback・React.memo による手動最適化が過去のものになりつつあります。仕組みと導入方法を実コードで解説します。"
+date: "2026-03-18"
+status: "draft"
+tags: ["React", "Performance", "React Compiler", "Next.js", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "react-compiler-automatic-memoization"
+---
+
+React Compiler 1.0 が 2025年10月に Stable になって以来、フロントエンド界隈では「もう `useMemo` を書かなくていい」という話が当たり前になってきました。Meta Quest Store では初期ロードが最大 12%、一部 Interaction が 2.5 倍高速化した事例も報告されています。Next.js 16 では `reactCompiler: true` の一行で有効化できます。
+
+本記事では React Compiler が何をしているのか、どう導入するのか、そして「手動 Memoization はもう書かなくていいのか」という問いに実例で答えます。
+
+## React Compiler が解決する問題
+
+React のレンダリングは「Props や State が変化したコンポーネントとその子孫を再レンダリングする」という単純なモデルで動きます。ただし親コンポーネントが再レンダリングされると、Props が変化していなくても子コンポーネントまで巻き込まれる問題がありました。
+
+これを防ぐために開発者は長年、以下のパターンを書き続けてきました:
+
+```tsx
+// 従来の手動最適化 — 書くのも読むのも煩雑
+const memoizedValue = useMemo(() => expensiveCalc(a, b), [a, b]);
+const handleClick = useCallback(() => doSomething(id), [id]);
+const MemoizedChild = React.memo(ChildComponent);
+```
+
+React Compiler はこれらの最適化を Build 時に自動で行います。コンパイラがコンポーネントのコードを静的解析し、どの値・関数が再計算不要かを判断して Memoization を注入します。
+
+## 導入方法
+
+### Next.js 16
+
+`next.config.ts` に一行追加するだけです:
+
+```ts
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  reactCompiler: true,
+};
+
+export default nextConfig;
+```
+
+### Vite / その他のプロジェクト
+
+```bash
+npm install -D babel-plugin-react-compiler
+```
+
+```json
+{
+  "plugins": ["babel-plugin-react-compiler"]
+}
+```
+
+### 段階的な導入
+
+既存の大規模プロジェクトでは `"use memo"` ディレクティブで一部コンポーネントだけ先行適用できます:
+
+```tsx
+"use memo";
+
+export function ProductList({ items }: { items: Item[] }) {
+  const sortedItems = items.sort((a, b) => a.name.localeCompare(b.name));
+  return <ul>{sortedItems.map(item => <li key={item.id}>{item.name}</li>)}</ul>;
+}
+```
+
+## 手動 Memoization はどうなるか
+
+React Compiler の公式見解は「新しいコードではコンパイラに任せ、精密なコントロールが必要な場面でのみ `useMemo` / `useCallback` を使う」です。完全廃止ではなく escape hatch として残ります。
+
+既存の `useMemo` / `useCallback` は削除しなくて構いません。Compiler はそれらを尊重しつつ、他の箇所を自動最適化します。
+
+Compiler は「React のルールに準拠したコード」のみを最適化します。ESLint Plugin を有効にしておくことで、対応が必要な箇所を事前に把握できます:
+
+```bash
+npm install -D eslint-plugin-react-compiler
+```
+
+```json
+{
+  "plugins": ["react-compiler"],
+  "rules": {
+    "react-compiler/react-compiler": "error"
+  }
+}
+```
+
+## パフォーマンス検証の方法
+
+React DevTools の Profiler でどのコンポーネントが再レンダリングを減らしたか確認できます。`why-did-you-render` ライブラリと組み合わせると、コンパイラが最適化した箇所と手動対応が必要な箇所を明確に分けて把握できます:
+
+```tsx
+if (process.env.NODE_ENV === "development") {
+  const whyDidYouRender = await import("@welldone-software/why-did-you-render");
+  whyDidYouRender.default(React, { trackAllPureComponents: true });
+}
+```
+
+## まとめ
+
+React Compiler 1.0 は、React アプリのパフォーマンス最適化を Build 時の自動処理に移行させる大きな転換点です。導入コストは低く、Next.js 16 であれば Config 一行で完了します。
+
+実務での推奨手順は、まず ESLint Plugin を入れて規則外のコードを洗い出し、修正してから Compiler を有効化することです。手動 Memoization のコードを読む認知負荷がなくなり、コンポーネントのロジック自体に集中できるようになります。
