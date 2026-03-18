@@ -1,0 +1,172 @@
+---
+title: "TypeScript 6.0 RC リリース — strict デフォルト化と using キーワードが変えること"
+description: "Microsoft がリリースした TypeScript 6.0 RC の主要変更点を整理します。strict モードのデフォルト化、using キーワードの安定サポート、型推論の強化と、Next.js 16 / React 19.2 との実践的な組み合わせ方を解説します。"
+date: "2026-03-19"
+status: "published"
+tags: ["TypeScript", "Next.js", "React", "Frontend", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-6-rc-new-features-2026"
+---
+
+Microsoft が TypeScript 6.0 のリリース候補（RC）を公開しました。「現行の JavaScript 仕様に基づく最後のメジャーバージョン」と位置付けられており、次のアーキテクチャ転換（Type Stripping ネイティブ対応など）に向けた重要なマイルストーンです。
+
+本記事では、RC で確認できた主な変更点と、Next.js 16 / React 19.2 との組み合わせで押さえておくべきポイントを整理します。
+
+## strict モードのデフォルト化
+
+TypeScript 6.0 の最大の破壊的変更は、`strict` フラグがデフォルトで有効になる点です。既存プロジェクトを移行する場合、`tsconfig.json` で明示的に `strict: false` を指定しない限り、型チェックが一気に厳しくなります。
+
+```json
+// tsconfig.json — 6.0 以降はこれが暗黙のデフォルト
+{
+  "compilerOptions": {
+    "strict": true,
+    "strictNullChecks": true,
+    "noImplicitAny": true,
+    "strictFunctionTypes": true
+  }
+}
+```
+
+移行前の推奨手順は次のとおりです。
+
+```bash
+# まず型エラーの全量を把握する
+npx tsc --noEmit 2>&1 | wc -l
+
+# エラーが多い場合は段階的に有効化
+# Step 1: noImplicitAny のみ有効化
+# Step 2: strictNullChecks を追加
+# Step 3: strict: true に統合
+```
+
+一度に全部直そうとせず、エラーカテゴリごとに優先度を付けて対処するのが現実的です。
+
+## `using` / `await using` の安定サポート
+
+ECMAScript の Explicit Resource Management proposal に対応した `using` と `await using` が安定版として取り込まれました。従来 `try/finally` で書いていたリソース解放処理を、スコープベースで簡潔に記述できます。
+
+```typescript
+// 従来の書き方
+async function processData() {
+  const db = await openDatabase();
+  try {
+    const result = await db.query("SELECT * FROM users");
+    return result;
+  } finally {
+    await db.close();
+  }
+}
+
+// TypeScript 6.0 の using を使った書き方
+async function processData() {
+  await using db = await openDatabase();
+  // スコープを抜けると自動で db[Symbol.asyncDispose]() が呼ばれる
+  const result = await db.query("SELECT * FROM users");
+  return result;
+}
+```
+
+`Symbol.dispose` / `Symbol.asyncDispose` を実装したクラスであれば、ファイルハンドル、HTTP クライアント、テスト用のモックサーバーなど幅広い場面で応用できます。
+
+```typescript
+class TempDirectory {
+  constructor(public readonly path: string) {}
+
+  [Symbol.dispose]() {
+    fs.rmSync(this.path, { recursive: true, force: true });
+  }
+}
+
+function runBuildTask() {
+  using tmpDir = new TempDirectory(fs.mkdtempSync("build-"));
+  // ビルド処理 ...
+  // 関数終了時に tmpDir が自動削除される
+}
+```
+
+## 型推論の強化
+
+条件型（Conditional Types）における型推論が改善され、深くネストしたジェネリクスでより正確な型が得られるようになりました。ORM や API クライアントのような複雑な型定義を持つライブラリで特に恩恵を受けやすいです。
+
+```typescript
+// 再帰的な DeepReadonly の型推論が 6.0 でより正確に
+type DeepReadonly<T> = {
+  readonly [K in keyof T]: T[K] extends object
+    ? T[K] extends Function
+      ? T[K]
+      : DeepReadonly<T[K]>
+    : T[K];
+};
+
+type AppConfig = DeepReadonly<{
+  server: { host: string; port: number };
+  db: { url: string; pool: { max: number; idle: number } };
+  features: { enableBeta: boolean };
+}>;
+
+// config.db.pool.max = 20; // エラー: readonly プロパティには代入不可
+```
+
+## Next.js 16 との組み合わせ
+
+Next.js 16 は TypeScript 6.0 RC に対応済みです。`params` と `searchParams` が非同期になった変更と組み合わせると、型安全性が一層高まります。
+
+```typescript
+// app/blog/[slug]/page.tsx
+type Props = {
+  params: Promise<{ slug: string }>;
+  searchParams: Promise<{ page?: string }>;
+};
+
+export default async function BlogPost({ params, searchParams }: Props) {
+  const { slug } = await params;
+  const { page = "1" } = await searchParams;
+
+  const post = await getPostBySlug(slug);
+  if (!post) notFound();
+
+  return <Article post={post} page={parseInt(page)} />;
+}
+```
+
+また、React Compiler 1.0 が Next.js 16 でデフォルト有効になっており、TypeScript の型情報を活かしたコンパイル最適化が期待できます。
+
+## React 19.2 の新機能との連携
+
+React 19.2 で追加された `useEffectEvent` は、TypeScript 6.0 の型定義更新に依存しています。イベントハンドラが最新のプロパティを参照しつつ、再レンダリングをまたいで安定した参照を保てます。
+
+```typescript
+import { useEffectEvent } from "react";
+
+function SearchBox({
+  onSearch,
+  debounceMs = 300,
+}: {
+  onSearch: (query: string) => void;
+  debounceMs?: number;
+}) {
+  const handleSearch = useEffectEvent(onSearch);
+
+  const debouncedSearch = useMemo(
+    () => debounce((q: string) => handleSearch(q), debounceMs),
+    [debounceMs] // handleSearch を依存に含めなくてよい
+  );
+
+  return <input onChange={(e) => debouncedSearch(e.target.value)} />;
+}
+```
+
+## 移行チェックリスト
+
+TypeScript 6.0 RC への移行を計画する際は、次の順序で進めることを推奨します。
+
+1. `tsc --noEmit` でエラー数を把握する
+2. `@types/*` パッケージを最新版にアップデートする
+3. `strict: false` を明示的に設定し、現状を維持したままアップグレード
+4. エラーカテゴリごとに優先度を付けて段階的に修正する
+5. リソース管理が必要な箇所を `using` / `await using` に置き換える
+6. CI に `tsc --noEmit` を追加し、型安全性を継続的に担保する
+
+TypeScript 6.0 は現行 JavaScript 仕様への対応を完結させる節目のリリースです。次のアーキテクチャ転換に備えて、今のうちに `strict` モードへの移行と `using` キーワードの活用を進めておくことが、長期的なコードベースの健全性につながります。

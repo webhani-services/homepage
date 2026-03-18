@@ -1,0 +1,218 @@
+---
+title: "Docker Kanvas and Kubernetes 1.33: Bridging Local Dev to AI/ML Production"
+description: "Docker Kanvas automates the gap between Compose and Kubernetes, while Kubernetes 1.33 brings GPU sharing and AI-assisted observability. Here's what both mean for teams running AI/ML workloads."
+date: "2026-03-19"
+status: "published"
+tags: ["Docker", "Kubernetes", "Cloud", "AI/ML", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-kubernetes-ai-ml-2026"
+---
+
+Two infrastructure developments are worth paying attention to this month: Docker launched Kanvas, a platform designed to automate the transition from Docker Compose to Kubernetes, and Kubernetes 1.33 shipped with meaningful improvements to GPU resource management for AI/ML workloads.
+
+Neither is a silver bullet, but both address real friction points that infrastructure teams deal with regularly.
+
+## Docker Kanvas: Compose → Kubernetes Without the Manual Work
+
+The problem Kanvas targets is familiar: you run `docker compose up` locally and everything works. Then you deploy to Kubernetes and spend hours reconciling configuration differences. Compose and Kubernetes have fundamentally different design philosophies — single-host orchestration versus multi-node distributed systems — and the translation between them has always been manual, error-prone work.
+
+Tools like `kompose` have existed for years, but they produce rough output that requires significant cleanup. Kanvas takes a more opinionated approach, generating production-ready Kubernetes artifacts and providing a visual interface for managing the configuration.
+
+```yaml
+# Starting point: docker-compose.yml
+services:
+  api:
+    build: ./api
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgres://postgres:password@db:5432/myapp
+      - NODE_ENV=production
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: myapp
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      retries: 5
+
+volumes:
+  pgdata:
+```
+
+Kanvas parses this and generates a Deployment, Service, ConfigMap, Secret, and PersistentVolumeClaim. The generated output is a starting point, not a final answer:
+
+```yaml
+# Kanvas output: Deployment (abbreviated)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+  template:
+    spec:
+      containers:
+        - name: api
+          image: myregistry/api:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: database-url
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+```
+
+What you'll still need to configure manually: security context (non-root user), network policies, pod disruption budgets, and proper secret management (Sealed Secrets or External Secrets Operator rather than plain Kubernetes Secrets). Kanvas reduces the boilerplate substantially but doesn't replace Kubernetes expertise.
+
+## Kubernetes 1.33: GPU Sharing for AI Workloads
+
+The more immediately impactful change for AI/ML teams is Kubernetes 1.33's GPU resource management improvements. The core addition is proper support for GPU sharing — multiple workloads splitting a single GPU rather than requiring exclusive access.
+
+Under the traditional model, a small inference service that uses 10% of a GPU's capacity still reserved the entire device. For teams running dozens of inference endpoints, that's significant waste. Kubernetes 1.33 with NVIDIA's updated device plugin addresses this:
+
+```yaml
+# Kubernetes 1.33: GPU time-slicing configuration
+# Applied via ConfigMap to the NVIDIA device plugin
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nvidia-device-plugin-config
+  namespace: kube-system
+data:
+  config.yaml: |
+    version: v1
+    sharing:
+      timeSlicing:
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 4  # Expose each GPU as 4 virtual GPUs
+```
+
+```yaml
+# Inference pod requesting 1/4 of a GPU
+apiVersion: v1
+kind: Pod
+metadata:
+  name: text-embedder
+spec:
+  containers:
+    - name: embedder
+      image: myapp/embeddings:latest
+      resources:
+        limits:
+          nvidia.com/gpu: 1  # Gets 1 virtual GPU = 1/4 physical GPU
+        requests:
+          memory: "4Gi"
+          cpu: "2"
+```
+
+The 60% cost reduction figure cited in benchmark reports assumes you're currently running many small inference workloads on dedicated GPUs. Your actual savings depend on workload profiles — bursty batch jobs benefit less from time-slicing than steady low-utilization services.
+
+## GPU Observability with Standard Metrics
+
+Kubernetes 1.33 also improves GPU metrics exposure via the DCGM Exporter, making GPU utilization data available in standard Prometheus format:
+
+```yaml
+# ServiceMonitor for GPU metrics collection
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dcgm-exporter
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: dcgm-exporter
+  endpoints:
+    - port: metrics
+      interval: 15s
+```
+
+With this in place, you can identify underutilized GPUs and make data-driven scaling decisions:
+
+```promql
+# Find inference pods with GPU utilization below 20%
+# (candidates for consolidation or spot instance migration)
+avg by (pod, namespace) (
+  DCGM_FI_DEV_GPU_UTIL{namespace=~"ml-.*"}
+) < 20
+
+# Alert when GPU memory pressure is high
+avg by (node) (
+  DCGM_FI_DEV_FB_USED / DCGM_FI_DEV_FB_TOTAL * 100
+) > 85
+```
+
+## Kanvas and the Helm vs. Kustomize Question
+
+Docker Kanvas generates raw Kubernetes manifests. How you manage those manifests post-generation is a separate decision:
+
+**Kanvas + Kustomize** works well for teams that want environment-specific overlays without a templating language. The generated manifests become the base layer; overlays handle staging vs. production differences:
+
+```
+k8s/
+├── base/           # Kanvas output
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── kustomization.yaml
+└── overlays/
+    ├── staging/
+    │   └── kustomization.yaml  # patch replicas, image tag
+    └── production/
+        └── kustomization.yaml  # patch resources, add HPA
+```
+
+**Kanvas + Helm** makes sense if you're packaging infrastructure for reuse across multiple projects or distributing it as a chart. The conversion from generated manifests to Helm templates adds overhead but pays off at scale.
+
+For most internal applications, start with Kustomize — it's simpler and Kanvas's output fits naturally into the base/overlay model.
+
+## Practical Adoption Guidance
+
+**Consider Docker Kanvas if:**
+- Your team uses Docker Compose for local development and Kubernetes for production, and the gap causes regular deployment friction
+- Kubernetes YAML is currently maintained by one or two people and hasn't scaled to the broader team
+
+**Leverage Kubernetes 1.33 GPU sharing if:**
+- You're running multiple small-to-medium inference services and GPU costs are a visible budget line
+- Your workloads have predictable, steady utilization profiles (time-slicing works poorly for highly variable GPU demand)
+
+**Skip for now if:**
+- Kanvas: your Kubernetes setup is already well-managed with Helm/Kustomize — adding another layer won't help
+- GPU sharing: your inference workloads are large and GPU-saturating — sharing adds overhead without benefit
+
+Both tools address real infrastructure problems. The value depends almost entirely on whether the specific problem they solve matches your current pain points.

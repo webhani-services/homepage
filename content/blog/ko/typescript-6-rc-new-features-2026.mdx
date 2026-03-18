@@ -1,0 +1,177 @@
+---
+title: "TypeScript 6.0 RC: strict 기본값 적용과 using 키워드가 가져오는 변화"
+description: "Microsoft가 릴리즈한 TypeScript 6.0 RC의 주요 변경점을 정리합니다. strict 모드 기본값화, using/await using 안정화, 타입 추론 강화와 Next.js 16 / React 19.2 연동 방법을 실용적으로 설명합니다."
+date: "2026-03-19"
+status: "published"
+tags: ["TypeScript", "Next.js", "React", "Frontend", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-6-rc-new-features-2026"
+---
+
+Microsoft가 TypeScript 6.0 Release Candidate(RC)를 공개했습니다. "현재 JavaScript 명세를 기반으로 한 마지막 메이저 버전"으로 정의되며, 다음 아키텍처 전환(Type Stripping 네이티브 지원 등)을 위한 중요한 이정표입니다.
+
+이번 글에서는 RC에서 확인된 주요 변경점과 Next.js 16 / React 19.2와의 실용적인 연동 방법을 정리합니다.
+
+## strict 모드 기본값 적용
+
+가장 큰 Breaking Change는 `strict` 플래그가 기본값으로 활성화된다는 점입니다. `tsconfig.json`에서 명시적으로 `strict: false`를 설정하지 않으면, 업그레이드 즉시 기존 코드에서 타입 에러가 대량 발생할 수 있습니다.
+
+```json
+// tsconfig.json — 6.0부터 이것이 암묵적 기본값
+{
+  "compilerOptions": {
+    "strict": true,
+    "strictNullChecks": true,
+    "noImplicitAny": true,
+    "strictFunctionTypes": true
+  }
+}
+```
+
+대규모 코드베이스를 마이그레이션할 때는 단계적 접근이 현실적입니다.
+
+```bash
+# Step 1: 에러 전체 규모 파악
+npx tsc --noEmit 2>&1 | grep "error TS" | wc -l
+
+# Step 2: 임시로 strict: false 유지하며 업그레이드
+# Step 3: 플래그를 하나씩 활성화
+# noImplicitAny → strictNullChecks → strict: true
+```
+
+## using / await using 안정화
+
+ECMAScript Explicit Resource Management proposal이 TypeScript 6.0에서 안정 기능으로 포함되었습니다. `using` 키워드는 리소스를 현재 스코프에 바인딩하고, 스코프를 벗어날 때 `Symbol.dispose`를 자동으로 호출합니다. 예외가 발생해도 정리가 보장됩니다.
+
+```typescript
+// 기존 방식: try/finally로 수동 정리
+async function generateReport(id: string) {
+  const conn = await pool.connect();
+  try {
+    const rows = await conn.query("SELECT * FROM reports WHERE id = $1", [id]);
+    return formatReport(rows[0]);
+  } finally {
+    conn.release();
+  }
+}
+
+// TypeScript 6.0: await using으로 스코프 기반 자동 정리
+async function generateReport(id: string) {
+  await using conn = await pool.connect();
+  // 스코프 종료 시 conn[Symbol.asyncDispose]()가 자동 호출됨
+  const rows = await conn.query("SELECT * FROM reports WHERE id = $1", [id]);
+  return formatReport(rows[0]);
+}
+```
+
+테스트 환경에서도 유용하게 활용할 수 있습니다.
+
+```typescript
+class MockApiServer {
+  private server: http.Server;
+
+  constructor(handler: http.RequestListener) {
+    this.server = http.createServer(handler);
+    this.server.listen(0);
+  }
+
+  get url() {
+    const addr = this.server.address() as net.AddressInfo;
+    return `http://localhost:${addr.port}`;
+  }
+
+  [Symbol.dispose]() {
+    this.server.close();
+  }
+}
+
+test("유효한 요청에 200을 반환해야 합니다", async () => {
+  using server = new MockApiServer(myHandler);
+  const res = await fetch(`${server.url}/api/health`);
+  expect(res.status).toBe(200);
+  // afterEach 없이 서버가 자동으로 종료됨
+});
+```
+
+## 조건부 타입 추론 강화
+
+중첩된 조건부 타입(Conditional Types)에서 타입 추론이 개선되어, 복잡한 제네릭에서 더 정확한 타입이 도출됩니다. ORM이나 API 클라이언트처럼 타입이 깊게 중첩되는 라이브러리에서 특히 효과적입니다.
+
+```typescript
+type DeepReadonly<T> = {
+  readonly [K in keyof T]: T[K] extends object
+    ? T[K] extends Function
+      ? T[K]
+      : DeepReadonly<T[K]>
+    : T[K];
+};
+
+// 6.0에서는 깊은 중첩에서도 정확하게 추론
+type AppConfig = DeepReadonly<{
+  server: { host: string; port: number };
+  db: { url: string; pool: { max: number } };
+}>;
+
+// config.db.pool.max = 20; // 에러: readonly 프로퍼티에 할당 불가
+```
+
+## Next.js 16과의 연동
+
+Next.js 16은 TypeScript 6.0 RC를 지원합니다. 비동기로 변경된 Request API와 조합하면 타입 안전성이 더욱 강화됩니다.
+
+```typescript
+// app/blog/[slug]/page.tsx
+type Props = {
+  params: Promise<{ slug: string }>;
+  searchParams: Promise<{ page?: string }>;
+};
+
+export default async function BlogPost({ params, searchParams }: Props) {
+  const { slug } = await params;
+  const { page = "1" } = await searchParams;
+
+  const post = await getPostBySlug(slug);
+  if (!post) notFound();
+
+  return <Article post={post} page={parseInt(page)} />;
+}
+```
+
+Next.js 16에서 기본으로 활성화된 React Compiler 1.0도 TypeScript 6.0의 엄격한 타입 정보를 활용해 메모이제이션 최적화를 더 정확하게 수행합니다.
+
+## React 19.2 useEffectEvent와의 연동
+
+React 19.2에 추가된 `useEffectEvent`는 TypeScript 6.0의 타입 정의 업데이트에 의존합니다. 이벤트 핸들러가 최신 Props를 참조하면서도 리렌더링 사이에서 안정된 참조를 유지합니다.
+
+```typescript
+import { useEffectEvent } from "react";
+
+function SearchBox({
+  onSearch,
+  debounceMs = 300,
+}: {
+  onSearch: (query: string) => void;
+  debounceMs?: number;
+}) {
+  const handleSearch = useEffectEvent(onSearch);
+
+  const debouncedSearch = useMemo(
+    () => debounce((q: string) => handleSearch(q), debounceMs),
+    [debounceMs] // handleSearch를 의존성에 포함하지 않아도 됨
+  );
+
+  return <input onChange={(e) => debouncedSearch(e.target.value)} />;
+}
+```
+
+## 마이그레이션 체크리스트
+
+1. `tsc --noEmit`으로 에러 전체 규모를 파악합니다
+2. `@types/*` 패키지를 최신 버전으로 업데이트합니다
+3. `"strict": false`를 명시적으로 설정해 TypeScript 업그레이드와 strict 마이그레이션을 분리합니다
+4. 플래그를 단계적으로 활성화합니다: `noImplicitAny` → `strictNullChecks` → `strict: true`
+5. `try/finally` 리소스 정리 패턴을 `using` / `await using`으로 교체합니다
+6. CI 파이프라인에 `tsc --noEmit`을 추가해 타입 안전성을 지속적으로 검증합니다
+
+TypeScript 6.0은 현재 JavaScript 명세와의 정렬을 완성하는 통합 릴리즈입니다. strict 기본값화가 가장 눈에 띄는 변화이지만, 이미 strict 모드를 사용 중인 팀에게는 대부분 기능 추가입니다. `using` 키워드는 리소스 누수 버그 전체 범주를 최소한의 코드 변경으로 제거하므로 적극적으로 도입을 검토해 볼 만합니다.

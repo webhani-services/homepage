@@ -1,0 +1,191 @@
+---
+title: "Docker Kanvas と Kubernetes 1.33 — ローカル開発から AI/ML ワークロードの本番運用まで"
+description: "Docker が発表した Kanvas プラットフォームと Kubernetes 1.33 の GPU スケジューリング強化を解説します。Compose ファイルから Kubernetes マニフェストへの自動変換と、AI/ML ワークロードのコスト削減アプローチを実例とともに紹介します。"
+date: "2026-03-19"
+status: "published"
+tags: ["Docker", "Kubernetes", "Cloud", "AI/ML", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-kubernetes-ai-ml-2026"
+---
+
+Docker が新プラットフォーム「Kanvas」を発表しました。ローカル開発環境と本番の Kubernetes クラスターのギャップを埋めることを目的とし、Docker Compose ファイルを Kubernetes マニフェストに自動変換する機能が中核にあります。
+
+同時期に、Kubernetes 1.33 の AI/ML ワークロード向け GPU スケジューリング強化も注目を集めています。本記事では両者の実態と、現場への導入価値を整理します。
+
+## Docker Kanvas が解決する課題
+
+多くのチームが経験している課題があります。ローカルでは `docker compose up` で動くのに、本番の Kubernetes にデプロイすると設定の差異でトラブルが起きる問題です。
+
+Compose と Kubernetes は設計思想が異なります。Compose はシングルホストのオーケストレーション、Kubernetes はマルチノードの分散システムです。この差を埋めるために、これまでは `kompose` のようなツールや手作業での変換が必要でした。
+
+Docker Kanvas はこの変換を自動化し、さらにビジュアルな設定インターフェースで Kubernetes のリソース定義を管理できるようにします。
+
+```yaml
+# docker-compose.yml（ローカル開発）
+version: "3.9"
+services:
+  api:
+    build: ./api
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgres://postgres:password@db:5432/myapp
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: myapp
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
+```
+
+Kanvas はこれを解析し、Deployment、Service、ConfigMap、PersistentVolumeClaim に変換します。変換後の Kubernetes マニフェストは手動で調整できるため、自動生成の出発点として活用できます。
+
+```yaml
+# Kanvas が生成する Kubernetes Deployment（簡略版）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: myapp/api:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: url
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+```
+
+Kanvas の生成物はあくまで出発点です。本番運用には、適切なリソースリミット、ヘルスチェック、セキュリティコンテキストの手動調整が必要です。
+
+## Kubernetes 1.33 の GPU スケジューリング強化
+
+Kubernetes 1.33 は AI/ML ワークロード向けの GPU リソース管理を大幅に強化しました。最も注目すべきは「GPU の共有スケジューリング」です。
+
+従来、GPU は 1 ワークロードに 1 台の割り当てが基本でした。小さな推論タスクが 1 台の高価な GPU を占有するケースが多く、コスト効率が低い状態でした。Kubernetes 1.33 では、複数のワークロードが 1 台の GPU を分割利用できるようになり、最大 60% のコスト削減が報告されています。
+
+```yaml
+# Kubernetes 1.33: GPU 共有スケジューリングの設定例
+apiVersion: v1
+kind: Pod
+metadata:
+  name: inference-worker
+spec:
+  containers:
+    - name: model-server
+      image: myapp/inference:latest
+      resources:
+        limits:
+          # 1 GPU の 1/4 を要求（4 ワークロードで 1 GPU を共有）
+          nvidia.com/gpu: "0.25"
+        requests:
+          nvidia.com/gpu: "0.25"
+          memory: "4Gi"
+          cpu: "2"
+```
+
+```yaml
+# Dynamic Resource Allocation (DRA) を使った柔軟な GPU 要求
+apiVersion: resource.k8s.io/v1alpha2
+kind: ResourceClaim
+metadata:
+  name: gpu-claim
+spec:
+  resourceClassName: nvidia-gpu
+  parametersRef:
+    apiGroup: gpu.resource.k8s.io
+    kind: GpuParameters
+    name: inference-params
+---
+apiVersion: gpu.resource.k8s.io/v1alpha1
+kind: GpuParameters
+metadata:
+  name: inference-params
+spec:
+  count: 1
+  sharing:
+    strategy: TimeSlicing
+    timeSlicingConfig:
+      intervalUs: 1000  # 1ms のタイムスライス
+```
+
+## AI ワークロードの観測性
+
+Kubernetes 1.33 では、GPU メトリクスが標準の Prometheus 形式で公開されるようになりました。Grafana と組み合わせて GPU 使用率を可視化するのが容易になっています。
+
+```yaml
+# Prometheus で GPU メトリクスを収集する ServiceMonitor
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gpu-metrics
+spec:
+  selector:
+    matchLabels:
+      app: nvidia-dcgm-exporter
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+```
+
+```promql
+# 推論ワークロードの GPU 使用率を確認するクエリ例
+# GPU 利用率が低い（20% 以下）ワークロードを特定
+avg by (pod, namespace) (
+  DCGM_FI_DEV_GPU_UTIL{namespace="ml-inference"}
+) < 20
+```
+
+このクエリで GPU が遊んでいるワークロードを特定し、スケールダウンやスポットインスタンスへの移行を判断できます。
+
+## Helm と Kustomize への影響
+
+Docker Kanvas が Kubernetes マニフェストの生成を自動化するにつれ、「Helm vs Kustomize」の選択に新しい文脈が加わります。
+
+- **Kanvas + Kustomize**: 生成されたマニフェストを環境別にオーバーレイで管理。シンプルで学習コストが低い。
+- **Kanvas + Helm**: 生成されたマニフェストをチャートに変換。再利用性が高く、チャートリポジトリで配布可能。
+
+小規模チームや内部ツールには Kustomize + Kanvas の組み合わせが現実的です。プロダクトを外部配布する場合や複数環境で再利用する場合は Helm が引き続き有効です。
+
+## 現場への導入の考え方
+
+Docker Kanvas と Kubernetes 1.33 の GPU 強化は、それぞれ異なる課題を解決します。
+
+**Docker Kanvas を検討すべきケース:**
+- ローカル開発で Compose を使っているが、Kubernetes への移行に踏み切れていないチーム
+- Kubernetes の設定が属人化しており、開発者が自分でマニフェストを更新できない状況
+
+**GPU スケジューリング強化を活用すべきケース:**
+- 小〜中規模の推論ワークロードを複数運用しており、GPU コストが課題のチーム
+- バッチ処理と常時稼働の推論が混在するワークロード構成
+
+どちらも「既存の運用を置き換える」ものではなく、「既存の課題を解消する追加オプション」として捉えるのが適切です。特に Kanvas は現在パブリックベータ段階のため、本番導入前に十分な検証が必要です。
