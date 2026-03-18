@@ -2,6 +2,7 @@
 import Image from "next/image";
 import { useTranslations } from "next-intl";
 import { useScrollReveal } from "@/hooks/useScrollReveal";
+import { getRevealDelayClass } from "@/lib/constants";
 
 const WORKS_DATA = [
   { id: "cloudInfra", image: "/images/works/cloud.jpg" },
@@ -15,21 +16,22 @@ type WorkCardProps = {
   index: number;
   t: (
     key:
-      | `works.items.${(typeof WORKS_DATA)[number]["id"]}.title`
-      | `works.items.${(typeof WORKS_DATA)[number]["id"]}.category`
+      | `items.${(typeof WORKS_DATA)[number]["id"]}.title`
+      | `items.${(typeof WORKS_DATA)[number]["id"]}.category`
   ) => string;
 };
 
 const WorkCard = ({ work, index, t }: WorkCardProps) => (
   <div
-    className={`reveal reveal-delay-${(index % 3) + 1} group relative overflow-hidden rounded-2xl`}
+    className={`reveal ${getRevealDelayClass(index)} group relative overflow-hidden rounded-2xl`}
   >
     <div className="relative h-72 lg:h-80">
       <Image
         src={work.image}
-        alt={t(`works.items.${work.id}.title`)}
+        alt={t(`items.${work.id}.title`)}
         fill
         sizes="(max-width: 768px) 100vw, 50vw"
+        loading="lazy"
         className="object-cover transition-transform duration-700 group-hover:scale-105"
       />
       {/* Default gradient at bottom */}
@@ -41,11 +43,11 @@ const WorkCard = ({ work, index, t }: WorkCardProps) => (
       <div className="absolute bottom-0 left-0 right-0 p-6 text-white">
         <span className="text-amber-400 text-xs font-semibold tracking-[0.15em] uppercase mb-2 block
           transform transition-transform duration-500 group-hover:-translate-y-1">
-          {t(`works.items.${work.id}.category`)}
+          {t(`items.${work.id}.category`)}
         </span>
         <h3 className="text-lg font-bold leading-snug
           transform transition-transform duration-500 group-hover:-translate-y-1">
-          {t(`works.items.${work.id}.title`)}
+          {t(`items.${work.id}.title`)}
         </h3>
       </div>
     </div>
@@ -53,7 +55,7 @@ const WorkCard = ({ work, index, t }: WorkCardProps) => (
 );
 
 export default function AreaWorks() {
-  const t = useTranslations();
+  const t = useTranslations("works");
   const revealRef = useScrollReveal();
 
   return (
@@ -64,10 +66,10 @@ export default function AreaWorks() {
             Works
           </span>
           <h2 className="reveal reveal-delay-1 text-4xl md:text-5xl font-bold text-gray-900 dark:text-gray-100 tracking-tight">
-            {t("works.title")}
+            {t("title")}
           </h2>
           <p className="reveal reveal-delay-2 mt-4 text-lg text-gray-500 dark:text-gray-400 max-w-2xl mx-auto">
-            {t("works.description")}
+            {t("description")}
           </p>
         </div>
 
