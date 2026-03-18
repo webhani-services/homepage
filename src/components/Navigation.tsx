@@ -25,18 +25,7 @@ const navigationData = {
     },
   },
   menuItems: [
-    {
-      nameKey: "services",
-      href: "/#services",
-      children: [
-        { nameKey: "webDevelopment", href: "/#web-development" },
-        { nameKey: "consulting", href: "/#consulting" },
-        { nameKey: "education", href: "/#education" },
-        { nameKey: "digitalContent", href: "/#digital-content" },
-        { nameKey: "outsourcing", href: "/#outsourcing" },
-        { nameKey: "llmServices", href: "/#llm-services" },
-      ],
-    },
+    { nameKey: "services", href: "/#services" },
     { nameKey: "philosophy", href: "/#corporate-philosophy" },
     { nameKey: "about", href: "/#about" },
     { nameKey: "works", href: "/#works" },
@@ -67,7 +56,7 @@ const navigationUtils = {
 
 export default function Navigation() {
   const [isOpen, setIsOpen] = useState(false);
-  const [activeDropdown, setActiveDropdown] = useState<string | null>(null);
+
   const [isScrolled, setIsScrolled] = useState(false);
   const [isDark, setIsDark] = useState(false);
 
@@ -147,11 +136,7 @@ export default function Navigation() {
 
           {/* デスクトップメニュー */}
           <div className="hidden md:flex md:items-center md:space-x-8 justify-between flex-1">
-            <DesktopMenu
-              items={navigationData.menuItems}
-              activeDropdown={activeDropdown}
-              setActiveDropdown={setActiveDropdown}
-            />
+            <DesktopMenu items={navigationData.menuItems} />
             <div className="flex items-center space-x-4">
               <LanguageToggle />
               <DarkModeToggle isDark={isDark} onToggle={handleToggleDarkMode} />

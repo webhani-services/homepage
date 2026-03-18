@@ -28,33 +28,14 @@ export default function MobileMenu({
         {/* メインメニュー */}
         <div className="border-b border-gray-200 dark:border-gray-800 pb-2 mb-2">
           {items.map((item) => (
-            <div key={item.nameKey}>
-              <Link
-                href={item.href}
-                className="block px-3 py-2 rounded-md text-base font-medium text-gray-700 dark:text-gray-300 hover:bg-amber-50 hover:text-amber-600 dark:hover:bg-amber-900/20 dark:hover:text-amber-400 transition-colors duration-200"
-                onClick={() => {
-                  if (!item.children) {
-                    setIsOpen(false);
-                  }
-                }}
-              >
-                {t(item.nameKey)}
-              </Link>
-              {item.children && (
-                <div className="pl-4">
-                  {item.children.map((child) => (
-                    <Link
-                      key={child.nameKey}
-                      href={child.href}
-                      className="block px-3 py-2 text-sm text-gray-600 dark:text-gray-400 hover:bg-amber-50 hover:text-amber-600 dark:hover:bg-amber-900/20 dark:hover:text-amber-400 transition-colors duration-200"
-                      onClick={() => setIsOpen(false)}
-                    >
-                      {t(child.nameKey)}
-                    </Link>
-                  ))}
-                </div>
-              )}
-            </div>
+            <Link
+              key={item.nameKey}
+              href={item.href}
+              className="block px-3 py-2 rounded-md text-base font-medium text-gray-700 dark:text-gray-300 hover:bg-amber-50 hover:text-amber-600 dark:hover:bg-amber-900/20 dark:hover:text-amber-400 transition-colors duration-200"
+              onClick={() => setIsOpen(false)}
+            >
+              {t(item.nameKey)}
+            </Link>
           ))}
         </div>
 
