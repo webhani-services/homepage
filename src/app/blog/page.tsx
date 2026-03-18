@@ -1,6 +1,7 @@
+import { Suspense } from "react";
 import { getLocale, getTranslations } from "next-intl/server";
 import { getPosts } from "@/lib/blog";
-import BlogCard from "@/components/blog/BlogCard";
+import BlogList from "@/components/blog/BlogList";
 import Link from "next/link";
 import type { Metadata } from "next";
 
@@ -18,7 +19,19 @@ export async function generateMetadata(): Promise<Metadata> {
 
 export default async function BlogListPage() {
   const locale = await getLocale();
+  const t = await getTranslations("blog");
   const posts = getPosts(locale);
+
+  const frontmatters = posts.map((p) => p.frontmatter);
+  const allTags = Array.from(new Set(frontmatters.flatMap((p) => p.tags))).sort();
+
+  const translations = {
+    searchPlaceholder: t("searchPlaceholder"),
+    allTags: t("allTags"),
+    noResults: t("noResults"),
+    prev: t("prev"),
+    next: t("next"),
+  };
 
   return (
     <section className="section-padding bg-[var(--surface-muted)] dark:bg-[var(--dark-bg)] min-h-screen">
@@ -41,20 +54,13 @@ export default async function BlogListPage() {
           </h1>
         </div>
 
-        {posts.length === 0 ? (
-          <p className="text-center text-gray-500 dark:text-gray-400">
-            No posts yet.
-          </p>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {posts.map((post) => (
-              <BlogCard
-                key={post.frontmatter.slug}
-                frontmatter={post.frontmatter}
-              />
-            ))}
-          </div>
-        )}
+        <Suspense fallback={null}>
+          <BlogList
+            posts={frontmatters}
+            allTags={allTags}
+            translations={translations}
+          />
+        </Suspense>
       </div>
     </section>
   );
