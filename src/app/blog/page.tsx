@@ -1,12 +1,20 @@
-import { getLocale } from "next-intl/server";
+import { getLocale, getTranslations } from "next-intl/server";
 import { getPosts } from "@/lib/blog";
 import BlogCard from "@/components/blog/BlogCard";
 import Link from "next/link";
+import type { Metadata } from "next";
 
-export const metadata = {
-  title: "Blog | webhani Inc.",
-  description: "Technical blog posts from webhani",
-};
+export async function generateMetadata(): Promise<Metadata> {
+  const t = await getTranslations("blog");
+  return {
+    title: `${t("title")} | webhani Inc.`,
+    description: t("description"),
+    openGraph: {
+      title: `${t("title")} | webhani Inc.`,
+      description: t("description"),
+    },
+  };
+}
 
 export default async function BlogListPage() {
   const locale = await getLocale();

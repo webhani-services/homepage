@@ -26,6 +26,11 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     openGraph: {
       title: post.frontmatter.title,
       description: post.frontmatter.description,
+      type: "article",
+      publishedTime: post.frontmatter.date,
+      modifiedTime: post.frontmatter.updatedAt,
+      authors: [post.frontmatter.author],
+      tags: post.frontmatter.tags,
       images: post.frontmatter.thumbnail
         ? [post.frontmatter.thumbnail]
         : [],
@@ -39,8 +44,29 @@ export default async function BlogDetailPage({ params }: Props) {
   const post = getPostBySlug(locale, slug);
   if (!post) notFound();
 
+  const jsonLd = {
+    "@context": "https://schema.org",
+    "@type": "BlogPosting",
+    headline: post.frontmatter.title,
+    description: post.frontmatter.description,
+    datePublished: post.frontmatter.date,
+    dateModified: post.frontmatter.updatedAt ?? post.frontmatter.date,
+    author: {
+      "@type": "Organization",
+      name: post.frontmatter.author,
+    },
+    keywords: post.frontmatter.tags,
+    ...(post.frontmatter.thumbnail && {
+      image: post.frontmatter.thumbnail,
+    }),
+  };
+
   return (
     <section className="section-padding bg-[var(--surface-muted)] dark:bg-[var(--dark-bg)] min-h-screen">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
+      />
       <div className="max-w-3xl mx-auto">
         <div className="mb-8">
           <Link
