@@ -1,0 +1,120 @@
+---
+title: "Docker Kanvas — Compose ファイルを Kubernetes マニフェストに自動変換する新ツール"
+description: "Docker が発表した Kanvas は、Docker Compose ファイルを Kubernetes の Artifact に自動変換するプラットフォームです。Helm や Kustomize との比較も踏まえ、実用的な位置づけを整理します。"
+date: "2026-03-18"
+status: "draft"
+tags: ["Docker", "Kubernetes", "DevOps", "Helm", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-compose-to-kubernetes-2026"
+---
+
+## Docker Kanvas とは
+
+Docker が 2026年初頭に発表した Kanvas は、ローカル開発環境と本番環境の橋渡しを目的としたプラットフォームです。中心的な機能は、開発者が使い慣れた `docker-compose.yml` を Kubernetes の Deployment、Service、ConfigMap などのマニフェストに自動変換することです。
+
+これまで「ローカルは Docker Compose、本番は Kubernetes」という構成は開発者にとって大きなコンテキストスイッチを伴っていました。Kanvas はそのギャップを埋めることを目指しています。
+
+## 既存ツールとの比較
+
+### Helm との違い
+
+Helm は Kubernetes のパッケージマネージャーであり、テンプレート化された Chart を使って複雑なアプリケーションをデプロイします。Helm は強力ですが、Chart の書き方やライフサイクル管理を学ぶコストがあります。
+
+Kanvas のアプローチは逆で、すでに書いてある `docker-compose.yml` から始めます。K8s の知識を持たない開発者でも、Compose ファイルさえ書ければ K8s にデプロイできる入口を提供します。
+
+### Kustomize との違い
+
+Kustomize はベースとなるマニフェストに差分を重ねる方法で環境差異を管理します。K8s の YAML を直接扱うため、K8s の理解が前提です。
+
+Kanvas は K8s マニフェストの生成自体を担うため、Kustomize とは役割が異なります。生成されたマニフェストを Kustomize で管理するという組み合わせも考えられます。
+
+## 実際の変換フロー
+
+以下のような典型的な `docker-compose.yml` を用意した場合:
+
+```yaml
+# docker-compose.yml
+version: "3.9"
+services:
+  web:
+    image: my-app:latest
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://db:5432/myapp
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+volumes:
+  db-data:
+```
+
+Kanvas はこれを元に、以下のような K8s リソースを生成します:
+
+- `Deployment` (web, db)
+- `Service` (web → ClusterIP, db → ClusterIP)
+- `ConfigMap` または `Secret` (環境変数)
+- `PersistentVolumeClaim` (db-data ボリューム)
+
+生成されたマニフェストは出発点として使い、プロジェクトの要件に合わせて修正していくワークフローが現実的です。
+
+## 実用上の注意点
+
+### 1:1 変換の限界
+
+Docker Compose と Kubernetes はモデルが異なります。Compose の `depends_on` は K8s の起動順序保証に直接対応しないため、InitContainer や Readiness Probe の追加が必要なケースがあります。
+
+自動変換は8割の作業を省力化しますが、残りの2割は K8s の理解が必要です。
+
+### Secrets の扱い
+
+`docker-compose.yml` に平文で書かれた環境変数（パスワードなど）は、K8s Secret として適切に管理する必要があります。Kanvas が生成したマニフェストに Secret が含まれる場合、`kubectl apply` する前に値を安全な方法（External Secrets、Vault など）に置き換えることを強く推奨します。
+
+```yaml
+# Kanvas が生成した Secret（この状態で commit しない）
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-secret
+type: Opaque
+data:
+  POSTGRES_PASSWORD: c2VjcmV0  # base64 エンコードのみ（暗号化ではない）
+```
+
+### Production Ready かどうかの判断
+
+Kanvas の出力は「Kubernetes にデプロイできる最小限の構成」です。本番環境で必要な以下の要素は別途追加が必要です:
+
+- Resource Requests / Limits
+- Horizontal Pod Autoscaler
+- PodDisruptionBudget
+- Network Policy
+- Liveness / Readiness Probe
+
+## どんなチームに向いているか
+
+**向いている:**
+- Docker Compose での開発経験はあるが K8s への移行を検討しているチーム
+- 小規模なアプリケーションを初めて K8s にデプロイするプロジェクト
+- K8s の学習曲線を下げたいスタートアップ
+
+**向いていない:**
+- すでに Helm Chart や Kustomize の構成が整っているチーム（移行コストに見合わない）
+- マルチクラスター、複雑なネットワーク構成など高度な K8s 機能を使っているプロジェクト
+
+## まとめ
+
+Docker Kanvas は「Compose で書いたものをそのまま K8s で動かしたい」という開発者の素朴な要求に応えるツールです。Helm や Kustomize と競合するというより、K8s 入門のハードルを下げる位置づけが現実的です。
+
+生成されたマニフェストをベースに K8s を学習しながら調整していくアプローチは、チームの K8s 習熟度を段階的に高める手段としても有効です。
+
+webhani では Kubernetes への移行設計や既存インフラの最適化支援を行っています。ご相談はお気軽にどうぞ。

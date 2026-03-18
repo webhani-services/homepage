@@ -1,0 +1,154 @@
+---
+title: "Docker Kanvas: Automating the Jump from Compose to Kubernetes"
+description: "Docker's new Kanvas platform converts Docker Compose files into Kubernetes manifests automatically. Here's where it fits alongside Helm and Kustomize, and what to watch out for."
+date: "2026-03-18"
+status: "draft"
+tags: ["Docker", "Kubernetes", "DevOps", "Helm", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-compose-to-kubernetes-2026"
+---
+
+## What Docker Kanvas Does
+
+Docker's Kanvas, announced in early 2026, targets one of the most common friction points in cloud-native development: the gap between local Docker Compose setups and production Kubernetes clusters.
+
+The core feature is conversion — take a `docker-compose.yml` that your team already uses for local development and generate the corresponding Kubernetes manifests from it. Deployments, Services, ConfigMaps, PersistentVolumeClaims — Kanvas produces the boilerplate so you don't have to write it from scratch.
+
+The positioning is as a bridge tool, not a replacement for Helm or Kustomize. It targets the developer who knows Docker Compose well but hasn't yet built up Kubernetes expertise.
+
+## Comparison with Existing Tools
+
+### vs. Helm
+
+Helm is a full package manager for Kubernetes. It uses templated Charts to manage complex application deployments, with release history, rollback, and dependency management built in. The tradeoff is a learning curve — Chart structure, values files, templating syntax.
+
+Kanvas starts from where many developers already are: a working Compose file. It lowers the entry point to Kubernetes without requiring you to learn Helm before you can deploy anything.
+
+### vs. Kustomize
+
+Kustomize takes the opposite approach — start from raw Kubernetes manifests and layer environment-specific patches on top. It requires you to understand Kubernetes primitives to use it.
+
+Kanvas handles the manifest generation step that Kustomize assumes you've already done. They're not directly competing; a reasonable workflow is Kanvas to generate the initial manifests, then Kustomize to manage environment differences.
+
+### vs. Kompose
+
+`kompose` is the existing open-source tool for converting Compose to Kubernetes. Kanvas appears to be a more integrated, UI-driven evolution of the same concept, with Docker's toolchain wrapped around it.
+
+## The Conversion in Practice
+
+Given a typical `docker-compose.yml`:
+
+```yaml
+version: "3.9"
+services:
+  api:
+    image: my-api:latest
+    ports:
+      - "4000:4000"
+    environment:
+      DATABASE_URL: postgres://db:5432/myapp
+      NODE_ENV: production
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+volumes:
+  db-data:
+```
+
+Kanvas generates approximately:
+
+- `Deployment` for `api` and `db`
+- `Service` for each (ClusterIP by default; NodePort or LoadBalancer for exposed ports)
+- `ConfigMap` or `Secret` for environment variables
+- `PersistentVolumeClaim` for `db-data`
+
+The output is a starting point. Treat it as generated scaffolding that you review and adapt, not as production-ready configuration.
+
+## What Automatic Conversion Can't Handle
+
+### Startup Ordering
+
+`depends_on` in Compose controls container startup order. Kubernetes doesn't have an equivalent — it uses health checks and restarts to reach a stable state eventually. If your app fails hard when the database isn't ready, you'll need to add:
+
+```yaml
+# Add to your api Deployment
+initContainers:
+  - name: wait-for-db
+    image: busybox
+    command: ['sh', '-c', 'until nc -z db 5432; do sleep 2; done']
+```
+
+### Secrets Management
+
+Any plaintext credentials in your Compose file will land in a Kubernetes Secret as base64-encoded values. Base64 is encoding, not encryption — don't commit these to source control as-is:
+
+```yaml
+# Generated output — not safe to commit
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-secret
+data:
+  POSTGRES_PASSWORD: c2VjcmV0  # just base64("secret")
+```
+
+Replace generated secrets with references to your secrets management system (AWS Secrets Manager, HashiCorp Vault, External Secrets Operator) before deploying to a real environment.
+
+### Production Requirements
+
+Generated manifests cover the minimum for deployment. For production, you'll need to add manually:
+
+```yaml
+# Add to your Deployment spec
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 4000
+  initialDelaySeconds: 10
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 4000
+```
+
+Beyond that: HorizontalPodAutoscaler, PodDisruptionBudget, NetworkPolicy — none of these appear in auto-generated output.
+
+## Who Should Use Kanvas
+
+**Good fit:**
+- Teams with solid Docker Compose experience moving to Kubernetes for the first time
+- Small applications where the overhead of full Helm Charts isn't justified
+- Learning contexts — the generated manifests are good study material for understanding Kubernetes primitives
+
+**Not a good fit:**
+- Teams already running Helm Charts or Kustomize overlays — the migration cost exceeds the benefit
+- Complex multi-service architectures with advanced networking, RBAC, or multi-cluster requirements
+- Organizations with strict security policies that require IaC review before any manifest reaches production
+
+## The Broader Pattern
+
+Kanvas reflects a shift in the tooling ecosystem: developer-facing tools are increasingly abstracting Kubernetes complexity rather than exposing it. This mirrors what happened with Docker Compose itself — abstracting raw `docker run` commands into something manageable.
+
+The risk with abstraction layers is that they defer rather than eliminate the need for underlying knowledge. When something breaks in production, you still need someone who understands Kubernetes to debug it.
+
+## Summary
+
+Docker Kanvas is a practical tool for closing the gap between local development and Kubernetes deployment. For teams taking their first steps into Kubernetes, it removes the blank-page problem of writing manifests from scratch.
+
+Approach the output as a first draft: review it, understand each generated resource, and add the production concerns it omits. That combination — generated structure plus informed review — is a reasonable path into Kubernetes without the full upfront investment in Helm expertise.
