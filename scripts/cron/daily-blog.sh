@@ -83,7 +83,7 @@ git pull origin master 2>&1 | tee -a "${LOG_FILE}"
 # === Claude Code CLI を非 Interactive モードで実行 (Timeout 付き) ===
 echo "Starting Claude Code (max-turns: ${MAX_TURNS}, timeout: ${TIMEOUT_SECONDS}s)..." | tee -a "${LOG_FILE}"
 
-timeout "${TIMEOUT_SECONDS}" \
+gtimeout "${TIMEOUT_SECONDS}" \
 claude -p "$(cat <<'PROMPT'
 以下の作業を自動で実行してください。ユーザー確認は不要です。すべて自動で判断して進めてください。
 
