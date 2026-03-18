@@ -23,7 +23,7 @@ export default async function BlogListPage() {
   const posts = getPosts(locale);
 
   const frontmatters = posts.map((p) => p.frontmatter);
-  const allTags = [...new Set(frontmatters.flatMap((p) => p.tags))].sort();
+  const allTags = Array.from(new Set(frontmatters.flatMap((p) => p.tags))).sort();
 
   const translations = {
     searchPlaceholder: t("searchPlaceholder"),
