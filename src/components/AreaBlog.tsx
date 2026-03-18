@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useTranslations } from "next-intl";
 import { useScrollReveal } from "@/hooks/useScrollReveal";
 import BlogCard from "@/components/blog/BlogCard";
+import { getRevealDelayClass } from "@/lib/constants";
 import type { BlogFrontmatter } from "@/lib/blog";
 
 type AreaBlogProps = {
@@ -43,7 +44,7 @@ export default function AreaBlog({ posts }: AreaBlogProps) {
               {posts.map((frontmatter, index) => (
                 <div
                   key={frontmatter.slug}
-                  className={`reveal reveal-delay-${(index % 3) + 1}`}
+                  className={`reveal ${getRevealDelayClass(index)}`}
                 >
                   <BlogCard frontmatter={frontmatter} />
                 </div>

@@ -2,6 +2,7 @@
 import Image from "next/image";
 import { useTranslations } from "next-intl";
 import { useScrollReveal } from "@/hooks/useScrollReveal";
+import { getRevealDelayClass } from "@/lib/constants";
 
 const SERVICE_IDS = [
   { icon: "/images/services/web-development.svg", id: "webDevelopment" },
@@ -23,30 +24,30 @@ const ServiceCard = ({ icon, id, index, t }: ServiceCardProps) => (
   <div
     key={id}
     id={id}
-    className={`reveal reveal-delay-${(index % 3) + 1} group relative bg-white dark:bg-[var(--dark-surface-elevated)] p-8 rounded-2xl
+    className={`reveal ${getRevealDelayClass(index)} group relative bg-white dark:bg-[var(--dark-surface-elevated)] p-8 rounded-2xl
     border border-gray-100 dark:border-gray-800 hover:border-amber-200 dark:hover:border-amber-800
     transition-all duration-500 hover:-translate-y-1 hover:shadow-xl hover:shadow-amber-500/5`}
   >
     <div className="w-14 h-14 mb-5 p-3 rounded-xl bg-amber-50 dark:bg-amber-900/20">
       <Image
         src={icon}
-        alt={t(`areaServices.services.${id}.title`)}
+        alt={t(`services.${id}.title`)}
         width={64}
         height={64}
         className="w-full h-full"
       />
     </div>
     <h3 className="text-lg font-bold text-gray-900 dark:text-gray-100 mb-3">
-      {t(`areaServices.services.${id}.title`)}
+      {t(`services.${id}.title`)}
     </h3>
     <p className="text-sm text-gray-500 dark:text-gray-400 leading-relaxed">
-      {t(`areaServices.services.${id}.description`)}
+      {t(`services.${id}.description`)}
     </p>
   </div>
 );
 
 export default function AreaServices() {
-  const t = useTranslations();
+  const t = useTranslations("areaServices");
   const revealRef = useScrollReveal();
 
   return (
@@ -57,10 +58,10 @@ export default function AreaServices() {
             Services
           </span>
           <h2 className="reveal reveal-delay-1 text-4xl md:text-5xl font-bold text-gray-900 dark:text-gray-100 tracking-tight">
-            {t("areaServices.title")}
+            {t("title")}
           </h2>
           <p className="reveal reveal-delay-2 mt-4 text-lg text-gray-500 dark:text-gray-400 max-w-2xl mx-auto">
-            {t("areaServices.description")}
+            {t("description")}
           </p>
         </div>
 
