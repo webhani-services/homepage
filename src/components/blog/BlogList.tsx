@@ -38,8 +38,7 @@ export default function BlogList({
     () =>
       new Fuse(posts, {
         keys: ["title", "description", "tags"],
-        threshold: 0.3,
-        ignoreLocation: true,
+        threshold: 0.15,
       }),
     [posts]
   );
