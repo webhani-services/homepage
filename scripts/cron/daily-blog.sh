@@ -1,4 +1,4 @@
-#!/bin/bash
+ #!/bin/bash
 set -euo pipefail
 
 # ============================================================
@@ -199,8 +199,12 @@ echo "Updating local master branch..." | tee -a "${LOG_FILE}"
 git checkout master 2>&1 | tee -a "${LOG_FILE}"
 git pull origin master 2>&1 | tee -a "${LOG_FILE}"
 
+# === Local Branch を削除 ===
+echo "Deleting local branch: ${BRANCH_NAME}..." | tee -a "${LOG_FILE}"
+git branch -D "${BRANCH_NAME}" 2>&1 | tee -a "${LOG_FILE}" || echo "Branch already deleted or does not exist" | tee -a "${LOG_FILE}"
+
 echo "" | tee -a "${LOG_FILE}"
 echo "End: $(date)" | tee -a "${LOG_FILE}"
-echo "SUCCESS: Full workflow completed (blog generation + CI + merge)." | tee -a "${LOG_FILE}"
+echo "SUCCESS: Full workflow completed (blog generation + CI + merge + cleanup)." | tee -a "${LOG_FILE}"
 
 exit 0

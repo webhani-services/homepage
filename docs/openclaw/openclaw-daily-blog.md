@@ -107,6 +107,7 @@ Claude Code CLI를 비인터랙티브(비대화형) 모드로 실행하여,
 날짜별로 git 브랜치를 생성한 뒤 Draft PR을 발행합니다.
 CI 가 성공하면 master 브랜치로 merge 합니다.
 local 에서 master branch 로 checkout 하고, git pull 을 해서 master branch 를 최신으로 업데이트 합니다.
+마지막으로, 작성한 git 브랜치를 삭제합니다.
 
 설정 조건:
 - 스케줄: 매일 오전 8시(JST)
