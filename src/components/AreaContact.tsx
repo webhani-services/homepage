@@ -1,52 +1,8 @@
 "use client";
-import React from "react";
-import { useForm } from "react-hook-form";
+
 import { useTranslations } from "next-intl";
 import { useScrollReveal } from "@/hooks/useScrollReveal";
-
-type FormInputs = {
-  name: string;
-  email: string;
-  message: string;
-};
-
-const useContactForm = () => {
-  const t = useTranslations("contact.form");
-  const [isSubmitting, setIsSubmitting] = React.useState(false);
-  const [submitStatus, setSubmitStatus] = React.useState<{
-    type: "success" | "error" | null;
-    message: string;
-  }>({ type: null, message: "" });
-
-  const {
-    register,
-    handleSubmit,
-    reset,
-    formState: { errors },
-  } = useForm<FormInputs>();
-
-  const onSubmit = async (data: FormInputs) => {
-    setIsSubmitting(true);
-    try {
-      const response = await fetch("/api/contact", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data),
-      });
-
-      if (!response.ok) throw new Error(t("error"));
-
-      setSubmitStatus({ type: "success", message: t("success") });
-      reset();
-    } catch {
-      setSubmitStatus({ type: "error", message: t("error") });
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  return { register, handleSubmit, onSubmit, isSubmitting, submitStatus, errors };
-};
+import { useContactForm } from "@/hooks/useContactForm";
 
 const inputClassName = `w-full px-5 py-3.5 border border-gray-200 dark:border-gray-700 rounded-xl
   focus:ring-2 focus:ring-amber-400/40 dark:focus:ring-amber-500/40 focus:border-amber-400 dark:focus:border-amber-500
