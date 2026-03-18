@@ -89,8 +89,9 @@ export default function Navigation() {
       (!("theme" in localStorage) &&
         window.matchMedia("(prefers-color-scheme: dark)").matches);
 
-    setIsDark(isDarkMode);
     document.documentElement.classList.toggle("dark", isDarkMode);
+    // Initial state sync with DOM - required for hydration
+    queueMicrotask(() => setIsDark(isDarkMode));
 
     // システムのカラースキーム変更を監視
     const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
@@ -138,9 +139,10 @@ export default function Navigation() {
           <div className="flex-shrink-0 flex items-center">
             <Link href="/" className="flex items-center">
               <Image
-                {...(isDark
-                  ? navigationData.logo.dark
-                  : navigationData.logo.light)}
+                src={isDark ? navigationData.logo.dark.src : navigationData.logo.light.src}
+                alt={isDark ? navigationData.logo.dark.alt : navigationData.logo.light.alt}
+                width={isDark ? navigationData.logo.dark.width : navigationData.logo.light.width}
+                height={isDark ? navigationData.logo.dark.height : navigationData.logo.light.height}
                 priority
                 className="bg-transparent"
                 style={{

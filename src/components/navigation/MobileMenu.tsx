@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { NavigationItem, NavigationChild } from "@/components/navigation/types";
+import { NavigationItem } from "@/components/navigation/types";
 import { useTranslations } from "next-intl";
 import LanguageToggle from "./LanguageToggle";
 
