@@ -1,4 +1,4 @@
-#!/bin/bash
+ #!/bin/bash
 set -euo pipefail
 
 # ============================================================
@@ -136,16 +136,75 @@ PROMPT
 EXIT_CODE=${PIPESTATUS[0]}
 
 echo "" | tee -a "${LOG_FILE}"
-echo "End: $(date)" | tee -a "${LOG_FILE}"
+echo "Claude Code finished: $(date)" | tee -a "${LOG_FILE}"
 echo "Exit code: ${EXIT_CODE}" | tee -a "${LOG_FILE}"
 
-# === 結果サマリー ===
-if [ ${EXIT_CODE} -eq 0 ]; then
-  echo "SUCCESS: Daily blog generation completed." | tee -a "${LOG_FILE}"
-elif [ ${EXIT_CODE} -eq 124 ]; then
-  echo "ERROR: Claude Code timed out after ${TIMEOUT_SECONDS}s." | tee -a "${LOG_FILE}"
-else
-  echo "ERROR: Claude Code failed with exit code ${EXIT_CODE}." | tee -a "${LOG_FILE}"
+if [ ${EXIT_CODE} -ne 0 ]; then
+  if [ ${EXIT_CODE} -eq 124 ]; then
+    echo "ERROR: Claude Code timed out after ${TIMEOUT_SECONDS}s." | tee -a "${LOG_FILE}"
+  else
+    echo "ERROR: Claude Code failed with exit code ${EXIT_CODE}." | tee -a "${LOG_FILE}"
+  fi
+  exit ${EXIT_CODE}
 fi
 
-exit ${EXIT_CODE}
+echo "SUCCESS: Daily blog generation completed." | tee -a "${LOG_FILE}"
+
+# === PR 番号を取得 ===
+echo "Fetching PR number for branch: ${BRANCH_NAME}..." | tee -a "${LOG_FILE}"
+PR_NUMBER=$(gh pr list --head "${BRANCH_NAME}" --json number --jq '.[0].number' 2>&1)
+
+if [ -z "${PR_NUMBER}" ] || [ "${PR_NUMBER}" = "null" ]; then
+  echo "WARNING: No PR found for branch ${BRANCH_NAME}. Skipping CI check and merge." | tee -a "${LOG_FILE}"
+  exit 0
+fi
+
+echo "Found PR #${PR_NUMBER}" | tee -a "${LOG_FILE}"
+
+# === CI が成功するまで待機 (最大 10 分) ===
+echo "Waiting for CI to complete (max 10 minutes)..." | tee -a "${LOG_FILE}"
+CI_TIMEOUT=600  # 10 分
+CI_CHECK_INTERVAL=30  # 30 秒ごとにチェック
+ELAPSED=0
+
+while [ ${ELAPSED} -lt ${CI_TIMEOUT} ]; do
+  CI_STATUS=$(gh pr checks "${PR_NUMBER}" --json state --jq '.[] | select(.name != "netlify/webhani/deploy-preview") | .state' 2>&1 | sort -u)
+  
+  # すべての Check が success か確認
+  if echo "${CI_STATUS}" | grep -qv "SUCCESS"; then
+    echo "CI still running... (${ELAPSED}s elapsed)" | tee -a "${LOG_FILE}"
+    sleep ${CI_CHECK_INTERVAL}
+    ELAPSED=$((ELAPSED + CI_CHECK_INTERVAL))
+  else
+    echo "All CI checks passed!" | tee -a "${LOG_FILE}"
+    break
+  fi
+done
+
+if [ ${ELAPSED} -ge ${CI_TIMEOUT} ]; then
+  echo "WARNING: CI checks timed out after ${CI_TIMEOUT}s. Skipping merge." | tee -a "${LOG_FILE}"
+  exit 0
+fi
+
+# === PR を Ready for Review に変更 ===
+echo "Marking PR #${PR_NUMBER} as ready for review..." | tee -a "${LOG_FILE}"
+gh pr ready "${PR_NUMBER}" 2>&1 | tee -a "${LOG_FILE}"
+
+# === PR を master にマージ ===
+echo "Merging PR #${PR_NUMBER} into master..." | tee -a "${LOG_FILE}"
+gh pr merge "${PR_NUMBER}" --merge --delete-branch 2>&1 | tee -a "${LOG_FILE}"
+
+# === Local の master を最新に更新 ===
+echo "Updating local master branch..." | tee -a "${LOG_FILE}"
+git checkout master 2>&1 | tee -a "${LOG_FILE}"
+git pull origin master 2>&1 | tee -a "${LOG_FILE}"
+
+# === Local Branch を削除 ===
+echo "Deleting local branch: ${BRANCH_NAME}..." | tee -a "${LOG_FILE}"
+git branch -D "${BRANCH_NAME}" 2>&1 | tee -a "${LOG_FILE}" || echo "Branch already deleted or does not exist" | tee -a "${LOG_FILE}"
+
+echo "" | tee -a "${LOG_FILE}"
+echo "End: $(date)" | tee -a "${LOG_FILE}"
+echo "SUCCESS: Full workflow completed (blog generation + CI + merge + cleanup)." | tee -a "${LOG_FILE}"
+
+exit 0
