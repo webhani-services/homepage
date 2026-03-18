@@ -1,0 +1,191 @@
+---
+title: "MARL — LLMのハルシネーションを低減するModel-Agnostic Runtime Middleware"
+description: "VIDRAFTが公開したMARLの仕組みと、LLMハルシネーション対策をプロダクション環境で実践する方法を解説します。"
+date: "2026-03-18"
+status: "published"
+tags: ["LLM", "AI", "Middleware", "Hallucination", "Python"]
+thumbnail: ""
+author: "webhani"
+slug: "marl-llm-hallucination-middleware"
+---
+
+## はじめに
+
+LLMをプロダクション環境で運用する上で、ハルシネーション（事実と異なる情報の生成）は最も厄介な課題の一つです。2026年3月17日、VIDRAFTがMARLという新しいMiddlewareを公開しました。MARLは「Model-Agnostic Runtime Layer」の略で、特定のModelに依存せずにLLMの自己修正能力を強化し、ハルシネーションの発生を抑制する仕組みを提供します。
+
+本記事では、MARLのアーキテクチャを概観した上で、実際のプロジェクトへの統合方法と、webhaniがプロダクション環境でのLLM運用から得た知見を共有します。
+
+## MARLとは
+
+MARLは、LLMの推論プロセスに介入するRuntime Middlewareです。OpenAI API形式をサポートするModelであれば、GPT、Claude、Gemini、DeepSeek、Grok、Llamaなど、どのModelでも利用できます。
+
+### 主な特徴
+
+- **Model非依存**: OpenAI API互換のEndpointであればどのProviderでも動作
+- **推論時の自己修正**: 生成されたResponseに対してリアルタイムで整合性チェックを実行
+- **Pluggableなアーキテクチャ**: 検証ルールをカスタマイズ可能
+- **軽量**: 既存のAPI呼び出しパイプラインに最小限の変更で導入可能
+
+Hugging Face、GitHub、PyPI、ClawHubで公開されており、`pip install`ですぐに利用を始められます。
+
+## なぜRuntime層でのハルシネーション対策が重要なのか
+
+これまでのハルシネーション対策は、主にPrompt Engineeringやファインチューニングに依存していました。しかし、これらのアプローチにはいくつかの限界があります。
+
+- **Prompt Engineering**: 効果はあるが、入力の変化に対して脆弱
+- **ファインチューニング**: コストが高く、Model更新のたびに再実行が必要
+- **RAG（検索拡張生成）**: 参照データの品質に依存し、検索失敗時の対策が不十分
+
+Runtime Middlewareはこれらと競合するのではなく、補完的に機能します。Prompt設計やRAGパイプラインの後段で、最終的な出力の品質を検証するレイヤーとして働きます。
+
+## 導入方法
+
+### インストール
+
+```bash
+pip install marl-middleware
+```
+
+### 基本的な使い方
+
+MARLはOpenAI互換のClientをラップする形で利用します。
+
+```python
+from openai import OpenAI
+from marl import MarlMiddleware, ConsistencyChecker, FactGrounder
+
+client = OpenAI(api_key="your-api-key")
+
+# MARLのMiddlewareを構成
+middleware = MarlMiddleware(
+    checks=[
+        ConsistencyChecker(),    # 内部矛盾の検出
+        FactGrounder(            # 既知の事実との照合
+            knowledge_base="./data/knowledge.json"
+        ),
+    ],
+    max_retries=2,               # 自己修正の最大試行回数
+    confidence_threshold=0.85,   # 信頼度の閾値
+)
+
+# 通常のAPI呼び出しをラップ
+response = middleware.complete(
+    client=client,
+    model="gpt-4o",
+    messages=[
+        {"role": "user", "content": "日本の人口について教えてください"}
+    ],
+)
+
+print(response.content)
+print(f"信頼度スコア: {response.confidence_score}")
+print(f"修正回数: {response.correction_count}")
+```
+
+### Claude APIでの利用例
+
+OpenAI互換のEndpointを持つProviderであれば同じ方法で利用できます。
+
+```python
+from openai import OpenAI
+from marl import MarlMiddleware, ConsistencyChecker
+
+# Claude APIをOpenAI互換形式で利用
+client = OpenAI(
+    api_key="your-anthropic-api-key",
+    base_url="https://api.anthropic.com/v1/",
+)
+
+middleware = MarlMiddleware(
+    checks=[ConsistencyChecker()],
+    max_retries=1,
+)
+
+response = middleware.complete(
+    client=client,
+    model="claude-sonnet-4-20250514",
+    messages=[
+        {"role": "user", "content": "Explain quantum computing basics"}
+    ],
+)
+```
+
+### カスタム検証ルールの作成
+
+プロジェクト固有の検証ロジックを追加することも可能です。
+
+```python
+from marl import BaseChecker, CheckResult
+
+class DomainSpecificChecker(BaseChecker):
+    """自社ドメインに特化した検証ルール"""
+
+    def __init__(self, domain_rules: dict):
+        self.rules = domain_rules
+
+    def check(self, response_text: str, context: dict) -> CheckResult:
+        violations = []
+        for rule_name, validator in self.rules.items():
+            if not validator(response_text):
+                violations.append(rule_name)
+
+        return CheckResult(
+            passed=len(violations) == 0,
+            confidence=1.0 - (len(violations) / len(self.rules)),
+            details={"violations": violations},
+        )
+
+# 利用例
+domain_checker = DomainSpecificChecker(
+    domain_rules={
+        "no_competitor_mention": lambda text: "competitor" not in text.lower(),
+        "includes_disclaimer": lambda text: "※" in text or "注意" in text,
+    }
+)
+```
+
+## プロダクション環境での運用ポイント
+
+webhaniではクライアント向けのLLMシステム開発を通じて、以下のような運用上の知見を蓄積してきました。
+
+### 1. Latencyへの影響を把握する
+
+Runtime検証は追加のLatencyを発生させます。自己修正が発動した場合、Responseの返却までに元の2〜3倍の時間がかかることがあります。ストリーミング対応やTimeout設定を事前に計画してください。
+
+### 2. 検証ルールは段階的に導入する
+
+すべてのチェックを一度に有効にするのではなく、最も影響の大きいルールから段階的に導入するのが現実的です。ConsistencyCheckerから始め、運用データを見ながらルールを追加していくアプローチを推奨します。
+
+### 3. 信頼度スコアをLoggingする
+
+`confidence_score`をLoggingしておくと、品質劣化の検知やModel間の比較に役立ちます。
+
+```python
+import logging
+
+logger = logging.getLogger("marl")
+
+response = middleware.complete(client=client, model="gpt-4o", messages=messages)
+
+logger.info(
+    "MARL response",
+    extra={
+        "confidence": response.confidence_score,
+        "corrections": response.correction_count,
+        "model": "gpt-4o",
+        "latency_ms": response.latency_ms,
+    },
+)
+```
+
+### 4. Fallback戦略を設計する
+
+信頼度が閾値を下回った場合のFallback処理も重要です。ユーザーへの通知、別Modelへの切り替え、人間によるレビューキューへの転送など、用途に応じた戦略を用意しましょう。
+
+## まとめ
+
+MARLのようなRuntime Middlewareは、LLMのハルシネーション対策における新しいレイヤーとして有望です。Model非依存という設計思想により、Providerの乗り換えやMulti-Model構成でも一貫した品質管理が可能になります。
+
+ただし、Middlewareの導入だけでハルシネーションが完全に解消されるわけではありません。Prompt設計、RAG、ファインチューニング、そしてRuntime検証を組み合わせた多層防御が、プロダクション品質のLLMシステムには不可欠です。
+
+webhaniでは、LLMを活用したシステム開発やAI導入コンサルティングを行っています。ハルシネーション対策を含むLLM運用でお困りの際は、お気軽にご相談ください。

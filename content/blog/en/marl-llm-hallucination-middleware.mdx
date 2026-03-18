@@ -1,0 +1,195 @@
+---
+title: "MARL — A Model-Agnostic Runtime Middleware for Reducing LLM Hallucinations"
+description: "An overview of MARL, VIDRAFT's new runtime middleware for LLM hallucination reduction, and how to integrate similar patterns into production systems."
+date: "2026-03-18"
+status: "published"
+tags: ["LLM", "AI", "Middleware", "Hallucination", "Python"]
+thumbnail: ""
+author: "webhani"
+slug: "marl-llm-hallucination-middleware"
+---
+
+## Introduction
+
+Hallucination remains one of the most persistent challenges when deploying LLMs in production. On March 17, 2026, VIDRAFT released MARL (Model-Agnostic Runtime Layer), an open-source middleware that sits between your application and any OpenAI-compatible LLM API. It performs runtime consistency checks and enables self-correction before responses reach end users.
+
+This article examines MARL's architecture, walks through practical integration patterns, and shares lessons from webhani's experience building production LLM systems.
+
+## What is MARL?
+
+MARL is a runtime middleware that intercepts LLM responses to verify internal consistency and factual grounding. It works with any model exposing an OpenAI-compatible API — GPT, Claude, Gemini, DeepSeek, Grok, Llama, and others.
+
+### Core Capabilities
+
+- **Model-agnostic**: Works with any OpenAI API-compatible endpoint
+- **Runtime self-correction**: Validates responses and triggers re-generation when issues are detected
+- **Pluggable checkers**: Add custom validation rules for your domain
+- **Lightweight integration**: Wraps existing API calls with minimal code changes
+
+The library is available on PyPI, Hugging Face, GitHub, and ClawHub.
+
+## Why Runtime Hallucination Mitigation Matters
+
+Existing approaches to hallucination reduction each have trade-offs:
+
+- **Prompt engineering** helps but is fragile — small input variations can bypass carefully crafted instructions
+- **Fine-tuning** is expensive and must be repeated for each model update
+- **RAG** depends on retrieval quality and fails silently when relevant documents are missing
+
+Runtime middleware does not replace these techniques. It adds a final validation layer after generation, catching issues that upstream strategies miss. Think of it as a quality gate at the last mile of your LLM pipeline.
+
+## Getting Started
+
+### Installation
+
+```bash
+pip install marl-middleware
+```
+
+### Basic Usage
+
+MARL wraps an OpenAI-compatible client and applies validation checks to every response.
+
+```python
+from openai import OpenAI
+from marl import MarlMiddleware, ConsistencyChecker, FactGrounder
+
+client = OpenAI(api_key="your-api-key")
+
+middleware = MarlMiddleware(
+    checks=[
+        ConsistencyChecker(),
+        FactGrounder(knowledge_base="./data/knowledge.json"),
+    ],
+    max_retries=2,
+    confidence_threshold=0.85,
+)
+
+response = middleware.complete(
+    client=client,
+    model="gpt-4o",
+    messages=[
+        {"role": "user", "content": "What is the population of Japan?"}
+    ],
+)
+
+print(response.content)
+print(f"Confidence: {response.confidence_score}")
+print(f"Corrections applied: {response.correction_count}")
+```
+
+### Using with Different Providers
+
+Since MARL targets the OpenAI API format, switching providers requires only a client configuration change.
+
+```python
+from openai import OpenAI
+from marl import MarlMiddleware, ConsistencyChecker
+
+# Point to any OpenAI-compatible endpoint
+client = OpenAI(
+    api_key="your-api-key",
+    base_url="https://api.anthropic.com/v1/",
+)
+
+middleware = MarlMiddleware(
+    checks=[ConsistencyChecker()],
+    max_retries=1,
+)
+
+response = middleware.complete(
+    client=client,
+    model="claude-sonnet-4-20250514",
+    messages=[
+        {"role": "user", "content": "Explain the CAP theorem"}
+    ],
+)
+```
+
+### Writing Custom Checkers
+
+For domain-specific validation, implement the `BaseChecker` interface.
+
+```python
+from marl import BaseChecker, CheckResult
+
+class ComplianceChecker(BaseChecker):
+    """Validates responses against domain-specific compliance rules."""
+
+    def __init__(self, prohibited_terms: list[str]):
+        self.prohibited_terms = prohibited_terms
+
+    def check(self, response_text: str, context: dict) -> CheckResult:
+        found = [
+            term for term in self.prohibited_terms
+            if term.lower() in response_text.lower()
+        ]
+
+        return CheckResult(
+            passed=len(found) == 0,
+            confidence=1.0 - (len(found) / max(len(self.prohibited_terms), 1)),
+            details={"prohibited_terms_found": found},
+        )
+
+# Usage
+checker = ComplianceChecker(
+    prohibited_terms=["guaranteed", "risk-free", "100% accurate"]
+)
+```
+
+## Production Considerations
+
+At webhani, we have built and maintained LLM-powered systems for several clients. Here are practical lessons that apply when integrating runtime middleware like MARL.
+
+### 1. Measure Latency Impact
+
+Runtime validation adds latency. When self-correction triggers, response time can increase 2-3x. Plan for this by:
+
+- Setting appropriate timeouts
+- Using streaming where possible
+- Making validation checks async when the use case allows
+
+### 2. Start with High-Impact Checks
+
+Do not enable every checker at once. Start with `ConsistencyChecker` for internal contradiction detection, monitor the results, then gradually add domain-specific rules based on observed failure patterns.
+
+### 3. Log Confidence Scores
+
+Confidence scores are valuable operational data. Log them consistently to detect quality degradation over time and to compare performance across models.
+
+```python
+import logging
+
+logger = logging.getLogger("marl")
+
+response = middleware.complete(client=client, model="gpt-4o", messages=messages)
+
+logger.info(
+    "marl_response",
+    extra={
+        "confidence": response.confidence_score,
+        "corrections": response.correction_count,
+        "model": "gpt-4o",
+        "latency_ms": response.latency_ms,
+    },
+)
+```
+
+### 4. Design Fallback Strategies
+
+When confidence drops below your threshold, you need a plan. Options include:
+
+- Returning a safe default response with a disclaimer
+- Routing to a different model
+- Escalating to human review
+- Retrying with a modified prompt
+
+The right choice depends on your application's risk tolerance and user expectations.
+
+## Conclusion
+
+MARL represents a practical approach to hallucination mitigation — adding a runtime validation layer that works across models and providers. Its model-agnostic design is particularly valuable for teams running multi-model architectures or anticipating provider changes.
+
+That said, no single layer eliminates hallucinations entirely. Production LLM systems benefit from defense in depth: well-crafted prompts, reliable retrieval pipelines, and runtime validation working together.
+
+At webhani, we help organizations build reliable LLM-powered systems, from architecture design through production operations. If you are working through hallucination challenges or LLM integration in general, we are happy to help.
