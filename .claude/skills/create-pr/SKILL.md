@@ -12,8 +12,8 @@ Commit changes and create a draft PR following the PR template.
 
 - Changed files: !`git status --short`
 - Current branch: !`git branch --show-current`
-- Commit history (diff from base branch): !`git log --oneline develop..HEAD 2>/dev/null || git log --oneline main..HEAD 2>/dev/null`
-- File diff summary: !`git diff develop --stat 2>/dev/null || git diff main --stat 2>/dev/null`
+- Commit history (diff from base branch): !`git log --oneline master..HEAD 2>/dev/null || git log --oneline master..HEAD 2>/dev/null`
+- File diff summary: !`git diff master --stat 2>/dev/null || git diff master --stat 2>/dev/null`
 
 ## Task
 
@@ -21,7 +21,7 @@ Follow the steps below to commit and create a PR.
 
 ### 0. Determine Base Branch
 
-- If a base branch is specified in `$ARGUMENTS`, use it; otherwise, use `develop`
+- If a base branch is specified in `$ARGUMENTS`, use it; otherwise, use `master`
 - **Use this determined base branch consistently throughout all subsequent steps**
 
 ### 1. Check Uncommitted Changes
