@@ -78,6 +78,7 @@ scripts/           # Blog generation scripts
 - Translation keys: Access via `useTranslations("sectionName")`
 - Dark mode: `class`-based toggle (`dark:` prefix)
 - Images: Must use `next/image` Image component
+- Image optimization: 새 Image 추가 시 반드시 `sharp-cli`로 압축 후 Commit (아래 Image Optimization 참조)
 - New features: Create `docs/spec-and-task/[YYYYMMDD]-[feature-name]/specification.md` and `task.md` for specification and task management
 
 ## Blog
@@ -91,6 +92,23 @@ scripts/           # Blog generation scripts
   - `/project:generate-blog [topic]` — Generate blog post by topic
   - `/project:polish-blog [file path]` — Polish and translate user draft
   - `/project:daily-blog` — Generate from latest tech news
+
+## Image Optimization
+
+`public/images/` 에 새 Image를 추가할 때 반드시 압축해야 합니다. 미압축 Image는 Core Web Vitals에 큰 악영향을 줍니다.
+
+```bash
+# Hero/Background (Full Width) — 1920px, Quality 75
+npx sharp-cli -i public/images/<file>.jpg -o public/images/ -q 75 resize 1920
+
+# Content Image (Half Width) — 1200px, Quality 80
+npx sharp-cli -i public/images/<file>.jpg -o public/images/ -q 80 resize 1200
+
+# Thumbnail/Card — 800px, Quality 80
+npx sharp-cli -i public/images/<file>.jpg -o public/images/ -q 80 resize 800
+```
+
+목표 File Size: Hero ~200-300KB, Content ~100-200KB, Thumbnail ~50-100KB. `next.config.mjs`에서 AVIF/WebP 자동 변환이 설정되어 있습니다.
 
 ## Documentation Writing Guidelines
 
