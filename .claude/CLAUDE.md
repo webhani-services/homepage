@@ -66,3 +66,10 @@ public/images/     # 정적 이미지 (hero, services SVG, works, logos)
 - 다크모드: `class` 기반 토글 (`dark:` 접두사)
 - 이미지: `next/image` Image 컴포넌트 사용 필수
 - 새로운 기능 추가 시: `docs/spec-and-task/[YYYYMMDD]-[feature-name]/specification.md` 와 `task.md` 를 작성하여 사양과 태스크를 관리한다
+
+## Blog
+- **콘텐츠**: `content/blog/{locale}/{slug}.mdx` (MDX + frontmatter)
+- **Status**: `draft` | `published` | `private` (frontmatter의 status 필드)
+- **자동 생성**: `npm run generate-blog -- -t "topic"` (default: Anthropic)
+  - Provider 전환: `--provider openai` 또는 `LLM_PROVIDER=gemini`
+  - 생성된 글은 `status: draft` 로 저장됨

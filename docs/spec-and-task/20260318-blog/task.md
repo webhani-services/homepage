@@ -84,16 +84,19 @@
 
 ## Phase 5 (Future): LLM Auto-Generation
 
-- [ ] **5-1. 생성 스크립트 작성 (`scripts/generate-blog.ts`)**
-  - LLM API 호출하여 MDX 콘텐츠 생성
-  - frontmatter 자동 채우기 (status: draft)
-  - 다국어 버전 자동 생성
+- [x] **5-1. 생성 스크립트 작성 (`scripts/generate-blog.ts`)**
+  - LLM 프로바이더 추상화 레이어 (`scripts/lib/types.ts`, `registry.ts`)
+  - Anthropic (기본), OpenAI, Gemini 프로바이더 구현
+  - `--provider` 플래그 또는 `LLM_PROVIDER` 환경변수로 전환
+  - OpenAI, Gemini는 optional dependency (dynamic import)
+  - 다국어 자동 생성 (ja/en/ko), status: draft 로 생성
+  - `npm run generate-blog -- -t "topic"` 으로 실행
 
-- [ ] **5-2. GitHub API 연동**
+- [ ] **5-2. GitHub API 연동** (향후)
   - 생성된 MDX 파일을 GitHub API로 커밋
   - PR 자동 생성 (검토용)
 
-- [ ] **5-3. 워크플로 자동화**
+- [ ] **5-3. 워크플로 자동화** (향후)
   - 정기 실행 (Cron / GitHub Actions)
   - 주제 큐 관리
 
