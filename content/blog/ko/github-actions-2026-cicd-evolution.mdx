@@ -1,0 +1,163 @@
+---
+title: "GitHub Actions 2026 — 가격 변경과 새 기능으로 CI/CD 환경이 바뀐다"
+description: "2026년 GitHub Actions는 호스티드 Runner 가격을 최대 39% 인하하고, 셀프 호스트 Runner 무료 제공을 종료했습니다. 변경 사항과 팀의 대응 방안을 정리합니다."
+date: "2026-03-18"
+status: "draft"
+tags: ["GitHub Actions", "CI/CD", "DevOps", "GitHub", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-2026-cicd-evolution"
+---
+
+2026년 GitHub Actions에 주목할 만한 변화들이 도입됐습니다. 하루 7,100만 건 이상의 Job을 처리하는 이 플랫폼은 Backend Architecture 전면 재설계, 가격 체계 개편, 그리고 오랜 제약을 해소하는 새 기능들을 연달아 선보였습니다. 현재 GitHub Actions를 사용 중인 팀이라면 지금 바로 검토가 필요합니다.
+
+## 가격 체계 변경
+
+### 호스티드 Runner 최대 39% 인하
+
+2026년 1월 1일부터 GitHub이 관리하는 호스티드 Runner 가격이 최대 **39% 인하**됐습니다. 가장 많이 사용되는 Linux Runner가 가장 큰 인하 혜택을 받았습니다. 종량제로 Actions를 사용하는 팀은 별도 설정 변경 없이 월간 CI 비용이 절감됩니다.
+
+### 셀프 호스트 Runner 유료화
+
+2026년 3월부터 **셀프 호스트 Runner가 더 이상 무료가 아닙니다**. 이제 Runner 사용 시간(분)에 따른 과금이 적용됩니다.
+
+이 변경은 주로 비용 절감을 위해 셀프 호스트 Runner를 채택한 팀에 영향을 줍니다:
+
+```yaml
+jobs:
+  build:
+    runs-on: self-hosted  # 이제 분 단위 과금 대상
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci && npm test
+```
+
+셀프 호스트 Runner를 보안 요구사항, 특수 하드웨어, 사내 네트워크 접근 등의 이유로 사용한다면 여전히 유효한 선택입니다. 하지만 단순히 "GitHub 과금을 피하기 위해" 선택했다면, 이제 호스티드 Runner와 비용을 다시 비교해볼 필요가 있습니다.
+
+## Backend Architecture 재설계
+
+GitHub은 2025년 동안 Job Queue와 Runner 관리 기반 인프라를 전면 재설계했으며, 이제 모든 Actions Job이 새 Architecture에서 실행됩니다.
+
+변경의 주요 목표:
+- **가용성 향상**: 인프라 장애에 대한 내성 강화
+- **Throttling 감소**: 고부하 시 Job 지연 최소화
+- **전반적인 성능 개선**: Job 실행 시간 단축
+
+하루 7,100만 건의 Job을 처리하는 규모에서 인프라 효율성 개선은 Queue 대기 시간과 Job 처리량에 직접적인 영향을 미칩니다. 실제로 피크 타임의 이유를 알 수 없는 지연이 줄었다는 보고가 있습니다.
+
+## 새로운 주요 기능
+
+### Cache 용량 제한 해제
+
+10GB Cache 용량 상한이 폐지됐습니다. 이는 Monorepo와 대규모 의존성 프로젝트에서 지속적으로 발생하던 문제를 해소합니다. Cache가 넘치면 Hit Rate가 떨어지고 의존성 재설치로 CI 시간이 늘어나는 악순환이 반복됐습니다.
+
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: |
+      ~/.npm
+      ~/.cache/cypress
+      node_modules
+      .next/cache
+    key: ${{ runner.os }}-full-${{ hashFiles('**/package-lock.json') }}
+    restore-keys: |
+      ${{ runner.os }}-full-
+# 이제 이전 10GB 상한 없이 Cache 확장 가능
+```
+
+대규모 Monorepo에서 의존성 트리 전체, 빌드 결과물, 테스트 Artifact를 Eviction 걱정 없이 Cache할 수 있게 됩니다.
+
+### 재사용 가능 Workflow: 10단계 중첩, 50회 호출
+
+재사용 가능 Workflow가 이제 **10단계 중첩**과 **실행당 50회 Workflow 호출**을 지원합니다. 이전에는 복잡한 다단계 Pipeline에서 이 제한에 부딪혀 우회책을 찾아야 했습니다.
+
+```yaml
+# workflows/ci.yml — 제한 없이 Sub-workflow 호출
+jobs:
+  lint:
+    uses: ./.github/workflows/lint.yml
+
+  test-unit:
+    needs: lint
+    uses: ./.github/workflows/test-unit.yml
+
+  test-integration:
+    needs: lint
+    uses: ./.github/workflows/test-integration.yml
+
+  build:
+    needs: [test-unit, test-integration]
+    uses: ./.github/workflows/build.yml
+
+  deploy-staging:
+    needs: build
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: staging
+```
+
+여러 Repository나 팀에 걸쳐 모듈형 CI/CD Pipeline을 구성하는 팀은 이제 인위적인 중첩 제약 없이 워크플로우를 깔끔하게 설계할 수 있습니다.
+
+### 조직 내부 Workflow Template
+
+조직은 이제 `.github` Repository에 비공개(non-public) Workflow Template을 정의해 새 Repository 생성 시 공통 시작점을 제공할 수 있습니다:
+
+```
+.github/
+  workflow-templates/
+    node-ci.yml           # 조직 내부 Template
+    python-ci.yml
+    deploy-production.yml
+    security-scan.yml
+```
+
+팀마다 미묘하게 다른 CI 설정이 각 Repository에 존재하는 문제를 해소합니다. Template으로 공통 패턴을 강제하면서도 각 팀이 수동으로 동기화할 필요가 없어집니다.
+
+### 스케줄 Job의 Timezone 지원
+
+스케줄 Job에 이제 UTC만이 아닌 Timezone을 직접 지정할 수 있습니다:
+
+```yaml
+on:
+  schedule:
+    - cron: '0 9 * * 1-5'
+      timezone: 'Asia/Seoul'   # 월~금 오전 9시 KST 실행
+```
+
+작은 변화처럼 보이지만, 비 UTC Timezone의 팀이 Cron 식을 역산해온 오랜 불편함을 해소합니다. 한국, 일본 팀에서는 즉시 체감되는 개선입니다.
+
+## 셀프 호스트에서 호스티드로 전환 판단
+
+셀프 호스트 Runner를 운영 중인 팀을 위한 판단 기준:
+
+**호스티드로 전환하기 좋은 경우:**
+- 비용 절감이 셀프 호스트 채택의 주요 이유였을 때
+- 특수 하드웨어(GPU, 대용량 메모리, 맞춤형 Architecture) 불필요
+- 빌드 의존성을 `actions/setup-*` Action 또는 Docker로 대체 가능
+- 사내 네트워크 접근 요구사항 없음
+
+**셀프 호스트를 유지해야 하는 경우:**
+- 보안/컴플라이언스 정책상 자체 인프라에서만 Job 실행 가능
+- GPU 추론, ARM 등 특수 하드웨어 필요
+- 빌드 규모가 매우 커 새 단가에서도 호스티드가 비경제적인 경우
+
+계산 방법은 단순합니다. 현재 셀프 호스트 Runner 운영 비용(인프라 + 유지보수 공수) + 새 과금 분 단위 비용을 계산하고, 39% 인하된 호스티드 Runner 단가와 비교합니다. 유지보수 부담까지 포함하면 호스티드가 더 경제적인 경우가 많습니다.
+
+## 2026년 3월 체크리스트
+
+GitHub Actions를 사용 중인 팀이 지금 확인해야 할 사항:
+
+- [ ] 셀프 호스트 Runner 사용 현황 파악 — 실제로 셀프 호스트가 필요한 Job과 이전 가능한 Job 구분
+- [ ] 새 단가 기준 예상 비용 계산 (셀프 호스트 과금 분 + 호스티드 단가 비교)
+- [ ] Cache 설정 확장 — 10GB 제한 해제를 활용해 의존성 Cache 최적화
+- [ ] 여러 Repository 관리 시 조직 Workflow Template 도입 검토
+- [ ] 스케줄 Job의 Cron 식에 명시적 Timezone 설정 적용
+- [ ] 재사용 가능 Workflow 중첩 구조 정리 — 이전 제한 우회책 단순화 기회
+
+## 정리
+
+2026년 GitHub Actions의 변화는 일관된 방향성을 가집니다. 호스티드 인프라 진입 비용을 낮추고, 오래된 기능 제한을 해소하며, 조직 단위의 도구를 강화하는 것입니다.
+
+셀프 호스트 Runner 유료화는 가장 즉각적인 대응이 필요한 변경입니다. 비용 이유로 채택했다면 지금 재계산하세요. 기술적 요구사항 때문이라면 예산 항목 하나가 추가될 뿐입니다.
+
+Cache 상한 해제, Workflow 중첩 강화, Timezone 지원, 조직 Template은 낮은 Migration Risk로 점진적으로 채택할 수 있는 순수한 개선입니다.
