@@ -148,10 +148,19 @@ IMPORTANT RULES:
 - Do NOT simply translate or copy the original article
 - Write an ORIGINAL article from webhani's perspective
 - Add your own analysis, practical insights, and code examples
+- All content MUST be 100% original — never copy or closely paraphrase the source article
+- Code examples must be original or use only officially documented public APIs/patterns
+- Do not reproduce proprietary code, copyrighted text, or trademarked content without attribution
+- If citing statistics or research, mention the source inline (e.g., "according to [source]")
 - Relate the topic to web development, cloud, or AI consulting
 - Write 800-1500 words
 - Use proper markdown headings (##, ###), code blocks, and lists
-- Write in a professional but approachable tone
+- Write in a professional but approachable tone — as a senior engineer sharing knowledge with peers, not as a marketer
+- Avoid hype, buzzwords ("revolutionary", "game-changing"), excessive exclamation marks, or clickbait
+- Keep introductions brief and get to practical content quickly
+- For Japanese: use です/ます style, keep technical terms in English/katakana
+- For Korean: use 합니다 style, mix Korean and English technical terms naturally
+- For English: use clear, direct technical writing — no filler phrases
 
 Output ONLY the complete MDX file content. No explanation before or after.
 

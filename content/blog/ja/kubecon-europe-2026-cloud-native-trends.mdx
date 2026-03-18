@@ -1,0 +1,209 @@
+---
+title: "KubeCon Europe 2026 — Cloud Nativeの最新トレンドと注目ポイント"
+description: "KubeCon + CloudNativeCon Europe 2026で注目すべきCloud Nativeトレンドを、Platform EngineeringやAgentic DevOpsの観点から実践的に解説します。"
+date: "2026-03-18"
+status: "published"
+tags: ["Kubernetes", "Cloud Native", "Platform Engineering", "DevOps", "KubeCon"]
+thumbnail: ""
+author: "webhani"
+slug: "kubecon-europe-2026-cloud-native-trends"
+---
+
+## はじめに
+
+2026年3月23日から26日にかけて、アムステルダムでKubeCon + CloudNativeCon Europe 2026が開催されます。Cloud Nativeエコシステムは年々成熟し、もはや「導入するかどうか」ではなく「どう運用を洗練させるか」というフェーズに入っています。
+
+本記事では、今年のKubeConで特に注目すべき3つのトレンド — Platform Engineering、Agentic DevOps、Software Supply Chain Security — について、実務に即した視点で整理します。
+
+## Platform Engineeringの本格化
+
+### IDPが標準的な運用モデルに
+
+Internal Developer Platform（IDP）は、開発者が自律的にインフラをプロビジョニングし、デプロイできる仕組みです。これまで「あると便利」だったIDPが、2026年には中規模以上の組織で標準的な運用モデルになりつつあります。
+
+背景には、Kubernetesの複雑さが増す一方で、開発者にインフラの詳細を意識させたくないという現実があります。IDPはその抽象化レイヤーとして機能します。
+
+### Backstageを使ったIDPの構築例
+
+CNCFプロジェクトであるBackstageは、IDPの基盤として広く採用されています。以下は、サービスカタログにKubernetesコンポーネントを登録する設定例です。
+
+```yaml
+# catalog-info.yaml
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: order-service
+  description: 注文処理マイクロサービス
+  annotations:
+    backstage.io/kubernetes-id: order-service
+    backstage.io/techdocs-ref: dir:.
+  tags:
+    - go
+    - grpc
+spec:
+  type: service
+  lifecycle: production
+  owner: team-backend
+  system: ecommerce
+  dependsOn:
+    - resource:default/postgres-order-db
+    - component:default/payment-service
+```
+
+### Scorecardsで品質を可視化する
+
+IDPの価値は「作って終わり」ではなく、組織全体のサービス品質を継続的に可視化できる点にあります。Backstage Scorecardsを活用すれば、各サービスの成熟度を定量的に評価できます。
+
+```yaml
+# scorecard.yaml
+apiVersion: backstage.io/v1alpha1
+kind: Scorecard
+metadata:
+  name: production-readiness
+spec:
+  checks:
+    - id: has-owner
+      name: オーナーチームが設定されている
+      rule:
+        metadata.annotations['team/owner']: { exists: true }
+    - id: has-runbook
+      name: Runbookが整備されている
+      rule:
+        metadata.links[?title=='Runbook']: { exists: true }
+    - id: has-slo
+      name: SLOが定義されている
+      rule:
+        metadata.annotations['slo/availability']: { exists: true }
+```
+
+## Agentic DevOps — CI/CDへのAI統合
+
+### 76%のチームがAIをCI/CDに統合
+
+2025年の調査によると、DevOpsチームの76%がすでにCI/CDパイプラインにAIを統合しているとされています。単純な自動化を超え、AIエージェントがパイプラインの判断を補助する「Agentic DevOps」という考え方が広がっています。
+
+具体的には、テスト失敗時の原因分析、デプロイ判定の自動化、セキュリティスキャン結果のトリアージなどにAIが関与するケースが増えています。
+
+### GitHub Actionsでの実践例
+
+以下は、CI/CDパイプラインにAIベースのコードレビューステップを組み込む例です。
+
+```yaml
+# .github/workflows/ai-assisted-review.yaml
+name: AI-Assisted Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Diff解析とリスク評価
+        id: risk-assessment
+        run: |
+          CHANGED_FILES=$(git diff --name-only origin/main...HEAD)
+          HIGH_RISK_PATTERNS="migration|security|auth|payment"
+          RISK_LEVEL="low"
+          for file in $CHANGED_FILES; do
+            if echo "$file" | grep -qiE "$HIGH_RISK_PATTERNS"; then
+              RISK_LEVEL="high"
+              break
+            fi
+          done
+          echo "risk_level=$RISK_LEVEL" >> "$GITHUB_OUTPUT"
+
+      - name: 高リスク変更の追加レビュー
+        if: steps.risk-assessment.outputs.risk_level == 'high'
+        run: |
+          echo "高リスクの変更を検出しました。追加のセキュリティスキャンを実行します。"
+          # Trivyなどのセキュリティスキャンを実行
+          trivy fs --severity HIGH,CRITICAL .
+```
+
+このように、変更内容に応じてパイプラインの振る舞いを動的に変えるアプローチは、Agentic DevOpsの入り口として実用的です。
+
+## Software Supply Chain Security
+
+### SBOMとSLSAの普及
+
+ソフトウェアサプライチェーン攻撃の増加を受けて、SBOM（Software Bill of Materials）の生成とSLSA（Supply-chain Levels for Software Artifacts）フレームワークへの準拠が重要視されています。
+
+Kubernetesエコシステムでは、コンテナイメージの署名・検証が標準的なプラクティスになりつつあります。
+
+### Cosignによるイメージ署名
+
+```dockerfile
+# Dockerfile (マルチステージビルド例)
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /app/server ./cmd/server
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=builder /app/server /server
+USER nonroot:nonroot
+ENTRYPOINT ["/server"]
+```
+
+```bash
+# ビルド後のイメージ署名と検証
+cosign sign --key cosign.key ghcr.io/myorg/order-service:v1.2.0
+
+# 署名の検証
+cosign verify --key cosign.pub ghcr.io/myorg/order-service:v1.2.0
+
+# SBOMの生成と添付
+syft ghcr.io/myorg/order-service:v1.2.0 -o spdx-json > sbom.json
+cosign attach sbom --sbom sbom.json ghcr.io/myorg/order-service:v1.2.0
+```
+
+Admission Controllerと組み合わせることで、署名されていないイメージのデプロイをクラスタレベルで拒否できます。
+
+```yaml
+# Kyverno Policyの例
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signature
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: check-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/myorg/*"
+          attestors:
+            - entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      ...
+                      -----END PUBLIC KEY-----
+```
+
+## 中規模プロジェクトへの影響
+
+webhaniがコンサルティングで関わるような中規模プロジェクト（チーム5〜20名程度）にとって、これらのトレンドは以下のように影響します。
+
+- **Platform Engineering**: フルスケールのIDPを構築する必要はありませんが、Helmチャートのテンプレート化やGitOps（ArgoCD）の導入から始めるだけで、開発者体験は大きく改善されます
+- **Agentic DevOps**: まずはCI/CDパイプラインにセキュリティスキャンと変更リスク分析を組み込むところから始めるのが現実的です
+- **Supply Chain Security**: コンテナイメージの署名は、導入コストが低く効果が大きい施策です。SBOMの生成もCIに1ステップ追加するだけで実現できます
+
+## まとめ
+
+KubeCon Europe 2026のテーマは、Cloud Nativeが「当たり前」になった先の運用品質をどう高めるかに集約されます。Platform Engineeringによる開発者体験の向上、AIを活用したDevOpsの高度化、そしてサプライチェーンセキュリティの強化。いずれも段階的に導入可能で、小さく始めて効果を実感しながら拡大できるものです。
+
+アムステルダムでの議論がどのような方向に進むか、注目していきたいと思います。

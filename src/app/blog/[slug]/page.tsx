@@ -1,6 +1,10 @@
 import { getLocale } from "next-intl/server";
 import { getPostBySlug, getAllSlugs } from "@/lib/blog";
 import { MDXRemote } from "next-mdx-remote/rsc";
+import remarkGfm from "remark-gfm";
+import rehypePrettyCode from "rehype-pretty-code";
+import rehypeSlug from "rehype-slug";
+import rehypeAutolinkHeadings from "rehype-autolink-headings";
 import { notFound } from "next/navigation";
 import BlogHeader from "@/components/blog/BlogHeader";
 import Link from "next/link";
@@ -80,7 +84,19 @@ export default async function BlogDetailPage({ params }: Props) {
         <BlogHeader frontmatter={post.frontmatter} />
 
         <article className="prose prose-lg dark:prose-invert prose-headings:tracking-tight prose-a:text-amber-600 dark:prose-a:text-amber-400 max-w-none">
-          <MDXRemote source={post.content} />
+          <MDXRemote
+            source={post.content}
+            options={{
+              mdxOptions: {
+                remarkPlugins: [remarkGfm],
+                rehypePlugins: [
+                  [rehypePrettyCode, { theme: "github-dark-default", keepBackground: true }],
+                  rehypeSlug,
+                  [rehypeAutolinkHeadings, { behavior: "wrap" }],
+                ],
+              },
+            }}
+          />
         </article>
 
         <div className="mt-16 pt-8 border-t border-gray-200 dark:border-gray-800">

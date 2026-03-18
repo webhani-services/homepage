@@ -1,0 +1,191 @@
+---
+title: "MARL — LLM Hallucination을 줄이는 Model-Agnostic Runtime Middleware"
+description: "VIDRAFT가 공개한 MARL의 구조와 LLM Hallucination 대책을 프로덕션 환경에서 실천하는 방법을 소개합니다."
+date: "2026-03-18"
+status: "published"
+tags: ["LLM", "AI", "Middleware", "Hallucination", "Python"]
+thumbnail: ""
+author: "webhani"
+slug: "marl-llm-hallucination-middleware"
+---
+
+## 소개
+
+LLM을 프로덕션 환경에서 운용할 때 Hallucination(사실과 다른 정보 생성)은 가장 까다로운 문제 중 하나입니다. 2026년 3월 17일, VIDRAFT가 MARL이라는 새로운 Middleware를 공개했습니다. MARL은 "Model-Agnostic Runtime Layer"의 약자로, 특정 Model에 의존하지 않고 LLM의 자기 수정 능력을 강화하여 Hallucination 발생을 억제하는 구조를 제공합니다.
+
+이 글에서는 MARL의 Architecture를 살펴보고, 실제 프로젝트에 통합하는 방법과 webhani가 프로덕션 LLM 시스템 운용에서 얻은 경험을 공유합니다.
+
+## MARL이란
+
+MARL은 LLM의 추론 과정에 개입하는 Runtime Middleware입니다. OpenAI API 형식을 지원하는 Model이라면 GPT, Claude, Gemini, DeepSeek, Grok, Llama 등 어떤 Model에서든 사용할 수 있습니다.
+
+### 주요 특징
+
+- **Model 비의존**: OpenAI API 호환 Endpoint라면 어떤 Provider에서든 동작
+- **Runtime 자기 수정**: 생성된 Response에 대해 실시간으로 정합성 검사를 수행
+- **Pluggable Architecture**: 검증 규칙을 자유롭게 커스터마이즈 가능
+- **경량 통합**: 기존 API 호출 Pipeline에 최소한의 변경으로 도입 가능
+
+Hugging Face, GitHub, PyPI, ClawHub에서 공개되어 있으며 `pip install`로 바로 사용할 수 있습니다.
+
+## Runtime 층에서 Hallucination 대책이 중요한 이유
+
+기존의 Hallucination 대책은 주로 Prompt Engineering이나 Fine-tuning에 의존해왔습니다. 하지만 각 접근 방식에는 한계가 있습니다.
+
+- **Prompt Engineering**: 효과적이지만 입력 변화에 취약
+- **Fine-tuning**: 비용이 높고 Model 업데이트마다 재실행이 필요
+- **RAG(검색 증강 생성)**: 참조 데이터 품질에 의존하며, 검색 실패 시 대응이 부족
+
+Runtime Middleware는 이러한 기법들과 경쟁하는 것이 아니라 보완적으로 동작합니다. Prompt 설계나 RAG Pipeline 이후 단계에서 최종 출력의 품질을 검증하는 Layer로 기능합니다.
+
+## 도입 방법
+
+### 설치
+
+```bash
+pip install marl-middleware
+```
+
+### 기본 사용법
+
+MARL은 OpenAI 호환 Client를 래핑하는 형태로 사용합니다.
+
+```python
+from openai import OpenAI
+from marl import MarlMiddleware, ConsistencyChecker, FactGrounder
+
+client = OpenAI(api_key="your-api-key")
+
+# MARL Middleware 구성
+middleware = MarlMiddleware(
+    checks=[
+        ConsistencyChecker(),    # 내부 모순 검출
+        FactGrounder(            # 알려진 사실과의 대조
+            knowledge_base="./data/knowledge.json"
+        ),
+    ],
+    max_retries=2,               # 자기 수정 최대 시도 횟수
+    confidence_threshold=0.85,   # 신뢰도 임계값
+)
+
+# 일반 API 호출을 래핑
+response = middleware.complete(
+    client=client,
+    model="gpt-4o",
+    messages=[
+        {"role": "user", "content": "일본의 인구에 대해 알려주세요"}
+    ],
+)
+
+print(response.content)
+print(f"신뢰도 점수: {response.confidence_score}")
+print(f"수정 횟수: {response.correction_count}")
+```
+
+### 다른 Provider에서의 사용
+
+OpenAI 호환 Endpoint를 제공하는 Provider라면 동일한 방법으로 사용할 수 있습니다.
+
+```python
+from openai import OpenAI
+from marl import MarlMiddleware, ConsistencyChecker
+
+# Claude API를 OpenAI 호환 형식으로 사용
+client = OpenAI(
+    api_key="your-anthropic-api-key",
+    base_url="https://api.anthropic.com/v1/",
+)
+
+middleware = MarlMiddleware(
+    checks=[ConsistencyChecker()],
+    max_retries=1,
+)
+
+response = middleware.complete(
+    client=client,
+    model="claude-sonnet-4-20250514",
+    messages=[
+        {"role": "user", "content": "CAP 정리에 대해 설명해주세요"}
+    ],
+)
+```
+
+### Custom 검증 규칙 작성
+
+프로젝트 고유의 검증 Logic을 추가할 수도 있습니다.
+
+```python
+from marl import BaseChecker, CheckResult
+
+class DomainSpecificChecker(BaseChecker):
+    """도메인 특화 검증 규칙"""
+
+    def __init__(self, domain_rules: dict):
+        self.rules = domain_rules
+
+    def check(self, response_text: str, context: dict) -> CheckResult:
+        violations = []
+        for rule_name, validator in self.rules.items():
+            if not validator(response_text):
+                violations.append(rule_name)
+
+        return CheckResult(
+            passed=len(violations) == 0,
+            confidence=1.0 - (len(violations) / len(self.rules)),
+            details={"violations": violations},
+        )
+
+# 사용 예시
+domain_checker = DomainSpecificChecker(
+    domain_rules={
+        "no_competitor_mention": lambda text: "competitor" not in text.lower(),
+        "includes_disclaimer": lambda text: "주의" in text or "참고" in text,
+    }
+)
+```
+
+## 프로덕션 환경에서의 운용 포인트
+
+webhani에서는 클라이언트 대상 LLM 시스템 개발을 통해 다음과 같은 운용 경험을 축적해왔습니다.
+
+### 1. Latency 영향을 파악합니다
+
+Runtime 검증은 추가 Latency를 발생시킵니다. 자기 수정이 발동하면 Response 반환까지 원래의 2~3배 시간이 걸릴 수 있습니다. Streaming 대응이나 Timeout 설정을 사전에 계획해야 합니다.
+
+### 2. 검증 규칙은 단계적으로 도입합니다
+
+모든 검사를 한 번에 활성화하기보다, 가장 영향이 큰 규칙부터 단계적으로 도입하는 것이 현실적입니다. ConsistencyChecker부터 시작해서 운용 데이터를 보면서 규칙을 추가하는 접근을 권장합니다.
+
+### 3. 신뢰도 점수를 Logging합니다
+
+`confidence_score`를 Logging해두면 품질 저하 감지나 Model 간 비교에 유용합니다.
+
+```python
+import logging
+
+logger = logging.getLogger("marl")
+
+response = middleware.complete(client=client, model="gpt-4o", messages=messages)
+
+logger.info(
+    "marl_response",
+    extra={
+        "confidence": response.confidence_score,
+        "corrections": response.correction_count,
+        "model": "gpt-4o",
+        "latency_ms": response.latency_ms,
+    },
+)
+```
+
+### 4. Fallback 전략을 설계합니다
+
+신뢰도가 임계값 이하로 떨어졌을 때의 Fallback 처리도 중요합니다. 사용자 안내, 다른 Model로의 전환, 사람에 의한 Review Queue 전송 등 용도에 맞는 전략을 준비해야 합니다.
+
+## 마무리
+
+MARL과 같은 Runtime Middleware는 LLM Hallucination 대책에서 새로운 Layer로서 가능성이 있습니다. Model 비의존이라는 설계 철학 덕분에 Provider 전환이나 Multi-Model 구성에서도 일관된 품질 관리가 가능해집니다.
+
+다만, Middleware 도입만으로 Hallucination이 완전히 해소되는 것은 아닙니다. Prompt 설계, RAG, Fine-tuning, 그리고 Runtime 검증을 조합한 다층 방어가 프로덕션 수준의 LLM 시스템에는 필수적입니다.
+
+webhani에서는 LLM을 활용한 시스템 개발과 AI 도입 컨설팅을 진행하고 있습니다. Hallucination 대책을 포함한 LLM 운용에 어려움이 있으시면 편하게 문의해 주세요.

@@ -89,6 +89,13 @@ Write a technical blog post in ${langName} about the following topic:
 
 Output ONLY the complete MDX file content including frontmatter. No explanation before or after.
 
+Copyright & Originality:
+- All content MUST be 100% original — never copy or closely paraphrase existing articles or documentation
+- Use external sources only as background knowledge; rewrite all ideas in your own words
+- Code examples must be original or use only officially documented public APIs/patterns
+- Do not reproduce proprietary code, copyrighted text, or trademarked content without attribution
+- If citing statistics or research, mention the source inline (e.g., "according to [source]")
+
 Requirements:
 - frontmatter must include: title, description, date, status, tags, thumbnail, author, slug
 - status must be "draft"
@@ -100,7 +107,12 @@ Requirements:
 - The blog content should be 800-1500 words
 - Use proper markdown headings (##, ###), code blocks, and lists
 - Include practical code examples where appropriate
-- Write in a professional but approachable tone
+- Write in a professional but approachable tone — as a senior engineer sharing knowledge with peers, not as a marketer
+- Avoid hype, buzzwords ("revolutionary", "game-changing"), excessive exclamation marks, or clickbait
+- Keep introductions brief and get to practical content quickly
+- For Japanese: use です/ます style, keep technical terms in English/katakana
+- For Korean: use 합니다 style, mix Korean and English technical terms naturally
+- For English: use clear, direct technical writing — no filler phrases
 
 Format:
 ---
