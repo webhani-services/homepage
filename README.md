@@ -100,6 +100,21 @@ npm run daily-blog -- --dry-run
 npm run daily-blog -- -p gemini
 ```
 
+### Claude Code で直接生成（API キー不要）
+
+Claude Code 内で以下のコマンドを使うと、API キー不要でブログ記事を生成できます。
+
+```bash
+# トピック指定で生成
+/project:generate-blog Next.js Server Actions の活用方法
+
+# ユーザー原稿を校正・翻訳
+/project:polish-blog drafts/my-article.md
+
+# 最新ニュースから自動生成（Top 3 選定、うち1つは LLM/AI 関連）
+/project:daily-blog
+```
+
 ### ブログ記事の公開フロー
 
 1. `npm run generate-blog -- -t "トピック"` で記事を生成（`status: "draft"`）

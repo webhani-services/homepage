@@ -73,3 +73,7 @@ public/images/     # 정적 이미지 (hero, services SVG, works, logos)
 - **자동 생성**: `npm run generate-blog -- -t "topic"` (default: Anthropic)
   - Provider 전환: `--provider openai` 또는 `LLM_PROVIDER=gemini`
   - 생성된 글은 `status: draft` 로 저장됨
+- **Claude Code 커맨드** (API 키 불필요, Claude Code 가 직접 생성):
+  - `/project:generate-blog [topic]` — 토픽 지정 블로그 생성
+  - `/project:polish-blog [file path]` — 유저 원고 교정・번역
+  - `/project:daily-blog` — 최신 뉴스 기반 블로그 생성
