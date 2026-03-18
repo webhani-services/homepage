@@ -28,6 +28,57 @@
 
 - [Vesperr](https://bootstrapmade.com/demo/Vesperr/)
 
+## Blog
+
+MDX ファイルベースのブログ機能。`content/blog/{locale}/{slug}.mdx` にコンテンツを配置します。
+
+### ブログ記事の自動生成
+
+LLM を使って技術ブログ記事を自動生成できます。生成された記事は `status: "draft"` で保存されます。
+
+```bash
+# 基本的な使い方（デフォルト: Anthropic Claude）
+npm run generate-blog -- -t "Next.js Server Actions"
+
+# プロバイダーを指定
+npm run generate-blog -- -t "React 19 features" -p openai
+npm run generate-blog -- -t "Docker tips" -p gemini
+
+# モデルを指定
+npm run generate-blog -- -t "AWS Lambda" -p anthropic -m claude-haiku-4-5-20251001
+
+# 生成対象の言語を指定（デフォルト: ja,en,ko）
+npm run generate-blog -- -t "TypeScript 5.x" -l "ja,en"
+
+# ファイル保存せずにプレビュー
+npm run generate-blog -- -t "Kubernetes入門" --dry-run
+```
+
+### 対応プロバイダー
+
+| Provider | 環境変数 | デフォルトモデル | パッケージ |
+|----------|----------|------------------|------------|
+| `anthropic` (デフォルト) | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` | `@anthropic-ai/sdk` (インストール済み) |
+| `openai` | `OPENAI_API_KEY` | `gpt-4o` | `npm install openai` |
+| `gemini` | `GEMINI_API_KEY` | `gemini-2.5-flash` | `npm install @google/generative-ai` |
+
+環境変数 `LLM_PROVIDER` と `LLM_MODEL` でデフォルト値を変更できます。
+
+### ブログ記事の公開フロー
+
+1. `npm run generate-blog -- -t "トピック"` で記事を生成（`status: "draft"`）
+2. `content/blog/{locale}/` に生成された MDX ファイルを確認・編集
+3. frontmatter の `status` を `"published"` に変更
+4. コミット & デプロイ
+
+### Status
+
+| Status | Production | Development | 用途 |
+|--------|-----------|-------------|------|
+| `draft` | 非表示 | 表示 | 作成中 |
+| `published` | 表示 | 表示 | 公開 |
+| `private` | 非表示 | 非表示 | アーカイブ |
+
 ## package 更新方法
 
 ```bash
