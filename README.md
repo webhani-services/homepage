@@ -64,6 +64,42 @@ npm run generate-blog -- -t "Kubernetes入門" --dry-run
 
 環境変数 `LLM_PROVIDER` と `LLM_MODEL` でデフォルト値を変更できます。
 
+### ユーザー原稿を LLM で仕上げる
+
+ユーザーが書いた原稿（下書き）を LLM が校正・翻訳し、3言語の MDX ファイルを生成します。
+
+```bash
+# 基本的な使い方
+npm run polish-blog -- -f drafts/my-article.md
+
+# カスタムスラグを指定
+npm run polish-blog -- -f drafts/my-article.md -s "my-custom-slug"
+
+# タグを手動指定
+npm run polish-blog -- -f drafts/my-article.md --tags "React,TypeScript,Next.js"
+
+# プレビュー（ファイル保存なし）
+npm run polish-blog -- -f drafts/my-article.md --dry-run
+```
+
+### 最新ニュースからブログ記事を自動生成
+
+Hacker News と Dev.to から最新の技術ニュースを取得し、LLM が Top 3 を選定（うち1件は LLM/AI 関連必須）して会社ブログ記事を生成します。
+
+```bash
+# 基本的な使い方（Top 3 記事を生成）
+npm run daily-blog
+
+# 生成記事数を変更
+npm run daily-blog -- -c 5
+
+# トピック選定のみ（記事生成なし）
+npm run daily-blog -- --dry-run
+
+# プロバイダー指定
+npm run daily-blog -- -p gemini
+```
+
 ### ブログ記事の公開フロー
 
 1. `npm run generate-blog -- -t "トピック"` で記事を生成（`status: "draft"`）
