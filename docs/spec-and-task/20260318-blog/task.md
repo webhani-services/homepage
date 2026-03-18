@@ -71,16 +71,16 @@
 
 ## Phase 4: SEO Optimization
 
-- [ ] **4-1. 메타데이터 최적화**
-  - 블로그 목록 페이지 메타데이터
-  - 블로그 상세 페이지 OG 태그 (title, description, image)
+- [x] **4-1. 메타데이터 최적화**
+  - 블로그 목록 페이지: locale 대응 동적 메타데이터 (`generateMetadata`)
+  - 블로그 상세 페이지: OG article type, publishedTime, tags 추가
 
-- [ ] **4-2. Sitemap 연동**
-  - 블로그 글을 sitemap에 포함
-  - `generateStaticParams` 활용
+- [x] **4-2. Sitemap 연동**
+  - `src/app/sitemap.ts` 작성
+  - 홈, 블로그 목록, 블로그 글을 sitemap.xml에 포함
 
-- [ ] **4-3. Structured Data**
-  - BlogPosting JSON-LD 추가 (선택)
+- [x] **4-3. Structured Data**
+  - BlogPosting JSON-LD 스키마 추가 (상세 페이지)
 
 ## Phase 5 (Future): LLM Auto-Generation
 
