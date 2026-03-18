@@ -51,22 +51,23 @@
 
 ## Phase 3: Homepage Integration
 
-- [ ] **3-1. AreaBlog 컴포넌트 (`src/components/AreaBlog.tsx`)**
+- [x] **3-1. AreaBlog 컴포넌트 (`src/components/AreaBlog.tsx`)**
   - 최신 published 글 3개 표시
   - 기존 Section Pattern 적용 (영어 eyebrow + 일본어 제목)
   - `reveal` 애니메이션 적용
   - "View All" 링크 → `/blog`
 
-- [ ] **3-2. Navigation 업데이트**
-  - Blog 링크 추가
-  - 모바일 메뉴에도 반영
+- [x] **3-2. Navigation 업데이트**
+  - Blog 링크 추가 (`/blog`)
+  - 모바일 메뉴에도 반영 (기존 navigationData 구조 활용)
 
-- [ ] **3-3. 홈페이지에 AreaBlog 추가**
+- [x] **3-3. 홈페이지에 AreaBlog 추가**
   - `src/app/page.tsx`에 AreaBlog 섹션 추가
-  - 적절한 위치에 배치 (AreaWorks 다음)
+  - AreaWorks 다음에 배치
+  - page.tsx を async 化하여 서버에서 글 목록 취득
 
-- [ ] **3-4. 번역 키 추가**
-  - `messages/ja.json`, `messages/en.json`, `messages/ko.json`에 Blog 섹션 번역 키 추가
+- [x] **3-4. 번역 키 추가**
+  - `messages/ja.json`, `messages/en.json`, `messages/ko.json`에 Blog 섹션 + navigation 번역 키 추가
 
 ## Phase 4: SEO Optimization
 
