@@ -40,6 +40,7 @@ const navigationData = {
     { nameKey: "philosophy", href: "#corporate-philosophy" },
     { nameKey: "about", href: "#about" },
     { nameKey: "works", href: "#works" },
+    { nameKey: "blog", href: "/blog" },
     { nameKey: "contact", href: "#contact" },
   ],
 };
