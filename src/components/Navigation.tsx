@@ -27,21 +27,21 @@ const navigationData = {
   menuItems: [
     {
       nameKey: "services",
-      href: "#services",
+      href: "/#services",
       children: [
-        { nameKey: "webDevelopment", href: "#web-development" },
-        { nameKey: "consulting", href: "#consulting" },
-        { nameKey: "education", href: "#education" },
-        { nameKey: "digitalContent", href: "#digital-content" },
-        { nameKey: "outsourcing", href: "#outsourcing" },
-        { nameKey: "llmServices", href: "#llm-services" },
+        { nameKey: "webDevelopment", href: "/#web-development" },
+        { nameKey: "consulting", href: "/#consulting" },
+        { nameKey: "education", href: "/#education" },
+        { nameKey: "digitalContent", href: "/#digital-content" },
+        { nameKey: "outsourcing", href: "/#outsourcing" },
+        { nameKey: "llmServices", href: "/#llm-services" },
       ],
     },
-    { nameKey: "philosophy", href: "#corporate-philosophy" },
-    { nameKey: "about", href: "#about" },
-    { nameKey: "works", href: "#works" },
+    { nameKey: "philosophy", href: "/#corporate-philosophy" },
+    { nameKey: "about", href: "/#about" },
+    { nameKey: "works", href: "/#works" },
     { nameKey: "blog", href: "/blog" },
-    { nameKey: "contact", href: "#contact" },
+    { nameKey: "contact", href: "/#contact" },
   ],
 };
 
