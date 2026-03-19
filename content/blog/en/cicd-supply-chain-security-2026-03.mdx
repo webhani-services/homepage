@@ -1,0 +1,190 @@
+---
+title: "Supply Chain Attacks on CI/CD Pipelines: What March 2026 Incidents Tell Us"
+description: "Malicious Rust crates, compromised GitHub Actions workflows, and autonomous attack bots targeting open-source repos—here's what happened in February–March 2026 and how to harden your pipeline."
+date: "2026-03-20"
+status: "published"
+tags: ["Security", "CI/CD", "DevSecOps", "Supply Chain", "GitHub Actions"]
+thumbnail: ""
+author: "webhani"
+slug: "cicd-supply-chain-security-2026-03"
+---
+
+CI/CD pipelines have become a primary target for supply chain attacks. The February–March 2026 period produced several concrete incidents that illustrate how these attacks work in practice: malicious packages impersonating legitimate crates, a "Pwn Request" exploit in a popular open-source project, and an autonomous AI bot scanning GitHub for vulnerable workflows.
+
+Datadog's State of DevSecOps 2026 report adds context: 87% of organizations have at least one exploitable vulnerability, and 57% have experienced a security incident caused by secrets exposed through insecure DevOps processes in the past two years.
+
+## Recent Incidents
+
+### Malicious Rust Crates Targeting Developer Environments (Late Feb – Early March 2026)
+
+Five Rust crates impersonating `timeapi.io` were published to crates.io between late February and early March 2026. The crates used typosquatting—names nearly identical to legitimate packages—and were designed to collect sensitive data from developer environments.
+
+The attack mechanism: malicious code embedded in `build.rs` (Rust's build script) executed at `cargo build` time, scanning the environment for `.env` files and system environment variables, then exfiltrating them to attacker-controlled infrastructure.
+
+CI/CD environments are particularly high-value targets because they aggregate secrets from multiple services: registry tokens, cloud credentials, deployment keys.
+
+**Mitigation:**
+
+```toml
+# Pin exact versions in Cargo.toml — avoid ^ or * ranges
+[dependencies]
+time-api = { version = "=1.2.3" }
+```
+
+```bash
+# Audit for known vulnerabilities regularly
+cargo audit
+
+# Review build.rs files in dependencies before adding them
+cargo metadata --format-version 1 | jq '.packages[].manifest_path'
+```
+
+### "Pwn Request" Attack on kubernetes-el (March 5, 2026)
+
+On March 5, a threat actor exploited a Pwn Request vulnerability in the CI workflow of `kubernetes-el/kubernetes-el`, an Emacs package for managing Kubernetes clusters.
+
+A Pwn Request occurs when a GitHub Actions workflow uses `pull_request_target`—which runs with repository secrets—while also checking out and executing code from the pull request's branch. An external attacker can submit a PR with malicious code that gets executed with access to the repository's secrets.
+
+```yaml
+# Vulnerable pattern
+on:
+  pull_request_target:         # ← runs with repo secrets even for external PRs
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}  # ← attacker's code
+      - run: npm test           # ← executes attacker's code with secrets
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}  # ← exposed
+```
+
+```yaml
+# Safe pattern
+on:
+  pull_request:                # ← no secrets for external PRs
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read           # ← minimal permissions
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm test
+```
+
+If you need secrets in a PR workflow (e.g., for deployment previews), use a two-job pattern: run the untrusted code in a first job without secrets, then trigger a second job with secrets only after a trusted reviewer approves.
+
+### Autonomous Bot Targeting OSS Repos (February 21–28, 2026)
+
+Between February 21 and 28, a GitHub account described as an "autonomous security research agent" submitted malicious pull requests to repositories belonging to Microsoft, Datadog, and Aqua Security—including `aquasecurity/trivy`, the widely-used container vulnerability scanner.
+
+The account was not a human researcher. It was a bot designed to automatically scan for vulnerable workflow patterns and submit PRs at scale. This represents an escalation: supply chain attacks that previously required manual effort can now be automated and run continuously.
+
+## Key Findings from Datadog's DevSecOps 2026 Report
+
+**87% of organizations have at least one exploitable vulnerability** across their services. However, the more actionable finding is this: only 18% of vulnerabilities labeled "critical" by scanning tools are actually critical when runtime context is applied. The other 82% have no viable attack path in the actual running environment.
+
+This matters because chasing every "critical" alert is unsustainable and obscures the vulnerabilities that genuinely need urgent attention.
+
+## Practical Hardening Steps
+
+### 1. Minimize GitHub Actions permissions
+
+```yaml
+# Set read-only as the default for all workflows
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      id-token: write    # Only add what the job actually needs
+```
+
+### 2. Pin third-party Actions to commit SHAs
+
+Tags can be rewritten; commit SHAs cannot.
+
+```yaml
+# Risky — tag can point to different code after an update
+- uses: actions/checkout@v4
+
+# Safe — pinned to a specific, immutable commit
+- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+```
+
+Tools like [Dependabot](https://docs.github.com/en/code-security/dependabot) can keep pinned SHAs up to date automatically.
+
+### 3. Replace long-lived secrets with OIDC
+
+OIDC (OpenID Connect) tokens are short-lived and scoped to a specific workflow run. They eliminate the risk of a stolen token being replayed after the fact.
+
+```yaml
+- name: Configure AWS credentials via OIDC
+  uses: aws-actions/configure-aws-credentials@010d0da01d0b5a38af31e9c3470dbfdabdecca3a
+  with:
+    role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsRole
+    aws-region: us-east-1
+    # No access key or secret key — authentication via OIDC token
+```
+
+### 4. Audit your `pull_request_target` usage
+
+```bash
+# Find workflows using pull_request_target
+grep -r "pull_request_target" .github/workflows/
+
+# Review each result: does it check out and execute PR code?
+# If yes, it's likely vulnerable to Pwn Request attacks
+```
+
+### 5. Add dependency scanning to your pipeline
+
+```yaml
+# GitHub Actions example — run on every PR
+- name: Run cargo audit
+  uses: rustsec/audit-check@a1af3437b55b851bcab7b74c03c180dfb6c58d4c
+  with:
+    token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+```bash
+# Node.js
+npm audit --audit-level=high
+
+# Python
+pip install pip-audit && pip-audit
+
+# Go
+go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...
+```
+
+### 6. Triage vulnerabilities by runtime reachability
+
+Given that only 18% of "critical" findings are actually exploitable, apply these filters before treating a vulnerability as urgent:
+
+1. **Is it reachable at runtime?** — Does the vulnerable code path actually execute in your application?
+2. **Is it exposed externally?** — Internet-facing services warrant higher urgency than internal tools.
+3. **Is it pre-authentication?** — Vulnerabilities exploitable without credentials are highest priority.
+
+Most SAST and dependency scanners surface theoretical vulnerabilities. Apply runtime context before mobilizing the team.
+
+## Summary
+
+The incidents from February–March 2026 point to two developments worth tracking: the professionalization of supply chain attacks (typosquatting at scale, automated Pwn Request scanning) and the growing use of AI to automate attack workflows.
+
+The defensive priorities in order:
+
+1. Audit `pull_request_target` usage and fix any that check out PR code with secrets
+2. Pin third-party Actions to commit SHAs
+3. Replace long-lived credentials with OIDC where possible
+4. Add dependency scanning to your CI pipeline
+5. Apply runtime reachability filtering before prioritizing vulnerability remediation
+
+None of these require significant engineering effort, but collectively they eliminate the most common attack vectors observed in recent incidents.
