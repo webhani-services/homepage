@@ -1,0 +1,184 @@
+---
+title: "CI/CD パイプラインを狙う Supply Chain 攻撃：2026 年 3 月の実例から学ぶ対策"
+description: "悪意ある Rust Crate や GitHub Actions の脆弱性を悪用した Supply Chain 攻撃が増加しています。Datadog の DevSecOps 2026 レポートと実際の事例をもとに、今すぐ取れる対策を解説します。"
+date: "2026-03-20"
+status: "published"
+tags: ["セキュリティ", "CI/CD", "DevSecOps", "Supply Chain", "GitHub Actions"]
+thumbnail: ""
+author: "webhani"
+slug: "cicd-supply-chain-security-2026-03"
+---
+
+2026 年 2〜3 月にかけて、CI/CD パイプラインを標的にした攻撃が相次いで報告されました。悪意ある Rust Crate の公開、GitHub Actions ワークフローの "Pwn Request" 脆弱性の悪用、そして OpenSource リポジトリを自律的に攻撃する AI ボットの登場と、攻撃の手口は多様化しています。
+
+Datadog の State of DevSecOps 2026 レポートによると、87% の組織に少なくとも 1 件の悪用可能な脆弱性が存在し、57% の組織が過去 2 年間で DevOps プロセスから露出したシークレットによるセキュリティインシデントを経験しています。
+
+## 2026 年 3 月の主な攻撃事例
+
+### 1. 悪意ある Rust Crate の公開（2 月下旬〜3 月上旬）
+
+`timeapi.io` を装った 5 つの Rust Crate が、2026 年 2 月下旬から 3 月上旬にかけて crates.io に公開されました。これらのパッケージは正規のパッケージと酷似した名前を持ち（タイポスクワッティング）、インストールされると開発者の環境から `.env` ファイルや秘密情報を収集し、攻撃者が制御するインフラに送信していました。
+
+攻撃の流れ：
+
+1. 正規パッケージに似た名前でパッケージを公開
+2. `build.rs`（ビルドスクリプト）に悪意あるコードを埋め込む
+3. `cargo build` 実行時にシステム環境変数と `.env` ファイルを外部送信
+4. CI/CD 環境では特に大量のシークレットが漏洩するリスク
+
+```toml
+# Cargo.toml でのバージョン固定（推奨）
+[dependencies]
+time-api = { version = "=1.2.3", features = ["minimal"] }
+# バージョンに ^ や * を使わない
+```
+
+### 2. kubernetes-el への Pwn Request 攻撃（3 月 5 日）
+
+3 月 5 日、Kubernetes クラスターを管理する Emacs パッケージ `kubernetes-el/kubernetes-el` の CI ワークフローで "Pwn Request" 脆弱性が悪用されました。
+
+Pwn Request とは、外部の Pull Request が `pull_request_target` イベントでトリガーされる GitHub Actions ワークフローに対して、リポジトリのシークレットにアクセスできる攻撃手法です。
+
+```yaml
+# 危険なパターン（外部 PR でシークレットにアクセスできてしまう）
+on:
+  pull_request_target:  # 注意: 外部 PR でも secrets が使える
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}  # 攻撃者のコードをチェックアウト
+      - run: npm test  # 攻撃者のコードが実行される
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}  # シークレットが漏洩
+```
+
+```yaml
+# 安全なパターン
+on:
+  pull_request:  # 外部 PR では secrets を使えない
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read  # 最小権限の付与
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm test
+```
+
+### 3. AI ボットによる OSS リポジトリへの攻撃（2 月）
+
+2026 年 2 月 21〜28 日にかけて、「自律型セキュリティリサーチエージェント」を名乗る GitHub アカウントが Microsoft、Datadog、Aqua Security のリポジトリ（特に `aquasecurity/trivy`）に対して攻撃を試みました。このアカウントは人間ではなく、脆弱なワークフローを自動スキャンし、悪意ある PR を大量送信するように設計された自律型ボットでした。
+
+## Datadog DevSecOps 2026 レポートの主な知見
+
+- **87%** の組織に悪用可能な脆弱性が存在
+- "critical" とラベルされた脆弱性のうち、実行時コンテキストで実際に critical なのは **18%** のみ
+  - 残り 82% は実際の攻撃経路が存在しない
+  - スキャンツールのアラートを盲目的に追うのは非効率
+- **57%** の組織が過去 2 年間にシークレット露出によるインシデントを経験
+- CI/CD パイプラインと GitHub Actions はサプライチェーン攻撃の主要標的
+
+## 今すぐ取れる対策
+
+### 1. GitHub Actions の権限を最小化する
+
+```yaml
+# すべてのジョブにデフォルトの最小権限を設定
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      id-token: write  # OIDC 認証が必要な場合のみ追加
+    steps:
+      # ...
+```
+
+### 2. サードパーティ Action をコミット SHA でピン留めする
+
+```yaml
+# 危険（タグは書き換えられる可能性がある）
+- uses: actions/checkout@v4
+
+# 安全（特定のコミット SHA を使用）
+- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+```
+
+### 3. シークレットを環境変数に直接書かない
+
+```yaml
+# 悪い例
+- run: |
+    export API_KEY="hardcoded-key"
+    npm deploy
+
+# 良い例
+- run: npm deploy
+  env:
+    API_KEY: ${{ secrets.API_KEY }}
+```
+
+### 4. Dependabot と OIDC を組み合わせる
+
+長期的なシークレットの代わりに、OIDC（OpenID Connect）トークンを使った短命な認証情報を利用します：
+
+```yaml
+- name: Configure AWS credentials
+  uses: aws-actions/configure-aws-credentials@010d0da01d0b5a38af31e9c3470dbfdabdecca3a
+  with:
+    role-to-assume: arn:aws:iam::123456789:role/GitHubActionsRole
+    aws-region: ap-northeast-1
+    # アクセスキーの代わりに OIDC を使用
+```
+
+### 5. `pull_request_target` の使用を見直す
+
+既存のワークフローで `pull_request_target` を使っている場合：
+
+```bash
+# リポジトリ内の危険なパターンを検索
+grep -r "pull_request_target" .github/workflows/
+```
+
+外部 PR でシークレットが必要な場合は、承認後に別ジョブとして実行する設計を検討します。
+
+### 6. 依存関係の整合性確認
+
+```bash
+# Rust の場合：cargo-audit でセキュリティ脆弱性をスキャン
+cargo audit
+
+# Node.js の場合
+npm audit --audit-level=high
+
+# Python の場合
+pip-audit
+```
+
+## Datadog が言う「アラート疲れ」への対処
+
+critical とラベルされた脆弱性の 82% が実際には悪用不可能であるという指摘は重要です。すべての critical アラートに即座に対応しようとすると、開発速度が著しく低下します。
+
+**優先度付けのフレームワーク**：
+
+1. **実行時に到達可能か** — スキャンツールが見つけた脆弱性が、実際の実行コードパスに存在するか
+2. **インターネットに露出しているか** — 内部サービスと外部公開サービスで優先度を分ける
+3. **認証前に悪用可能か** — 認証なしで攻撃できるものを最優先
+
+ツールのデフォルト severity に頼らず、上記の基準でトリアージすることで、実際に対処すべき脆弱性に集中できます。
+
+## webhani の見解
+
+今回報告された攻撃事例は、CI/CD パイプラインが「コードをビルドする場所」から「攻撃者がシークレットを盗む場所」に変化していることを明確に示しています。
+
+特に注意が必要なのは、攻撃の自動化です。AI ボットが脆弱なワークフローを自動でスキャンし、大量の PR を送信するようになったことで、OSS プロジェクトだけでなく、ワークフローを公開している企業のリポジトリも標的になります。
+
+webhani では、クライアントの GitHub Actions 設定の監査と、OIDC ベースの認証への移行支援を行っています。まずは `pull_request_target` の使用状況と、サードパーティ Action のピン留め状況の確認から始めることをお勧めします。

@@ -1,0 +1,192 @@
+---
+title: "CI/CD 파이프라인을 노리는 Supply Chain 공격: 2026년 3월 사례로 배우는 대응책"
+description: "악성 Rust Crate와 GitHub Actions 취약점을 악용한 공급망 공격이 증가하고 있습니다. Datadog DevSecOps 2026 보고서와 실제 사례를 바탕으로 즉시 적용 가능한 보안 대책을 정리합니다."
+date: "2026-03-20"
+status: "published"
+tags: ["보안", "CI/CD", "DevSecOps", "공급망공격", "GitHub Actions"]
+thumbnail: ""
+author: "webhani"
+slug: "cicd-supply-chain-security-2026-03"
+---
+
+2026년 2~3월, CI/CD 파이프라인을 표적으로 한 공급망 공격이 잇따라 보고되었습니다. 악성 Rust Crate 공개, GitHub Actions 워크플로우의 "Pwn Request" 취약점 악용, 그리고 오픈소스 저장소를 자율적으로 공격하는 AI 봇의 등장까지, 공격 수법이 다양해지고 있습니다.
+
+Datadog의 State of DevSecOps 2026 보고서에 따르면 87%의 조직에 악용 가능한 취약점이 존재하며, 57%의 조직이 지난 2년간 DevOps 프로세스에서 노출된 시크릿으로 인한 보안 사고를 경험했습니다.
+
+## 2026년 3월 주요 공격 사례
+
+### 1. 악성 Rust Crate 공개 (2월 말 ~ 3월 초)
+
+`timeapi.io`를 사칭한 5개의 Rust Crate가 2026년 2월 말부터 3월 초 사이에 crates.io에 게시되었습니다. 타이포스쿼팅(Typosquatting) 방식으로 정상 패키지와 매우 유사한 이름을 사용했으며, 설치 후 개발자 환경의 `.env` 파일과 시크릿 정보를 수집하여 공격자 서버로 전송했습니다.
+
+공격 메커니즘:
+- `build.rs`(Rust 빌드 스크립트)에 악성 코드 삽입
+- `cargo build` 실행 시 환경 변수와 `.env` 파일을 외부로 유출
+- CI/CD 환경은 다양한 서비스의 시크릿이 집중되어 특히 고가치 표적
+
+**대응책:**
+
+```toml
+# Cargo.toml에서 정확한 버전 고정 (^, * 범위 지정 지양)
+[dependencies]
+time-api = { version = "=1.2.3" }
+```
+
+```bash
+# 정기적인 취약점 감사
+cargo audit
+
+# 의존성의 build.rs 파일 사전 검토
+cargo metadata --format-version 1 | jq '.packages[].manifest_path'
+```
+
+### 2. kubernetes-el Pwn Request 공격 (3월 5일)
+
+3월 5일, Kubernetes 클러스터 관리 Emacs 패키지인 `kubernetes-el/kubernetes-el`의 CI 워크플로우에서 Pwn Request 취약점이 악용되었습니다.
+
+**Pwn Request란?** GitHub Actions에서 `pull_request_target` 이벤트를 사용하는 워크플로우가 외부 PR의 코드를 체크아웃하여 실행할 때, 외부 공격자가 저장소의 시크릿에 접근할 수 있는 취약점입니다.
+
+```yaml
+# 취약한 패턴
+on:
+  pull_request_target:  # ← 외부 PR에서도 저장소 시크릿에 접근 가능
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}  # ← 공격자 코드 체크아웃
+      - run: npm test           # ← 공격자 코드가 시크릿으로 실행됨
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}  # ← 시크릿 노출
+```
+
+```yaml
+# 안전한 패턴
+on:
+  pull_request:         # ← 외부 PR에서 시크릿 접근 불가
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read    # ← 최소 권한 설정
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm test
+```
+
+### 3. AI 봇의 자율적 OSS 저장소 공격 (2월)
+
+2026년 2월 21~28일 사이, "자율형 보안 연구 에이전트"를 자칭하는 GitHub 계정이 Microsoft, Datadog, Aqua Security의 저장소(특히 `aquasecurity/trivy`)를 표적으로 공격을 시도했습니다.
+
+이 계정은 인간 연구자가 아닌, 취약한 워크플로우 패턴을 자동으로 스캔하고 악성 PR을 대량 전송하도록 설계된 자율형 봇이었습니다. 공급망 공격의 자동화 수준이 크게 높아졌음을 보여주는 사례입니다.
+
+## Datadog DevSecOps 2026 보고서 주요 시사점
+
+- **87%**의 조직에 악용 가능한 취약점 존재
+- "critical" 레이블 취약점 중 실행 시 컨텍스트 적용 시 실제로 critical한 것은 **18%**에 불과
+  - 나머지 82%는 실제 공격 경로가 없음
+  - 모든 critical 알림에 즉각 대응하는 것은 개발 속도를 심각하게 저하시킬 수 있음
+- **57%**의 조직이 지난 2년간 시크릿 노출로 인한 보안 사고 경험
+- CI/CD 파이프라인과 GitHub Actions이 공급망 공격의 주요 표적
+
+## 즉시 적용 가능한 보안 대책
+
+### 1. GitHub Actions 권한 최소화
+
+```yaml
+# 모든 워크플로우에 읽기 전용 기본 권한 설정
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      id-token: write    # 해당 Job에 실제로 필요한 권한만 추가
+```
+
+### 2. 서드파티 Action을 Commit SHA로 고정
+
+태그는 재작성될 수 있지만 커밋 SHA는 불변입니다.
+
+```yaml
+# 위험 — 태그가 다른 코드를 가리킬 수 있음
+- uses: actions/checkout@v4
+
+# 안전 — 특정 불변 커밋에 고정
+- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+```
+
+Dependabot을 통해 고정된 SHA를 자동으로 최신 상태로 유지할 수 있습니다.
+
+### 3. 장기 시크릿을 OIDC로 교체
+
+OIDC(OpenID Connect) 토큰은 단기 발행되며 특정 워크플로우 실행에만 유효합니다. 토큰이 탈취되어도 재사용이 불가능합니다.
+
+```yaml
+- name: OIDC로 AWS 자격 증명 설정
+  uses: aws-actions/configure-aws-credentials@010d0da01d0b5a38af31e9c3470dbfdabdecca3a
+  with:
+    role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsRole
+    aws-region: ap-northeast-2
+    # 액세스 키 대신 OIDC 토큰으로 인증
+```
+
+### 4. `pull_request_target` 사용 현황 감사
+
+```bash
+# 저장소 내 pull_request_target 사용 워크플로우 검색
+grep -r "pull_request_target" .github/workflows/
+
+# 각 결과 검토: PR 코드를 체크아웃하여 시크릿과 함께 실행하는지 확인
+```
+
+시크릿이 필요한 PR 워크플로우는 두 단계로 분리합니다:
+1. 신뢰할 수 없는 코드를 시크릿 없이 실행하는 첫 번째 Job
+2. 신뢰할 수 있는 리뷰어 승인 후 시크릿으로 실행하는 두 번째 Job
+
+### 5. CI 파이프라인에 의존성 취약점 스캔 추가
+
+```yaml
+# GitHub Actions에서 자동 감사 실행
+- name: Rust 취약점 감사
+  uses: rustsec/audit-check@a1af3437b55b851bcab7b74c03c180dfb6c58d4c
+  with:
+    token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+```bash
+# 각 언어별 취약점 스캔
+npm audit --audit-level=high        # Node.js
+pip install pip-audit && pip-audit  # Python
+cargo audit                         # Rust
+govulncheck ./...                   # Go
+```
+
+### 6. 취약점 우선순위 합리적으로 결정하기
+
+"critical" 취약점의 82%가 실제로는 악용 불가능하다는 점에서, 아래 기준으로 트리아지합니다:
+
+1. **실행 시 도달 가능한가?** — 취약한 코드 경로가 실제 애플리케이션에서 실행되는가?
+2. **외부에 노출되어 있는가?** — 인터넷 접근 가능 서비스를 내부 도구보다 높은 우선순위로 처리
+3. **인증 전에 악용 가능한가?** — 인증 없이 공격 가능한 취약점을 최우선 대응
+
+## 결론
+
+2026년 2~3월의 사례들은 CI/CD 파이프라인이 "코드를 빌드하는 곳"에서 "공격자가 시크릿을 탈취하는 곳"으로 변화하고 있음을 명확히 보여줍니다.
+
+특히 주목해야 할 것은 공격의 자동화입니다. AI 봇이 취약한 워크플로우를 자동 스캔하고 대량의 악성 PR을 전송할 수 있게 되면서, OSS 프로젝트뿐만 아니라 기업 저장소도 표적이 됩니다.
+
+우선 적용해야 할 보안 조치 순서:
+
+1. `pull_request_target` 사용 현황 감사 및 취약한 패턴 수정
+2. 서드파티 Action을 Commit SHA로 고정
+3. 장기 자격 증명을 OIDC로 교체
+4. CI 파이프라인에 의존성 스캔 추가
+5. 실행 시 도달 가능성 기준으로 취약점 우선순위 결정
+
+각각의 조치가 큰 엔지니어링 작업을 요구하지 않으면서도, 최근 사례에서 확인된 주요 공격 벡터를 효과적으로 차단합니다.
