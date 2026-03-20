@@ -1,0 +1,140 @@
+---
+title: "Docker Kanvas：Compose から Kubernetes への自動変換が変えるデプロイのあり方"
+description: "Dockerが公開したDocker Kanvasは、Docker ComposeファイルをKubernetesマニフェストに自動変換するプラットフォームです。HelmやKustomizeへの挑戦となるこのツールの実力と限界を考察します。"
+date: "2026-03-21"
+status: "published"
+tags: ["Docker", "Kubernetes", "DevOps", "Infrastructure", "Cloud Native"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-compose-to-kubernetes"
+---
+
+## Docker が Kubernetes 移行を自動化する
+
+ローカル開発環境でDocker Composeを使っているが、本番環境ではKubernetesが必要——この「ギャップ問題」は多くのチームが抱えてきました。
+
+Dockerが公開したDocker Kanvasは、このギャップを直接解決しようとするプラットフォームです。既存のDocker Composeファイルを入力として受け取り、Kubernetesのマニフェストを生成します。HelmやKustomizeといった既存ツールへの挑戦として注目されています。
+
+## Docker Kanvas の基本的なアプローチ
+
+Docker Kanvasのコアは、Compose定義とKubernetesリソースの意味的な対応付けです。
+
+```yaml
+# docker-compose.yml（入力）
+version: '3.8'
+services:
+  api:
+    image: myapp/api:latest
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://db:5432/myapp
+    depends_on:
+      - db
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 512M
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+volumes:
+  db_data:
+```
+
+このComposeファイルを入力すると、Docker KanvasはDeployment、Service、PersistentVolumeClaim、ConfigMap、Secretといった対応するKubernetesリソースを生成します。
+
+加えて、変換結果を視覚的に確認できるUI（「Kanvas」の名前の由来）も提供しており、生成されたリソース間の依存関係をグラフで確認できます。
+
+## Helm・Kustomize との位置づけの違い
+
+Docker KanvasがHelmやKustomizeへの「挑戦」と表現される理由を整理します。
+
+| 観点 | Docker Kanvas | Helm | Kustomize |
+|---|---|---|---|
+| 入力形式 | Docker Compose | 独自テンプレート（Go template） | Kubernetes YAML + overlay |
+| 学習コスト | 低（Composeを知っていれば） | 中〜高 | 中 |
+| 環境差分の管理 | 開発中 | チャートによる変数化 | overlayによるパッチ |
+| エコシステム | 新興 | 成熟（Artifact Hub） | 成熟（kubectl内蔵） |
+| 可視化 | あり（グラフUI） | なし（標準では） | なし |
+
+重要な点は、Docker KanvasはComposeユーザーの「Kubernetesへの入口」として設計されているという点です。Helmチャートの高度な機能（フック、テスト、依存関係管理）を完全に置き換えるものではなく、Composeファイルという既存資産からKubernetesを出発点として使える状態にすることを目的としています。
+
+## 実務での活用シナリオ
+
+Docker Kanvasが特に力を発揮するのは次のケースです。
+
+**1. 小〜中規模アプリのKubernetes移行**
+
+複数サービスをDockerで運用していて、スケーラビリティの問題からKubernetesに移行したいが、Helmチャートを一から書く工数がない。そのようなチームにとって、Composeファイルをそのまま変換のベースラインとして使えることは大きな時間節約になります。
+
+**2. 開発チームへのKubernetes入門**
+
+生成されたマニフェストを確認することで、Composeの設定がKubernetesのどのリソースに対応するかを学べます。ツールを使いながらKubernetesの概念を習得できるという教育的な価値もあります。
+
+**3. プロトタイプのクラウド展開**
+
+PoC段階のアプリケーションを素早くKubernetes環境に展開したい場合、Kanvasでベースラインを生成してから手動で調整するアプローチは、Helmチャートをゼロから書くより現実的です。
+
+## 注意すべき限界
+
+実務導入前に把握しておくべき点があります。
+
+**自動生成はベースラインに過ぎない**
+
+生成されたマニフェストはそのまま本番利用できるものではありません。Resource Requests/Limits、Liveness/Readiness Probe、NetworkPolicy、RBAC設定など、本番運用に必要な設定は手動での追加が必要です。
+
+```yaml
+# 生成後に手動追加が必要な設定例
+spec:
+  containers:
+    - name: api
+      # Kanvasが生成するもの
+      image: myapp/api:latest
+      # 本番運用に必要な追加設定
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 3000
+        initialDelaySeconds: 30
+        periodSeconds: 10
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 3000
+        initialDelaySeconds: 5
+        periodSeconds: 5
+```
+
+**Secret管理は別途考慮が必要**
+
+ComposeファイルにベタがきされたパスワードはKubernetes Secretに変換されますが、Secretの管理方法（External Secrets Operator、Sealed Secrets、Vault連携など）は環境ごとに設計が必要です。
+
+**エコシステムの成熟度**
+
+HelmはArtifact Hubに大量のコミュニティチャートが存在し、PostgreSQL、Redis、Nginxなどのミドルウェアを一行のコマンドで展開できます。KanvasはComposeからの変換に特化しており、このエコシステムはまだ構築段階です。
+
+## KubeCon + CloudNativeCon Europe 2026
+
+タイミング的な補足として、2026年3月23日〜26日にアムステルダムでKubeCon + CloudNativeCon Europeが開催されます。Kubernetes関連の最新情報やDocker Kanvasの動向もこのイベントで詳しく扱われる見込みです。
+
+## まとめ
+
+Docker KanvasはComposeとKubernetesの間の移行コストを下げる実用的なアプローチです。HelmやKustomizeの完全な代替ではなく、Composeユーザーがスムーズにクラウドネイティブの世界に入るための橋渡し役として機能します。
+
+Composeで開発していてKubernetesへの移行を検討しているチームは、Kanvasをベースライン生成ツールとして試してみる価値があります。ただし、生成物を本番に適用するにはセキュリティ・可用性・リソース管理の観点でのレビューが必須です。
