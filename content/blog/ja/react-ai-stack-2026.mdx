@@ -1,0 +1,111 @@
+---
+title: "2026年のReact + AIスタック：AIが書きやすいフロントエンド構成"
+description: "Next.js、TypeScript、Tailwind CSS、shadcn/ui、TanStack Queryで構成されるReact AIスタック。AIとの相性を軸に、このスタックが標準化された理由を解説します。"
+date: "2026-03-23"
+status: "published"
+tags: ["React", "Next.js", "TypeScript", "shadcn/ui", "AI"]
+thumbnail: ""
+author: "webhani"
+slug: "react-ai-stack-2026"
+---
+
+2026年のフロントエンド開発において、React + AIスタックの標準的な構成が固まりつつあります。Next.js、TypeScript、Tailwind CSS、shadcn/ui、TanStack Query——この組み合わせが選ばれる理由は、開発者の好みだけでなく、AIとの相性の良さにもあります。
+
+## このスタックが「AI対応」である理由
+
+AIコーディングツールがコードを生成する際、一貫性と予測可能性が精度に直結します。このスタックは各ライブラリが役割を明確に分担しており、AIが判断に迷う余地を減らします。
+
+| レイヤー | ツール | 役割 |
+|---------|--------|------|
+| フレームワーク | Next.js 16 | ルーティング、SSR/SSG、APIルート |
+| 型システム | TypeScript | 型安全性、AIへの仕様提供 |
+| スタイリング | Tailwind CSS 4 | ユーティリティクラス、一貫したデザイン |
+| UIコンポーネント | shadcn/ui | コピー可能なコンポーネント、カスタマイズ可能 |
+| データフェッチ | TanStack Query | サーバー状態管理 |
+
+## Next.js 16のApp Routerを起点に
+
+```typescript
+// app/dashboard/page.tsx
+// Server Componentがデフォルト。クライアント処理が必要な箇所のみ分離する
+import { DashboardStats } from "@/components/dashboard/DashboardStats";
+import { RecentActivity } from "@/components/dashboard/RecentActivity";
+
+export default async function DashboardPage() {
+  // サーバーサイドでデータを取得
+  const stats = await fetchDashboardStats();
+
+  return (
+    <div className="space-y-6">
+      <DashboardStats stats={stats} />
+      {/* クライアントコンポーネントをServer Component内にネスト */}
+      <RecentActivity />
+    </div>
+  );
+}
+```
+
+App RouterのServer Componentを起点にすることで、AIが生成するコードのデフォルト動作がサーバーサイド実行になります。これにより、不要な`useState`や`useEffect`の使用を自然に減らせます——LLMが陥りがちなReactのミスのひとつです。
+
+## shadcn/ui：AIが読めるコンポーネント
+
+shadcn/uiはコンポーネントのソースコードをプロジェクトにコピーする仕組みを取っています。AIにとってこのアプローチは最適です——ブラックボックスのnpmパッケージを参照するのではなく、コードが手元にあるため、AIが直接読んで編集できます。
+
+```typescript
+// components/ui/button.tsx
+// このファイルはnode_modulesではなくプロジェクト内にある
+// AIが直接参照・理解・編集できる
+import { cn } from "@/lib/utils";
+import { ButtonHTMLAttributes, forwardRef } from "react";
+
+export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  variant?: "default" | "destructive" | "outline" | "ghost";
+  size?: "default" | "sm" | "lg";
+}
+
+export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
+  ({ className, variant = "default", size = "default", ...props }, ref) => {
+    return (
+      <button
+        ref={ref}
+        className={cn(buttonVariants({ variant, size }), className)}
+        {...props}
+      />
+    );
+  }
+);
+```
+
+AIがこのコンポーネントを拡張する場合、`@types/`の型宣言ファイルではなく実際のソースコードを扱えます。これが修正の精度に影響します。
+
+## TanStack QueryでサーバーStateを管理
+
+```typescript
+// hooks/useDashboardStats.ts
+import { useQuery } from "@tanstack/react-query";
+
+export function useDashboardStats() {
+  return useQuery({
+    queryKey: ["dashboard", "stats"],
+    queryFn: () =>
+      fetch("/api/dashboard/stats").then((res) => res.json()),
+    staleTime: 5 * 60 * 1000, // 5分間はキャッシュを使用
+  });
+}
+```
+
+TanStack QueryはサーバーStateの管理パターンを標準化します。AIがデータフェッチのコードを書く際、このパターンに乗ることでクライアントStateとサーバーStateを意図せず混在させるミスを防ぎます。
+
+## Vercelのreact-best-practices
+
+Vercelは2月に、React・Next.jsアプリケーションの最適化ルールを40件以上収録したオープンソースリポジトリ`react-best-practices`を公開しました。このルールセットはAIエージェントが消費しやすい形式で構造化されており、主な内容は以下の通りです。
+
+- Server ComponentとClient Componentの適切な使い分け
+- `next/image`による画像最適化の徹底
+- 不要な再レンダリングの防止
+
+AIコーディングツールがこのルールセットを参照することで、生成コードと本番品質のコードとのギャップを自動的に縮めることができます。
+
+## まとめ
+
+このスタックが強力なのは、各ツールが互いを補完し合い、かつAIが理解しやすい一貫したパターンを提供するためです。新規プロジェクトでスタックを選ぶ際は、「人間が使いやすいか」に加えて「AIが扱いやすいか」という視点を加えることが、2026年の現実的な判断基準です。
