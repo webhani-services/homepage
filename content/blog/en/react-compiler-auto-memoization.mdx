@@ -1,0 +1,154 @@
+---
+title: "React Compiler in 2026: Why useMemo and useCallback Are Becoming Legacy Code"
+description: "Six months after React Compiler v1.0 stabilized, manual memoization is increasingly unnecessary. Here's what changes in practice and how to adapt."
+date: "2026-03-25"
+status: "published"
+tags: ["React", "React Compiler", "Frontend", "Performance", "TypeScript"]
+thumbnail: ""
+author: "webhani"
+slug: "react-compiler-auto-memoization"
+---
+
+Six months have passed since React Compiler v1.0 shipped stable in October 2025. By early 2026, the developer community has largely confirmed what was promised: manually writing `useMemo`, `useCallback`, and `React.memo` is unnecessary for most components. That's a meaningful shift in how React code gets written and reviewed.
+
+## What the React Compiler Actually Does
+
+React Compiler is a build-time Babel plugin that statically analyzes component code and inserts memoization automatically. It understands React's rules — pure render functions, stable references, dependency tracking — and applies optimizations that previously required developer-written annotations.
+
+```tsx
+// What you write
+function ProductList({ products, onAddToCart }: Props) {
+  const filtered = products.filter(p => p.inStock);
+
+  return (
+    <ul>
+      {filtered.map(product => (
+        <ProductItem
+          key={product.id}
+          product={product}
+          onAdd={onAddToCart}
+        />
+      ))}
+    </ul>
+  );
+}
+
+// What the compiler handles at build time:
+// - Memoizes `filtered` when `products` hasn't changed
+// - Stabilizes the `onAddToCart` reference passed to children
+// - Skips re-rendering ProductItem when neither prop changed
+```
+
+No `useMemo`, no `useCallback`, no `React.memo` needed.
+
+## The Before/After in Practice
+
+Before the compiler, performant React code looked like this:
+
+```tsx
+// Pre-compiler style (circa 2024)
+function ProductList({ products, onAddToCart }: Props) {
+  const filtered = useMemo(
+    () => products.filter(p => p.inStock),
+    [products]
+  );
+
+  const handleAdd = useCallback(
+    (id: string) => onAddToCart(id),
+    [onAddToCart]
+  );
+
+  return (
+    <ul>
+      {filtered.map(product => (
+        <MemoizedProductItem
+          key={product.id}
+          product={product}
+          onAdd={handleAdd}
+        />
+      ))}
+    </ul>
+  );
+}
+```
+
+With the compiler, the same component drops the annotations entirely:
+
+```tsx
+// 2026 style — write the logic, let the compiler optimize
+function ProductList({ products, onAddToCart }: Props) {
+  const filtered = products.filter(p => p.inStock);
+
+  return (
+    <ul>
+      {filtered.map(product => (
+        <ProductItem
+          key={product.id}
+          product={product}
+          onAdd={onAddToCart}
+        />
+      ))}
+    </ul>
+  );
+}
+```
+
+Less code, fewer dependency array bugs (a historically common source of subtle React issues), easier to read and reason about.
+
+## What Still Needs Manual Attention
+
+The compiler doesn't eliminate all optimization concerns.
+
+**Side effects in computed values**: If a derived value involves a side effect — writing to an external store, triggering an analytics event — the compiler skips optimizing it for safety. Structure those cases explicitly.
+
+**Third-party library hooks**: Most major libraries (Zustand, Jotai, TanStack Query) have confirmed compiler compatibility. Older custom hooks in existing codebases may need review if you observe unexpected re-renders after enabling the compiler.
+
+**Profiling habit**: Don't stop measuring. The compiler handles a specific class of performance problems, but architectural issues — over-fetching data, deeply nested component trees, over-subscribing to state updates — remain your responsibility. Keep React DevTools Profiler in your toolkit.
+
+## Enabling the Compiler
+
+In Next.js 16, the compiler is on by default. For explicit configuration:
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next';
+
+const nextConfig: NextConfig = {
+  experimental: {
+    reactCompiler: true,
+  },
+};
+
+export default nextConfig;
+```
+
+For gradual rollout in existing projects, use annotation mode:
+
+```typescript
+// next.config.ts — opt-in per component
+const nextConfig: NextConfig = {
+  experimental: {
+    reactCompiler: {
+      compilationMode: 'annotation',
+    },
+  },
+};
+```
+
+Then add `"use memo"` at the top of individual components to enable optimization selectively. This lets you validate behavior on a component-by-component basis before going project-wide.
+
+```tsx
+"use memo";
+
+function MyComponent({ data }: Props) {
+  // Compiler optimizations applied here
+}
+```
+
+## The Practical Takeaway
+
+For new projects: write clean components without memoization annotations. Let the compiler handle it. Validate with React DevTools Profiler to confirm there are no regressions.
+
+For existing projects: don't rush to strip `useMemo` and `useCallback`. Enable annotation mode, validate a few components, build confidence, then decide on broader migration. Existing manual memoization doesn't break — it just becomes redundant.
+
+The biggest benefit isn't reduced line count. It's that new developers no longer need to learn when and why to reach for `useMemo` as a prerequisite for writing correct, performant React. The cognitive overhead drops, and component code stays focused on logic rather than optimization bookkeeping.
