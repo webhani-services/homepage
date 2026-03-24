@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import Script from "next/script";
+import { GoogleTagManager } from "@next/third-parties/google";
 import Navigation from "@/components/Navigation";
 import { Noto_Sans_JP, DM_Sans } from "next/font/google";
 import { NextIntlClientProvider } from "next-intl";
@@ -33,31 +33,10 @@ export default async function RootLayout({
   const messages = await getMessages();
   return (
     <html lang={locale}>
-      <head />
+      {process.env.NEXT_PUBLIC_GTM_ID && (
+        <GoogleTagManager gtmId={process.env.NEXT_PUBLIC_GTM_ID} />
+      )}
       <body className={`${noto.className} ${dmSans.variable}`}>
-        <Script
-          src="https://www.googletagmanager.com/gtag/js?id=G-M9E2FH8EK1"
-          strategy="afterInteractive"
-        />
-        <Script id="google-analytics" strategy="afterInteractive">
-          {`
-            window.dataLayer = window.dataLayer || [];
-            function gtag(){dataLayer.push(arguments);}
-            gtag('js', new Date());
-            gtag('config', 'G-M9E2FH8EK1');
-          `}
-        </Script>
-        {process.env.NEXT_PUBLIC_CLARITY_PROJECT_ID && (
-          <Script id="microsoft-clarity" strategy="afterInteractive">
-            {`
-              (function(c,l,a,r,i,t,y){
-                c[a]=c[a]||function(){(c[a].q=c[a].q||[]).push(arguments)};
-                t=l.createElement(r);t.async=1;t.src="https://www.clarity.ms/tag/"+i;
-                y=l.getElementsByTagName(r)[0];y.parentNode.insertBefore(t,y);
-              })(window, document, "clarity", "script", "${process.env.NEXT_PUBLIC_CLARITY_PROJECT_ID}");
-            `}
-          </Script>
-        )}
         <NextIntlClientProvider messages={messages}>
           <Navigation />
           <main>{children}</main>
