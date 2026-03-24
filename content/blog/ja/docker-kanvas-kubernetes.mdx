@@ -1,0 +1,95 @@
+---
+title: "Docker Kanvas: Docker Compose から Kubernetes への橋渡しツールが登場"
+description: "DockerがリリースしたKanvasは、Docker ComposeファイルをKubernetesマニフェストに自動変換する新プラットフォームです。HelmやKustomizeへの影響を分析します。"
+date: "2026-03-25"
+status: "published"
+tags: ["Docker", "Kubernetes", "DevOps", "Cloud", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-kubernetes"
+---
+
+Dockerが新しいプラットフォーム「Kanvas」をリリースしました。Kanvasはローカル開発環境（Docker Compose）とクラウドプロダクション環境（Kubernetes）の間にある溝を埋めることを目的としており、ComposeファイルをKubernetesのマニフェストに自動変換する機能が中心です。HelmやKustomizeといった既存のエコシステムに挑戦する存在として注目を集めています。
+
+## Kanvasが解決しようとしている問題
+
+多くのチームが経験している課題があります。ローカルでは`docker compose up`で問題なく動作するアプリケーションが、Kubernetesにデプロイしようとすると大量のYAMLを書く必要があり、そのギャップを埋めるコストが高い。
+
+従来の選択肢にはそれぞれ摩擦があります：
+
+- **Kompose**: Docker ComposeをKubernetesマニフェストに変換するOSSツール。シンプルだが出力品質が低く、本番利用前に手動での調整が必要。
+- **Helm**: テンプレート機能を持つKubernetesパッケージマネージャー。強力だが独自のDSLと学習コストが高い。
+- **Kustomize**: `kubectl`に組み込まれたオーバーレイ方式。小規模には適しているが、規模が大きくなると複雑化する。
+
+Kanvasはこれらとは異なるアプローチを取ります。ComposeファイルをSource of Truthとして維持しながら、そこからデプロイ可能なKubernetes構成への自動化されたパスを提供します。
+
+## 主な機能
+
+典型的なComposeファイルを例に取ります：
+
+```yaml
+# docker-compose.yml（既存のファイルをそのまま使用）
+services:
+  web:
+    image: my-app:latest
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://db:5432/myapp
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+volumes:
+  db-data:
+```
+
+KanvasはこのComposeファイルから以下のKubernetesリソースを自動生成します：
+
+- 各サービスに対する`Deployment`
+- ポート公開設定に応じた`Service`（ClusterIPまたはLoadBalancer）
+- 名前付きボリュームに対する`PersistentVolumeClaim`
+- 環境変数のための`ConfigMap`または`Secret`
+- 該当する場合は`Ingress`設定
+
+変換機能に加えて、生成されたマニフェストをビジュアルに確認・編集できるWebUIと、ローカル設定と本番設定の差分を管理する機能が提供されています。
+
+## HelmやKustomizeとの比較
+
+| 比較軸 | Kanvas | Helm | Kustomize |
+|--------|--------|------|-----------|
+| 学習コスト | 低 | 高 | 中 |
+| Composeとの親和性 | ◎ | △ | △ |
+| テンプレート柔軟性 | 中 | 高 | 中 |
+| GitOpsとの統合 | 対応予定 | 成熟 | 成熟 |
+| コミュニティ成熟度 | 初期 | 成熟 | 成熟 |
+
+Helmの強みはテンプレート機能と膨大なパブリックChartエコシステムです。Prometheus、PostgreSQLなどの共通インフラコンポーネントについては既存のHelmチャートが存在し、Kanvasはその領域では競合しません。
+
+KustomizeはBase設定に環境別のオーバーレイを適用する階層的な構成管理に強みがあります。`kubectl apply -k`に統合されており、チームが理解すれば有効です。
+
+Kanvasが競合するのは入口部分です。`docker-compose.yml`を持つチームが、新しい設定パラダイムを学ぶ前にKubernetesを開始できるようにすることが目標です。
+
+## Kanvasが適しているケース
+
+**ComposeからKubernetesへ初めて移行するチーム**: 機械的な変換を自動化することで、チームはYAML構文よりKubernetesのコンセプト理解に集中できます。
+
+**専任のプラットフォームエンジニアがいないアプリケーションチーム**: アプリケーション開発者が深いKubernetes専門知識なしにインフラ設定に参加できます。
+
+**Composeがローカル開発の標準であるプロジェクト**: ComposeをSource of Truthとして維持しながらKubernetesマニフェストを派生させることで、単一の信頼できる情報源を保てます。
+
+## HelmやKustomizeを維持すべきケース
+
+すでにHelmチャートやKustomize overlayを管理しているチームは、Kanvasへの移行コストがメリットを上回る可能性が高いです。Helmのテンプレート柔軟性はマルチテナント構成、複雑なロールアウト戦略、チーム間のチャート共有で重要になります。
+
+## webhaniとしての評価
+
+Kanvasはすべてのチームが乗り換えるべき「次世代標準」ではありません。ただし、Kubernetes初挑戦のチームやComposeワークフローを維持したいチームには明確なメリットがあります。
+
+重要な点は、Kanvasが生成するKubernetes YAMLは標準形式であるため、将来的にKanvasを使わなくなっても他のツールで管理できます。ベンダーロックインのリスクが低く、実験的な採用がしやすい設計です。
+
+新規プロジェクトやKubernetes初挑戦のプロジェクトでは、まず試してみる価値があります。ローカルのCompose環境を崩さずにKubernetesを学べる点は、チームのオンボーディングコストを下げる効果があります。
