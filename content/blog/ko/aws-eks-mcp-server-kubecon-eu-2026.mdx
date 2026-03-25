@@ -1,0 +1,130 @@
+---
+title: "KubeCon EU 2026: AWS EKS MCP Server로 AI Assistant가 Kubernetes를 자연어로 관리한다"
+description: "KubeCon EU 2026에서 AWS가 발표한 EKS MCP Server(Preview)를 분석합니다. AI Coding Assistant가 Kubernetes Cluster를 자연어로 조작하는 새로운 패러다임과 안전한 도입 방법을 소개합니다."
+date: "2026-03-26"
+status: "published"
+tags: ["Kubernetes", "AWS", "EKS", "MCP", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-eks-mcp-server-kubecon-eu-2026"
+---
+
+2026년 3월 23~26일 네덜란드 암스테르담에서 열린 KubeCon + CloudNativeCon Europe 2026에서 AWS는 두 가지 중요한 발표를 했습니다. EKS MCP Server(Preview)와 AWS DevOps Agent(Preview)로, AI Assistant가 Kubernetes Cluster를 자연어로 운영할 수 있는 환경을 제공합니다.
+
+## EKS MCP Server란
+
+MCP(Model Context Protocol)는 AI Assistant가 External Tool을 표준화된 방식으로 호출하기 위한 Protocol입니다. AWS의 EKS MCP Server는 이 Protocol을 Amazon EKS에 적용하여 Claude Code, GitHub Copilot 같은 AI Coding Assistant에서 Kubernetes Cluster 운영 작업을 직접 수행할 수 있게 합니다.
+
+기존 Kubernetes 트러블슈팅 워크플로우:
+
+```bash
+kubectl get pods -n production
+kubectl describe pod api-server-7f8b9d-xyz -n production
+kubectl logs api-server-7f8b9d-xyz -n production --tail=100 | grep -i error
+kubectl top pod -n production
+kubectl scale deployment api-server --replicas=5 -n production
+```
+
+EKS MCP Server 연결 후:
+
+```
+"production Namespace의 api-server에서 에러율이 높습니다.
+로그를 확인해서 원인을 파악하고 조치 방안을 제안해주세요."
+```
+
+AI Assistant가 MCP Tool을 반복적으로 호출하여 Pod 상태 확인, 로그 분석, 리소스 사용량 조회를 수행하고 진단 보고서를 제공합니다. Write 작업은 기본적으로 명시적인 확인을 요구합니다.
+
+## 시스템 구조
+
+```
+Claude Code / GitHub Copilot
+      ↓  MCP Protocol (JSON-RPC over HTTP/SSE)
+EKS MCP Server (AWS 관리형)
+      ↓  AWS SDK + kubectl
+Amazon EKS Cluster
+      ↓
+CloudWatch / CloudTrail / EKS Audit Log
+```
+
+EKS MCP Server는 AWS가 관리하는 서비스이므로 별도 Infrastructure를 유지할 필요가 없습니다. 인증은 IAM Role을 사용하고, Kubernetes 접근 권한은 표준 RBAC으로 제어합니다.
+
+MCP Server가 제공하는 Tool의 예:
+
+```json
+{
+  "name": "describe_pod",
+  "description": "특정 Pod의 상태와 이벤트 정보를 Kubernetes에서 조회",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "pod_name": { "type": "string" },
+      "namespace": { "type": "string", "default": "default" }
+    },
+    "required": ["pod_name"]
+  }
+}
+```
+
+## AWS DevOps Agent
+
+EKS MCP Server와 함께 발표된 AWS DevOps Agent는 Kubernetes 운영에 특화된 Multi-Step Agentic Reasoning을 제공합니다.
+
+"API Latency가 14:30 UTC부터 급증했다"는 지시에 대해:
+
+1. 해당 시간대의 CloudWatch Metrics 조회
+2. EKS Pod 이벤트와 HPA 활동 확인
+3. Node 리소스 상태 분석
+4. 원인 가설 종합
+5. 조치 방안 제안(선택적 자동 실행)
+
+CloudWatch 콘솔, EKS Dashboard, kubectl 간의 Context Switching 없이 단일 대화로 처리합니다.
+
+## 접근 제어 설계
+
+AI Assistant에게 Kubernetes 접근 권한을 부여할 때는 Read-only부터 시작해 단계적으로 확장하는 방식을 강력히 권장합니다.
+
+```yaml
+# EKS MCP Server용 최소 권한 ClusterRole — Read-only 기준선
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mcp-server-readonly
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints", "events", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+  # Scale, Delete 등 Write 작업은 명시적으로 포함하지 않음
+```
+
+Scale이나 Delete 같은 Write 작업은 AI Assistant UI의 확인 프롬프트나 CI/CD Pipeline의 Approval Step으로 게이팅해야 합니다. EKS MCP Server를 통한 모든 Kubernetes 작업은 권한 범위와 관계없이 CloudTrail과 Kubernetes Audit Log에 자동으로 기록됩니다.
+
+Write 권한을 부여하기 전에 비정상적인 운영 패턴(야간 대규모 스케일링, 평소와 다른 Namespace 접근 등)을 감지하는 CloudWatch 알람을 먼저 설정해두세요.
+
+## 단계별 도입 로드맵
+
+**Phase 1 — 개발 환경, Read-only**
+개발 Cluster에 EKS MCP Server를 연결하고 Read-only RBAC으로 AI Assistant의 진단 능력을 평가합니다. 실제 장애 시나리오로 정확도를 검증한 후 상위 환경으로 진행합니다.
+
+**Phase 2 — Staging 환경, 제한적 Write**
+Staging 환경에서 Scaling 권한 등 제한적인 Write 권한을 부여하고, AI Assistant의 조치 제안이 실제로 기대한 효과를 내는지 검증합니다.
+
+**Phase 3 — Production 환경, Human-in-the-loop**
+운영 환경에서는 모든 Write 작업에 명시적인 Human Approval을 필수로 설정합니다. AI Assistant는 조사와 가설 도출에 활용하고, 실행 결정은 담당자가 내리는 형태가 현실적입니다.
+
+## webhani의 평가
+
+Kubernetes 트러블슈팅은 kubectl 명령어에 대한 깊은 지식이 필요하며, 대부분의 팀에서 이를 능숙하게 다루는 인원이 제한적입니다. EKS MCP Server는 이 진입 장벽을 낮추는 데 실질적으로 기여할 수 있습니다. Kubernetes 지식의 필요성을 없애는 것이 아니라, 조사를 더 빠르게 만들고 더 많은 팀원이 접근할 수 있게 하는 것입니다.
+
+리스크는 적절한 권한 설계로 충분히 관리 가능합니다. 핵심 원칙은 AI가 시작한 Kubernetes 작업도 일반 Infrastructure 변경과 동일하게 취급하는 것입니다. 검토 기록을 남기고 RBAC으로 영향 범위를 제한하세요.
+
+이미 Claude Code나 GitHub Copilot을 사용하는 팀이라면 Preview 기간 중 EKS MCP Server를 연결해보는 것을 권장합니다. 표준 Workflow로 자리잡을 가능성이 높은 패턴에 미리 익숙해지는 기회입니다.
+
+## 정리
+
+AWS EKS MCP Server는 AI 통합 Platform Engineering을 향한 실용적인 첫걸음입니다. 완전 자율 Cluster 관리가 아니라 Kubernetes 전문 지식을 더 많은 사람이 활용할 수 있게 만드는 도구입니다. Read-only 기준선은 지금 바로 안전하게 시도할 수 있습니다. Write 권한은 그 평가에서 배운 것을 바탕으로 확장하세요.
