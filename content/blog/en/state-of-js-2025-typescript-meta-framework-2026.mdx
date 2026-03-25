@@ -1,0 +1,182 @@
+---
+title: "State of JavaScript 2025: TypeScript Is the Default, Meta-Frameworks Are the Standard"
+description: "The 2025 State of JavaScript survey confirms what many teams have observed: 40% of developers use TypeScript exclusively, Next.js leads at 59% adoption, and meta-frameworks have become the default entry point for web projects."
+date: "2026-03-26"
+status: "published"
+tags: ["TypeScript", "JavaScript", "Next.js", "Frontend", "Survey"]
+thumbnail: ""
+author: "webhani"
+slug: "state-of-js-2025-typescript-meta-framework-2026"
+---
+
+The 2025 State of JavaScript survey, reported by InfoQ in March 2026, puts numbers to trends that experienced developers have been observing for some time. The JavaScript ecosystem has stabilized around TypeScript and meta-frameworks. The remaining debates are at the margins.
+
+## TypeScript Has Won
+
+The headline finding: 40% of developers now use TypeScript exclusively. Another 46% mix TypeScript and JavaScript. Only 14% are JavaScript-only.
+
+Eighty-six percent of surveyed developers use TypeScript in some capacity. In 2026, the question is no longer "should we adopt TypeScript?"—it's "how strict is our TypeScript configuration?" For most teams, the answer should involve strict mode, disciplined type-only imports, and type checking in CI:
+
+```typescript
+// tsconfig.json — recommended baseline for new projects in 2026
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitReturns": true,
+    "target": "ES2024",
+    "moduleResolution": "bundler",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+```
+
+The `strict` flag should be on from day one. Enabling it retroactively on an established codebase is expensive—not because the changes are complex individually, but because there are usually many of them.
+
+Three factors behind TypeScript's dominance:
+
+**Editor support is mature**: The VSCode + TypeScript Language Server combination delivers high-quality type checking, autocomplete, and refactoring that was only partially available a few years ago.
+
+**Frameworks default to TypeScript**: Next.js, NestJS, and Remix all generate TypeScript projects by default. There's now less reason to choose JavaScript for a new project.
+
+**AI coding tools work better with types**: Type information improves the context quality that AI coding assistants use. Defined types let Claude Code and GitHub Copilot generate more accurate completions.
+
+## The Meta-Framework Default
+
+Next.js is used by 59% of respondents—the highest adoption of any framework category. The survey's structural observation is significant:
+
+> "In 2026, meta-frameworks like Next.js are the standard entry points for most professional web projects, handling routing, data fetching, caching, rendering strategies, and API layers, with the backend for many web apps now just a folder inside the frontend repository."
+
+Server Components and Server Actions have blurred the backend/frontend boundary to the point where small-to-medium applications don't need a separate backend service:
+
+```typescript
+// app/actions/order.ts — server-side logic living in the frontend repo
+"use server";
+
+import { db } from "@/lib/db";
+import { stripe } from "@/lib/stripe";
+import { revalidatePath } from "next/cache";
+
+export async function createOrder(
+  cartId: string,
+  paymentMethodId: string
+): Promise<{ success: boolean; orderId?: string }> {
+  const cart = await db.cart.findUnique({
+    where: { id: cartId },
+    include: { items: { include: { product: true } } },
+  });
+
+  if (!cart) throw new Error("Cart not found");
+
+  const total = cart.items.reduce(
+    (sum, item) => sum + item.quantity * item.product.price,
+    0
+  );
+
+  const paymentIntent = await stripe.paymentIntents.create({
+    amount: total,
+    currency: "jpy",
+    payment_method: paymentMethodId,
+    confirm: true,
+  });
+
+  const order = await db.order.create({
+    data: {
+      cartId,
+      total,
+      stripePaymentIntentId: paymentIntent.id,
+      status: "confirmed",
+    },
+  });
+
+  revalidatePath("/orders");
+  return { success: true, orderId: order.id };
+}
+```
+
+```typescript
+// app/checkout/page.tsx — UI calling the server action directly
+"use client";
+
+import { createOrder } from "@/actions/order";
+import { useRouter } from "next/navigation";
+
+export default function CheckoutPage({ cartId }: { cartId: string }) {
+  const router = useRouter();
+
+  const handleSubmit = async (paymentMethodId: string) => {
+    const result = await createOrder(cartId, paymentMethodId);
+    if (result.success) router.push(`/orders/${result.orderId}`);
+  };
+
+  return <CheckoutForm onSubmit={handleSubmit} />;
+}
+```
+
+The database call, Stripe API call, and cache invalidation all happen server-side. No separate API layer needed for this pattern.
+
+## What Developers Are Criticizing
+
+Next.js generated more survey comments than any other project—a sign of wide adoption and strong opinions. The central complaints:
+
+**Caching behavior complexity**: Next.js 13–15 automatic caching caused predictability issues that frustrated many teams. Routes cached by default, `fetch` was cached at the framework level, and the revalidation options were inconsistent across different contexts.
+
+Next.js 16 addresses this with explicit opt-in caching via `'use cache'`:
+
+```typescript
+// Next.js 16 — explicit, predictable caching
+import { unstable_cache as cache } from "next/cache";
+
+const getProducts = cache(
+  async (category: string) => {
+    return db.product.findMany({ where: { category } });
+  },
+  ["products"],
+  { revalidate: 3600, tags: ["products"] }
+);
+```
+
+**Vendor dependency concerns**: The tight integration between Next.js and Vercel's platform features creates coupling that matters for teams with self-hosted deployment requirements. This is a legitimate consideration—understand which features you depend on before committing to an architecture that relies on Vercel-specific behavior.
+
+## TypeScript 6.0
+
+TypeScript 6.0 RC is available in 2026, with improvements relevant to most teams:
+
+```typescript
+// Stricter type-only import enforcement
+import type { User, Post } from "@/types";
+
+// Improved const type parameter inference
+function createConfig<const T extends Record<string, unknown>>(config: T): T {
+  return config;
+}
+
+const config = createConfig({ mode: "production", retries: 3 });
+// config.mode inferred as "production", not string
+// config.retries inferred as 3, not number
+```
+
+The strictness improvements in 6.0 catch real bugs. Enable them progressively if upgrading an existing project.
+
+## Our Recommendations
+
+For teams starting projects in 2026:
+
+**TypeScript strict mode from the start.** Non-negotiable for anything beyond a prototype. The ergonomics are better than ever and the error-prevention value is high. If your team is debating this, the debate is already resolved by the industry.
+
+**Next.js App Router for most web projects.** The Server Component model is mature enough for production. Push `'use client'` boundaries as far down the component tree as possible. Use Server Actions for mutations instead of Route Handlers unless you're building a public API.
+
+**Understand your Vercel coupling.** Know which features in your architecture depend on Vercel-specific infrastructure. If self-hosted deployment is a possibility, test it early—not after you've built against platform-specific caching or image optimization behavior.
+
+Our current recommended stack:
+- **Language**: TypeScript (strict mode)
+- **Framework**: Next.js 16 (App Router)
+- **AI tools**: Claude Code + GitHub Copilot
+- **Testing**: Vitest + Playwright
+
+## Summary
+
+The 2025 State of JavaScript confirms that TypeScript and meta-frameworks are the baseline for professional web development. Forty percent exclusive TypeScript adoption and Next.js at 59% aren't just interesting statistics—they represent a settled consensus that reduces framework decision fatigue for teams. The ecosystem stabilization is net positive: more accumulated knowledge, more stable hiring, and more mature tooling across the board.

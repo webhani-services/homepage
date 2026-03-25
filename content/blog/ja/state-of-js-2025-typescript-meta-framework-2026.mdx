@@ -1,0 +1,168 @@
+---
+title: "State of JavaScript 2025：TypeScriptが事実上の標準言語になった現在地"
+description: "2025年のState of JavaScriptサーベイが示す開発者の現実。TypeScript専用使用が40%に達し、meta-frameworkがWebプロジェクトの標準エントリーポイントになった成熟したエコシステムを分析します。"
+date: "2026-03-26"
+status: "published"
+tags: ["TypeScript", "JavaScript", "Next.js", "Frontend", "Survey"]
+thumbnail: ""
+author: "webhani"
+slug: "state-of-js-2025-typescript-meta-framework-2026"
+---
+
+InfoQが2026年3月に報告した「State of JavaScript 2025」サーベイの結果は、JavaScriptエコシステムの成熟を数字で示しています。中でも注目すべきは、TypeScriptを「専用言語として使用」する開発者が40%に達したこと、そしてmeta-frameworkが大多数のWebプロジェクトの標準エントリーポイントとなっていることです。
+
+## 「TypeScriptが勝った」
+
+サーベイの最も印象的な結論：
+
+- TypeScriptを**専用言語として使用**: 40%
+- TypeScriptとJavaScriptを**混在使用**: 46%
+- JavaScriptのみ使用: 14%
+
+調査対象の開発者の86%が何らかの形でTypeScriptを使用しています。2026年において「TypeScriptを採用すべきか」という議論はすでに終わっています。現在の論点は「TypeScriptをどの程度厳格に使うか」です。
+
+新規プロジェクトの推奨TypeScript基本設定：
+
+```typescript
+// tsconfig.json — 2026年の新規プロジェクト基本設定
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitReturns": true,
+    "target": "ES2024",
+    "moduleResolution": "bundler",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+```
+
+`strict`モードはプロジェクト開始時点から必ず有効にしてください。既存のコードベースに後から適用すると修正コストが非常に大きくなります。
+
+このトレンドを支える要因：
+
+**エディタサポートの成熟**：VSCode + TypeScript Language Serverの組み合わせで、型チェック・Auto-complete・Refactoringが高水準で動作します。
+
+**FrameworkのデフォルトTypeScript化**：Next.js・NestJS・RemixはいずれもデフォルトでTypeScriptプロジェクトを生成します。新規プロジェクトでJavaScriptを選ぶ理由が減っています。
+
+**AI Coding Toolとの相性**：型情報はAI Coding AssistantのContext品質を向上させます。型定義があることで、ClaudeやGitHub CopilotはよりAccurateなコード補完を提供できます。
+
+## meta-framework標準化の時代
+
+Next.jsは回答者の59%が使用しており、最も高い採択率のFrameworkです。サーベイレポートの核心的な分析：
+
+> 「2026年において、Next.jsのようなmeta-frameworkはほとんどの専門的なWebプロジェクトの標準エントリーポイントになっている。Routing、Data Fetching、Caching、Rendering戦略、API Layerを処理し、多くのWebアプリにとってBackendはFrontend Repositoryの中の1フォルダになっている。」
+
+Server ComponentsとServer Actionsがフロントエンド/バックエンドの境界を曖昧にしたことで、小中規模プロジェクトは別途バックエンドサービスなしに単一のNext.js Repositoryで実装可能になりました：
+
+```typescript
+// app/actions/order.ts — Frontend Repositoryのサーバーサイドロジック
+"use server";
+
+import { db } from "@/lib/db";
+import { revalidatePath } from "next/cache";
+
+export async function createOrder(
+  cartId: string,
+  paymentMethodId: string
+): Promise<{ success: boolean; orderId?: string }> {
+  const cart = await db.cart.findUnique({
+    where: { id: cartId },
+    include: { items: { include: { product: true } } },
+  });
+
+  if (!cart) throw new Error("カートが見つかりません");
+
+  const total = cart.items.reduce(
+    (sum, item) => sum + item.quantity * item.product.price,
+    0
+  );
+
+  const order = await db.order.create({
+    data: { cartId, total, paymentMethodId, status: "confirmed" },
+  });
+
+  revalidatePath("/orders");
+  return { success: true, orderId: order.id };
+}
+```
+
+```typescript
+// app/checkout/page.tsx — Server ActionをUIから直接呼び出す
+"use client";
+
+import { createOrder } from "@/actions/order";
+import { useRouter } from "next/navigation";
+
+export default function CheckoutPage({ cartId }: { cartId: string }) {
+  const router = useRouter();
+
+  const handleSubmit = async (paymentMethodId: string) => {
+    const result = await createOrder(cartId, paymentMethodId);
+    if (result.success) router.push(`/orders/${result.orderId}`);
+  };
+
+  return <CheckoutForm onSubmit={handleSubmit} />;
+}
+```
+
+DBアクセス・決済処理・キャッシュ無効化がすべてサーバーサイドで処理されるため、このパターンでは別途API Layerは不要です。
+
+## Next.jsへの正直な批判
+
+サーベイでNext.jsは最も多くのコメントが寄せられたFrameworkでもあります。主な批判：
+
+**Caching挙動の複雑さ**：Next.js 13〜15における自動Cacheが予測しにくい挙動を引き起こすことが多くありました。Next.js 16は`'use cache'`指示子による明示的なOpt-in方式に切り替えています：
+
+```typescript
+// Next.js 16 — 明示的なCache設定
+import { unstable_cache as cache } from "next/cache";
+
+const getProducts = cache(
+  async (category: string) => {
+    return db.product.findMany({ where: { category } });
+  },
+  ["products"],
+  { revalidate: 3600, tags: ["products"] }
+);
+```
+
+**ベンダーロックの懸念**：Next.jsの一部機能がVercel Platform向けに最適化されており、セルフホスト環境との動作差異が生じる可能性があります。デプロイ環境の選択前に明確にしておくべきトレードオフです。
+
+## TypeScript 6.0の方向性
+
+2026年にはTypeScript 6.0 RCも利用可能です。主な改善：
+
+```typescript
+// より厳格なtype-only import
+import type { User, Post } from "@/types";
+
+// Const Type Parameterの改善 — より正確な型推論
+function createConfig<const T extends Record<string, unknown>>(config: T): T {
+  return config;
+}
+
+const config = createConfig({ mode: "production", retries: 3 });
+// config.modeはstringではなく"production"として推論される
+```
+
+## webhaniの推奨スタック
+
+2026年に新規プロジェクトを始めるチームへの推奨事項：
+
+1. **TypeScript strict modeは最初から** — 妥協なく。エラー防止効果が高く、エコシステムのサポートも成熟しています
+2. **ほとんどのWebプロジェクトはNext.js App Router** — Server Componentモデルは本番環境で十分に成熟しています。`'use client'`境界はComponentツリーの深い位置に押し込んでください
+3. **Vercel依存度を意識的に評価する** — どのVercel固有機能を使っているか把握し、セルフホストデプロイが要件かどうかを事前に確認してください
+
+現在webhaniが推奨するスタック：
+- **Language**: TypeScript（strict mode有効）
+- **Framework**: Next.js 16（App Router）
+- **AI Tool**: Claude Code + GitHub Copilot
+- **Testing**: Vitest + Playwright
+
+## まとめ
+
+State of JavaScript 2025が示すのは、JavaScriptエコシステムが実験期から成熟期に入ったということです。TypeScriptとmeta-frameworkは専門的なWeb開発のベースラインです。残る議論は周辺部にあります。どのmeta-frameworkを選ぶか、Vercel依存度をどの程度許容するか、型設定をどこまで厳格にするか。このエコシステムの安定化はチームの意思決定疲れを減らし、蓄積された知識を活用できる良いシグナルです。

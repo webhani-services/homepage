@@ -1,0 +1,138 @@
+---
+title: "KubeCon EU 2026：AWS EKS MCP ServerでKubernetesをAI Assistantから自然言語で操作する"
+description: "KubeCon EU 2026でAWSが発表したEKS MCP Server（Preview）を解説。AI Coding AssistantがKubernetesクラスターを自然言語で操作できる新しいアプローチとその注意点を紹介します。"
+date: "2026-03-26"
+status: "published"
+tags: ["Kubernetes", "AWS", "EKS", "MCP", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-eks-mcp-server-kubecon-eu-2026"
+---
+
+2026年3月23日〜26日、オランダ・アムステルダムで開催されているKubeCon + CloudNativeCon Europe 2026において、AWSはEKS MCP Server（Preview）とAWS DevOps Agent（Preview）を発表しました。AI Coding AssistantがKubernetesクラスターを自然言語で操作できる実践的なアプローチです。
+
+## MCP（Model Context Protocol）とKubernetesの組み合わせ
+
+MCPは、AI AssistantがExternal Toolを標準化されたインターフェースで呼び出すためのプロトコルです。AWSはこのプロトコルをAmazon EKSに対応させることで、Claude CodeやGitHub CopilotなどのAI Coding AssistantからKubernetesクラスターを直接操作できる環境を実現しました。
+
+従来のKubernetes Troubleshootingワークフロー：
+
+```bash
+# 手動でのkubectl操作
+kubectl get pods -n production
+kubectl describe pod api-server-7f8b9d-xyz -n production
+kubectl logs api-server-7f8b9d-xyz -n production --tail=100 | grep -i error
+kubectl top pod -n production
+kubectl scale deployment api-server --replicas=5 -n production
+```
+
+EKS MCP Server接続後のワークフロー：
+
+```
+# Claude Codeへの自然言語指示
+"productionネームスペースのapi-serverのPodでエラーレートが高くなっています。
+ログを確認して原因を特定し、必要であれば対処法を提案してください。"
+```
+
+AI AssistantがEKS MCP Serverを経由してMCP Toolを反復的に呼び出し、Pod状態確認・ログ分析・リソース使用量確認を行って診断レポートを生成します。
+
+## システムアーキテクチャ
+
+```
+Claude Code / GitHub Copilot
+      ↓  MCP Protocol（JSON-RPC over HTTP/SSE）
+EKS MCP Server（AWS管理型）
+      ↓  AWS SDK + kubectl
+Amazon EKS Cluster
+      ↓
+CloudWatch / CloudTrail / EKS Audit Log
+```
+
+EKS MCP ServerはAWSが管理するサービスのため、追加のInfrastructureを維持する必要はありません。認証はIAM Roleを使用し、Kubernetes側のアクセス制御は標準のRBACで行います。
+
+MCPサーバーが公開するToolの例：
+
+```json
+{
+  "name": "describe_pod",
+  "description": "指定PodのStatus・EventsをKubernetesから取得",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "pod_name": { "type": "string" },
+      "namespace": { "type": "string", "default": "default" }
+    },
+    "required": ["pod_name"]
+  }
+}
+```
+
+## AWS DevOps Agentとの連携
+
+EKS MCP Serverと同時発表されたAWS DevOps Agentは、Kubernetes運用に特化したMulti-Step Agentic Reasoningを提供します。
+
+「14:30 UTCからAPIレイテンシが急増した」という指示に対して：
+
+1. 当該時刻前後のCloudWatchメトリクスを照会
+2. EKS PodのEventsとHPA活動を確認
+3. Nodeのリソース状況を分析
+4. 根本原因の仮説を総合
+5. 対処手順を提案（任意で自動実行）
+
+これらをCloudWatchコンソール・EKS Dashboard・kubectlを行き来することなく、単一の対話で処理できます。
+
+## アクセス制御の設計
+
+AI AssistantにKubernetesのWrite権限を与える場合は、慎重な設計が必要です。まずはRead-only権限から始め、段階的に拡張することを強く推奨します。
+
+```yaml
+# EKS MCP Server用の最小権限ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mcp-server-readonly
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints", "events", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+  # Scale・Delete等のWrite操作は明示的に許可しない
+```
+
+Scale・Delete等のWrite操作は、AI AssistantのUI上での確認プロンプト、またはCI/CDシステムのApproval Workflowでゲートすることを推奨します。
+
+## 監査とトレーサビリティ
+
+EKS MCP Server経由のすべてのKubernetes操作は、CloudTrailとKubernetes Audit Logに自動記録されます。AI Assistantによる操作かどうかに関わらず、通常の変更管理と同等の審査証跡が残ります。
+
+異常な操作パターン（深夜の大規模スケールや、通常とは異なるNamespaceへのアクセス）を検知するCloudWatchアラートを事前に設定しておくことで、AI Assistantの操作リスクを管理できます。
+
+## 本番環境への適用ロードマップ
+
+実際の導入では、以下のステップアップを推奨します。
+
+**Phase 1（Development環境 / Read-only）**
+EKS MCP Serverを開発クラスターに接続し、Read-only権限でAI Assistantの診断能力を評価します。どのような問題をどの程度の精度で特定できるか、実際のIncidentシナリオで検証します。
+
+**Phase 2（Staging環境 / 限定Write）**
+Staging環境でScaling操作など限定的なWrite権限を付与し、AI Assistantの提案と実際の効果を検証します。
+
+**Phase 3（Production環境 / Human-in-the-loop）**
+本番環境ではWrite操作にHuman Approvalを必須とする運用から開始します。AI Assistantの診断を参考にしながら、最終判断は人間が行う形が現実的です。
+
+## webhaniの見解
+
+Kubernetes Troubleshootingはkubectlの深い知識が必要で、多くのチームでこれを能熟に扱える人材が限られています。EKS MCP ServerはこのKubernetesのアクセス障壁を下げる実質的な貢献をする可能性があります。
+
+一方、AI AgentがInfrastructureを直接操作するリスクも見過ごせません。EKS MCP Serverを試す価値は十分ありますが、適切なRBACスコーピングとHuman-in-the-loopフローを前提とした導入計画が不可欠です。
+
+すでにClaude CodeやGitHub Copilotを使用しているチームにとっては、Preview期間中の試用は低コストで高い学習価値があります。このワークフローパターンが標準化される前に早めに経験を積んでおくことが、将来的な競争優位につながります。
+
+## まとめ
+
+AWS EKS MCP ServerはKubernetes運用にAI Assistantを統合する実践的なファーストステップです。完全自律的なクラスター管理ではなく、Kubernetes専門知識をより多くのチームメンバーが活用しやすくするためのToolです。KubeCon EU 2026のPreviewを早めに評価して、本番リリース時にはすでに運用知見を持てる状態にしておくことを推奨します。

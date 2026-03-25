@@ -1,0 +1,126 @@
+---
+title: "KubeCon EU 2026: AWS EKS MCP Server Brings Natural Language to Kubernetes Operations"
+description: "At KubeCon EU 2026, AWS announced the EKS MCP Server in preview, enabling AI coding assistants to manage Kubernetes clusters through natural language. Here's what it means for platform teams."
+date: "2026-03-26"
+status: "published"
+tags: ["Kubernetes", "AWS", "EKS", "MCP", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-eks-mcp-server-kubecon-eu-2026"
+---
+
+At KubeCon + CloudNativeCon Europe 2026 in Amsterdam (March 23–26), AWS announced two tools that bring AI-assisted operations to Kubernetes: the EKS MCP Server (in preview) and the AWS DevOps Agent (in preview). Both represent a concrete direction for what AI-integrated platform engineering looks like in practice.
+
+## What the EKS MCP Server Does
+
+The Model Context Protocol (MCP) standardizes how AI assistants call external tools. AWS's EKS MCP Server implements this protocol for Amazon EKS, exposing Kubernetes cluster operations as MCP tools that AI coding assistants like Claude Code or GitHub Copilot can call directly.
+
+The shift in workflow is meaningful. Traditional Kubernetes troubleshooting:
+
+```bash
+kubectl get pods -n production
+kubectl describe pod api-server-7f8b9d-xyz -n production
+kubectl logs api-server-7f8b9d-xyz -n production --tail=100 | grep -i error
+kubectl top pod -n production
+kubectl scale deployment api-server --replicas=5 -n production
+```
+
+With EKS MCP Server connected to Claude Code:
+
+```
+"The api-server pods in production are showing high error rates.
+Investigate, identify the root cause, and recommend remediation."
+```
+
+The assistant calls MCP tools iteratively—listing pods, pulling logs, checking resource usage—and synthesizes a diagnosis. Write operations require explicit confirmation by default.
+
+## Architecture
+
+```
+Claude Code / GitHub Copilot
+      ↓  MCP Protocol (JSON-RPC over HTTP/SSE)
+EKS MCP Server (AWS-managed)
+      ↓  AWS SDK + kubectl
+Amazon EKS Cluster
+      ↓
+CloudWatch, CloudTrail, EKS Audit Log
+```
+
+The MCP server is managed by AWS—no infrastructure to maintain on your end. Authentication uses IAM roles, and Kubernetes access is controlled via standard RBAC. A minimal MCP tool definition from the server:
+
+```json
+{
+  "name": "describe_pod",
+  "description": "Get detailed status and events for a specific pod",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "pod_name": { "type": "string" },
+      "namespace": { "type": "string", "default": "default" }
+    },
+    "required": ["pod_name"]
+  }
+}
+```
+
+## AWS DevOps Agent
+
+Alongside the MCP server, the DevOps Agent applies multi-step agentic reasoning to Kubernetes operations. Given "our API latency spiked at 14:30 UTC," it:
+
+1. Queries CloudWatch metrics around the time window
+2. Cross-references EKS pod events and HPA activity
+3. Checks node resource conditions
+4. Synthesizes a root cause hypothesis
+5. Proposes remediation steps (with optional auto-execution)
+
+This closes the loop from observation to action in a single interaction, rather than requiring context-switching between CloudWatch, the EKS console, and kubectl.
+
+## Access Control
+
+Giving an AI assistant access to production Kubernetes requires a scoped approach. Start read-only and expand deliberately:
+
+```yaml
+# Minimal RBAC for EKS MCP Server — read-only baseline
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mcp-server-readonly
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints", "events", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+  # Write operations intentionally omitted
+```
+
+Scale and delete operations should be gated behind explicit human approval—either a confirmation prompt in the AI assistant's UI or an approval step in your CI/CD pipeline. All EKS MCP Server actions are logged to CloudTrail and Kubernetes audit logs regardless of permission scope.
+
+Set up CloudWatch alerts for anomalous operation patterns (unusual scaling events, access to namespaces outside normal scope) before enabling write permissions. This gives you a detection layer independent of the AI assistant's behavior.
+
+## Recommended Rollout Path
+
+**Phase 1 — Development cluster, read-only**
+Connect the EKS MCP Server to a dev cluster with read-only RBAC. Evaluate diagnostic accuracy against real incident scenarios before trusting it in higher environments.
+
+**Phase 2 — Staging, limited write**
+Grant scaling permissions in staging. Verify that the AI assistant's remediation suggestions produce the expected outcomes.
+
+**Phase 3 — Production, human-in-the-loop**
+In production, require explicit human approval for all write operations. Use the AI assistant for investigation and hypothesis generation; keep the execution decision with the operator.
+
+## Our Assessment
+
+Kubernetes troubleshooting is knowledge-intensive, and most teams have a small number of people who are proficient with kubectl under pressure. The EKS MCP Server can meaningfully lower that barrier—not by removing the need for Kubernetes knowledge, but by making investigation faster and accessible to more team members.
+
+The risks are manageable with proper scoping. The key operational principle: treat AI-initiated Kubernetes actions the same way you'd treat any infrastructure change—require a review trail and limit blast radius through RBAC.
+
+For teams already using Claude Code or GitHub Copilot, connecting to the EKS MCP Server during the preview period is low-effort and gives early exposure to a workflow pattern likely to become standard. Participating during preview also lets you influence the feature direction before production release.
+
+## Summary
+
+AWS EKS MCP Server is a practical step toward AI-integrated platform operations. It's not autonomous cluster management—it's a tool that makes Kubernetes expertise more accessible and troubleshooting faster. The read-only baseline is safe to try now; evaluate write permissions based on what you learn from that evaluation.
