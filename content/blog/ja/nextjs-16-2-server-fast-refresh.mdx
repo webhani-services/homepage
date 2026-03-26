@@ -1,0 +1,117 @@
+---
+title: "Next.js 16.2 の Server Fast Refresh: サーバーサイド HMR が変える開発体験"
+description: "Next.js 16.2 で導入された Server Fast Refresh の仕組みと、Turbopack の最新アップデートが開発ワークフローに与える影響を解説します。"
+date: "2026-03-27"
+status: "published"
+tags: ["Next.js", "Turbopack", "Server Components", "DX", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-2-server-fast-refresh"
+---
+
+Next.js 16.2 がリリースされました。派手な新機能より開発体験の改善に焦点を当てたリリースで、中でも注目すべきは **Server Fast Refresh** です。これはサーバーサイドコンポーネントに対して細粒度のホットリロードを実現する機能です。
+
+## Server Fast Refresh とは
+
+従来の Fast Refresh はクライアントコンポーネントに対して高速なホットリロードを提供していました。しかし Server Components を変更すると、フルページリロードや状態のリセットが発生するケースがありました。スクロール位置、フォーム入力値、フォーカス状態——これらがすべて初期化されるのは、頻繁に変更を加えるリファクタリング作業で特に煩わしく感じる点でした。
+
+Server Fast Refresh はこの問題を解決します。Server Components のコードを変更した際に、影響を受けるコンポーネントツリーの部分のみを再レンダリングし、ブラウザの状態を可能な限り維持します。
+
+```typescript
+// app/dashboard/page.tsx — Server Component
+// このファイルを変更しても、クライアントのスクロール位置や他のコンポーネント状態が維持される
+export default async function DashboardPage() {
+  const metrics = await fetchMetrics();
+  return (
+    <section>
+      <MetricsGrid data={metrics} />
+      <ActivityFeed /> {/* マウント状態を維持、スクロール位置も保持 */}
+    </section>
+  );
+}
+```
+
+Server Components 中心で開発しているチームには、リファクタリング作業の体感速度が改善する実質的なアップデートです。
+
+## Turbopack の主要アップデート
+
+16.2 の Turbopack アップデートには 200 以上の変更が含まれています。開発者に直接影響するポイントをまとめます。
+
+### Web Worker Origin の解決
+
+WASM ライブラリを使用するプロジェクトで問題になっていた Web Worker のオリジン問題が解決されました。WebAssembly モジュールを使っているプロジェクトで、これまで原因不明だったバグが解消される可能性があります。
+
+### Subresource Integrity (SRI) サポート
+
+CDN 経由で配信されるスクリプトの完全性検証が Turbopack レベルでサポートされました。コンテンツセキュリティポリシーが厳しいプロジェクトで有効です。
+
+### Dynamic Import のツリーシェイキング改善
+
+`import()` で動的に読み込まれるモジュールのうち、実際に使用されないコードがより積極的にバンドルから除外されるようになりました。大規模アプリケーションでのバンドルサイズ削減に効果的です。
+
+```typescript
+// 動的インポートの未使用コードがより積極的に除外される
+const { HeavyComponent } = await import('./HeavyComponent');
+// HeavyComponent の依存関係のうち、実際に使用されないものは
+// バンドルに含まれなくなる
+```
+
+## AI-Ready な create-next-app
+
+16.2 ではプロジェクト初期化ツールにも変更があります。`create-next-app` が AI 機能の統合を前提としたテンプレート選択をサポートしました。
+
+```bash
+npx create-next-app@latest my-app
+# AI 機能を含むテンプレートが選択肢として追加
+```
+
+新規プロジェクトで AI SDK を最初から組み込むことが当たり前になっているトレンドを反映した変更です。後付けで統合するのではなく、プロジェクト開始時点から AI 機能を考慮した構成にできます。
+
+## Browser Log Forwarding
+
+開発サーバー起動中のブラウザコンソールログがターミナルに転送されるようになりました。
+
+```
+[browser] TypeError: Cannot read properties of undefined
+[browser]   at ProductCard (components/ProductCard.tsx:23)
+```
+
+小さな変更ですが、クライアントサイドのエラーを追跡する際にブラウザ DevTools とターミナルを行き来する回数が減ります。エラーのコンテキストをより素早く把握できます。
+
+## 16.x での開発で押さえておきたいポイント
+
+16.2 を使う上で改めて確認しておきたい Next.js 16 の前提事項があります。
+
+**非同期 Request API**
+
+`cookies()`、`headers()`、`params`、`searchParams` はすべて非同期です。
+
+```typescript
+// ✅ Next.js 16.x の正しい書き方
+export default async function Page({
+  params,
+}: {
+  params: Promise<{ slug: string }>;
+}) {
+  const { slug } = await params;
+  const cookieStore = await cookies();
+  // ...
+}
+```
+
+**proxy.ts の配置**
+
+`middleware.ts` は `proxy.ts` に変更されています。Node.js ランタイムのみで動作し、配置場所は `app/` と同じ階層（`src/` 利用時は `src/` 直下）です。
+
+```
+src/
+├── proxy.ts    ← ここに配置（src/ 使用時）
+├── app/
+│   └── ...
+```
+
+## まとめ
+
+Next.js 16.2 は新機能の追加よりも、16.0 で導入されたパターンの開発体験を磨くリリースです。Server Fast Refresh はサーバーコンポーネント中心の開発を行うチームに特に恩恵が大きく、App Router のベストプラクティスを実践しているプロジェクトで体感差が出ます。
+
+Turbopack の継続的な改善と合わせて、フレームワークとしての信頼性が着実に高まっています。大規模プロジェクトへの Next.js 採用をためらわせていたビルドツールの不安定さが、着実に解消されてきています。
