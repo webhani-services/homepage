@@ -1,0 +1,140 @@
+---
+title: "Next.js 16.2: 400% Faster Dev Server and What It Means in Practice"
+description: "Next.js 16.2 ships with dramatically faster dev startup, Turbopack Server Fast Refresh, and AGENTS.md support. Here's what changed and how to make use of it."
+date: "2026-03-28"
+status: "published"
+tags: ["Next.js", "React", "Turbopack", "TypeScript", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-2-performance-features"
+---
+
+Next.js 16.2 landed on March 18, 2026, with a focused set of improvements that affect daily development work rather than introducing new abstractions. The headline numbers are hard to ignore — up to 400% faster `next dev` startup and roughly 50% faster rendering — but what matters is whether you'll actually feel the difference. The short answer: yes, especially on larger projects.
+
+## Dev Server Startup: Where the Speed Comes From
+
+The startup improvement comes from switching to lazy compilation for routes. Instead of parsing and bundling every route at startup, Next.js 16.2 defers compilation until a route is first accessed. The result is a much faster initial startup, with the trade-off that the first request to a cold route takes slightly longer to respond.
+
+```bash
+# 16.1 on a ~150-page project
+$ next dev
+▶ Next.js 16.1
+Starting... 24.1s
+
+# 16.2 on the same project
+$ next dev
+▶ Next.js 16.2
+Starting... 5.9s
+```
+
+For small projects the difference will be less dramatic, but teams working on large codebases will notice it immediately.
+
+## Rendering Speed: Streaming Gets Faster
+
+SSR rendering time improved by ~50%, primarily through better coordination between Next.js and React's streaming model. TTFB (Time to First Byte) drops across the board, with the most noticeable gains on pages that use multiple Suspense boundaries.
+
+```tsx
+// app/dashboard/page.tsx
+import { Suspense } from 'react'
+import { DashboardStats } from './stats'
+import { RecentActivity } from './activity'
+
+export default function Dashboard() {
+  return (
+    <div>
+      <Suspense fallback={<StatsSkeleton />}>
+        <DashboardStats />
+      </Suspense>
+      <Suspense fallback={<ActivitySkeleton />}>
+        <RecentActivity />
+      </Suspense>
+    </div>
+  )
+}
+```
+
+Layouts like this now send the initial HTML shell to the client faster, which improves perceived performance even before JavaScript executes.
+
+## Turbopack: Server Fast Refresh
+
+This is the most developer-experience-relevant addition. Turbopack now supports Fast Refresh for Server Components, not just Client Components. Previously, any change to a Server Component triggered a full page reload. Now, only the affected component re-renders.
+
+```tsx
+// app/components/ServerWidget.tsx
+// Server Component — changes now hot-reload without full page refresh
+export async function ServerWidget() {
+  const data = await fetchData()
+  return <div className="widget">{data.value}</div>
+}
+```
+
+There are still edge cases where a full reload occurs — deeply nested state dependencies in particular — but for most day-to-day editing, the improvement is tangible. Iteration cycles that previously required waiting for a full reload now feel much closer to editing a Client Component.
+
+## AGENTS.md Support in create-next-app
+
+New projects created with `create-next-app` now include an `AGENTS.md` file. This file is read by AI coding tools (Claude Code, Cursor, Codex, etc.) to understand project conventions before generating code.
+
+```markdown
+# AGENTS.md
+
+## Project Overview
+Next.js 16.2 app using App Router.
+
+## Conventions
+- Default to Server Components; use 'use client' only when needed
+- All request APIs (cookies, headers, params) must be awaited
+- Mutations go in Server Actions, not Route Handlers
+
+## Directory Structure
+- `app/` — routing and layouts
+- `components/` — shared UI
+- `lib/` — utilities and data access
+```
+
+If you're already maintaining a `CLAUDE.md` or `.cursorrules` file, review how it overlaps with `AGENTS.md`. Keeping them in sync avoids conflicting instructions being sent to different tools.
+
+## Next.js Across Platforms
+
+On March 25, Vercel announced a formal commitment to cross-platform Next.js support. The plan includes a stable Adapter API, a shared test suite, and closer collaboration with projects like OpenNext that enable deployment to AWS Lambda, Cloudflare Workers, and other edge runtimes.
+
+This is a meaningful change in stance. Previously, non-Vercel deployments were community-supported at best. The new Adapter API gives infrastructure teams a stable interface to build on, rather than working around undocumented internals.
+
+## What to Check Before Upgrading
+
+**Async request APIs**: Still required from 16.0. If you haven't migrated all `cookies()`, `headers()`, and `params` calls to awaited versions, do it before upgrading.
+
+```ts
+// Required in 16.x
+import { cookies } from 'next/headers'
+
+export async function GET() {
+  const cookieStore = await cookies()
+  const token = cookieStore.get('token')
+  // ...
+}
+```
+
+**Turbopack config location**: Stays at the top level of `next.config.ts`. The `experimental.turbopack` path is deprecated.
+
+```ts
+// next.config.ts
+import type { NextConfig } from 'next'
+
+const config: NextConfig = {
+  turbopack: {
+    resolveAlias: {
+      '@': './src',
+    },
+  },
+}
+
+export default config
+```
+
+**Type strictness**: 16.2 tightens some type checks. Run `tsc --noEmit` after upgrading to catch anything that slipped through before.
+
+## Takeaway
+
+Next.js 16.2 is a quality-of-life release. The speed improvements are real and immediately noticeable on larger projects. Turbopack Server Fast Refresh removes one of the more annoying friction points in day-to-day development. AGENTS.md and the cross-platform commitment are lower-profile additions that signal the direction: tighter AI tooling integration and broader runtime support.
+
+Upgrading is straightforward for projects already on 16.x. Check async API usage and Turbopack config placement, run your type checks, and you're likely done.
