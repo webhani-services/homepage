@@ -1,0 +1,175 @@
+---
+title: "Kubernetes 1.35 と Cloud Native 開発の現在地: KubeCon Europe 2026 から"
+description: "KubeCon Europe 2026 での発表を中心に、Kubernetes 1.35 の DRA ベータ昇格、Cloud Native 開発者数 1990 万人という現状、Docker の AI 統合方針を整理します。"
+date: "2026-03-28"
+status: "published"
+tags: ["Kubernetes", "Cloud Native", "Docker", "DevOps", "インフラ"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-35-cloud-native-2026"
+---
+
+KubeCon + CloudNativeCon Europe 2026 が開催され、CNCF と SlashData の Q1 2026 State of Cloud Native Development レポートが公開されました。グローバルな Cloud Native 開発者数は 1,990 万人に達しており、Kubernetes の本番利用率は 80% を超えています。このポストでは、今回の KubeCon の主要発表と Kubernetes 1.35 の変更点を整理します。
+
+## Cloud Native 開発者数 1,990 万人が意味すること
+
+CNCF の調査によれば、Kubernetes を「使用中、パイロット中、または評価中」の企業は 93% に上り、そのうち 80% が本番環境で運用しています。2年前と比べると、Kubernetes はもはや「先進的な選択肢」ではなく「業界標準インフラ」の位置づけになっています。
+
+この変化が実務に与える影響は大きく、Kubernetes の知識は特定のクラウドネイティブチームだけでなく、バックエンドエンジニア全般に求められるスキルになりつつあります。また、エコシステムの成熟に伴い、運用の複雑さを隠蔽する抽象化レイヤーも整備されてきています。
+
+## Kubernetes 1.35: DRA がベータに昇格
+
+Kubernetes 1.35 の注目変更は、Dynamic Resource Allocation (DRA) の Binding Conditions がベータに昇格したことです。
+
+DRA は GPU や FPGA などの特殊なハードウェアリソースを、従来の静的な割り当てではなく動的にポッドへ割り当てるための仕組みです。AI/ML ワークロードでは GPU の利用が前提となることが多く、この機能の安定化はインフラ構築の選択肢を広げます。
+
+```yaml
+# DRA を使った GPU リソースの動的割り当て例
+apiVersion: resource.k8s.io/v1alpha3
+kind: ResourceClaim
+metadata:
+  name: gpu-resource
+spec:
+  devices:
+    requests:
+    - name: gpu
+      deviceClassName: nvidia-gpu
+      selectors:
+      - cel:
+          expression: device.attributes["memory"].isGreaterThan(quantity("16Gi"))
+```
+
+従来の `resources.limits` で GPU を指定する方法と比べて、DRA ではより柔軟な条件指定とリソースの共有が可能になります。AI 推論サービスや機械学習パイプラインを Kubernetes 上で運用する場合、この変更は実際のリソース効率に影響します。
+
+## Docker の 2026 年ロードマップ: 3つの軸
+
+Docker は 2026 年の方針として以下の 3 つを軸に据えています。
+
+**1. AI ネイティブな開発環境**
+
+Docker Desktop への AI 機能の統合が進んでいます。コンテナ設定の自動生成、Dockerfile の最適化提案、セキュリティスキャン結果の解釈補助などが対象です。
+
+```dockerfile
+# Docker が提案する最適化の例（概念図）
+# Before: 非効率なレイヤー構成
+FROM node:24
+COPY . .
+RUN npm install
+RUN npm run build
+
+# After: キャッシュ効率を考慮した構成
+FROM node:24-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+
+FROM node:24-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build
+
+FROM node:24-alpine AS runner
+WORKDIR /app
+COPY --from=builder /app/.next ./.next
+COPY --from=deps /app/node_modules ./node_modules
+EXPOSE 3000
+CMD ["npm", "start"]
+```
+
+**2. Security by Design**
+
+イメージのビルド時点からセキュリティを組み込む方針です。既知の脆弱性を含むベースイメージを使用している場合の警告、最小権限原則に基づく設定の推奨などが強化されます。
+
+**3. WebAssembly (Wasm) との統合**
+
+軽量なワークロードや高セキュリティが必要な処理に対して、Linux コンテナの代替として Wasm の活用が進んでいます。コンテナよりも起動が速く、サンドボックスが強固な点が特長で、エッジコンピューティングでの用途が広がっています。
+
+## Mirantis の k0rdent と AI インフラ統合
+
+KubeCon では Mirantis が k0rdent の AI パートナーエコシステム拡張を発表しました。NVIDIA NCX Infra Controller のサポートが含まれており、AI インフラを Kubernetes クラスタに統合するパターンが整備されつつあります。
+
+```yaml
+# AI ワークロード向け Namespace の設定例
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-workloads
+  labels:
+    nvidia.com/gpu.present: "true"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: gpu-limit-range
+  namespace: ml-workloads
+spec:
+  limits:
+  - type: Container
+    default:
+      nvidia.com/gpu: "1"
+    max:
+      nvidia.com/gpu: "4"
+```
+
+AI ワークロードの需要増加に伴い、Kubernetes 上での GPU スケジューリングと資源効率の最適化は今後も重要なテーマです。
+
+## Serverless Containers と管理の抽象化
+
+2026 年の Kubernetes 運用トレンドとして、インフラの複雑さを隠蔽した「Serverless Containers」モデルへの移行が加速しています。AWS Fargate、Google Cloud Run、Azure Container Apps などが代表例で、Kubernetes のコントロールプレーンを意識せずにコンテナを実行できます。
+
+選択基準の目安：
+
+| ユースケース | 推奨 |
+|-----------|------|
+| 細かい制御が必要、大規模クラスタ | 直接 Kubernetes |
+| チームに K8s 専門家がいない | マネージドサービス (GKE, EKS, AKS) |
+| インフラ管理を最小化したい | Serverless Containers |
+| 複雑な依存関係のある AI/ML パイプライン | Kubernetes + DRA |
+
+## YAML を超えた Kubernetes 設定管理
+
+Pulumi などのツールが推進する「コードによる Kubernetes 管理」が実用段階に入っています。YAML の限界（ループなし、条件分岐なし、型なし）を TypeScript や Python で補う方法です。
+
+```typescript
+// Pulumi で Kubernetes リソースを定義する例
+import * as k8s from "@pulumi/kubernetes"
+
+const appLabels = { app: "api-service" }
+
+const deployment = new k8s.apps.v1.Deployment("api-service", {
+  spec: {
+    replicas: 3,
+    selector: { matchLabels: appLabels },
+    template: {
+      metadata: { labels: appLabels },
+      spec: {
+        containers: [{
+          name: "api",
+          image: "myapp/api:1.2.0",
+          resources: {
+            requests: { cpu: "100m", memory: "128Mi" },
+            limits: { cpu: "500m", memory: "512Mi" },
+          },
+        }],
+      },
+    },
+  },
+})
+```
+
+この方法では既存のプログラミング言語の機能（ループ、条件分岐、モジュール化）を活用でき、大規模な設定管理が YAML 単体よりはるかにスケールします。
+
+## AIOps と FinOps の融合
+
+クラウドコストの最適化に AI を使う「AIOps-driven FinOps」が注目されています。コンテナリソースの実際の使用パターンを分析し、`requests` と `limits` の設定を継続的に最適化するアプローチです。
+
+過剰なリソース予約はコスト増加に直結します。AI モデルが使用パターンを学習し、適切なリソース設定を提案することで、クラスタ全体のコスト効率を上げる取り組みが実用化されつつあります。
+
+## まとめ
+
+Kubernetes 1.35 の DRA ベータ昇格は、AI/ML ワークロードをクラスタ上で効率的に扱うための基盤として重要なステップです。Cloud Native 開発者数 1,990 万人という数字は、Kubernetes が一部専門家のツールから業界標準になったことを示しています。
+
+Docker の AI 統合と Wasm への注力は、コンテナエコシステムが単なるパッケージング手段から開発全体を支えるプラットフォームへ進化しているという方向性を示しています。
+
+実務でのポイントは、Kubernetes の抽象化レイヤー（マネージドサービスや Serverless Containers）を積極的に使いつつ、GPU スケジューリングのような専門的なユースケースには DRA などの新機能を適用していくことです。

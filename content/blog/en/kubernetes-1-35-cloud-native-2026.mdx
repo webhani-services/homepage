@@ -1,0 +1,165 @@
+---
+title: "Kubernetes 1.35 and the State of Cloud Native in 2026"
+description: "KubeCon Europe 2026 highlighted 19.9M cloud native developers, Kubernetes 1.35's DRA graduation to beta, and Docker's AI-native roadmap. Here's what it means for infrastructure teams."
+date: "2026-03-28"
+status: "published"
+tags: ["Kubernetes", "Cloud Native", "Docker", "DevOps", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-35-cloud-native-2026"
+---
+
+KubeCon + CloudNativeCon Europe 2026 wrapped up with CNCF's Q1 2026 State of Cloud Native Development report estimating the global cloud native developer population at 19.9 million. 93% of surveyed companies are using, piloting, or evaluating Kubernetes, with 80% running it in production. These numbers tell a simple story: Kubernetes has become default infrastructure, not a cutting-edge choice.
+
+This post covers the key technical developments from KubeCon: Kubernetes 1.35's Dynamic Resource Allocation graduating to beta, Docker's 2026 roadmap, and what the AI-native infrastructure trend means in practice.
+
+## Kubernetes 1.35: DRA Binding Conditions Go Beta
+
+The most technically significant change in Kubernetes 1.35 is Dynamic Resource Allocation (DRA) binding conditions graduating from alpha to beta. DRA enables flexible, dynamic assignment of hardware resources — primarily GPUs and FPGAs — to pods, replacing the older static approach.
+
+For teams running AI/ML workloads on Kubernetes, this matters. The existing `resources.limits` approach for GPU allocation is rigid: a GPU is either allocated to a pod or it isn't. DRA introduces structured requests with conditions:
+
+```yaml
+apiVersion: resource.k8s.io/v1alpha3
+kind: ResourceClaim
+metadata:
+  name: gpu-resource
+spec:
+  devices:
+    requests:
+    - name: gpu
+      deviceClassName: nvidia-gpu
+      selectors:
+      - cel:
+          expression: device.attributes["memory"].isGreaterThan(quantity("16Gi"))
+```
+
+This allows workloads to express requirements like "any GPU with more than 16GB of memory" rather than requesting a specific device. The scheduler can then match available hardware dynamically. For inference services that need to share GPUs across multiple pods, or training pipelines with variable resource needs, this is a meaningful improvement.
+
+```yaml
+# Namespace configuration for ML workloads with GPU access
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-workloads
+  labels:
+    nvidia.com/gpu.present: "true"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: gpu-limits
+  namespace: ml-workloads
+spec:
+  limits:
+  - type: Container
+    default:
+      nvidia.com/gpu: "1"
+    max:
+      nvidia.com/gpu: "4"
+```
+
+The beta graduation means DRA is stable enough for production testing, though teams should still plan for potential API changes before GA.
+
+## Docker's 2026 Roadmap: Three Focus Areas
+
+Docker's stated roadmap for 2026 centers on AI-native development, security by design, and WebAssembly integration.
+
+**AI-native development** means embedding AI assistance directly into Docker Desktop workflows — Dockerfile optimization suggestions, security scan interpretation, and configuration generation. The practical implication is that container configuration, already simplified by Docker Compose, will become easier for teams without deep Docker expertise.
+
+Multi-stage builds are a good example of where AI-assisted Dockerfile optimization helps:
+
+```dockerfile
+# Optimized multi-stage build
+FROM node:24-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+
+FROM node:24-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build
+
+FROM node:24-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=builder /app/.next ./.next
+COPY --from=deps /app/node_modules ./node_modules
+EXPOSE 3000
+CMD ["npm", "start"]
+```
+
+**Security by design** focuses on shifting vulnerability detection to build time — warnings when base images contain known CVEs, and recommendations based on least-privilege principles.
+
+**WebAssembly (Wasm)** integration positions Wasm as a complement to Linux containers for lightweight, security-sensitive workloads. Wasm modules start faster than containers and run in a stronger sandbox, making them suitable for edge compute scenarios where startup latency and isolation matter.
+
+## Serverless Containers and Abstracting Kubernetes Complexity
+
+A recurring theme at KubeCon was the continued move toward managed control planes that hide Kubernetes' operational complexity. "Serverless Containers" — AWS Fargate, Google Cloud Run, Azure Container Apps — let teams deploy containers without managing cluster nodes, control planes, or etcd.
+
+The tradeoff is straightforward:
+
+| Scenario | Recommendation |
+|----------|---------------|
+| Fine-grained control, large-scale clusters | Direct Kubernetes |
+| No dedicated Kubernetes expertise | Managed service (GKE, EKS, AKS) |
+| Minimize infrastructure management | Serverless containers |
+| Complex AI/ML pipelines requiring GPU scheduling | Kubernetes + DRA |
+
+For most web application workloads, a managed Kubernetes service or serverless containers is the better default. Direct cluster management makes sense when you need DRA-level GPU control, specific network policies, or are operating at a scale where managed services become cost-prohibitive.
+
+## Beyond YAML: Infrastructure as Code
+
+Pulumi and similar tools that bring Kubernetes configuration into general-purpose programming languages are seeing increased adoption. The core issue with YAML-based configuration is well-known: no loops, no conditionals, no types, and no reuse beyond copy-paste.
+
+```typescript
+// Pulumi: Kubernetes deployment with TypeScript
+import * as k8s from "@pulumi/kubernetes"
+
+const appLabels = { app: "api-service" }
+
+const deployment = new k8s.apps.v1.Deployment("api-service", {
+  spec: {
+    replicas: 3,
+    selector: { matchLabels: appLabels },
+    template: {
+      metadata: { labels: appLabels },
+      spec: {
+        containers: [{
+          name: "api",
+          image: "myapp/api:1.2.0",
+          resources: {
+            requests: { cpu: "100m", memory: "128Mi" },
+            limits: { cpu: "500m", memory: "512Mi" },
+          },
+          readinessProbe: {
+            httpGet: { path: "/health", port: 3000 },
+            initialDelaySeconds: 10,
+            periodSeconds: 5,
+          },
+        }],
+      },
+    },
+  },
+})
+```
+
+This isn't replacing Helm for most teams, but it's a practical option for complex configurations where YAML's limitations create maintenance problems.
+
+## AIOps-Driven FinOps
+
+Cloud cost optimization is getting an AI layer. As Kubernetes clusters grow and AI workloads increase resource consumption, the gap between provisioned resources and actual usage widens. AIOps tools analyze real usage patterns and recommend — or automatically adjust — resource `requests` and `limits`.
+
+The problem they're solving is straightforward: teams tend to over-provision out of caution. A container with a memory limit of 512Mi that consistently uses 180Mi is wasting reserved capacity across potentially hundreds of replicas. Automated right-sizing based on observed patterns can materially reduce cluster costs without sacrificing reliability.
+
+## Practical Takeaways
+
+**For teams starting new infrastructure projects**: Use a managed Kubernetes service (GKE, EKS, AKS) rather than self-managed clusters unless you have specific reasons not to. The operational overhead of managing control planes is rarely justified for most application workloads.
+
+**For teams with AI/ML workloads**: Watch the Kubernetes 1.35 DRA beta closely. If you're currently working around GPU allocation limitations with static configurations, DRA offers a cleaner path — start testing now while it's beta.
+
+**For teams evaluating Docker's roadmap**: The AI-assisted Dockerfile optimization features are likely to be most useful for onboarding new team members to container best practices. Security-by-design scanning is worth prioritizing regardless — catching CVEs at build time rather than in production is always better.
+
+Cloud native infrastructure is maturing. The frontier is no longer "should we use Kubernetes" but "how do we run GPU-accelerated AI workloads efficiently while keeping costs under control." That's a more concrete problem, and the tools are catching up to it.
