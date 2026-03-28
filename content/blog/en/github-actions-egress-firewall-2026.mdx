@@ -1,0 +1,121 @@
+---
+title: "GitHub Actions Egress Firewall: Network-Level Protection for CI/CD Pipelines"
+description: "GitHub's 2026 security roadmap introduces a Layer 7 egress firewall operating outside the runner VM. Here's what it changes, and what to do while waiting for GA."
+date: "2026-03-29"
+status: "published"
+tags: ["GitHub Actions", "CI/CD Security", "DevSecOps", "Supply Chain", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-egress-firewall-2026"
+---
+
+CI/CD pipelines have become a primary target for supply chain attacks. In the first quarter of 2026 alone, incidents involving tj-actions/changed-files, trivy-action, and a string of malicious Rust crates demonstrated a consistent attack pattern: gain code execution inside a CI runner, then exfiltrate secrets to an external server.
+
+GitHub published its 2026 Actions security roadmap in response. The headline capability is a **native egress firewall** operating at Layer 7, outside the runner VM.
+
+## Why Outside the VM Matters
+
+Most existing egress control solutions (including popular options like `harden-runner`) run *inside* the runner. That means an attacker who achieves root access inside the VM can disable them.
+
+GitHub's firewall is placed at the network infrastructure level — between the runner and the internet. Root access inside the VM doesn't help an attacker bypass it.
+
+```
+┌─────────────────────────────────┐
+│  GitHub Actions Runner (VM)     │
+│  └── build script               │
+│      └── attempts outbound call │
+└─────────────────────────────────┘
+           ↓ traffic exits VM
+┌─────────────────────────────────┐
+│  Egress Firewall (Layer 7)      │  ← outside VM, immutable
+│  ├── ALLOW: api.github.com      │
+│  ├── ALLOW: registry.npmjs.org  │
+│  └── DENY:  everything else     │
+└─────────────────────────────────┘
+```
+
+## How Policy Configuration Works
+
+The egress policy is defined per-job in workflow files:
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    egress-policy: block
+
+    allowed-endpoints:
+      - api.github.com:443
+      - registry.npmjs.org:443
+      - objects.githubusercontent.com:443
+
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm test
+```
+
+GitHub recommends starting with `audit` mode: the firewall logs all outbound connections without blocking, allowing teams to observe real traffic and build accurate allowlists. Once the allowlist is validated, switch to `block`.
+
+Organizations can also define centralized policies enforced across all repositories, reducing the configuration burden on individual teams.
+
+## The Actions Data Stream
+
+Also in the roadmap: **Actions Data Stream**, which delivers near real-time execution telemetry to Amazon S3 or Azure Event Hub. Future capabilities include process-level visibility and file system monitoring.
+
+This brings CI/CD observability in line with production systems — you can route CI telemetry into the same SIEM or observability platform you use for your application infrastructure.
+
+## What to Do Right Now
+
+The firewall enters public preview in the next 3-6 months, with GA at 6-9 months. In the meantime:
+
+**Pin Actions to specific SHAs**
+
+```yaml
+# Specify exact commit SHA, not a version tag
+- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+# Tags can be moved by an attacker who compromises the action repo
+# SHAs cannot
+```
+
+**Minimize GITHUB_TOKEN permissions**
+
+```yaml
+# Top of workflow file
+permissions:
+  contents: read        # minimum for checkout
+  pull-requests: write  # only if needed
+
+# Avoid leaving permissions unset — default is broad
+```
+
+**Be careful with `pull_request_target`**
+
+This trigger runs in the context of the base branch and has access to secrets. If it checks out code from a fork and executes it, an attacker can access your secrets through a PR. Audit your workflows for this pattern.
+
+**Use harden-runner as an interim measure**
+
+```yaml
+- uses: step-security/harden-runner@v2
+  with:
+    egress-policy: audit
+```
+
+It runs inside the VM (less hardened than GitHub's native solution) but provides meaningful visibility until the native firewall is available.
+
+## Background: Recent CI/CD Incidents
+
+The three incidents that shaped this roadmap:
+
+1. **tj-actions/changed-files** — A widely-used action was compromised; attackers exfiltrated CI secrets from thousands of repositories that referenced a mutable tag.
+
+2. **Kubernetes-el Emacs package** — Exploited a `pull_request_target` misconfiguration to steal the `GITHUB_TOKEN` and inject destructive code.
+
+3. **Malicious Rust crates** — Five crates published between February and March 2026 contained code to collect `.env` files and send them to attacker-controlled infrastructure. Developer machines and CI environments were both targeted.
+
+## Summary
+
+The egress firewall addresses the root cause of these attacks: unrestricted outbound network access from CI runners. Once GA, teams can define exactly what their build pipeline is allowed to communicate with — and block everything else at the infrastructure level.
+
+Until then: pin your action SHAs, scope your tokens tightly, and audit any use of `pull_request_target`. These three changes eliminate the most common attack vectors with minimal effort.

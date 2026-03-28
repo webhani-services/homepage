@@ -1,0 +1,113 @@
+---
+title: "GitHub Actions の Egress Firewall：CI/CD パイプラインをサプライチェーン攻撃から守る"
+description: "GitHub が 2026 年の Actions セキュリティロードマップで発表した Egress Firewall は、Runner VM の外側で動作する Layer 7 ネットワーク制御機能です。最近の CI/CD 侵害事例と合わせて、実務での対応策を整理します。"
+date: "2026-03-29"
+status: "published"
+tags: ["GitHub Actions", "CI/CD Security", "DevSecOps", "Supply Chain", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-egress-firewall-2026"
+---
+
+2026 年に入ってから、CI/CD パイプラインを標的にした攻撃が相次いで報告されています。GitHub はこれを受けて 2026 年のセキュリティロードマップを公表し、その中心となる機能が **Egress Firewall for GitHub Actions Runners** です。
+
+## なぜ今 CI/CD セキュリティが重要か
+
+2026 年初頭に発生した主な侵害事例：
+
+- **tj-actions/changed-files**：広く使われる Action が侵害され、多数のリポジトリの Secrets が漏洩
+- **trivy-action**：サードパーティ Action 経由での GITHUB_TOKEN 窃取
+- **Kubernetes-el Emacs パッケージ**：Pwn Request 脆弱性を悪用した CI workflow 侵害
+- **悪意のある Rust crate（5 件）**：`.env` ファイルの内容を外部に送信するコードを含む Crate が PyPI ライクに公開
+
+共通するパターンは「CI 環境の外部通信を制御できない」ことです。攻撃者がランナー内でコードを実行できれば、クレデンシャルを外部サーバーに送信できてしまいます。
+
+## Egress Firewall の仕組み
+
+GitHub の Egress Firewall は、Runner VM の**外側**で動作します。これが重要なポイントです。
+
+```
+GitHub Actions Runner（VM）
+  └── ビルドスクリプト実行
+      └── 外部通信の試み
+          ↓
+[Egress Firewall - Layer 7]  ← ここで制御（VM 外）
+  ├── 許可: api.github.com
+  ├── 許可: registry.npmjs.org
+  ├── 許可: your-artifactory.example.com
+  └── 拒否: 未定義のすべての通信
+```
+
+Runner 内で攻撃者が root 権限を取得したとしても、VM の外側にある Firewall は変更できません。既存のエージェントベースのソリューション（harden-runner 等）が Runner 内で動作するのとは根本的に異なる設計です。
+
+## ポリシーの設定方法
+
+GitHub が公開している設定例：
+
+```yaml
+# .github/workflows/build.yml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    egress-policy: block  # または audit
+
+    # 許可する通信先を明示
+    allowed-endpoints:
+      - api.github.com:443
+      - registry.npmjs.org:443
+      - objects.githubusercontent.com:443
+
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm test
+```
+
+`audit` モードでは実際のブロックは行わず、通信先をログに記録します。まず `audit` で稼働させて allowlist を構築し、その後 `block` に切り替えるアプローチが推奨されています。
+
+## Actions Data Stream：CI の可観測性
+
+同じロードマップに含まれる **Actions Data Stream** も注目機能です。CI/CD の実行テレメトリをリアルタイムで Amazon S3 または Azure Event Hub に送信できます。
+
+```
+CI 実行ログ → Actions Data Stream → Amazon S3 / Azure Event Hub
+                                   → Datadog / SIEM 等で分析
+```
+
+本番システムと同様の可観測性を CI に持ち込める仕組みです。将来はプロセスレベルの可視化やファイルシステム監視も追加予定です。
+
+## 今できる対策
+
+Egress Firewall はパブリックプレビューが 3〜6 ヶ月以内、GA が 6〜9 ヶ月以内の予定です。GA を待つ間にも取れる対策があります。
+
+**短期で実施できること**
+
+```yaml
+# 1. 信頼済み Action は SHA 固定でピン止め
+- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+# 2. GITHUB_TOKEN のスコープを最小化
+permissions:
+  contents: read
+  pull-requests: write
+  # 不要なスコープは明示しない
+
+# 3. pull_request_target は慎重に使う（PAT 漏洩リスクあり）
+# フォークからのコードを実行する場合は特に注意
+```
+
+**harden-runner の活用（現時点）**
+
+```yaml
+- uses: step-security/harden-runner@v2
+  with:
+    egress-policy: audit  # まず監査モードで
+```
+
+GitHub 公式の Egress Firewall が GA になるまでの暫定策として、既存の OSS ツールを使う選択肢も有効です。
+
+## まとめ
+
+CI/CD パイプラインはソフトウェアサプライチェーンの中で最も攻撃リスクが高い箇所の一つです。GitHub の Egress Firewall は「ランナー内部に侵入されても外部に情報を出させない」という設計で、根本的な対策になります。
+
+GA リリースまでの間は：アクションの SHA ピン止め、GITHUB_TOKEN の最小権限化、`pull_request_target` の慎重な利用を実施しておくことで、現状のリスクを大幅に低減できます。

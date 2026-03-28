@@ -1,0 +1,104 @@
+---
+title: "TypeScript 6.0 GA: JavaScript 구현의 마지막 릴리스와 Go 네이티브 7.0"
+description: "TypeScript 6.0이 3월 23일 정식 출시되었습니다. JavaScript 기반 컴파일러의 마지막 버전입니다. Go 네이티브 TypeScript 7.0이 이미 출시된 상황에서 팀이 취해야 할 행동을 정리합니다."
+date: "2026-03-29"
+status: "published"
+tags: ["TypeScript", "TypeScript 6.0", "TypeScript 7.0", "Go", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-6-0-ga-final-js-release"
+---
+
+TypeScript 6.0이 2026년 3월 23일 정식 출시(GA)되었습니다. 이 릴리스는 JavaScript로 작성된 TypeScript 컴파일러의 마지막 버전입니다. Go 네이티브 구현인 TypeScript 7.0(Project Corsa)은 이미 1월 15일에 출시되어 있습니다.
+
+## 두 개의 TypeScript 트랙이 동시에 존재한다
+
+현재 상황을 정리하면:
+
+- **TypeScript 6.0** (GA: 2026년 3월 23일): JavaScript 기반 구현의 최종판
+- **TypeScript 7.0** (GA: 2026년 1월 15일): Go 네이티브 컴파일러, 빌드 속도 10배 향상
+
+TypeScript 7.0이 6.0 GA보다 먼저 출시되었습니다. 이는 의도된 순서입니다. 6.0은 Migration 체크포인트로서 Deprecation 사이클을 완성하고 Default 값 변경을 통해 코드베이스를 Go 네이티브 트랙에 대비시킵니다.
+
+## 성능 차이는 실측치
+
+Microsoft가 공개한 Go 네이티브 컴파일러 벤치마크:
+
+| 코드베이스 | TypeScript 6.x | TypeScript 7.0 | 개선율 |
+|-----------|---------------|---------------|--------|
+| VSCode (150만 줄) | 89초 | 8.74초 | **10.2배** |
+| 메모리 사용량 | — | — | **약 1/3로 감소** |
+
+CI에서의 컴파일 시간 단축은 Pipeline 시간, 컴퓨트 비용, 개발자 피드백 루프 모두에 영향을 줍니다.
+
+## TypeScript 6.0의 주요 변경사항
+
+### Default 값 변경 (주의 필요)
+
+가장 임팩트가 큰 변경은 Default 값의 이동입니다:
+
+```json
+// tsconfig.json — TypeScript 6.0의 새로운 Default
+{
+  "compilerOptions": {
+    "strict": true,       // 이전: false
+    "module": "esnext",   // 이전: commonjs
+    "target": "ES2025"    // 이전: ES3
+  }
+}
+```
+
+`tsconfig.json`에 이 값들을 명시하지 않은 프로젝트는 업그레이드 후 동작이 달라질 수 있습니다. 업그레이드 전에 반드시 설정을 확인하세요.
+
+### ES2025 내장 타입 추가
+
+```typescript
+// Temporal API - 내장 타입으로 사용 가능
+const now = Temporal.Now.plainDateTimeISO();
+const nextWeek = now.add({ days: 7 });
+
+// Map upsert 메서드 (Stage 4 제안)
+const cache = new Map<string, number>();
+cache.getOrInsert("hits", 0);
+cache.getOrInsertComputed("computed", () => heavyCalculation());
+```
+
+### Subpath Import 지원
+
+```typescript
+// nodenext / bundler 모듈 해석에서 #/ 프리픽스 지원
+import { logger } from '#/utils/logger';
+
+// package.json
+{
+  "imports": {
+    "#/utils/*": "./src/utils/*.ts"
+  }
+}
+```
+
+Node.js의 Subpath Import 기능을 TypeScript가 공식 지원합니다.
+
+## 마이그레이션 경로
+
+**즉시 대응:**
+
+```bash
+# 업그레이드
+npm install typescript@6 --save-dev
+
+# 타입 에러 사전 확인
+npx tsc --noEmit
+```
+
+`tsconfig.json`에서 `strict`, `module`, `target`을 명시적으로 선언하세요. Default 변경에 의존하지 마세요.
+
+**중기적 검토:**
+
+새 프로젝트는 TypeScript 7.0을 직접 선택하는 것이 합리적입니다. 기존 프로젝트는 6.0으로 먼저 업그레이드하여 에러를 해결한 후 7.0으로 이동하는 순서가 안전합니다.
+
+## 정리
+
+TypeScript 6.0 GA는 JavaScript 기반 컴파일러 시대의 공식 마감입니다. CI Pipeline 속도가 병목인 팀, 대규모 Monorepo를 운영하는 팀에게 TypeScript 7.0의 10배 속도 향상은 Migration 비용을 정당화합니다. 소규모 프로젝트는 6.0을 통해 점진적으로 준비하는 경로가 리스크가 낮습니다.
+
+Go 네이티브 재작성은 TypeScript가 단순한 개발 도구를 넘어 인프라 수준의 투자 대상이 되었음을 보여줍니다.
