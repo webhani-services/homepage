@@ -1,0 +1,100 @@
+---
+title: "Next.js 16.2 リリース：React Compiler が Stable に、Turbopack も大幅改善"
+description: "Next.js 16.2がリリースされました。React Compilerの安定化、Turbopackの200以上のバグ修正、AI DevToolsの実験的導入など、実際の開発に影響する変更点を解説します。"
+date: "2026-03-30"
+status: "published"
+tags: ["nextjs", "react", "typescript", "frontend", "performance"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-2-react-compiler-stable"
+---
+
+## Next.js 16.2 の主な変更点
+
+Next.js 16.2 がリリースされた。今回のリリースの目玉は React Compiler の安定版化だが、それ以外にも開発体験を改善する変更が多数含まれている。
+
+## React Compiler が Stable に
+
+React 19 から登場した React Compiler は、コンポーネントのレンダリングを自動最適化する仕組みだ。これまで `useMemo` や `useCallback` で手動で行っていたメモ化を、コンパイラが自動的に判断して適用する。Next.js 16.2 では、この React Compiler が実験的機能（`experimental.reactCompiler`）から安定版オプションに昇格した。
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next';
+
+const nextConfig: NextConfig = {
+  reactCompiler: true, // 安定版オプションとして利用可能に
+};
+
+export default nextConfig;
+```
+
+ただし、Vercel は現時点ではデフォルト有効化を見送っており、ビルドパフォーマンスのデータを収集中とのこと。既存プロジェクトへの導入は、まずステージング環境で動作確認してから本番適用を推奨する。
+
+### React Compiler が解決すること
+
+手動のメモ化は、適切に行われなければパフォーマンス問題を引き起こす。よくある問題として、依存配列の誤りによる不要な再レンダリングや、過剰なメモ化によるメモリ消費がある。
+
+```tsx
+// Before: 手動メモ化が必要だったパターン
+function ProductList({ products, onAdd }: Props) {
+  const sorted = useMemo(
+    () => [...products].sort((a, b) => a.name.localeCompare(b.name)),
+    [products]
+  );
+  const handleAdd = useCallback((id: string) => onAdd(id), [onAdd]);
+
+  return sorted.map(p => (
+    <ProductCard key={p.id} product={p} onAdd={handleAdd} />
+  ));
+}
+
+// After: React Compiler が自動的に最適化
+function ProductList({ products, onAdd }: Props) {
+  const sorted = [...products].sort((a, b) => a.name.localeCompare(b.name));
+
+  return sorted.map(p => (
+    <ProductCard key={p.id} product={p} onAdd={onAdd} />
+  ));
+}
+```
+
+React Compiler は、コンポーネントのセマンティクスを解析して必要な最適化を自動判断するため、開発者はパフォーマンス最適化の実装ではなくビジネスロジックに集中できる。注意点として、Reactのルールを厳密に守っているコードが前提になる。レンダリング中のサイドエフェクトがある場合はコンパイラエラーとして検出される。
+
+## Turbopack: 200以上のバグ修正
+
+Next.js 16.2 では Turbopack に 200 件以上のバグ修正が含まれている。特に CSS Modules の挙動、サードパーティライブラリとの互換性、HMR（ホットモジュール置換）の信頼性が改善された。
+
+Webpack から Turbopack への移行を検討しているプロジェクトは、このバージョンを試す良いタイミングだ。
+
+## ブラウザログのサーバーへの転送
+
+開発時のデバッグを改善する機能として、ブラウザコンソールのログをサーバーターミナルに転送するオプションが追加された。
+
+```typescript
+// next.config.ts
+const nextConfig: NextConfig = {
+  logging: {
+    incomingRequests: {
+      ignore: [/\/_next\/static\/.*/, /\/api\/health/],
+    },
+  },
+};
+```
+
+クライアントサイドのエラーとサーバーサイドのログを一つのターミナルで確認できるため、フルスタックの開発時のコンテキスト切り替えが減る。
+
+## 実験的機能: Agent DevTools
+
+今回最も注目度が高い実験的機能として、Agent DevTools が追加された。ブラウザのDevTools内にAIアシスタントを統合するもので、コードの問題診断や修正提案をDevToolsパネルから直接行えるようにする。詳細は現時点では限定的だが、VercelとReactチームがAI開発体験の標準化に向けて動いているのが見える。
+
+## アップグレードの方法
+
+```bash
+npm install next@16.2.0 react@19 react-dom@19
+```
+
+16.x 系内のアップグレードであれば、ほとんどの場合は breaking change なしで適用できる。React Compiler は opt-in なので、既存のコードベースへの影響は自分でコントロールできる。
+
+## まとめ
+
+React Compiler の安定化は、Reactのパフォーマンス最適化のアプローチを根本から変える可能性がある。まずはステージング環境で React Compiler を有効にし、テストスイートを実行してレンダリング中にサイドエフェクトを持つコンポーネントがないか確認するのが良いスタート地点だ。ほとんどのプロジェクトでは問題なくアップグレードできるはずだ。
