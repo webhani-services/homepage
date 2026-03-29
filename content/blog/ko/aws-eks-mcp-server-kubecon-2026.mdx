@@ -1,0 +1,82 @@
+---
+title: "AWS EKS MCP Server: AI로 Kubernetes를 자연어로 관리하는 시대"
+description: "KubeCon EU 2026에서 AWS가 발표한 EKS MCP Server 프리뷰와 AWS DevOps Agent. AI 어시스턴트가 Kubernetes 클러스터를 자연어로 관리하는 변화와 실무 적용 방법을 살펴봅니다."
+date: "2026-03-30"
+status: "published"
+tags: ["aws", "kubernetes", "mcp", "devops", "cloud"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-eks-mcp-server-kubecon-2026"
+---
+
+## KubeCon EU 2026에서의 AWS 발표
+
+2026년 3월 23~26일 암스테르담에서 열린 KubeCon EU 2026에서 AWS가 주목할 만한 두 가지를 발표했습니다. EKS MCP Server(프리뷰)와 AWS DevOps Agent입니다.
+
+핵심을 요약하면, Claude나 GPT 같은 AI 어시스턴트가 Amazon EKS 클러스터의 실제 상태를 Context로 활용하여 자연어로 클러스터를 조회하고 운영할 수 있게 됩니다.
+
+## EKS MCP Server란
+
+MCP(Model Context Protocol)는 AI 에이전트가 외부 도구와 API에 연결하기 위한 표준 Protocol입니다. EKS MCP Server는 이 Protocol을 Amazon EKS에 구현하여, AI 어시스턴트가 제어된 인터페이스를 통해 클러스터 상태를 읽고 작업을 실행할 수 있게 합니다.
+
+```bash
+# 클러스터에 EKS MCP Server 설치 (프리뷰)
+aws eks install-mcp-server --cluster-name my-cluster --region ap-northeast-2
+
+# 자연어 쿼리 예시:
+# "Production Namespace에서 오늘 3번 이상 재시작된 Pod 목록 보여줘"
+# "api-service Deployment를 4개 Replica로 확장해"
+# "Backend Namespace 전체 Pod의 리소스 요청과 실제 사용량 비교해줘"
+```
+
+이전에는 이런 작업에 적절한 `kubectl` 명령을 알고 YAML 출력을 해석하는 능력이 필요했습니다. MCP Layer가 클러스터 상태를 AI 모델이 추론할 수 있는 형태로 변환하고, 자연어를 클러스터 작업으로 다시 변환합니다.
+
+## AWS DevOps Agent
+
+DevOps Agent는 MCP Server를 한 단계 더 발전시킵니다. 단순한 쿼리 응답을 넘어 클러스터 상태를 지속적으로 모니터링하고, 이상 현상을 감지하며, 근본 원인을 조사하는 추론 루프를 실행합니다.
+
+실무 시나리오:
+
+- Pod가 반복적으로 OOMKilled됩니다. 에이전트가 최근 배포와 연관짓고 변경된 메모리 제한을 식별하여 관련 Commit을 제시합니다.
+- 리소스 사용 추세에서 주말 트래픽 급증 전에 Node 추가가 필요함을 예측합니다. 에이전트가 인간의 승인을 위한 스케일링 계획을 작성합니다.
+- 세 개의 Security Group에 중복 규칙이 있어 불필요한 비용이 발생 중입니다. 에이전트가 수정 단계와 함께 이를 표시합니다.
+
+## 권한 설계 방법
+
+AI 에이전트에게 Kubernetes 클러스터 접근 권한을 부여할 때는 신중한 IAM 설계가 필요합니다. AWS의 접근 방식은 최소 권한 원칙을 기반으로 합니다. 에이전트는 부여된 권한 범위 내에서만 동작하며, 모든 작업이 CloudTrail에 기록됩니다.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "eks:DescribeCluster",
+        "eks:ListNodegroups",
+        "eks:DescribeNodegroup",
+        "eks:ListPodIdentityAssociations"
+      ],
+      "Resource": "arn:aws:eks:*:*:cluster/production-*"
+    }
+  ]
+}
+```
+
+실용적인 시작점은 AI 어시스턴트에게 읽기 전용 권한을 부여하고, 쓰기 작업은 명시적인 인간 승인을 요구하는 것입니다. 에이전트를 조사와 권고에 활용하고, 특정 환경에서 에이전트의 판단에 신뢰가 쌓일 때까지 '적용' 단계는 인간의 손에 두는 방식을 추천합니다.
+
+## Docker Kanvas와의 비교
+
+2026년 초에 발표된 Docker Kanvas는 Docker Compose 파일을 자동으로 Kubernetes Manifest로 변환하여, Helm/Kustomize의 복잡함 없이 Kubernetes를 도입하려는 팀을 위한 도구입니다.
+
+두 도구는 서로 다른 문제를 해결합니다. EKS MCP Server는 이미 Kubernetes를 운영 중인 팀의 운영 효율화를 위한 것이고, Docker Kanvas는 Kubernetes로 이전하려는 팀을 위한 더 쉬운 진입로입니다. 경쟁 관계가 아닌 상호 보완적인 관계입니다.
+
+## 이 흐름이 시사하는 것
+
+표준화된 Protocol(MCP)을 통해 AI 에이전트가 실제 인프라를 운영하는 패턴은 2026년의 핵심 트렌드 중 하나입니다. EKS MCP Server가 구체적인 사례이지만, 같은 접근 방식이 클라우드 제공업체와 인프라 카테고리 전반에 나타나고 있습니다.
+
+인프라 엔지니어의 역할이 변화합니다. `kubectl` 명령을 작성하고 디버깅하는 시간이 줄어들고, AI 에이전트가 무엇을 할 수 있는지 정의하고 제안된 변경사항을 검토하는 데 더 많은 시간을 쏟게 됩니다.
+
+## 시작하는 방법
+
+EKS MCP Server는 프리뷰 단계입니다. AWS 프리뷰 프로그램을 통해 신청하고, 비운영 클러스터부터 시작하여 초기에는 읽기 전용 권한으로 제한하세요. 특정 클러스터 구성에서 에이전트가 어떻게 추론하는지 이해를 쌓아가며 권한 범위를 확장하는 방식을 추천합니다.

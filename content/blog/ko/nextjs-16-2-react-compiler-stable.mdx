@@ -1,0 +1,93 @@
+---
+title: "Next.js 16.2 릴리스: React Compiler Stable 승격과 Turbopack 대규모 개선"
+description: "Next.js 16.2에서 React Compiler가 안정 버전 옵션으로 승격되었습니다. 200개 이상의 Turbopack 버그 수정, 브라우저 로그 전달, 실험적 AI DevTools까지 주요 변경사항을 정리합니다."
+date: "2026-03-30"
+status: "published"
+tags: ["nextjs", "react", "typescript", "frontend", "performance"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-2-react-compiler-stable"
+---
+
+## Next.js 16.2의 핵심 변경사항
+
+Next.js 16.2가 릴리스되었습니다. 이번 릴리스의 핵심은 React Compiler의 안정 버전 승격이며, Turbopack 개선과 개발 편의성 향상을 위한 변경사항도 다수 포함되었습니다.
+
+## React Compiler: 안정 버전으로 승격
+
+React 19와 함께 도입된 React Compiler는 빌드 시점에 컴포넌트 코드를 분석하여 메모이제이션을 자동 적용합니다. 이전에는 `useMemo`와 `useCallback`으로 수동 관리하던 최적화를 컴파일러가 처리합니다. 16.2에서는 `experimental.reactCompiler`에서 안정적인 최상위 설정 옵션으로 승격되었습니다.
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next';
+
+const nextConfig: NextConfig = {
+  reactCompiler: true,
+};
+
+export default nextConfig;
+```
+
+Vercel은 아직 기본 활성화를 보류하고 있으며 다양한 프로젝트 유형에서 빌드 성능 데이터를 수집 중입니다. Staging 환경에서 먼저 활성화하여 동작을 검증한 뒤 Production에 적용하는 것을 권장합니다.
+
+### React Compiler가 해결하는 문제
+
+수동 메모이제이션은 오류가 발생하기 쉽습니다. 잘못된 의존성 배열은 불필요한 리렌더링을 유발하고, 과도한 메모이제이션은 메모리를 낭비합니다. React Compiler는 컴포넌트의 의미를 분석하여 실제로 필요한 곳에 최적화를 적용함으로써 두 문제를 모두 해결합니다.
+
+```tsx
+// Before: 수동 최적화 필요
+function ProductList({ products, onAdd }: Props) {
+  const sorted = useMemo(
+    () => [...products].sort((a, b) => a.name.localeCompare(b.name)),
+    [products]
+  );
+  const handleAdd = useCallback((id: string) => onAdd(id), [onAdd]);
+
+  return sorted.map(p => <ProductCard key={p.id} product={p} onAdd={handleAdd} />);
+}
+
+// After: 컴파일러가 자동 최적화
+function ProductList({ products, onAdd }: Props) {
+  const sorted = [...products].sort((a, b) => a.name.localeCompare(b.name));
+  return sorted.map(p => <ProductCard key={p.id} product={p} onAdd={onAdd} />);
+}
+```
+
+코드가 단순해지고 컴파일러가 동일하거나 더 나은 성능 특성을 제공합니다. 단, React 규칙을 엄격히 따르는 컴포넌트가 필요합니다. 렌더링 중 사이드 이펙트가 있는 경우 컴파일러 오류로 나타나는데, 이는 사실 잠재적 버그를 조기에 발견하는 이점이기도 합니다.
+
+## Turbopack: 200개 이상의 버그 수정
+
+16.2에는 200개 이상의 Turbopack 버그 수정이 포함되어 있으며, CSS Modules 동작, 서드파티 라이브러리 호환성, HMR(Hot Module Replacement) 안정성이 개선되었습니다. Webpack에서 Turbopack으로 이전을 미뤄왔다면 이번 릴리스를 재평가할 시점입니다.
+
+## 브라우저 로그 전달
+
+개발 편의성을 위한 유용한 기능이 추가되었습니다. 개발 중 브라우저 콘솔 로그를 서버 터미널로 전달할 수 있습니다.
+
+```typescript
+// next.config.ts
+const nextConfig: NextConfig = {
+  logging: {
+    incomingRequests: {
+      ignore: [/\/_next\/static\/.*/, /\/api\/health/],
+    },
+  },
+};
+```
+
+클라이언트와 서버 출력을 한 곳에서 확인할 수 있어 풀스택 디버깅 시 탭 전환 없이 빠르게 문제를 파악할 수 있습니다.
+
+## 실험적 기능: Agent DevTools
+
+16.2에서는 실험적 Agent DevTools 통합이 도입되었습니다. 브라우저 개발자 도구 패널에 AI 어시스턴트를 직접 내장하는 기능입니다. 현재는 세부 내용이 제한적이지만, 별도의 에디터나 터미널이 아닌 브라우저 DevTools에서 직접 디버깅과 코드 제안이 이루어지는 방향을 시사합니다.
+
+## 업그레이드 방법
+
+```bash
+npm install next@16.2.0 react@19 react-dom@19
+```
+
+16.x 내의 마이너 릴리스이므로 Breaking Change는 최소화되어 있습니다. React Compiler는 Opt-in 방식이라 명시적으로 활성화하기 전까지 기존 프로젝트에 영향을 주지 않습니다.
+
+## 정리
+
+React Compiler의 안정 버전 승격이 이번 릴리스에서 가장 중요한 변경사항입니다. Staging 환경에서 활성화하고 테스트 스위트를 실행하여 렌더링 중 사이드 이펙트에 의존하는 컴포넌트가 있는지 확인하세요. 대부분의 프로젝트에서 업그레이드는 어렵지 않으며, 결과적으로 컴포넌트 코드가 단순해지고 성능 관련 버그가 줄어들 것입니다.
