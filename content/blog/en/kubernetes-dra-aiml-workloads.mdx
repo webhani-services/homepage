@@ -1,0 +1,111 @@
+---
+title: "Kubernetes 1.35 DRA Moves to Beta: What It Means for AI/ML Workloads"
+description: "Dynamic Resource Allocation graduates to beta in Kubernetes 1.35, announced at KubeCon Europe 2026. Here's why it matters for GPU scheduling and LLM inference workloads."
+date: "2026-03-31"
+status: "published"
+tags: ["Kubernetes", "AI/ML", "Cloud Native", "DevOps", "KubeCon"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-dra-aiml-workloads"
+---
+
+At KubeCon + CloudNativeCon Europe 2026, two announcements stood out for teams running AI workloads on Kubernetes. First, Dynamic Resource Allocation (DRA) is graduating to beta in Kubernetes 1.35. Second, Google, IBM, and Red Hat donated a Kubernetes blueprint for LLM inference to the CNCF. Together, they represent a maturing story for running serious AI/ML workloads on Kubernetes.
+
+## What DRA Actually Does
+
+DRA, introduced as alpha in Kubernetes 1.26, changes how Pods request specialized hardware like GPUs and FPGAs. The core difference from the existing Device Plugin model is flexibility.
+
+| | Device Plugin | DRA |
+|---|---|---|
+| Request granularity | Fixed (per device) | Attribute-based |
+| Sharing across Pods | Not supported | Supported |
+| Scheduler visibility | Opaque | Full visibility |
+| Dynamic modification | No | Yes |
+
+For AI/ML workloads, the most impactful differences are GPU sharing across Pods and the scheduler's ability to make placement decisions based on actual device attributes — not just device counts.
+
+## What Beta Graduation Means in Practice
+
+Beta in Kubernetes carries specific implications:
+
+**Closer to default-on**: Beta features are typically enabled by default in Kubernetes. If you're planning to run 1.35+ in production, DRA will be available without explicit feature gate flags.
+
+**API stability**: Beta APIs maintain backward compatibility, so manifests you write now won't require rewrites when DRA reaches GA.
+
+**Vendor ecosystem acceleration**: GPU vendors including NVIDIA are actively developing DRA-compatible drivers. Expect the number of supported DRA resource drivers to grow with 1.35 and beyond.
+
+## DRA in Practice: GPU Resource Requests
+
+The shift in how you express GPU requirements is worth understanding concretely.
+
+```yaml
+# Define a ResourceClaimTemplate with attribute-based selection
+apiVersion: resource.k8s.io/v1alpha3
+kind: ResourceClaimTemplate
+metadata:
+  name: gpu-claim-template
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpu
+          deviceClassName: nvidia.com/gpu
+          selectors:
+            - cel:
+                expression: device.attributes["memory"].isGreaterThan(quantity("16Gi"))
+```
+
+```yaml
+# Reference the claim in your Pod spec
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llm-inference-pod
+spec:
+  resourceClaims:
+    - name: gpu
+      resourceClaimTemplateName: gpu-claim-template
+  containers:
+    - name: inference
+      image: llm-inference:latest
+      resources:
+        claims:
+          - name: gpu
+```
+
+Instead of `nvidia.com/gpu: 1`, you're now saying "I need a GPU with more than 16GB VRAM." For LLM inference where model size directly determines minimum VRAM requirements, this is practically useful — not just theoretically elegant.
+
+## The CNCF LLM Inference Blueprint
+
+The Kubernetes blueprint for LLM inference, contributed to the CNCF by Google, IBM, and Red Hat, provides a reference architecture for running inference services on Kubernetes. Key components include:
+
+- **Inference engine deployment**: configuration patterns for vLLM and similar serving frameworks
+- **GPU scheduling**: affinity rules and topology-aware placement recommendations
+- **Autoscaling**: horizontal scaling based on inference latency, not just CPU/memory
+- **Observability**: monitoring endpoints and recommended metrics for inference workloads
+
+The value here is that teams can start from a community-validated baseline rather than building their own from scratch. Given the CNCF governance model, the blueprint is likely to evolve with contributions from the broader ecosystem.
+
+## Cloud Native Developer Growth
+
+The Q1 2026 State of Cloud Native Development report, released at KubeCon by SlashData, estimates the global cloud native developer population at 19.9 million. A significant driver of this growth is the increasing adoption of Kubernetes for AI/ML workloads — a trend that DRA and the LLM inference blueprint directly address.
+
+## What to Do Now
+
+If you're running GPU clusters on Kubernetes or planning to, here's a concrete preparation path:
+
+**Before Kubernetes 1.35 ships:**
+1. Audit your existing GPU manifests that rely on Device Plugin (`nvidia.com/gpu` requests). List which workloads would benefit from attribute-based selection.
+2. Track NVIDIA's DRA driver releases — availability of a vendor-supported DRA driver is the practical prerequisite.
+3. Read the CNCF LLM inference blueprint and note gaps between your current setup and the reference architecture.
+
+**After 1.35 is available:**
+1. Test DRA in a non-production cluster, focusing on workloads that need GPU sharing or specific VRAM requirements.
+2. For multi-tenant inference setups (multiple small models sharing a large GPU), DRA's sharing capability is the key use case to validate.
+3. Update autoscaling configuration to leverage DRA's richer resource visibility.
+
+## Our Assessment
+
+DRA graduating to beta is the clearest signal yet that Kubernetes intends to be a first-class platform for GPU workloads — not just a CPU orchestrator with GPU bolted on. The timeline from beta to GA typically runs 1-2 Kubernetes releases, which means teams building AI/ML infrastructure today should be designing with DRA compatibility in mind.
+
+The CNCF inference blueprint reduces the cost of getting started. Rather than designing LLM infrastructure from first principles, use the blueprint as a starting point and customize where your requirements differ.

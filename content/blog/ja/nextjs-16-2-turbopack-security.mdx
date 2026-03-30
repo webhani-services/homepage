@@ -1,0 +1,140 @@
+---
+title: "Next.js 16.2リリース：Turbopack強化とCVE-2026-29057セキュリティパッチ"
+description: "Next.js 16.2がリリースされました。200以上の変更を含むこのリリースの中で、リクエストスマグリング脆弱性の修正とTurbopackの主要改善点を実践的な視点で解説します。"
+date: "2026-03-31"
+status: "published"
+tags: ["Next.js", "Turbopack", "Security", "Web Development", "React"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-2-turbopack-security"
+---
+
+Next.js 16.2がリリースされました。200以上の変更と修正を含む本リリースでは、セキュリティパッチと開発体験の向上が中心的なテーマです。特にCVE-2026-29057の修正は本番環境を持つプロジェクトで早急に対応する価値があります。
+
+## セキュリティパッチ：CVE-2026-29057を優先対応
+
+`http-proxy`のリクエストスマグリング脆弱性（CVE-2026-29057）が修正されました。リクエストスマグリング攻撃は、フロントエンドプロキシとバックエンドサーバー間でHTTPリクエストの境界解釈に差異が生じる場合に発生します。これを悪用されると、キャッシュポイズニング、認証バイパス、あるいは他ユーザーへのリクエスト混入といった被害につながる可能性があります。
+
+現在Next.js 16系を使用しているプロジェクトは速やかなアップグレードを推奨します。
+
+```bash
+# アップグレード手順
+npm install next@latest react@latest react-dom@latest
+
+# または yarn
+yarn upgrade next react react-dom
+
+# バージョン確認
+npx next --version
+```
+
+アップグレード後は、Server Actionsとリバースプロキシ経由のルート（特にVercel以外のセルフホスト環境）について動作確認を行ってください。
+
+## Turbopackの主要改善点
+
+### Server Fast Refresh
+
+Server ComponentsでのFast Refreshが改善されました。サーバーサイドコンポーネントを編集した際の更新速度が向上し、開発中のフィードバックループが短くなります。
+
+```typescript
+// この Server Component を編集した場合の更新が高速化されます
+export default async function ProductList() {
+  const products = await fetchProducts();
+
+  return (
+    <ul>
+      {products.map((product) => (
+        <li key={product.id}>{product.name}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+### Web Worker Origin サポート
+
+WASMライブラリを使用するWeb Workerのオリジン設定がサポートされました。これにより、WebAssemblyを活用した処理（画像変換、暗号化、高速計算）をNext.jsアプリケーションに組み込みやすくなります。
+
+### Subresource Integrity（SRI）サポート
+
+JavaScriptファイルへのSRIサポートが追加されました。CDNや外部ホスト経由のスクリプトが改ざんされるサプライチェーン攻撃への対策として有効です。
+
+```typescript
+// next.config.ts でのSRI設定例
+import type { NextConfig } from 'next'
+
+const nextConfig: NextConfig = {
+  experimental: {
+    sri: {
+      algorithm: 'sha256',
+    },
+  },
+}
+
+export default nextConfig
+```
+
+### Dynamic ImportのTree Shaking強化
+
+動的インポートのTree Shakingが改善されました。条件付きでロードするモジュールが多いアプリケーションでは、本番バンドルサイズの削減が期待できます。
+
+```typescript
+// 条件付き動的インポートの例
+// 16.2以降、未使用のコードパスはより確実に除外されます
+const AdminPanel = dynamic(
+  () => import('@/components/AdminPanel'),
+  { ssr: false }
+);
+```
+
+## エラーページのリデザイン
+
+開発時のデフォルトエラーページがリデザインされ、スタックトレースの可読性が向上しました。カスタムエラーページを実装していないプロジェクトでは、このデザインが開発時に表示されます。エラーの発生箇所とコードコンテキストがより明確に表示されるため、初動のデバッグ時間が短縮されます。
+
+## AI関連の改善
+
+Next.js 16.2では、AI SDKとの連携に関わる改善も含まれています。`streamText`のレスポンスとServer Actionsの組み合わせがよりシームレスになっており、チャットインターフェースや補完機能の実装がスムーズになっています。
+
+```typescript
+// AI SDKとのストリーミング実装例（Route Handler）
+import { streamText } from 'ai';
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+
+  const result = streamText({
+    model: 'anthropic/claude-sonnet-4.6',
+    messages,
+  });
+
+  return result.toUIMessageStreamResponse();
+}
+```
+
+## アップグレード時に確認すべき点
+
+16.2への移行で注意が必要なポイントを整理します。
+
+**Streaming fetchのハング修正**: 特定条件でストリーミングが停止する問題が修正されています。本番で再現していた場合はアップグレードで解消される可能性があります。
+
+**Server Actionsの変換強化**: `node_modules`内でのServer Actions変換が厳格化されました。サードパーティパッケージとの組み合わせで予期しないエラーが出る場合は、そのパッケージのNext.js 16対応を確認してください。
+
+**Turbopack設定のトップレベル化**: `experimental.turbopack`は非推奨になり、トップレベルの`turbopack`キーへの移行が推奨されています。
+
+```typescript
+// next.config.ts — 推奨設定（16.2以降）
+import type { NextConfig } from 'next'
+
+const nextConfig: NextConfig = {
+  turbopack: {
+    // Turbopack固有の設定
+  },
+  // experimental.turbopack は使用しない
+}
+
+export default nextConfig
+```
+
+## まとめ
+
+Next.js 16.2はセキュリティ修正を含む重要なリリースです。CVE-2026-29057の修正は本番環境を持つすべてのNext.jsプロジェクトで対応を検討すべき内容であり、Turbopackの改善は日常の開発速度に直結します。アップグレード自体はほとんどのプロジェクトで破壊的変更なく行えますが、Turbopack設定の移行と、Server Actionsを使用しているルートの動作確認は忘れずに実施してください。

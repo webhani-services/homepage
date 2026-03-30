@@ -1,0 +1,116 @@
+---
+title: "Next.js 16.2: Turbopack Improvements and CVE-2026-29057 Security Patch"
+description: "Next.js 16.2 ships with over 200 changes. The request smuggling vulnerability fix deserves immediate attention, and the Turbopack improvements are worth knowing about."
+date: "2026-03-31"
+status: "published"
+tags: ["Next.js", "Turbopack", "Security", "Web Development", "React"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-2-turbopack-security"
+---
+
+Next.js 16.2 is out with over 200 changes and fixes. Two areas stand out: a security patch for a request smuggling vulnerability (CVE-2026-29057) and a round of meaningful Turbopack improvements. Here's what you need to know and what to do.
+
+## Security Patch: CVE-2026-29057
+
+The release patches a request smuggling vulnerability in `http-proxy` (CVE-2026-29057). Request smuggling attacks exploit differences in how frontend proxies and backend servers parse HTTP request boundaries. When exploitable, this can lead to cache poisoning, authentication bypass, or cross-user request contamination.
+
+If you're running any Next.js 16.x project in production, this is worth upgrading for now.
+
+```bash
+# Upgrade Next.js and React
+npm install next@latest react@latest react-dom@latest
+
+# Confirm the installed version
+npx next --version
+```
+
+After upgrading, verify Server Actions routes and any paths that flow through a reverse proxy — particularly in self-hosted environments outside Vercel, where proxy configuration varies.
+
+## Turbopack Changes Worth Knowing
+
+### Server Fast Refresh
+
+Hot Module Replacement for Server Components is faster. When you edit a server-side component, the feedback loop in dev mode is noticeably tighter. This primarily benefits large apps where previous HMR latency was observable.
+
+```typescript
+// Edits to this Server Component now reload faster
+export default async function ProductList() {
+  const products = await fetchProducts();
+
+  return (
+    <ul>
+      {products.map((product) => (
+        <li key={product.id}>{product.name}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+### Web Worker Origin Support for WASM
+
+Turbopack now handles origin configuration for Web Workers that use WASM libraries. This unblocks use cases like image processing, encryption, or compute-heavy operations running in workers alongside WASM modules in your Next.js app.
+
+### Subresource Integrity for JavaScript Files
+
+SRI support is added for JavaScript assets. This lets browsers verify that scripts loaded from a CDN or external host haven't been tampered with — a practical defense against supply chain attacks.
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next'
+
+const nextConfig: NextConfig = {
+  experimental: {
+    sri: {
+      algorithm: 'sha256',
+    },
+  },
+}
+
+export default nextConfig
+```
+
+### Improved Tree-Shaking for Dynamic Imports
+
+Dynamic imports now benefit from improved tree-shaking. If your app conditionally loads modules that are only needed in specific paths, expect smaller production bundle sizes without any code changes on your end.
+
+```typescript
+// Unused code paths in conditional imports are stripped more reliably
+const AdminPanel = dynamic(
+  () => import('@/components/AdminPanel'),
+  { ssr: false }
+);
+```
+
+## Redesigned Error Page
+
+The default development error page is redesigned for better readability — cleaner stack traces and more visible code context at the error site. If you're not using a custom error page, you'll see this automatically after upgrading.
+
+## What to Check When Upgrading
+
+Three things worth verifying after the upgrade:
+
+**Streaming fetch hangs**: A bug where streaming would stall under specific conditions is fixed in 16.2. If you've been working around this in production, the fix is here.
+
+**Server Actions transform enforcement**: Stricter transformation of Server Actions in `node_modules` may surface issues with third-party packages that weren't following the spec. Check the changelogs of any packages that use Server Actions if you see unexpected errors.
+
+**Turbopack config migration**: `experimental.turbopack` is deprecated. Move your configuration to the top-level `turbopack` key.
+
+```typescript
+// next.config.ts — recommended for 16.2+
+import type { NextConfig } from 'next'
+
+const nextConfig: NextConfig = {
+  turbopack: {
+    // Turbopack-specific configuration here
+  },
+  // Remove experimental.turbopack
+}
+
+export default nextConfig
+```
+
+## Bottom Line
+
+The CVE-2026-29057 fix is the primary reason to upgrade if you're running 16.x in production. The Turbopack improvements improve daily development speed, and the SRI addition is a welcome security hardening measure for teams with a supply chain security posture. For most projects, this is a low-friction upgrade — but do check Server Actions routes and the Turbopack config migration before shipping.

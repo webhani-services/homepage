@@ -1,0 +1,109 @@
+---
+title: "Kubernetes 1.35のDRA Beta：AI/MLワークロードが変えるクラスター設計の視点"
+description: "KubeCon + CloudNativeCon Europe 2026でのKubernetes 1.35発表を受け、Dynamic Resource Allocation（DRA）のBeta昇格がAI/MLワークロードの運用に与える実践的な影響を解説します。"
+date: "2026-03-31"
+status: "published"
+tags: ["Kubernetes", "AI/ML", "Cloud Native", "DevOps", "KubeCon"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-dra-aiml-workloads"
+---
+
+KubeCon + CloudNativeCon Europe 2026で、Kubernetes 1.35のDynamic Resource Allocation（DRA）がBetaに昇格することが発表されました。同時に、Google・IBM・Red HatがLLM推論向けKubernetes BlueprintをCNCFに寄贈するという発表もありました。これらは個別のニュースに見えますが、AIワークロードをKubernetes上で安定して運用するという課題への応答として読むことができます。
+
+## Dynamic Resource Allocation（DRA）とは何か
+
+DRAはKubernetes 1.26でAlphaとして導入された機能で、GPUやFPGAといった特殊なハードウェアリソースを柔軟にPodへ割り当てる仕組みです。従来のDevice Pluginと比較して、以下の点が異なります。
+
+| 項目 | Device Plugin | DRA |
+|------|--------------|-----|
+| リソース要求の粒度 | 固定（デバイス単位） | 柔軟（属性ベース） |
+| 複数Pod間での共有 | 不可 | 可能 |
+| スケジューリング情報 | スケジューラーに非公開 | スケジューラーが参照可能 |
+| 要求の動的変更 | 非対応 | 対応 |
+
+AI/MLワークロードにとってこの差異は大きく、特にGPUの共有と、スケジューラーがリソースの詳細を把握した上でPod配置を決定できる点が重要です。
+
+## Beta昇格の実際的な意味
+
+Betaとはいくつかの重要な変化を意味します。
+
+**デフォルト有効化に近づく**: KubernetesではBeta機能は通常デフォルトで有効化されます。本番クラスターへのKubernetes 1.35以降の採用を検討している場合、DRAは明示的なオプトインなしに利用可能になります。
+
+**APIの安定性が向上する**: Betaに昇格したAPIは原則として後方互換性が維持され、利用するManifestの書き直しを心配せずに使い始められます。
+
+**エコシステムの対応が加速する**: NVIDIAなどのGPUベンダーがDRA対応ドライバーの開発を本格化させています。Kubernetes 1.35以降を使用するクラスターでは、ベンダー提供のDRA対応リソースドライバーが増加する見込みです。
+
+## DRAを使ったGPUリソース要求の例
+
+```yaml
+# ResourceClaimTemplate の定義例
+apiVersion: resource.k8s.io/v1alpha3
+kind: ResourceClaimTemplate
+metadata:
+  name: gpu-claim-template
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpu
+          deviceClassName: nvidia.com/gpu
+          selectors:
+            - cel:
+                expression: device.attributes["memory"].isGreaterThan(quantity("16Gi"))
+```
+
+```yaml
+# Pod でのDRA ResourceClaim参照
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llm-inference-pod
+spec:
+  resourceClaims:
+    - name: gpu
+      resourceClaimTemplateName: gpu-claim-template
+  containers:
+    - name: inference
+      image: llm-inference:latest
+      resources:
+        claims:
+          - name: gpu
+```
+
+従来のDevice Pluginでは`nvidia.com/gpu: 1`と書くだけで特定できましたが、DRAでは属性ベースの条件（上記例では「16GB以上のVRAMを持つGPU」）を指定できます。これはモデルサイズに応じた要件の差異に対応する上で実用的です。
+
+## Google・IBM・Red HatによるLLM推論Blueprintの寄贈
+
+LLM推論向けのKubernetes BlueprintがCNCFに寄贈されました。このBlueprintは、LLMの推論サービスをKubernetes上で運用するための参照実装で、以下を含みます。
+
+- **vLLM等の推論エンジン**のデプロイ構成
+- **ノードのアフィニティ設定**とGPUスケジューリングの推奨パターン
+- **オートスケーリング**の設定例（推論レイテンシを基準とした水平スケーリング）
+- **可観測性**のための監視エンドポイント設定
+
+このBlueprintはCNCFのプロジェクトとして公開されるため、独自実装ではなくコミュニティの知見を活用した安定したベースラインから始められます。
+
+## Cloud Native開発者人口の推移と産業インパクト
+
+SlashDataのQ1 2026レポートでは、グローバルのCloud Native開発者人口が1990万人に達したことが示されています。この成長の背景には、Kubernetes上でのAI/MLワークロードの増加が大きく寄与していると分析されています。
+
+## 実運用への影響：今から準備すること
+
+DRAのBeta昇格を受けて、現在GPUクラスターを運用している、あるいは計画しているチームが取り組むべきことを整理します。
+
+**短期的な対応（1.35リリース前）:**
+1. 現在のGPUスケジューリングでDevice Pluginに依存しているManifestを棚卸しする
+2. DRA対応のNVIDIAドライバーのリリース状況を確認する
+3. CNCFのLLM推論Blueprintを参照し、現在の構成との差異を把握する
+
+**中期的な対応:**
+1. 開発クラスターでDRAを試用し、既存のワークロードに与える影響を確認する
+2. GPU共有を必要とするワークロード（複数の小規模推論サービス）でDRAの属性指定を評価する
+3. オートスケーリング設定をDRAのリソース情報を活用した形に更新する
+
+## webhaniとしての見解
+
+DRAのBeta昇格は、Kubernetesを「GPUもちゃんと使えるオーケストレーター」にするための重要なステップです。今後1〜2年でGPUクラスターの標準的なリソース管理手法がDevice PluginからDRAへシフトする可能性が高く、特にAI/ML基盤を構築・運用するチームにとっては早期に理解しておく価値のある変化です。
+
+CNCF Blueprintの存在は、各社が独自に試行錯誤するコストを減らします。まずBlueprintを参照実装として読み込み、自社のユースケースに合わせてカスタマイズするアプローチが現実的です。

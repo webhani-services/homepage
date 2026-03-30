@@ -1,0 +1,111 @@
+---
+title: "Kubernetes 1.35 DRA Beta 승격: AI/ML 워크로드에 미치는 영향"
+description: "KubeCon Europe 2026에서 Kubernetes 1.35의 Dynamic Resource Allocation이 Beta로 승격됐습니다. GPU 스케줄링과 LLM 추론 워크로드에 어떤 변화를 가져오는지 실무 관점에서 정리합니다."
+date: "2026-03-31"
+status: "published"
+tags: ["Kubernetes", "AI/ML", "Cloud Native", "DevOps", "KubeCon"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-dra-aiml-workloads"
+---
+
+KubeCon + CloudNativeCon Europe 2026에서 AI 워크로드를 Kubernetes로 운영하는 팀에게 주목할 두 가지 발표가 있었습니다. 첫째, Dynamic Resource Allocation(DRA)이 Kubernetes 1.35에서 Beta로 승격됩니다. 둘째, Google, IBM, Red Hat이 LLM 추론을 위한 Kubernetes Blueprint를 CNCF에 기증했습니다. 두 발표는 Kubernetes 위에서 AI/ML 워크로드를 안정적으로 운영하기 위한 에코시스템의 성숙을 보여줍니다.
+
+## DRA가 실제로 하는 일
+
+DRA는 Kubernetes 1.26에서 Alpha로 도입된 기능으로, Pod가 GPU나 FPGA 같은 특수 하드웨어를 요청하는 방식을 바꿉니다. 기존 Device Plugin 모델과의 핵심 차이는 유연성입니다.
+
+| | Device Plugin | DRA |
+|---|---|---|
+| 요청 단위 | 고정 (디바이스 단위) | 속성 기반 |
+| Pod 간 공유 | 불가 | 가능 |
+| 스케줄러 가시성 | 불투명 | 전체 가시성 |
+| 동적 변경 | 미지원 | 지원 |
+
+AI/ML 워크로드에서 가장 중요한 차이점은 두 가지입니다. Pod 간 GPU 공유 가능 여부와, 스케줄러가 단순한 디바이스 수가 아니라 실제 디바이스 속성을 기반으로 배치 결정을 내릴 수 있는지 여부입니다.
+
+## Beta 승격이 실무적으로 의미하는 것
+
+Kubernetes에서 Beta는 구체적인 의미를 갖습니다.
+
+**기본 활성화에 가까워집니다**: Kubernetes에서 Beta 기능은 일반적으로 기본값으로 활성화됩니다. 1.35 이상을 Production에서 사용한다면 Feature Gate 플래그 없이 DRA를 사용할 수 있게 됩니다.
+
+**API 안정성이 높아집니다**: Beta API는 하위 호환성이 유지되므로 지금 작성하는 Manifest를 GA 이후에 다시 작성할 필요가 없습니다.
+
+**벤더 에코시스템이 빨라집니다**: NVIDIA 등 GPU 벤더들이 DRA 호환 드라이버 개발을 본격화하고 있습니다. 1.35 이후부터 DRA를 지원하는 리소스 드라이버가 늘어날 것으로 예상됩니다.
+
+## DRA 실전: GPU 리소스 요청 방식의 변화
+
+GPU 요청 방식이 어떻게 달라지는지 구체적으로 살펴봅니다.
+
+```yaml
+# 속성 기반 선택을 사용하는 ResourceClaimTemplate 정의
+apiVersion: resource.k8s.io/v1alpha3
+kind: ResourceClaimTemplate
+metadata:
+  name: gpu-claim-template
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpu
+          deviceClassName: nvidia.com/gpu
+          selectors:
+            - cel:
+                expression: device.attributes["memory"].isGreaterThan(quantity("16Gi"))
+```
+
+```yaml
+# Pod Spec에서 Claim 참조
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llm-inference-pod
+spec:
+  resourceClaims:
+    - name: gpu
+      resourceClaimTemplateName: gpu-claim-template
+  containers:
+    - name: inference
+      image: llm-inference:latest
+      resources:
+        claims:
+          - name: gpu
+```
+
+`nvidia.com/gpu: 1`이라고 쓰는 대신, "VRAM이 16GB 이상인 GPU가 필요하다"고 조건을 지정할 수 있습니다. LLM 추론에서는 모델 크기가 최소 VRAM 요구사항을 직접 결정하므로, 이 방식은 이론적 우아함을 넘어 실용적 필요에서 비롯된 것입니다.
+
+## CNCF LLM 추론 Blueprint
+
+Google, IBM, Red Hat이 CNCF에 기증한 Kubernetes LLM 추론 Blueprint는 Kubernetes에서 추론 서비스를 운영하기 위한 참조 아키텍처입니다. 주요 구성 요소는 다음과 같습니다.
+
+- **추론 엔진 배포**: vLLM 등 서빙 프레임워크의 Configuration 패턴
+- **GPU 스케줄링**: Affinity 규칙과 토폴로지 인식 배치 권장 사항
+- **오토스케일링**: CPU/메모리가 아닌 추론 레이턴시 기반의 수평 스케일링
+- **가관측성**: 추론 워크로드를 위한 모니터링 엔드포인트와 권장 메트릭
+
+각 팀이 처음부터 직접 설계하는 대신 커뮤니티가 검증한 기준점에서 시작할 수 있다는 점이 핵심 가치입니다. CNCF 거버넌스 하에서 관리되므로 에코시스템의 기여를 통해 지속적으로 발전할 것으로 기대됩니다.
+
+## Cloud Native 개발자 수 성장
+
+SlashData의 Q1 2026 Cloud Native 개발 현황 보고서에 따르면 전 세계 Cloud Native 개발자 수가 1990만 명에 달했습니다. 이 성장의 주요 동인 중 하나로 Kubernetes 위에서 AI/ML 워크로드를 운영하는 사례 증가가 꼽혔습니다.
+
+## 지금 준비해야 할 것
+
+GPU 클러스터를 운영 중이거나 계획 중인 팀을 위해 구체적인 준비 순서를 정리합니다.
+
+**Kubernetes 1.35 출시 전:**
+1. Device Plugin 방식(`nvidia.com/gpu` 요청)에 의존하는 기존 GPU Manifest를 점검합니다. 속성 기반 선택으로 이득을 볼 수 있는 워크로드를 파악합니다.
+2. NVIDIA의 DRA 드라이버 릴리스를 추적합니다. 벤더 지원 DRA 드라이버의 가용성이 실용적 전제 조건입니다.
+3. CNCF LLM 추론 Blueprint를 읽고 현재 구성과의 차이점을 파악합니다.
+
+**1.35 이후:**
+1. Non-production 클러스터에서 DRA를 테스트합니다. GPU 공유 또는 특정 VRAM 요구사항이 있는 워크로드에 집중합니다.
+2. 멀티테넌트 추론 환경(하나의 대형 GPU를 여러 소형 모델이 공유)에서 DRA의 공유 기능을 검증합니다.
+3. DRA의 풍부한 리소스 가시성을 활용한 오토스케일링 설정으로 업데이트합니다.
+
+## webhani의 관점
+
+DRA의 Beta 승격은 Kubernetes가 GPU 워크로드를 위한 일급 플랫폼이 되려 한다는 가장 명확한 신호입니다. CPU 오케스트레이터에 GPU를 덧붙인 형태에서 벗어나는 방향입니다. Beta에서 GA까지는 통상 1~2개 Kubernetes 릴리스 주기가 걸리므로, 오늘 AI/ML 인프라를 설계하는 팀은 DRA 호환성을 염두에 두고 구성하는 것이 바람직합니다.
+
+CNCF 추론 Blueprint는 시작 비용을 낮춰줍니다. LLM 인프라를 처음부터 설계하는 대신 Blueprint를 출발점으로 삼고, 요구사항이 다른 부분만 커스터마이징하는 방식을 권장합니다.
