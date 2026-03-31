@@ -14,6 +14,7 @@
 - `webhani.com` authoritative DNS는 Cloudflare
 - Cloudflare DNS에서 `www`는 Vercel용 `CNAME`으로 연결되어 있음
 - Cloudflare DNS에서 `llm-api`는 이미 `Tunnel` Record로 운영 중
+- Cloudflare Tunnel `webhani-connectors`에 `paperclip.webhani.com` route를 추가해둔 상태
 - Mac mini에서는 아래 `docker compose` 구성을 사용 중
 
 핵심 서비스:
@@ -93,6 +94,15 @@ DATABASE_URL=...@db:5432/...
 4. 새 Tunnel의 Public Hostname으로 `paperclip.webhani.com` 추가
 5. Service는 `http://paperclip:3100`으로 지정
 
+현재 추가된 route 정보:
+
+| 항목 | 값 |
+| --- | --- |
+| Tunnel name | `webhani-connectors` |
+| Public hostname | `paperclip.webhani.com` |
+| Path | `*` |
+| Service | `http://paperclip:3100` |
+
 ## 새 Tunnel 생성 절차
 
 이 문서의 기준은 `cloudflared`를 Mac mini 호스트가 아니라 Docker 컨테이너로 실행하는 방식입니다.
@@ -152,6 +162,17 @@ docker compose --profile cloudflare-tunnel up -d
 | URL | `paperclip:3100` |
 
 핵심은 `localhost:3100`이 아니라 `paperclip:3100`이라는 점입니다.
+
+현재 Dashboard에 반영된 값:
+
+```text
+Tunnel: webhani-connectors
+Public hostname: paperclip.webhani.com
+Path: *
+Service: http://paperclip:3100
+```
+
+즉, domain 연결 정보 자체는 이미 Cloudflare 쪽에 추가된 상태입니다. 남은 작업은 Mac mini 쪽 `cloudflared`가 이 Tunnel에 연결될 수 있도록 올바른 Tunnel token을 `.env`에 설정하고 컨테이너를 실행하는 것입니다.
 
 ## compose 기준 동작 방식
 
@@ -227,7 +248,7 @@ https://paperclip.webhani.com
 
 1. `docker compose ps`에서 `cloudflared`와 `paperclip`이 실행 중인지 확인
 2. `docker compose exec cloudflared wget -qO- http://paperclip:3100`이 성공하는지 확인
-3. Cloudflare Tunnel의 Public Hostname이 `paperclip.webhani.com -> paperclip:3100`으로 등록되어 있는지 확인
+3. Cloudflare Tunnel `webhani-connectors`에 `paperclip.webhani.com -> http://paperclip:3100`이 등록되어 있는지 확인
 4. `.env`의 `CLOUDFLARE_TUNNEL_TOKEN`이 올바른지 확인
 
 ### `localhost:3100`으로 넣었더니 안 되는 경우
@@ -253,7 +274,7 @@ http://paperclip:3100
 
 - [ ] Cloudflare DNS에서 `www` 기존 Vercel 연결 유지 확인
 - [ ] Cloudflare에서 `paperclip` 전용 Tunnel 새로 생성
-- [ ] Cloudflare Tunnel에서 `paperclip.webhani.com` Public Hostname 추가
+- [ ] Cloudflare Tunnel `webhani-connectors`에 `paperclip.webhani.com` Public Hostname 추가 확인
 - [ ] Service URL을 `http://paperclip:3100`으로 설정
 - [ ] `.env`에 `CLOUDFLARE_TUNNEL_TOKEN` 설정
 - [ ] `.env`에 `PAPERCLIP_PUBLIC_URL=https://paperclip.webhani.com` 설정
