@@ -1,0 +1,231 @@
+---
+title: "Rust の Web フレームワーク Axum：2026年に選ぶ理由と実践パターン"
+description: "Axum は Rust の Web フレームワーク採用率で Actix-web を抜き、最も人気の選択肢になりました。Tower ミドルウェアとの統合、型安全なルーティング、async/await の実例を交えて紹介します。"
+date: "2026-04-01"
+status: "published"
+tags: ["Rust", "Axum", "Web Development", "Backend", "API"]
+thumbnail: ""
+author: "webhani"
+slug: "rust-axum-web-development-2026"
+---
+
+Rust の Web フレームワーク選択肢は 2026 年現在、**Axum** がデファクトスタンダードに近い位置を占めるようになりました。Rust Developer Survey のデータでは Axum が Actix-web の採用率を上回り、Tower ミドルウェアエコシステムとの統合を重視する開発者から支持されています。
+
+本記事では Axum を選ぶ理由、基本的なパターン、そして実務で使えるコード例を整理します。
+
+## Axum を選ぶ理由
+
+### Tower ミドルウェアとの統合
+
+Axum の最大の特徴は **Tower** サービスとの完全な統合です。認証、レート制限、タイムアウト、ロギングといったミドルウェアを `tower` および `tower-http` クレートからそのまま使えます。
+
+```toml
+# Cargo.toml
+[dependencies]
+axum = "0.8"
+tower = "0.4"
+tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+```
+
+### 型安全なルーティング
+
+Axum のルーターは型で守られており、ハンドラの引数がリクエストと一致しない場合はコンパイル時にエラーになります。
+
+```rust
+use axum::{
+    routing::{get, post},
+    Router,
+    extract::{Path, Json, State},
+    http::StatusCode,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct User {
+    id: u64,
+    name: String,
+    email: String,
+}
+
+#[derive(Deserialize)]
+struct CreateUserRequest {
+    name: String,
+    email: String,
+}
+
+async fn get_user(
+    Path(id): Path<u64>,
+    State(db): State<AppState>,
+) -> Result<Json<User>, StatusCode> {
+    db.find_user(id)
+        .await
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn create_user(
+    State(db): State<AppState>,
+    Json(payload): Json<CreateUserRequest>,
+) -> (StatusCode, Json<User>) {
+    let user = db.create_user(payload.name, payload.email).await;
+    (StatusCode::CREATED, Json(user))
+}
+```
+
+## 共有状態の管理
+
+Axum では `State` エクストラクタで共有状態を各ハンドラに渡します。`Arc` でラップすることでスレッドセーフに共有できます。
+
+```rust
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+#[derive(Clone)]
+struct AppState {
+    db_pool: sqlx::PgPool,
+    cache: Arc<RwLock<std::collections::HashMap<u64, User>>>,
+}
+
+#[tokio::main]
+async fn main() {
+    let pool = sqlx::PgPool::connect("postgres://localhost/mydb")
+        .await
+        .expect("DB connection failed");
+
+    let state = AppState {
+        db_pool: pool,
+        cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+    };
+
+    let app = Router::new()
+        .route("/users/:id", get(get_user))
+        .route("/users", post(create_user))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+        .await
+        .unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+```
+
+## Tower ミドルウェアのチェーン
+
+認証・CORS・圧縮・トレーシングを一括で設定できます。
+
+```rust
+use tower_http::{
+    trace::TraceLayer,
+    cors::{CorsLayer, Any},
+    compression::CompressionLayer,
+};
+use tower::ServiceBuilder;
+
+let app = Router::new()
+    .route("/users/:id", get(get_user))
+    .route("/users", post(create_user))
+    .layer(
+        ServiceBuilder::new()
+            .layer(TraceLayer::new_for_http())
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods(Any)
+                    .allow_headers(Any),
+            )
+            .layer(CompressionLayer::new()),
+    )
+    .with_state(state);
+```
+
+## エラーハンドリング
+
+Axum では `IntoResponse` トレイトを実装することでカスタムエラー型をレスポンスに変換できます。
+
+```rust
+use axum::{
+    response::{IntoResponse, Response},
+    http::StatusCode,
+    Json,
+};
+use serde_json::json;
+
+enum AppError {
+    NotFound(String),
+    Unauthorized,
+    Internal(anyhow::Error),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            AppError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized".to_string(),
+            ),
+            AppError::Internal(err) => {
+                tracing::error!("Internal error: {:?}", err);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                )
+            }
+        };
+
+        (status, Json(json!({ "error": message }))).into_response()
+    }
+}
+
+// ハンドラでの使用例
+async fn get_user(
+    Path(id): Path<u64>,
+    State(db): State<AppState>,
+) -> Result<Json<User>, AppError> {
+    db.find_user(id)
+        .await
+        .map(Json)
+        .ok_or_else(|| AppError::NotFound(format!("User {} not found", id)))
+}
+```
+
+## Actix-web との比較
+
+2026 年現在の両フレームワークの位置づけを整理します。
+
+| 観点 | Axum | Actix-web |
+|------|------|-----------|
+| 採用率 | 高い（調査で上位） | 高い（実績あり） |
+| 性能 | 高い | 最高水準（10〜15% 高速） |
+| ミドルウェア | Tower エコシステム | actix-web 独自 |
+| 学習コスト | 中程度 | 中程度〜やや高い |
+| 型安全性 | 強力 | 強力 |
+| ユースケース | 汎用 API | 極限の高スループットが必要な場合 |
+
+純粋な RPS（Requests Per Second）では Actix-web が 10〜15% 優位ですが、大半のアプリケーションではその差よりも Tower エコシステムとの統合や保守性の方が重要になります。
+
+## Loco：Rust の Rails
+
+2026 年に注目が高まっているのが **Loco** です。Axum をベースに、Ruby on Rails 風のコンベンション・オーバー・コンフィギュレーションを Rust にもたらすフレームワークです。
+
+```bash
+cargo install loco-cli
+loco new my_app
+cd my_app
+cargo loco start
+```
+
+Loco は ORM（SeaORM）、認証、タスクスケジューラ、メール送信など「フルスタック」な機能をデフォルトで提供します。小〜中規模のプロダクトを Rust で作る場合の選択肢として評価する価値があります。
+
+## まとめ
+
+Axum は 2026 年の Rust Web 開発において、バランスの取れた選択肢です。
+
+- Tower ミドルウェアとの統合により、本番環境で必要な機能（認証・レート制限・トレーシング）を既存ライブラリで揃えられる
+- 型安全なルーティングとエクストラクタでランタイムエラーを減らせる
+- 極限の性能が必要なら Actix-web、プロダクティビティ重視なら Loco という選択肢もある
+
+Rust を新規プロジェクトで使う場合、Axum から始めて必要に応じて他のフレームワークと比較するのが現実的なアプローチです。

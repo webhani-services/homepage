@@ -1,0 +1,238 @@
+---
+title: "Rust 웹 프레임워크 Axum: 2026년에 선택해야 하는 이유"
+description: "Axum이 Rust 웹 프레임워크 채택률에서 Actix-web을 앞섰습니다. Tower 미들웨어 통합, 타입 안전 라우팅, 상태 관리, 에러 처리 패턴을 실제 코드로 정리합니다."
+date: "2026-04-01"
+status: "published"
+tags: ["Rust", "Axum", "Web Development", "Backend", "API"]
+thumbnail: ""
+author: "webhani"
+slug: "rust-axum-web-development-2026"
+---
+
+최근 Rust 개발자 설문조사에서 Axum이 Actix-web을 제치고 가장 널리 채택되는 Rust 웹 프레임워크가 되었습니다. 벤치마크 수치로는 Actix-web이 여전히 더 빠르지만, Axum의 강점은 다른 곳에 있습니다. Tower 미들웨어 생태계와의 완전한 통합, 타입 안전한 요청 처리, async Rust 생태계와의 자연스러운 연결입니다.
+
+실제 코드로 Axum 개발 패턴을 살펴봅니다.
+
+## 프로젝트 설정
+
+```toml
+# Cargo.toml
+[dependencies]
+axum = "0.8"
+tower = "0.4"
+tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
+```
+
+## 타입 안전 라우팅과 Extractor
+
+Axum의 핸들러는 일반 async 함수입니다. 경로 파라미터, 쿼리 스트링, JSON Body, 공유 상태는 모두 타입화된 Extractor로 전달됩니다. 타입이 핸들러 시그니처와 맞지 않으면 컴파일 오류가 발생합니다.
+
+```rust
+use axum::{
+    routing::{get, post},
+    Router,
+    extract::{Path, Json, State},
+    http::StatusCode,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Clone)]
+struct User {
+    id: u64,
+    name: String,
+    email: String,
+}
+
+#[derive(Deserialize)]
+struct CreateUserRequest {
+    name: String,
+    email: String,
+}
+
+async fn get_user(
+    Path(id): Path<u64>,
+    State(db): State<AppState>,
+) -> Result<Json<User>, StatusCode> {
+    db.find_user(id)
+        .await
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn create_user(
+    State(db): State<AppState>,
+    Json(payload): Json<CreateUserRequest>,
+) -> (StatusCode, Json<User>) {
+    let user = db.create_user(payload.name, payload.email).await;
+    (StatusCode::CREATED, Json(user))
+}
+```
+
+매크로나 리플렉션 없이 컴파일러가 검증하는 명시적인 함수 시그니처입니다.
+
+## 공유 상태 관리
+
+DB Pool, Cache, 설정 등 애플리케이션 상태는 `State` Extractor로 각 핸들러에 주입됩니다. `Arc`로 감싸서 핸들러 태스크 간에 저렴하게 복제할 수 있습니다.
+
+```rust
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+#[derive(Clone)]
+struct AppState {
+    db_pool: sqlx::PgPool,
+    cache: Arc<RwLock<std::collections::HashMap<u64, User>>>,
+}
+
+#[tokio::main]
+async fn main() {
+    let pool = sqlx::PgPool::connect("postgres://localhost/mydb")
+        .await
+        .expect("DB 연결 실패");
+
+    let state = AppState {
+        db_pool: pool,
+        cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+    };
+
+    let app = Router::new()
+        .route("/users/:id", get(get_user))
+        .route("/users", post(create_user))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+        .await
+        .unwrap();
+
+    axum::serve(listener, app).await.unwrap();
+}
+```
+
+## Tower 미들웨어 스택
+
+Axum의 설계 철학이 가장 잘 드러나는 부분입니다. 인증, 레이트 제한, CORS, 압축, 분산 트레이싱은 모두 `tower`와 `tower-http` 생태계에서 가져옵니다. Axum 전용 플러그인이 필요하지 않습니다.
+
+```rust
+use tower_http::{
+    trace::TraceLayer,
+    cors::{CorsLayer, Any},
+    compression::CompressionLayer,
+    timeout::TimeoutLayer,
+};
+use tower::ServiceBuilder;
+use std::time::Duration;
+
+let app = Router::new()
+    .route("/users/:id", get(get_user))
+    .route("/users", post(create_user))
+    .layer(
+        ServiceBuilder::new()
+            .layer(TimeoutLayer::new(Duration::from_secs(30)))
+            .layer(TraceLayer::new_for_http())
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods(Any)
+                    .allow_headers(Any),
+            )
+            .layer(CompressionLayer::new()),
+    )
+    .with_state(state);
+```
+
+Tower는 범용 async 미들웨어 추상화이므로, 같은 미들웨어가 Axum, Tonic(gRPC) 등 Tower 호환 서비스 전체에서 동작합니다. REST API 옆에 gRPC Endpoint를 추가할 때도 미들웨어를 다시 작성할 필요가 없습니다.
+
+## 구조화된 에러 처리
+
+커스텀 에러 타입에 `IntoResponse`를 구현하면 모든 핸들러에서 일관된 에러 응답을 얻을 수 있습니다.
+
+```rust
+use axum::{
+    response::{IntoResponse, Response},
+    http::StatusCode,
+    Json,
+};
+use serde_json::json;
+
+enum AppError {
+    NotFound(String),
+    Unauthorized,
+    Internal(anyhow::Error),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            AppError::Unauthorized => {
+                (StatusCode::UNAUTHORIZED, "Unauthorized".to_string())
+            }
+            AppError::Internal(err) => {
+                tracing::error!("Internal error: {:?}", err);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                )
+            }
+        };
+
+        (status, Json(json!({ "error": message }))).into_response()
+    }
+}
+
+async fn get_user(
+    Path(id): Path<u64>,
+    State(db): State<AppState>,
+) -> Result<Json<User>, AppError> {
+    db.find_user(id)
+        .await
+        .map(Json)
+        .ok_or_else(|| AppError::NotFound(format!("User {} not found", id)))
+}
+```
+
+에러 처리 로직이 한 곳에 집중되고, 핸들러 반환 타입이 자기 문서화 역할을 합니다.
+
+## Axum vs Actix-web 비교
+
+| 비교 항목 | Axum | Actix-web |
+|----------|------|-----------|
+| 2026년 채택률 | 더 높음 | 높음 |
+| 최대 처리량 | 높음 | ~10-15% 더 높음 |
+| 미들웨어 | Tower 생태계 (공유) | actix-web 전용 |
+| 학습 난이도 | 보통 | 보통~다소 높음 |
+| gRPC 호환성 | Tower (Tonic과 공유) | 별도 통합 필요 |
+| 적합한 용도 | 범용 API | 극한의 처리량이 필요한 경우 |
+
+대부분의 프로덕션 API에서 두 프레임워크의 성능 차이는 실질적 의미가 없습니다. 병목은 프레임워크가 아닌 DB나 네트워크에서 발생하기 때문입니다. Tower 미들웨어 공유가 더 실질적인 장점입니다.
+
+## Loco: Rust의 Rails
+
+주목할 만한 프레임워크로 **Loco**가 있습니다. Axum 위에 구축된 의견 있는(opinionated) 풀스택 Rust 프레임워크로, Ruby on Rails 방식의 컨벤션을 Rust에 도입합니다.
+
+```bash
+cargo install loco-cli
+loco new my_app
+cd my_app
+cargo loco start
+```
+
+Loco는 SeaORM, 인증 스캐폴딩, 태스크 스케줄러, 메일 발송 기능을 기본 제공합니다. 성능 임계 서비스보다 제품을 빠르게 만들고 싶을 때 평가해볼 가치가 있습니다.
+
+## Rust를 웹에 사용할 시점
+
+Rust가 웹 개발에 적합한 경우:
+
+- **성능 여유**가 필요한 경우: 밀리초 이하 지연이나 수평 확장이 어려운 환경
+- **시스템 경계의 메모리 안전성**: 신뢰할 수 없는 바이너리 데이터나 복잡한 파싱 처리
+- **엄격한 리소스 제약**이 있는 장기 실행 서비스
+
+일반적인 CRUD API에는 Python(FastAPI)이나 TypeScript(Hono, Fastify)가 더 빠르게 개발되고 유지 비용이 낮습니다. Rust의 강점이 실제로 필요한 곳에 사용하는 것이 합리적입니다.
+
+## 정리
+
+2026년 Axum은 모든 벤치마크를 이기기 때문이 아니라, async Rust 생태계에 자연스럽게 맞고, Tower 스택과 미들웨어를 공유하며, 핸들러 코드를 읽기 쉽게 유지하기 때문에 Rust 웹 개발의 실용적인 기본 선택지가 되었습니다. Rust로 웹 서비스를 시작한다면 Axum부터 시작하고, 더 많은 스캐폴딩이 필요하면 Loco를, 프로파일링 결과 더 높은 처리량이 필요하다면 Actix-web으로 전환을 고려하세요.
