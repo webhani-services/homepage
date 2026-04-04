@@ -1,0 +1,143 @@
+---
+title: "Docker Kanvas: From Docker Compose to Kubernetes Without Writing Helm Charts"
+description: "Docker Kanvas automates Docker Compose to Kubernetes manifest conversion with GitOps-aware output and environment overlays. Here's what it does, how it compares to Helm, and where it fits in 2026 platform workflows."
+date: "2026-04-05"
+status: "published"
+tags: ["Docker", "Kubernetes", "DevOps", "Infrastructure", "Platform Engineering"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-kubernetes-platform-2026"
+---
+
+Docker launched Kanvas to address a specific, persistent pain point: the gap between `docker compose up` in development and production Kubernetes deployments. Rather than asking teams to maintain parallel Docker Compose and Helm configurations, Kanvas automates the translation — converting Compose files into production-ready Kubernetes manifests with GitOps-aware output.
+
+Here's what Kanvas actually does, how it differs from existing tools, and where it fits in a modern platform stack.
+
+## The Compose-to-Kubernetes Translation Problem
+
+Most teams start with Docker Compose. It's fast, readable, and covers 90% of local development needs. The problem appears when deploying to production:
+
+- Kubernetes requires Deployments, Services, ConfigMaps, Secrets, and PersistentVolumeClaims — each a separate resource type
+- Environment-specific configuration (dev vs. staging vs. prod) needs to be managed across both Compose and K8s formats
+- Secrets in Compose `environment` blocks need to route to Kubernetes Secrets, not ConfigMaps
+- `depends_on` has no direct Kubernetes equivalent
+
+The standard solution — write Helm charts or Kustomize overlays — requires significant Kubernetes knowledge and creates a second configuration surface to maintain.
+
+## What Kanvas Generates
+
+Given a Compose file, Kanvas produces structured Kubernetes manifests:
+
+```yaml
+# Input: docker-compose.yml
+services:
+  api:
+    image: myapp/api:1.4.0
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://db:5432/app
+      API_SECRET: ${API_SECRET}
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "512M"
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+```
+
+Kanvas outputs:
+
+- `api-deployment.yaml` — with resource limits from `deploy.resources`, replica count, and init container derived from `depends_on` healthcheck
+- `api-service.yaml` — ClusterIP service with correct port mapping
+- `db-statefulset.yaml` — StatefulSet instead of Deployment for the database
+- `api-secret.yaml` — `API_SECRET` and `DB_PASSWORD` routed to a Kubernetes Secret (not ConfigMap)
+- `kustomization.yaml` — base overlay for GitOps integration
+
+The translation is not naive. Resource limits, health checks, and secret detection are handled — which is where tools like `kompose` historically fell short.
+
+## How Kanvas Differs from Kompose
+
+`kompose` converts Compose to Kubernetes, but the output requires significant manual editing before it's production-ready. Kanvas extends this with:
+
+| Feature | kompose | Kanvas |
+|---|---|---|
+| Basic resource generation | Yes | Yes |
+| Secret vs. ConfigMap detection | Manual | Automatic |
+| StatefulSet for databases | Manual | Automatic |
+| Resource limits from deploy config | Partial | Full |
+| Environment overlays (dev/prod) | No | Yes |
+| GitOps-structured output | No | Yes (ArgoCD/Flux compatible) |
+| Drift detection | No | Yes |
+
+## Environment Overlays
+
+Kanvas handles the dev/staging/prod variation problem with an overlay system similar to Kustomize:
+
+```bash
+# Generate base + environment overlays
+kanvas convert -f docker-compose.yml \
+  --envs dev,staging,prod \
+  -o k8s/
+
+# Output structure:
+# k8s/
+#   base/           ← shared manifests
+#   overlays/
+#     dev/          ← reduced replicas, debug flags
+#     staging/      ← production-like config
+#     prod/         ← full resource limits, HPA config
+```
+
+The dev overlay reduces replica counts and adjusts resource limits; the prod overlay enables HorizontalPodAutoscaler configuration. Teams edit these overlays directly — they're standard Kubernetes YAML owned by the team.
+
+## Where Kanvas Fits vs. Where Helm Still Wins
+
+Kanvas is well-suited for teams that:
+
+- Own their services end-to-end and Compose is the canonical configuration
+- Are migrating from Compose-based staging environments to Kubernetes
+- Want GitOps without the overhead of learning Helm templating
+
+Helm remains the better choice when:
+
+- Deploying third-party software where community charts exist
+- Managing complex multi-chart dependencies with shared values
+- Your team already has established Helm workflows with custom hooks and lifecycle management
+
+The two aren't mutually exclusive. A reasonable approach: use Kanvas for your own services, Helm for third-party infrastructure components.
+
+## Practical Starting Point
+
+```bash
+# Install via Docker Desktop extension
+docker extension install docker/kanvas
+
+# Dry-run to preview generated manifests
+kanvas convert -f docker-compose.yml --dry-run
+
+# Convert and write to directory
+kanvas convert -f docker-compose.yml -o ./k8s/
+
+# Deploy directly to current kubectl context
+kanvas deploy -f docker-compose.yml --context staging
+```
+
+The generated YAML is plain Kubernetes — no Kanvas-specific dependencies at runtime. Once generated, it works with any standard Kubernetes toolchain.
+
+## Takeaway
+
+Docker Kanvas is a practical answer to a real workflow problem. It won't replace Helm for complex deployments, but it significantly lowers the barrier for teams bringing Compose-based services to Kubernetes production environments. If you maintain parallel Compose and K8s configs today, the drift detection and overlay system alone are worth evaluating.

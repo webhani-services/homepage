@@ -1,0 +1,143 @@
+---
+title: "Docker Kanvas: Helm Chartを書かずにDocker ComposeをKubernetesへ移行する"
+description: "Docker KanvasはCompose FileをKubernetes Manifestに自動変換し、GitOps対応の出力とEnvironment Overlayを提供します。HelmやKustomizeとの比較と、2026年のPlatformワークフローでの位置づけを解説します。"
+date: "2026-04-05"
+status: "published"
+tags: ["Docker", "Kubernetes", "DevOps", "Infrastructure", "Platform Engineering"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-kubernetes-platform-2026"
+---
+
+DockerはKanvasを、「`docker compose up`で動く開発環境」と「本番KubernetesのDeployment」の間にあるギャップを埋めるために立ち上げました。Docker ComposeとHelmの両方を並行して保守するのではなく、Compose Fileを自動的に本番対応のKubernetes Manifestに変換し、GitOps対応の出力を生成します。
+
+Kanvasが実際に何をするのか、既存ツールとの違い、そして現代的なPlatformスタックでどこに位置づけられるかを解説します。
+
+## Compose-to-KubernetesのTranslation Problem
+
+ほとんどのチームはDocker Composeから始めます。速く、読みやすく、ローカル開発ニーズの90%をカバーします。問題は本番Deploymentのときに現れます。
+
+- KubernetesはDeployment、Service、ConfigMap、Secret、PersistentVolumeClaimをそれぞれ別のResource Typeとして要求する
+- 環境ごとの設定（dev/staging/prod）はComposeとK8sの両方で管理が必要
+- Composeの`environment`ブロックにあるSecretはKubernetes Secret（ConfigMapではなく）にRouteする必要がある
+- `depends_on`に対応するKubernetesの直接的な機能は存在しない
+
+標準的な解決策であるHelm ChartやKustomize Overlayの作成には、相当なKubernetes知識と、維持管理が必要な第二の設定Surfaceが生まれます。
+
+## Kanvasが生成するもの
+
+Compose Fileを与えると、KanvasはKubernetes Manifestを生成します。
+
+```yaml
+# 入力: docker-compose.yml
+services:
+  api:
+    image: myapp/api:1.4.0
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://db:5432/app
+      API_SECRET: ${API_SECRET}
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "512M"
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+```
+
+Kanvasは以下を出力します。
+
+- `api-deployment.yaml` — `deploy.resources`のResource LimitとReplica Count、`depends_on`のHealth CheckからInit Containerを生成
+- `api-service.yaml` — 正しいPort MappingのClusterIP Service
+- `db-statefulset.yaml` — DatabaseにはDeploymentではなくStatefulSetを使用
+- `api-secret.yaml` — `API_SECRET`と`DB_PASSWORD`をConfigMapではなくKubernetes Secretにroute
+- `kustomization.yaml` — GitOps IntegrationのためのBase Overlay
+
+この変換は単純ではありません。Resource Limit、Health Check、Secretの自動検出が処理されており、これはkomposeが従来から弱い部分でした。
+
+## KomposeとKanvasの違い
+
+`kompose`はComposeからKubernetesへの変換を行いますが、本番利用のためには大幅な手動編集が必要です。Kanvasはこれを以下の点で拡張しています。
+
+| 機能 | kompose | Kanvas |
+|---|---|---|
+| 基本的なResource生成 | あり | あり |
+| SecretとConfigMapの自動判別 | 手動 | 自動 |
+| DatabaseへのStatefulSet適用 | 手動 | 自動 |
+| deployの設定からResource Limitを生成 | 部分的 | 完全 |
+| Environment Overlay（dev/prod） | なし | あり |
+| GitOps構造の出力 | なし | あり（ArgoCD/Flux対応） |
+| Drift検出 | なし | あり |
+
+## Environment Overlay
+
+KanvasはKustomizeに似たOverlayシステムでdev/staging/prodの設定差分を解決します。
+
+```bash
+# Base + Environment Overlayを生成
+kanvas convert -f docker-compose.yml \
+  --envs dev,staging,prod \
+  -o k8s/
+
+# 出力構造:
+# k8s/
+#   base/           ← 共通Manifest
+#   overlays/
+#     dev/          ← Replica数削減、デバッグフラグ
+#     staging/      ← 本番に近い設定
+#     prod/         ← 完全なResource Limit、HPA設定
+```
+
+dev overlayはReplica数を減らしてResource Limitを調整し、prod overlayはHorizontalPodAutoscalerの設定を有効にします。これらのoverlayは通常のKubernetes YAMLとして直接編集できます。Kanvasの独自形式にはロックインされません。
+
+## KanvasとHelmの適切な使い分け
+
+Kanvasが適しているケース。
+
+- サービスをEnd-to-Endで所有しており、Composeが設定の起点
+- ComposeベースのStagingからKubernetesへの移行
+- Helmの学習コストをかけずにGitOpsを採用したい
+
+Helmが適しているケース。
+
+- Community Chartが利用できるサードパーティソフトウェアのDeployment
+- 共有ValueによるMulti-Chart依存関係の複雑な管理
+- Custom HookとLifecycleを持つ確立されたHelmワークフローがある
+
+両者は排他的ではありません。自社サービスにはKanvas、インフラコンポーネントにはHelmという組み合わせは合理的なアプローチです。
+
+## 実践的な始め方
+
+```bash
+# Docker Desktop Extensionからインストール
+docker extension install docker/kanvas
+
+# 生成されるManifestをDry-runでプレビュー
+kanvas convert -f docker-compose.yml --dry-run
+
+# Directoryに変換して出力
+kanvas convert -f docker-compose.yml -o ./k8s/
+
+# 現在のkubectlのContextに直接Deploy
+kanvas deploy -f docker-compose.yml --context staging
+```
+
+生成されたYAMLは通常のKubernetesです。Runtime時にKanvasへの依存はなく、一度生成すれば標準のKubernetesツールチェーンで操作できます。
+
+## まとめ
+
+Docker Kanvasは、ComposeとKubernetesの間の実際のワークフロー問題に対する現実的な解です。確立されたHelmワークフローを持つチームにとってHelmの置き換えにはなりませんが、ComposeをサービスのCanonical Configurationとして使っているチームにとって、Kubernetesへの本番環境移行の障壁を大幅に下げます。現在ComposeとK8sの設定を並行管理しているチームには、Drift検出とOverlayシステムだけでも評価する価値があります。

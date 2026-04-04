@@ -1,0 +1,156 @@
+---
+title: "Platform Engineering 2026: IDP가 기존 DevOps를 대체하는 이유"
+description: "2026년까지 조직의 80%가 Internal Developer Platform을 도입할 것으로 예상됩니다. 이 전환을 이끄는 요인, 성숙한 IDP의 모습, 그리고 팀에 실제로 필요한지 평가하는 방법을 설명합니다."
+date: "2026-04-05"
+status: "published"
+tags: ["Platform Engineering", "DevOps", "Kubernetes", "Developer Experience", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "platform-engineering-idp-2026"
+---
+
+Platform Engineering이 DevOps를 대체하고 있는 것은 DevOps가 실패했기 때문이 아니라, 너무 잘 성공했기 때문입니다. 조직들이 Kubernetes, Cloud Native 툴링, Microservice를 대규모로 도입하면서 운영상의 Surface Area가 개별 팀이 관리할 수 있는 속도를 넘어서 확장되었습니다. Internal Developer Platform(IDP)은 그에 대한 대응으로 생겨났습니다. Application Developer와 Infrastructure 사이에 정제된 Self-Service 추상화 레이어를 두는 방식입니다.
+
+2026년 말까지 IDP 도입률은 조직 전체의 약 80%에 달할 것으로 예상되며, 몇 년 전의 약 45%에서 크게 증가했습니다. 이를 이끄는 배경, 성숙한 IDP의 실제 모습, 그리고 복잡성이 어디에 남아있는지를 설명합니다.
+
+## 기존 DevOps가 스케일하지 못하는 이유
+
+DevOps의 원래 약속인 "You build it, you run it"은 개발자가 상당한 운영 지식을 보유해야 함을 전제합니다. 실제 현장에서는 다음 문제가 발생합니다.
+
+- 모든 개발자가 Kubernetes Networking, RBAC, Resource Limit, Deployment Strategy를 이해해야 합니다
+- 팀 간에 Infrastructure 설정이 중복됩니다
+- 운영 Surface Area가 크기 때문에 새로운 엔지니어 온보딩이 오래 걸립니다
+- 각 팀이 독자적으로 설정하기 때문에 Security·Compliance Review가 일관되지 않습니다
+
+Platform Engineering은 모든 개발자가 모든 Infrastructure 세부사항을 알 필요는 없다는 전제에서 출발합니다. 대신 전담 Platform Team이 "포장된 도로(Paved Road)"를 구축하고 유지합니다. 일반적인 태스크에 대해 의견이 명확하고 사전 검증된 경로를 제공하고, 개발자는 Self-Service 인터페이스를 사용해 작업합니다.
+
+## IDP의 실제 모습
+
+성숙한 IDP는 단일 Tool이 아닙니다. 통합된 기능의 집합입니다.
+
+```
+개발자 요청
+        │
+        ▼
+┌────────────────────────┐
+│   Self-Service Portal  │  ← Backstage, Port, Cortex
+│   (Service Catalog)    │
+└────────┬───────────────┘
+         │
+         ▼
+┌────────────────────────┐
+│  Workflow Automation   │  ← GitHub Actions, Tekton, ArgoCD
+│  (CI/CD Pipeline)      │
+└────────┬───────────────┘
+         │
+         ▼
+┌────────────────────────┐
+│  Infrastructure Layer  │  ← Kubernetes, Terraform, Crossplane
+│  (Compute, Network,    │
+│   Storage, Secrets)    │
+└────────┬───────────────┘
+         │
+         ▼
+┌────────────────────────┐
+│  Observability Layer   │  ← Prometheus, Grafana, OpenTelemetry
+│  (Metrics, Logs,       │
+│   Traces, Alerts)      │
+└────────────────────────┘
+```
+
+핵심 특성은 개발자가 주로 상단 레이어와 상호작용한다는 것입니다. 새로운 Service를 요청하고 기본 설정을 정의하면, Platform이 Provisioning, CI/CD 설정, Secret 관리, Observability 계측을 처리합니다.
+
+## Backstage 패턴
+
+Spotify의 Backstage는 IDP Portal의 사실상 표준 출발점이 되었습니다. Service Catalog, Software Template, Plugin Architecture를 제공하고 팀이 자신의 환경에 맞게 확장할 수 있습니다.
+
+```yaml
+# Node.js 서비스용 Backstage Software Template
+# templates/nodejs-service/template.yaml
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: nodejs-service
+  title: Node.js Service
+  description: CI/CD가 포함된 프로덕션 준비된 Node.js 서비스를 Scaffold합니다
+spec:
+  parameters:
+    - title: Service Configuration
+      properties:
+        name:
+          type: string
+          title: Service 이름
+        owner:
+          type: string
+          title: 담당 Team
+        replicaCount:
+          type: integer
+          title: 초기 Replica 수
+          default: 2
+
+  steps:
+    - id: fetch
+      action: fetch:template
+      input:
+        url: ./skeleton
+        values:
+          name: ${{ parameters.name }}
+          owner: ${{ parameters.owner }}
+
+    - id: publish
+      action: publish:github
+      input:
+        repoUrl: github.com/your-org/${{ parameters.name }}
+
+    - id: register
+      action: catalog:register
+      input:
+        repoContentsUrl: ${{ steps.publish.output.repoContentsUrl }}
+```
+
+개발자가 이 Template으로 Service를 만들면, CI/CD가 설정된 GitHub Repository, 적절한 기본값의 Kubernetes Manifest, Observability 계측, Catalog 등록이 몇 분 만에 갖춰집니다.
+
+## Crossplane: Kubernetes 리소스로서의 Infrastructure
+
+2026년 IDP에서 부상하는 패턴 중 하나는 Crossplane을 사용해 Cloud Infrastructure를 Kubernetes Custom Resource로 표현하는 것입니다. Platform Team은 일반적인 Infrastructure 요구사항에 대해 단순하고 정책을 준수하는 추상화를 제공할 수 있습니다.
+
+```yaml
+# 개발자는 간단한 Custom Resource로 Database를 요청합니다
+# Platform Team의 Composition이 실제 RDS/CloudSQL 설정을 처리합니다
+apiVersion: platform.company.com/v1alpha1
+kind: Database
+metadata:
+  name: myapp-db
+  namespace: myapp-prod
+spec:
+  engine: postgres
+  version: "16"
+  size: small  # Platform Team이 보안 승인된 Instance Type으로 매핑
+  backupRetentionDays: 7
+```
+
+이 간단한 인터페이스 뒤에서 Platform Team의 Composition이 적절한 Security Group, 암호화, Backup 설정, Credential Injection을 갖춘 실제 Cloud Database를 프로비저닝합니다. 개발자는 Cloud Provider API를 직접 다루지 않습니다.
+
+## 복잡성이 남아있는 곳
+
+IDP는 Application Developer의 Cognitive Load를 Platform Team으로 이전해 경감시킵니다. 이는 실질적인 개선이지만, 복잡성이 사라지지는 않습니다.
+
+- **Platform Team Bottleneck**: 모든 Infrastructure 요구사항에 Platform Team 티켓이 필요하다면 큐를 옮긴 것에 불과합니다. 처음부터 Self-Service에 투자하세요.
+- **Abstraction Leakage**: 프로덕션에서 문제가 생기면 개발자는 여전히 근본적인 Infrastructure를 이해해야 합니다. 좋은 IDP는 추상화만이 아니라 Escape Hatch와 Observability를 제공합니다.
+- **Template 유지 관리**: Service Template은 낡아갑니다. Application 코드와 동일하게 Template에 대한 자동화된 테스트를 구축하세요.
+- **Adoption**: 최고의 IDP도 개발자가 우회 방법을 만들면 의미가 없습니다. Platform에 대한 개발자 만족도를 정기적으로 측정하고 개선하세요.
+
+## 팀에 IDP가 필요한지 평가하기
+
+100명 규모의 모든 조직에 공식적인 IDP가 필요한 것은 아닙니다. 필요하다는 신호는 다음과 같습니다.
+
+- 새로운 Service 온보딩에 하루 이상 걸립니다
+- 팀 간에 Infrastructure 설정이 일관되지 않습니다
+- Security나 Compliance Review가 Deployment의 병목이 됩니다
+- 개발자가 Self-Service여야 할 사항을 Ops/Infra 팀에 자주 문의합니다
+
+이에 해당한다면, Platform Team에 대한 투자는 Toil 감소와 더 빠른 배포로 회수됩니다. 그렇지 않다면, 잘 유지된 Template과 Runbook 세트로 충분한 경우가 많습니다.
+
+## 정리
+
+Platform Engineering으로의 전환은 스케일에 대한 성숙한 대응이지, 엔지니어링적 판단의 대체가 아닙니다. IDP에서 가장 많은 가치를 얻는 조직은 Platform을 제품으로 취급하는 곳입니다. 사용자 리서치, Adoption Metrics, 반복적인 개선을 통해 일회성 Infrastructure 프로젝트가 아닌 지속적으로 발전시킵니다. 개발자가 가장 마찰을 느끼는 태스크부터 시작해 그곳에 포장된 도로를 만드는 것이 출발점입니다.
