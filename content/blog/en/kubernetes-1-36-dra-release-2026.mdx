@@ -1,0 +1,170 @@
+---
+title: "Kubernetes 1.36: DRA Enhancements, User Namespaces GA, and the End of Ingress-Nginx"
+description: "Kubernetes 1.36 releases on April 22, 2026 with 80 enhancements. Here's what production cluster operators need to know: DRA hardware management, User Namespaces reaching GA, StatefulSet rollout fixes, and the Gateway API replacing Ingress-Nginx."
+date: "2026-04-06"
+status: "published"
+tags: ["Kubernetes", "Cloud Native", "DRA", "DevOps", "Container"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-36-dra-release-2026"
+---
+
+Kubernetes v1.36 is scheduled for release on April 22, 2026. It's the first Kubernetes release of the year, with 80 enhancements tracked across the release cycle — 18 graduating to stable, and several notable changes that will affect how teams manage production clusters.
+
+This post focuses on the changes most relevant to teams running Kubernetes in production: DRA hardware management improvements, User Namespaces reaching GA, the StatefulSet rollout fix that's been waited on since 2018, and the deprecation of Ingress-Nginx.
+
+## Dynamic Resource Allocation (DRA): Hardware Maintenance Gets Easier
+
+DRA is Kubernetes' mechanism for managing specialized hardware — GPUs, FPGAs, network accelerators — as first-class resources. In 1.36, four DRA enhancements are graduating to GA status, with the most operationally significant being **device-level maintenance support**.
+
+Previously, taking a GPU offline for maintenance in a Kubernetes cluster was a blunt operation: you'd drain the node, lose all workloads running on it, perform maintenance, then bring it back. The new DRA enhancement allows admins to mark specific devices as unavailable for scheduling without disrupting the entire node. Running workloads continue on other devices on the same node; new workloads simply won't be scheduled to the marked device.
+
+```yaml
+# Example: Mark a specific GPU device for maintenance
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceSlice
+metadata:
+  name: node-gpu-0
+spec:
+  nodeName: gpu-worker-01
+  driver: gpu.example.com
+  pool:
+    name: gpu-pool
+    generation: 2
+    resourceSliceCount: 1
+  devices:
+    - name: gpu-0
+      basic:
+        attributes:
+          model:
+            string: "A100"
+        capacity:
+          memory:
+            value: "80Gi"
+    - name: gpu-1
+      basic:
+        attributes:
+          model:
+            string: "A100"
+          maintenance:        # New: mark device unavailable
+            bool: true
+        capacity:
+          memory:
+            value: "80Gi"
+```
+
+For teams running AI/ML workloads on GPU clusters, this matters. Rolling hardware maintenance without full node drains is a significant operational improvement for clusters where restarting distributed training jobs has real cost.
+
+## User Namespaces: Now Stable
+
+User Namespaces in pods is graduating to stable in 1.36. This feature maps container UIDs to non-privileged host UIDs, so a process running as root inside a container is not root on the host system. The security benefit is straightforward: if a container breakout occurs, the attacker gets a non-privileged host user, not root access.
+
+Enabling user namespaces requires a kernel with the feature supported (Linux 6.3+) and a container runtime that supports it (containerd 1.7+, CRI-O 1.25+).
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-workload
+spec:
+  hostUsers: false  # Enable user namespaces
+  securityContext:
+    runAsUser: 65534
+    runAsGroup: 65534
+  containers:
+    - name: app
+      image: myapp:latest
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+```
+
+The `hostUsers: false` field is the key toggle. With user namespaces enabled, processes inside the pod that appear to run as UID 0 are mapped to a high UID range on the host (typically 65536+), with no capabilities on the host system.
+
+This is worth enabling for any workload that can't avoid running as root inside the container — legacy applications that weren't written with container security in mind. It's not a replacement for proper security contexts, but it is meaningful defense-in-depth.
+
+## StatefulSet Recreate Strategy: A Long-Waited Fix
+
+StatefulSets have had a stuck rollout problem since Kubernetes 1.0: if a pod fails to start during a rolling update, the rollout stalls indefinitely. There was no clean way to say "restart all pods at once and accept the downtime" — you had to manually delete pods or manipulate the StatefulSet directly.
+
+Kubernetes 1.36 introduces the `Recreate` update strategy for StatefulSets, borrowing the concept from Deployments:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: database
+spec:
+  updateStrategy:
+    type: Recreate   # New: delete all pods, then recreate
+  selector:
+    matchLabels:
+      app: database
+  template:
+    metadata:
+      labels:
+        app: database
+    spec:
+      containers:
+        - name: db
+          image: postgres:17
+```
+
+With `Recreate`, Kubernetes terminates all pods in the StatefulSet before creating new ones. This is the right strategy for stateful workloads where running mixed versions is worse than accepting a brief outage — database version upgrades being the canonical example.
+
+This won't replace `RollingUpdate` for most use cases, but having it as an option ends the workaround patterns that teams have been using for years.
+
+## Ingress-Nginx Retirement: Plan Your Migration
+
+Ingress-Nginx is being retired in Kubernetes 1.36 in favor of the Gateway API. This is a significant deprecation — Ingress-Nginx has been the default ingress controller for many clusters for years.
+
+The Gateway API is a more expressive replacement. It separates infrastructure concerns (which LoadBalancer to use, what TLS termination looks like) from application routing concerns (which paths route to which services), and it supports more advanced patterns: traffic splitting, request header manipulation, and multi-tenant setups where different teams manage their own routing rules.
+
+```yaml
+# Gateway API equivalent of a basic Ingress rule
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-routes
+  namespace: production
+spec:
+  parentRefs:
+    - name: main-gateway
+      namespace: infra
+  hostnames:
+    - "api.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/users
+      backendRefs:
+        - name: user-service
+          port: 8080
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/orders
+      backendRefs:
+        - name: order-service
+          port: 8080
+```
+
+The Gateway API is already stable and supported by major ingress implementations (Nginx, Envoy, HAProxy, Istio). If you're still on Ingress-Nginx, the migration path is well-documented. The main operational change is splitting the Ingress resource into a `Gateway` (managed by infra teams) and `HTTPRoute` resources (managed per namespace by application teams), which maps better to real organizational boundaries.
+
+## What Else Is in 1.36
+
+Beyond the highlighted changes:
+
+- **Mutating Admission Policies** graduate to stable — CEL-based mutation policies without a webhook server
+- **externalIPs in Service spec** is deprecated (full removal planned for v1.43)
+- **OCI artifact mounting** reaches beta — attach OCI artifacts as volumes directly in pod specs
+- Several storage and scheduler improvements across the 80 total enhancements
+
+## Preparing for 1.36
+
+The most urgent action item is evaluating Ingress-Nginx usage. If your cluster depends on Ingress-Nginx for production routing, plan the migration to Gateway API. It's not an emergency — the retirement is a signal that maintenance and development effort is shifting, not an immediate end-of-life — but delaying migration means accumulating technical debt on a component that will receive less attention going forward.
+
+For teams running AI/ML workloads on GPU nodes, the DRA hardware maintenance improvements are worth testing against your specific hardware setup before the GA release date.
+
+The full enhancement tracking list and release notes for v1.36 are available at kubernetes.io/releases.

@@ -1,0 +1,168 @@
+---
+title: "Kubernetes 1.36: DRA 강화, User Namespaces GA, Ingress-Nginx 퇴역"
+description: "2026년 4월 22일 출시 예정인 Kubernetes 1.36의 주요 변경 사항을 정리합니다. DRA Hardware 관리 개선, User Namespaces GA 승격, StatefulSet Rollout 수정, Gateway API로의 전환에 대해 실무 관점에서 설명합니다."
+date: "2026-04-06"
+status: "published"
+tags: ["Kubernetes", "Cloud Native", "DRA", "DevOps", "Container"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-36-dra-release-2026"
+---
+
+Kubernetes v1.36은 2026년 4월 22일 출시가 예정되어 있습니다. 올해 첫 번째 Kubernetes 릴리스로, 80개의 Enhancement가 추적되고 있습니다. 그 중 18개가 Stable로 승격되며, Production Cluster 운영에 영향을 미치는 중요한 변경 사항도 포함됩니다.
+
+이 글에서는 Production Cluster를 운영하는 팀에게 가장 중요한 변경 사항에 집중합니다. DRA를 통한 Hardware 관리 개선, User Namespaces GA 승격, 2018년부터 기다려온 StatefulSet Rollout 수정, 그리고 Ingress-Nginx 비권장화입니다.
+
+## Dynamic Resource Allocation(DRA): Hardware Maintenance가 쉬워진다
+
+DRA는 GPU, FPGA, Network Accelerator 등 특수 Hardware를 First-class 리소스로 관리하는 Kubernetes 메커니즘입니다. 1.36에서 네 가지 DRA Enhancement가 GA로 승격되며, 운영 측면에서 가장 중요한 것은 **Device 수준의 Maintenance 지원**입니다.
+
+기존에는 Kubernetes Cluster에서 GPU를 Maintenance를 위해 Offline으로 전환하려면 Node 전체를 Drain해야 했습니다. 해당 Node에서 실행 중인 모든 Workload가 중단됩니다. 새로운 DRA Enhancement를 사용하면 Administrator가 특정 Device만 Scheduling 불가로 표시할 수 있어 Node 전체를 중단시키지 않아도 됩니다. 기존 Workload는 같은 Node의 다른 Device에서 계속 동작하고, 새 Workload는 표시된 Device에 Schedule되지 않습니다.
+
+```yaml
+# 특정 GPU Device를 Maintenance 대상으로 표시하는 예시
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceSlice
+metadata:
+  name: node-gpu-0
+spec:
+  nodeName: gpu-worker-01
+  driver: gpu.example.com
+  pool:
+    name: gpu-pool
+    generation: 2
+    resourceSliceCount: 1
+  devices:
+    - name: gpu-0
+      basic:
+        attributes:
+          model:
+            string: "A100"
+        capacity:
+          memory:
+            value: "80Gi"
+    - name: gpu-1
+      basic:
+        attributes:
+          model:
+            string: "A100"
+          maintenance:        # 신규: Device를 사용 불가로 표시
+            bool: true
+        capacity:
+          memory:
+            value: "80Gi"
+```
+
+GPU Cluster에서 AI/ML Workload를 실행하는 팀에게 이 변경은 중요합니다. 분산 학습 Job을 재시작하는 비용이 높은 환경에서 Node 전체 Drain 없이 Hardware Rolling Maintenance를 할 수 있다는 것은 큰 운영 개선입니다.
+
+## User Namespaces: Stable 승격
+
+Pod 내 User Namespaces도 Kubernetes 1.36에서 Stable로 승격됩니다. 이 기능은 Container 내 UID/GID를 Host의 비특권 UID에 매핑하므로, Container 내에서 root로 실행되는 Process가 Host 시스템에서는 root가 아닙니다. 보안 효과는 명확합니다. Container 탈출이 발생해도 공격자는 비특권 Host 사용자를 얻을 뿐 root 접근 권한을 갖지 못합니다.
+
+User Namespaces는 Linux 6.3 이상의 Kernel과 호환 Container Runtime(containerd 1.7+ 또는 CRI-O 1.25+)이 필요합니다.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-workload
+spec:
+  hostUsers: false  # User Namespaces 활성화
+  securityContext:
+    runAsUser: 65534
+    runAsGroup: 65534
+  containers:
+    - name: app
+      image: myapp:latest
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+```
+
+`hostUsers: false`가 핵심 필드입니다. User Namespaces가 활성화되면, Pod 내에서 UID 0으로 실행되는 Process는 Host의 높은 UID 범위(보통 65536 이상)에 매핑되어 Host 시스템에서의 Capability를 갖지 않습니다.
+
+Container 내에서 root로 실행하지 않도록 수정하기 어려운 Workload(Container Security를 고려하지 않고 작성된 Legacy Application 등)에 활성화할 가치가 있습니다. 적절한 Security Context의 대체재는 아니지만, 의미 있는 Defense-in-depth가 됩니다.
+
+## StatefulSet Recreate Strategy: 오래 기다려온 수정
+
+StatefulSet은 Kubernetes 1.0부터 Rollout 정체 문제를 가지고 있었습니다. Rolling Update 중 Pod 시작에 실패하면 Rollout이 무기한 중단됩니다. "모든 Pod를 한 번에 재시작하고 Downtime을 감수한다"는 선택지가 없어서, Pod를 수동으로 삭제하거나 StatefulSet을 직접 조작해야 했습니다.
+
+Kubernetes 1.36은 Deployment의 개념을 차용해 StatefulSet에 `Recreate` Update Strategy를 도입합니다:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: database
+spec:
+  updateStrategy:
+    type: Recreate   # 신규: 전체 Pod 삭제 후 재생성
+  selector:
+    matchLabels:
+      app: database
+  template:
+    metadata:
+      labels:
+        app: database
+    spec:
+      containers:
+        - name: db
+          image: postgres:17
+```
+
+`Recreate`를 사용하면 Kubernetes가 StatefulSet의 모든 Pod를 종료한 후 새 Pod를 생성합니다. 혼합 Version으로 실행하는 것이 짧은 Downtime보다 나쁜 경우, 예를 들어 Database Version Upgrade가 대표적인 사례입니다.
+
+대부분의 경우 `RollingUpdate`를 대체하지는 않지만, 선택지로 갖게 됨으로써 팀이 수년간 사용해온 Workaround 패턴이 불필요해집니다.
+
+## Ingress-Nginx 퇴역: 지금이 Migration 계획을 세울 때
+
+Ingress-Nginx는 Kubernetes 1.36에서 Gateway API로의 전환에 따라 비권장 처리됩니다. 오랜 기간 많은 Cluster의 기본 Ingress Controller로 사용되어온 만큼 큰 변화입니다.
+
+Gateway API는 더 표현력이 풍부한 대체재입니다. Infrastructure 관심사(어떤 Load Balancer를 쓸지, TLS Termination 방식)와 Application Routing 관심사(어떤 Path를 어떤 Service로 보낼지)를 분리하며, Traffic Splitting, Request Header 조작, 여러 팀이 각자의 Routing Rule을 관리하는 Multi-tenant 구성 등 더 고급 패턴을 지원합니다.
+
+```yaml
+# 기본 Ingress Rule의 Gateway API 버전
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-routes
+  namespace: production
+spec:
+  parentRefs:
+    - name: main-gateway
+      namespace: infra
+  hostnames:
+    - "api.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/users
+      backendRefs:
+        - name: user-service
+          port: 8080
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/orders
+      backendRefs:
+        - name: order-service
+          port: 8080
+```
+
+Gateway API는 이미 Stable이며 주요 Ingress 구현체(Nginx, Envoy, HAProxy, Istio)에서 지원됩니다. 주요 운영상의 변화는 Ingress 리소스를 `Gateway`(Infra 팀 관리)와 `HTTPRoute` 리소스(각 Namespace에서 Application 팀 관리)로 분리하는 것입니다. 실제 조직 경계에 더 잘 매핑됩니다.
+
+## 그 외 1.36의 변경 사항
+
+기타 주목할 변경 사항:
+
+- **Mutating Admission Policies** Stable 승격 — Webhook Server 없이 사용 가능한 CEL 기반 Mutation 정책
+- **Service의 externalIPs 필드** 비권장화 (v1.43에서 완전 제거 예정)
+- **OCI Artifact Mounting** Beta 승격 — Pod Spec에서 OCI Artifact를 Volume으로 직접 Attach
+- Storage 및 Scheduler 개선을 포함한 총 80개의 Enhancement
+
+## 1.36 준비 사항
+
+가장 시급한 조치는 Ingress-Nginx 사용 현황 파악입니다. Production Routing에 Ingress-Nginx를 사용 중인 Cluster가 있다면 Gateway API Migration 계획을 세우세요. 즉각적인 EOL은 아니지만, Maintenance와 개발 노력이 이동하고 있다는 신호입니다. Migration을 미루면 향후 관리가 줄어들 Component에 대한 기술적 부채가 쌓입니다.
+
+GPU Node에서 AI/ML Workload를 실행하는 팀이라면 GA 릴리스 전에 실제 Hardware 환경에서 DRA Hardware Maintenance 개선 사항을 테스트해볼 가치가 있습니다.
