@@ -1,0 +1,122 @@
+---
+title: "Microsoft MAI-Transcribe-1·Voice-1·Image-2: 개발자가 알아야 할 기술적 포인트"
+description: "Microsoft가 2026년 4월 2일 세 가지 새로운 Foundational AI Model을 출시했습니다. 음성 인식, TTS, 이미지 생성 모델의 기술 사양과 실제 Application 개발에 적용하는 방법을 분석합니다."
+date: "2026-04-06"
+status: "published"
+tags: ["Microsoft", "AI", "Multimodal", "음성인식", "이미지생성"]
+thumbnail: ""
+author: "webhani"
+slug: "microsoft-mai-models-multimodal-2026"
+---
+
+2026년 4월 2일, Microsoft AI가 MAI 패밀리의 새로운 Foundational Model 세 가지를 발표했습니다: MAI-Transcribe-1, MAI-Voice-1, MAI-Image-2. 이 릴리스가 주목받는 이유는 타이밍이 아니라 각 모델의 기술적 구체성에 있습니다. 기존 대안 대비 명확한 Performance 우위를 제시하고 있습니다.
+
+이 글에서는 각 모델의 기능, 성능 특성, 그리고 Microsoft Foundry를 통해 Application에 통합하는 방법을 정리합니다.
+
+## MAI-Transcribe-1: 음성 인식
+
+MAI-Transcribe-1은 25개 언어를 지원하는 음성 인식(Speech-to-Text) Model입니다. 주요 성능 지표는 다음과 같습니다:
+
+- Microsoft의 Azure Fast 대비 **2.5배 빠른 처리 속도**
+- FLEURS 벤치마크에서 상위 25개 언어 평균 **WER(Word Error Rate) 3.8%**
+- 전체 25개 언어에서 OpenAI의 Whisper-large-v3를 능가
+- 스튜디오 녹음뿐 아니라 실환경 노이즈 대응을 설계 단계부터 고려
+
+Whisper나 Azure Speech-to-Text를 현재 사용 중인 Application이라면 직접 Benchmark할 가치가 있습니다. WER 개선은 작지 않습니다. 실환경 음성에서 WER이 5~6%에서 3.8%로 줄어든다는 것은 고객 통화, 회의 녹취, 음성 Interface에서 전사 오류가 실질적으로 감소함을 의미합니다.
+
+가격: 전사 음성 1시간당 $0.36.
+
+```python
+# MAI-Transcribe-1로 Audio 전사하는 예시 (Azure AI Foundry 경유)
+from azure.ai.inference import ChatCompletionsClient
+from azure.core.credentials import AzureKeyCredential
+import base64
+
+client = ChatCompletionsClient(
+    endpoint="https://YOUR_FOUNDRY_ENDPOINT.services.ai.azure.com/models",
+    credential=AzureKeyCredential("YOUR_KEY"),
+)
+
+with open("meeting_audio.mp3", "rb") as f:
+    audio_b64 = base64.b64encode(f.read()).decode()
+
+response = client.complete(
+    model="MAI-Transcribe-1",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio_url", "audio_url": {"url": f"data:audio/mpeg;base64,{audio_b64}"}},
+                {"type": "text", "text": "이 음성을 정확하게 전사해 주세요."}
+            ]
+        }
+    ]
+)
+
+print(response.choices[0].message.content)
+```
+
+## MAI-Voice-1: 텍스트 음성 합성
+
+MAI-Voice-1은 TTS(Text-to-Speech) Model로, 현행 TTS Service와 차별화되는 두 가지 능력을 갖습니다:
+
+- **60초 분량의 자연스러운 음성을 1초 이내에 생성** — Real-time factor가 대폭 1.0 이하
+- **몇 초의 참조 음성으로 Custom Voice 생성** 지원
+- 장문 콘텐츠 전체에서 Speaker Identity 유지
+
+실시간 생성 속도는 Interactive Application에서 중요합니다. 음성 Assistant나 IVR 시스템에서 TTS의 Latency가 종종 Bottleneck이 됩니다. 10초 분량의 음성을 합성하는 데 2~3초가 걸리면 대화가 부자연스럽게 느껴집니다. MAI-Voice-1의 처리 속도는 그 제약을 없앱니다.
+
+소량의 참조 음성으로 Custom Voice를 만드는 기능도 주목할 만합니다. 특정 화자의 음성을 재현하려면 기존에는 수 시간 분량의 녹음 세션이 필요했습니다. 몇 초의 참조 음성으로 가능해지면 제품용 AI 음성 Persona 구축이나 Accessibility 응용의 가능성이 크게 넓어집니다.
+
+가격: 텍스트 100만 자당 $22.
+
+```python
+# MAI-Voice-1로 Custom Voice를 사용한 음성 생성
+import requests
+
+payload = {
+    "model": "MAI-Voice-1",
+    "input": "4분기 실적 보고를 시작하겠습니다. 주요 지표부터 확인하겠습니다.",
+    "voice": "custom",
+    "voice_reference_url": "https://your-storage.blob.core.windows.net/voices/speaker_reference.wav",
+    "response_format": "mp3"
+}
+
+headers = {
+    "Authorization": "Bearer YOUR_FOUNDRY_KEY",
+    "Content-Type": "application/json"
+}
+
+response = requests.post(
+    "https://YOUR_FOUNDRY_ENDPOINT.services.ai.azure.com/v1/audio/speech",
+    json=payload,
+    headers=headers
+)
+
+with open("output.mp3", "wb") as f:
+    f.write(response.content)
+```
+
+## MAI-Image-2: 이미지 생성
+
+MAI-Image-2는 이미지 생성 Model입니다:
+
+- Arena.ai 이미지 생성 **Leaderboard 상위 3위 진입**
+- Foundry·Copilot에서 이전 세대 대비 **생성 속도 2배 향상**
+- Text-to-Image 및 Image-to-Image 워크플로우 모두 지원
+
+가격: 텍스트 입력 100만 Token당 $5, 이미지 출력 100만 Token당 $33.
+
+Arena.ai Leaderboard에서의 위치는 Midjourney나 Stable Diffusion 3와 유사한 품질을 보여주며, 별도 이미지 생성 API 의존성을 피하고 싶은 Azure 사용자에게 실질적인 선택지가 됩니다.
+
+## Application Architecture에 통합하기
+
+세 모델을 합치면 핵심 Multimodal Pipeline이 커버됩니다. "음성 입력 → 텍스트 → 음성 출력", 여기에 이미지 생성을 병렬 브랜치로 추가하는 구성입니다. 세 가지 모두가 필요한 Application(시각 콘텐츠도 생성하는 음성 지원 Assistant 등)이라면 단일 Azure AI Foundry Endpoint로 집약해 Auth, 과금, Rate Limit 관리를 단순화할 수 있습니다.
+
+더 현실적인 단기 활용 케이스는 선택적 도입입니다. 현재 서드파티 전사 Service, 별도 TTS API, 별도 이미지 생성 Model을 사용 중인 팀은 Foundry로 통합함으로써 External API 의존성을 줄이고 스케일에서의 총비용을 절감할 수 있습니다.
+
+## 알아둘 배경
+
+Microsoft MAI Model은 Mustafa Suleyman이 이끄는 MAI Superintelligence 팀이 구축·유지합니다. 기존 Azure Cognitive Services나 Azure OpenAI 팀과는 별도 조직으로, OpenAI의 Model을 Wrap하는 것이 아니라 경쟁하는 자체 Model을 개발합니다. OpenAI에 대한 단일 벤더 의존을 우려하는 조직에게는 명확한 Benchmark 비교를 갖춘 Microsoft 독자적 Alternative로서 평가할 가치가 있습니다.
+
+Foundry 통합은 표준 Azure SDK Pattern을 통해 이루어지며, 기존 Azure Infrastructure의 Identity, Network, Monitoring 설정을 그대로 활용할 수 있습니다.

@@ -1,0 +1,168 @@
+---
+title: "Kubernetes 1.36：DRA強化、User Namespaces GA、そしてIngress-Nginxの終焉"
+description: "2026年4月22日リリース予定のKubernetes 1.36の注目ポイントを解説。DRAによるHardware管理の改善、User NamespacesのGA昇格、StatefulSetのRollout問題の解決、Gateway APIへの移行について実践的に説明します。"
+date: "2026-04-06"
+status: "published"
+tags: ["Kubernetes", "Cloud Native", "DRA", "DevOps", "Container"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-36-dra-release-2026"
+---
+
+Kubernetes v1.36は2026年4月22日のリリースが予定されています。今年最初のKubernetesリリースで、80のEnhancementが追跡されています。そのうち18がStableに昇格し、本番Clusterの運用に影響するいくつかの重要な変更が含まれます。
+
+本稿では、本番Clusterを運用するチームにとって最も重要な変更点に焦点を当てます。DRAによるHardware管理の改善、User NamespacesのGA昇格、2018年から待ち望まれていたStatefulSetのRollout修正、そしてIngress-Nginxの非推奨化です。
+
+## Dynamic Resource Allocation（DRA）：Hardware Maintenanceが容易に
+
+DRAは、GPU、FPGA、Network AcceleratorなどのSpecialized HardwareをFirst-classリソースとして管理するKubernetesの仕組みです。1.36では4つのDRA EnhancementがGAに昇格し、その中で最も運用上重要なのが**Device レベルのMaintenance Support**です。
+
+これまで、KubernetesクラスターでGPUをメンテナンスのためにOfflineにするには荒っぽい操作が必要でした。Node全体をDrainし、そのNodeで実行中のすべてのWorkloadを停止させる必要がありました。新しいDRA Enhancementにより、Administratorは特定のDeviceをScheduling不可としてマークでき、Node全体を停止させずに済みます。既存のWorkloadは同じNode上の他のDeviceで継続動作し、新しいWorkloadはマークされたDeviceにはScheduleされません。
+
+```yaml
+# 特定のGPU DeviceをMaintenance対象としてマークする例
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceSlice
+metadata:
+  name: node-gpu-0
+spec:
+  nodeName: gpu-worker-01
+  driver: gpu.example.com
+  pool:
+    name: gpu-pool
+    generation: 2
+    resourceSliceCount: 1
+  devices:
+    - name: gpu-0
+      basic:
+        attributes:
+          model:
+            string: "A100"
+        capacity:
+          memory:
+            value: "80Gi"
+    - name: gpu-1
+      basic:
+        attributes:
+          model:
+            string: "A100"
+          maintenance:        # 新機能：Device を利用不可にマーク
+            bool: true
+        capacity:
+          memory:
+            value: "80Gi"
+```
+
+GPU ClusterでAI/MLワークロードを実行しているチームにとって、この変更は重要です。分散学習Jobを再起動するコストが高い環境では、Node全体のDrainなしにHardwareをRollingメンテナンスできることは大きな運用改善です。
+
+## User Namespaces：Stableに昇格
+
+Pod内のUser NamespacesもKubernetes 1.36でStableに昇格します。この機能はContainer内のUID/GIDをHost上の非特権UIDにマッピングするため、Container内でrootとして実行されているProcessはHostシステム上ではrootではありません。
+
+User NamespacesにはLinux 6.3以降のKernelと、対応するContainer Runtime（containerd 1.7+またはCRI-O 1.25+）が必要です。
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-workload
+spec:
+  hostUsers: false  # User Namespacesを有効化
+  securityContext:
+    runAsUser: 65534
+    runAsGroup: 65534
+  containers:
+    - name: app
+      image: myapp:latest
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+```
+
+`hostUsers: false`がキーとなるフィールドです。User Namespacesが有効な場合、Pod内でUID 0として実行されているProcessはHostの高UID範囲（通常65536以上）にマッピングされ、Hostシステム上でのCapabilityは持ちません。
+
+Container内でrootとして実行しないようにできないWorkload（Container Securityを考慮せずに設計されたLegacy Applicationなど）に対して有効化する価値があります。適切なSecurity Contextの代替ではありませんが、意味のあるDefense-in-depthとなります。
+
+## StatefulSet Recreate Strategy：長年待ち望まれた修正
+
+StatefulSetにはKubernetes 1.0以来、Rollout停止問題がありました。Rolling Update中にPodの起動が失敗すると、Rolloutが無期限に停止します。「すべてのPodを一度に再起動してDowntimeを受け入れる」という選択肢がなく、手動でPodを削除するかStatefulSetを直接操作するしかありませんでした。
+
+Kubernetes 1.36は、Deploymentの概念を借用してStatefulSetに`Recreate` Update Strategyを導入します：
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: database
+spec:
+  updateStrategy:
+    type: Recreate   # 新機能：全Podを削除してから再作成
+  selector:
+    matchLabels:
+      app: database
+  template:
+    metadata:
+      labels:
+        app: database
+    spec:
+      containers:
+        - name: db
+          image: postgres:17
+```
+
+`Recreate`を使用すると、KubernetesはStatefulSet内の全Podを終了してから新しいPodを作成します。混在Versionで実行することが短時間のOutageより悪い場合、たとえばDatabase Version Upgradeなどがその典型例です。
+
+ほとんどのユースケースで`RollingUpdate`を置き換えるものではありませんが、選択肢として持てることで、チームが長年使ってきたWorkaroundパターンが不要になります。
+
+## Ingress-Nginxの引退：移行計画を立てるべき時
+
+Ingress-NginxはKubernetes 1.36でGateway APIへの移行に伴い非推奨化されます。これは大きな変更です。長年、多くのClusterでIngress-NginxがデフォルトのIngress Controllerとして使われてきたためです。
+
+Gateway APIはより表現力の高い代替手段です。Infrastructure上の関心事（どのLoad Balancerを使うか、TLS Terminationの仕組み）とApplication Routingの関心事（どのPathをどのServiceに向けるか）を分離し、Traffic Splitting、Request Headerの操作、複数チームが独自のRouting Ruleを管理できるMulti-tenant設定など、より高度なパターンをサポートします。
+
+```yaml
+# 基本的なIngress RuleのGateway API版
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-routes
+  namespace: production
+spec:
+  parentRefs:
+    - name: main-gateway
+      namespace: infra
+  hostnames:
+    - "api.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/users
+      backendRefs:
+        - name: user-service
+          port: 8080
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/orders
+      backendRefs:
+        - name: order-service
+          port: 8080
+```
+
+Gateway APIは既にStableで、主要なIngress実装（Nginx、Envoy、HAProxy、Istio）でサポートされています。主要な運用上の変化は、Ingressリソースを`Gateway`（InfraチームがManage）と`HTTPRoute`リソース（各NamespaceでApplicationチームがManage）に分割することです。これは実際の組織の境界により適切にマッピングされます。
+
+## その他の1.36の変更点
+
+その他の注目すべき変更：
+
+- **Mutating Admission Policies**がStableに昇格 — Webhook Serverなしで使えるCELベースのMutationポリシー
+- **ServiceのexternalIPSフィールド**が非推奨化（v1.43での完全削除予定）
+- **OCI Artifact Mounting**がBetaに昇格 — Pod SpecでOCI ArtifactをVolumeとして直接アタッチ
+- StorageやSchedulerの改善を含む合計80のEnhancement
+
+## 1.36への備え
+
+最も緊急のアクションはIngress-Nginxの使用状況の評価です。本番RoutingにIngress-Nginxを使っているClusterがあれば、Gateway APIへの移行計画を立てましょう。即時のEOLではありませんが、メンテナンスと開発の注力対象がシフトしていることを示すシグナルであり、移行を遅らせることは今後メンテナンスが薄くなるComponentへの技術的負債を積み上げることになります。
+
+GPU NodeでAI/MLワークロードを実行しているチームにとっては、GAリリース前にDRA Hardware Maintenanceの改善を実際のHardwareセットアップに対してテストする価値があります。
