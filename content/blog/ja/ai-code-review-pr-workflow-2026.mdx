@@ -1,0 +1,205 @@
+---
+title: "PR ワークフローに AI コードレビューを組み込む：GitHub Actions と Claude API"
+description: "GitHub Actions と Anthropic の Claude API を使って、Pull Request に自動 AI コードレビューを組み込む実装方法を解説します。コスト管理やレート制限への対策も含めた実践的なガイドです。"
+date: "2026-04-07"
+status: published
+tags: ["AI", "code-review", "GitHub Actions", "LLM", "DevOps"]
+thumbnail: ""
+author: webhani
+slug: ai-code-review-pr-workflow-2026
+---
+
+## AI コードレビューの現状と課題
+
+チームが成長するにつれて、コードレビューの負担は単純に増えていきます。レビュアーが足りない、レビューが遅れる、品質にばらつきが出る。こうした問題を抱えているチームは少なくありません。
+
+AI によるコードレビューは「レビュアーの代替」ではなく、「一次チェックの自動化」として位置づけるのが現実的です。セキュリティの明らかな問題、未処理の例外、N+1 クエリのような定番のパターンを事前に検出しておくことで、人間のレビュアーは本質的な設計や仕様のズレに集中できます。
+
+ただし、AI レビューにはノイズの問題があります。過剰な指摘、文脈を無視した提案、既存の規約と矛盾するコメント。これらをどうコントロールするかが、実用化のカギです。
+
+## GitHub Actions で Claude API を呼び出す仕組み
+
+全体の流れはシンプルです。
+
+1. PR が作成・更新されたときに Actions が起動
+2. `git diff` で差分を取得してテキストファイルに保存
+3. Node.js スクリプトが Claude API に差分を送信
+4. レスポンスを PR コメントとして投稿
+
+重要なのは、差分をそのまま投げるのではなく、プロンプトで「何を見てほしいか」を明示することです。Claude は指示に素直に従うので、フォーカスを絞るほど精度が上がります。
+
+## 実装例
+
+### GitHub Actions ワークフロー
+
+```yaml
+# .github/workflows/ai-code-review.yml
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    # 大規模な PR はスキップして手動レビューに委ねる
+    if: github.event.pull_request.additions < 500
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm install @anthropic-ai/sdk
+
+      - name: Generate diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD \
+            -- "*.ts" "*.tsx" "*.js" "*.jsx" "*.py" "*.go" \
+            > diff.txt
+
+      - name: Run AI review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node scripts/ai-review.mjs
+```
+
+`additions < 500` の条件を入れているのは、巨大な PR に対してコストをかけないためです。500 行を超えるような PR はそもそも分割を検討すべきで、AI レビューより先にその指摘をするべきでしょう。
+
+### レビュースクリプト
+
+```javascript
+// scripts/ai-review.mjs
+import Anthropic from "@anthropic-ai/sdk";
+import { readFileSync } from "fs";
+import { execFileSync } from "child_process";
+
+const client = new Anthropic();
+
+const REVIEW_PROMPT = `
+以下の Pull Request の差分をレビューしてください。
+
+チェック対象：
+- セキュリティの問題（インジェクション、認証バイパス、機密情報のハードコードなど）
+- 明確なロジックのバグや例外処理の漏れ
+- パフォーマンスの問題（N+1、不要なループ、重いスキャンなど）
+- 型安全性の懸念（TypeScript の場合）
+
+スタイルや命名規則の細かい指摘は不要です。
+リンターや Formatter が設定されていると想定してください。
+
+問題がない場合は "LGTM — 自動レビューでは特に問題は見つかりませんでした。" とだけ返してください。
+問題がある場合は Markdown のリスト形式で、各指摘にファイル名と行番号を含めてください。
+`;
+
+async function reviewPR() {
+  const diff = readFileSync("diff.txt", "utf-8");
+
+  if (diff.trim().length === 0) {
+    console.log("差分が空のため、レビューをスキップします。");
+    return;
+  }
+
+  // トークン節約のため先頭 10000 文字に制限
+  const trimmedDiff = diff.slice(0, 10000);
+  const wasTrimmed = diff.length > 10000;
+
+  const response = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 1500,
+    messages: [
+      {
+        role: "user",
+        content: `${REVIEW_PROMPT}\n\n\`\`\`diff\n${trimmedDiff}\n\`\`\``,
+      },
+    ],
+  });
+
+  const reviewText =
+    response.content[0].type === "text" ? response.content[0].text : "";
+
+  const header = wasTrimmed
+    ? "> **Note**: 差分が大きいため、先頭部分のみレビューしています。\n\n"
+    : "";
+
+  const body = `## AI コードレビュー (Claude)\n\n${header}${reviewText}\n\n---\n*このコメントは自動生成です。誤検知の可能性があります。*`;
+
+  const prNumber = process.env.PR_NUMBER;
+  // gh CLI に引数として渡すことでシェルインジェクションを回避
+  execFileSync("gh", ["pr", "comment", prNumber, "--body", body], {
+    stdio: "inherit",
+  });
+
+  console.log("レビューコメントを投稿しました。");
+}
+
+reviewPR().catch((err) => {
+  console.error("レビューに失敗しました:", err);
+  process.exit(1);
+});
+```
+
+## 実際のレビューコメント例
+
+動作させると、以下のようなコメントが PR に投稿されます。
+
+```
+## AI コードレビュー (Claude)
+
+- **`src/api/users.ts:42`** — `req.params.id` をそのまま SQL クエリに結合しています。
+  プリペアドステートメントの使用を検討してください。
+- **`src/hooks/useData.ts:88`** — `useEffect` の依存配列が空ですが、
+  `fetchData` 関数がクロージャ内の state を参照しています。古い値を掴む可能性があります。
+- **`src/components/List.tsx:31`** — `items.map` の中で毎回 API 呼び出しをしています。
+  一括取得に変更するか、事前にデータを結合することを検討してください。
+
+---
+*このコメントは自動生成です。誤検知の可能性があります。*
+```
+
+当然ながら誤検知もあります。「すでに対応済みの箇所に指摘が来る」「プロジェクト固有の規約を知らないためにおかしな提案をする」といったケースは避けられません。そのため、コメントの末尾には「自動生成・誤検知の可能性あり」の注釈を必ず入れています。
+
+## 運用上の注意点
+
+### コスト管理
+
+Claude Sonnet を使った場合、差分 10000 文字はおよそ 2500 トークンに相当します。1 日 50 PR が来るチームでも月 $10 前後に収まる計算です。ただし差分を無制限に渡すと予想外の費用になります。スクリプト内でトリムするか、Actions 側で大きな PR を除外するかで対処してください。
+
+### レート制限への対策
+
+CI 環境でビルドが並列に走ると、複数の PR が同時にレビューリクエストを送ることがあります。Actions 側で `concurrency` グループを設定することで直列化できます。
+
+```yaml
+concurrency:
+  group: ai-review-${{ github.repository }}
+  cancel-in-progress: false
+```
+
+`cancel-in-progress: false` にしておくと、キューに積まれたジョブがキャンセルされずに順番に処理されます。
+
+### 誤検知への対処
+
+AI の指摘を「必ず直さなければならないもの」として扱うと、開発者が不満を持ちます。あくまで参考情報として扱い、CI のパスに必須にしないことが重要です。コメントのトーンも「〜してください」より「〜の可能性があります。確認してください」のほうが受け入れられやすいです。プロンプトでトーンを指定するのも有効な手です。
+
+## まとめ
+
+GitHub Actions と Claude API を使った AI コードレビューは、設定コストの低さと得られる恩恵のバランスが良く、小〜中規模のチームに向いています。
+
+導入で気をつけるべき点は 3 つです。
+
+- 差分サイズに上限を設けてコストをコントロールする
+- レビューコメントは参考情報として扱い、CI 必須にしない
+- プロンプトで何を見てほしいかを明示して、ノイズを減らす
+
+完璧なレビューは期待せず、「よくあるミスを事前に弾く」程度の役割を与えると、チームへの定着がうまくいきます。

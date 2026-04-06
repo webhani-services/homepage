@@ -1,0 +1,320 @@
+---
+title: React 19 の `use` フックと Suspense：実践的なデータフェッチパターン
+description: React 19 で導入された `use` フックの仕組みと、Suspense・Error Boundary との組み合わせ方を実践的なコード例で解説します。useEffect パターンからの移行を含む具体的な設計指針を紹介します。
+date: "2026-04-07"
+status: published
+tags: ["React", "React 19", "TypeScript", "hooks", "data-fetching"]
+thumbnail: ""
+author: webhani
+slug: react-19-use-hook-suspense-2026
+---
+
+React 19 の正式リリースとともに、データフェッチの書き方が大きく変わりました。その中心にあるのが `use` フックです。名前はシンプルですが、これまでの Hook とは異なる性質を持っており、`Suspense` と組み合わせることでコンポーネントの非同期処理を宣言的に記述できるようになります。
+
+この記事では `use` フックの動作原理から、実際のプロジェクトで使える設計パターンまでを具体的なコードとともに解説します。
+
+## `use` フックとは何か
+
+`use` は Promise や Context を受け取って、その値を返す関数です。ただし、他の Hook（`useState`、`useEffect` など）と違い、条件分岐やループの中でも呼び出せます。これは React の Hook ルールの大きな例外です。
+
+```tsx
+import { use } from "react";
+
+function UserProfile({ userPromise }: { userPromise: Promise<User> }) {
+  const user = use(userPromise);
+  return <div>{user.name}</div>;
+}
+```
+
+`use(promise)` を呼び出したとき、Promise がまだ pending 状態であれば、コンポーネントのレンダリングを中断（suspend）して、最も近い `<Suspense>` フォールバックを表示します。Promise が解決されると、コンポーネントが再レンダリングされて値を受け取ります。
+
+## useEffect パターンとの比較
+
+従来の React 18 以前のパターンを振り返ってみましょう。
+
+```tsx
+// React 18 以前の典型的なパターン
+type User = {
+  id: string;
+  name: string;
+  email: string;
+};
+
+function UserProfile({ userId }: { userId: string }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    fetchUser(userId)
+      .then((data) => {
+        if (!cancelled) {
+          setUser(data);
+          setLoading(false);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setError(err);
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
+
+  if (loading) return <Spinner />;
+  if (error) return <div>エラーが発生しました: {error.message}</div>;
+  return <div>{user?.name}</div>;
+}
+```
+
+このコードには複数の問題点があります。`loading`、`user`、`error` という 3 つの state を手動で管理しなければならず、クリーンアップ処理（`cancelled` フラグ）も自分で書く必要があります。また、ローディング中の UI と エラー UI がコンポーネントの本来のロジックに混在しています。
+
+React 19 の `use` を使うと、コンポーネントは「データが存在する前提」で書けます。
+
+```tsx
+// React 19 のパターン
+import { use, Suspense } from "react";
+
+function UserProfile({ userPromise }: { userPromise: Promise<User> }) {
+  const user = use(userPromise);
+
+  return (
+    <div className="profile">
+      <h2>{user.name}</h2>
+      <p>{user.email}</p>
+    </div>
+  );
+}
+```
+
+コンポーネント自体はデータが取得済みであることを前提に書き、ローディングとエラーの処理は外側に委ねます。
+
+## Suspense と組み合わせた基本パターン
+
+`use` フックが Promise を中断させるには、必ず `<Suspense>` が必要です。
+
+```tsx
+import { Suspense } from "react";
+
+async function fetchUser(userId: string): Promise<User> {
+  const res = await fetch(`/api/users/${userId}`);
+  if (!res.ok) throw new Error("ユーザーの取得に失敗しました");
+  return res.json();
+}
+
+function App() {
+  // Promise はレンダー外、もしくは useMemo でメモ化して作成する
+  const userPromise = useMemo(() => fetchUser("123"), []);
+
+  return (
+    <Suspense fallback={<Spinner />}>
+      <UserProfile userPromise={userPromise} />
+    </Suspense>
+  );
+}
+```
+
+重要なポイントは **Promise をレンダー内で直接作らない** ことです。`fetchUser("123")` をレンダー関数の直下に書くと、再レンダーのたびに新しい Promise が生成されてしまい、無限ループに近い挙動になります。`useMemo` か、コンポーネントの外側で作成するのが基本です。
+
+## Promise を親から子へ渡す設計
+
+データフェッチを開始する場所（親）と、データを表示する場所（子）を分離するのが、`use` パターンの設計思想です。
+
+```tsx
+// データフェッチを開始するのは親の責務
+function UserPage({ userId }: { userId: string }) {
+  // Promise の生成は親が担当
+  const userPromise = useMemo(() => fetchUser(userId), [userId]);
+  const postsPromise = useMemo(() => fetchUserPosts(userId), [userId]);
+
+  return (
+    <div>
+      <Suspense fallback={<ProfileSkeleton />}>
+        <UserProfileCard userPromise={userPromise} />
+      </Suspense>
+      <Suspense fallback={<PostListSkeleton />}>
+        <UserPostList postsPromise={postsPromise} />
+      </Suspense>
+    </div>
+  );
+}
+
+// 子コンポーネントはデータの表示に専念できる
+function UserProfileCard({ userPromise }: { userPromise: Promise<User> }) {
+  const user = use(userPromise);
+  return (
+    <div className="card">
+      <img src={user.avatarUrl} alt={user.name} />
+      <h2>{user.name}</h2>
+    </div>
+  );
+}
+
+function UserPostList({ postsPromise }: { postsPromise: Promise<Post[]> }) {
+  const posts = use(postsPromise);
+  return (
+    <ul>
+      {posts.map((post) => (
+        <li key={post.id}>{post.title}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+この構造の利点は、2 つの Promise が **並列で開始される** 点にあります。`userPromise` と `postsPromise` は親コンポーネントで同時に作成されるため、ウォーターフォール（直列フェッチ）を避けられます。
+
+## エラーバウンダリとの連携
+
+`use` フックで Promise が reject した場合、エラーは最も近い `ErrorBoundary` でキャッチされます。
+
+```tsx
+import { Component, type ReactNode } from "react";
+
+type ErrorBoundaryState = {
+  hasError: boolean;
+  error: Error | null;
+};
+
+class ErrorBoundary extends Component<
+  { children: ReactNode; fallback: (error: Error) => ReactNode },
+  ErrorBoundaryState
+> {
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError && this.state.error) {
+      return this.props.fallback(this.state.error);
+    }
+    return this.props.children;
+  }
+}
+
+// 使用例
+function App() {
+  const userPromise = useMemo(() => fetchUser("123"), []);
+
+  return (
+    <ErrorBoundary
+      fallback={(error) => (
+        <div className="error-box">
+          <p>データの読み込みに失敗しました</p>
+          <code>{error.message}</code>
+        </div>
+      )}
+    >
+      <Suspense fallback={<Spinner />}>
+        <UserProfile userPromise={userPromise} />
+      </Suspense>
+    </ErrorBoundary>
+  );
+}
+```
+
+`ErrorBoundary` は `Suspense` の外側に配置します。これにより、フェッチのエラーが UI に適切に伝播します。
+
+## 条件付きで `use` を呼び出す
+
+`use` の大きな特徴の一つは、条件分岐の中で呼び出せる点です。
+
+```tsx
+function ConditionalProfile({
+  userId,
+  userPromise,
+}: {
+  userId: string | null;
+  userPromise: Promise<User> | null;
+}) {
+  if (!userId || !userPromise) {
+    return <div>ユーザーが選択されていません</div>;
+  }
+
+  // 通常の Hook ではここで呼び出せないが、use は呼び出せる
+  const user = use(userPromise);
+
+  return <div>{user.name}</div>;
+}
+```
+
+これは `useContext` の代替としても機能します。
+
+```tsx
+import { use } from "react";
+import { ThemeContext } from "./ThemeContext";
+
+function ThemedButton({ label }: { label: string }) {
+  const theme = use(ThemeContext);
+  return (
+    <button
+      className={theme.buttonClass}
+      style={{ backgroundColor: theme.primaryColor }}
+    >
+      {label}
+    </button>
+  );
+}
+```
+
+`useContext` とほぼ同等ですが、条件分岐内で呼べる柔軟性があります。
+
+## Server Components との使い分け
+
+Next.js の App Router を使っている場合、Server Components での非同期処理と `use` フックの使い分けが重要になります。
+
+```tsx
+// Server Component（サーバーサイドで実行される）
+// async/await を直接使える
+async function UserPage({ params }: { params: { id: string } }) {
+  const user = await fetchUser(params.id); // サーバーで直接 await
+  return <UserProfile user={user} />;
+}
+
+// Client Component（ブラウザで実行される）
+// use フックが必要
+"use client";
+
+function UserProfileClient({
+  userPromise,
+}: {
+  userPromise: Promise<User>;
+}) {
+  const user = use(userPromise);
+  return <div>{user.name}</div>;
+}
+```
+
+判断基準としては：
+
+- **インタラクション不要のデータ表示** → Server Component で `await` を使う
+- **クライアントの状態に応じて動的に変わるデータ** → `use` フック + Suspense
+- **ユーザー操作でトリガーされるフェッチ** → Server Actions か `use` フック
+
+Server Components を使えばバンドルサイズを減らせますが、クライアントのインタラクションが必要な場面では Client Component に `use` を組み合わせるのが適切です。
+
+## まとめ
+
+React 19 の `use` フックは、データフェッチを宣言的に記述するための仕組みです。`useEffect` + `useState` で管理していたローディング・エラー・データの 3 状態管理から解放され、コンポーネントはデータが存在する前提で書けるようになります。
+
+要点を整理します：
+
+- `use(promise)` は Promise が解決するまでレンダリングを中断し、`Suspense` フォールバックを表示する
+- Promise は再レンダーのたびに新規作成されないよう、`useMemo` かコンポーネント外で作る
+- エラーは `ErrorBoundary` で捕捉し、`Suspense` の外側に配置する
+- 並列フェッチは親コンポーネントで複数の Promise を同時に作成することで実現する
+- 条件分岐内でも呼び出せるのが他の Hook との大きな違い
+- Next.js App Router では Server Components と適切に使い分ける
+
+まだ `useEffect` でデータフェッチを書いているコードがあれば、`use` フックへの移行を検討する価値があります。コードの見通しが大幅に改善されます。

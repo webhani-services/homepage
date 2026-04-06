@@ -1,0 +1,277 @@
+---
+title: GitHub Actions OIDC で実現するキーレス AWS 認証：長期クレデンシャルからの脱却
+description: AWS IAM Access Key を GitHub Actions のシークレットに保存するのは危険です。OIDC を使ったキーレス認証の仕組みと実装方法を、Terraform コードと実際のワークフロー設定を交えて解説します。
+date: "2026-04-07"
+status: published
+tags: ["GitHub Actions", "AWS", "security", "OIDC", "CI/CD"]
+thumbnail: ""
+author: webhani
+slug: github-actions-oidc-aws-keyless-2026
+---
+
+CI/CD パイプラインで AWS を操作するとき、多くのチームが最初に取る方法は `AWS_ACCESS_KEY_ID` と `AWS_SECRET_ACCESS_KEY` を GitHub Secrets に登録することです。手軽ではありますが、この方法には見過ごされがちな本質的なリスクがあります。本記事では、長期クレデンシャルが抱える問題を整理し、OIDC（OpenID Connect）を使ったキーレス認証へ移行する具体的な手順を紹介します。
+
+## 長期クレデンシャルが抱えるリスク
+
+IAM Access Key はリソースを作った瞬間から有効期限がありません。これが問題の根本です。
+
+**漏洩リスクの多様性**。ワークフローのデバッグ中に `env` コマンドをログに流してしまう、`actions/cache` が意図せず `.env` ファイルをキャッシュする、サードパーティの Action がシークレットを読み取る ── 実際のインシデントはこうした些細なミスから始まります。GitHub のシークレットマスキングは出力をある程度隠しますが、Base64 エンコードや分割出力で回避できることも知られています。
+
+**ローテーションの困難さ**。長期クレデンシャルは「定期的にローテーションすべき」とはわかっていても、実際には放置されるケースが多いです。ローテーション手順が文書化されていない、誰が管理しているかわからない、複数のリポジトリで同じキーを使い回しているといった状況は珍しくありません。侵害が発生してから慌ててローテーションすると、その間も攻撃者はアクセスを継続できます。
+
+**最小権限の形骸化**。「とりあえず動かしたい」という状況で AdministratorAccess を付けてしまい、後から絞り忘れる。これはセキュリティ事故の典型パターンです。長期クレデンシャルを使っている限り、このリスクは常に存在します。
+
+## OIDC の仕組み：トークン交換フロー
+
+OIDC 認証では、長期的な秘密情報をまったく保存しません。代わりに「このジョブは本当に GitHub Actions から来たのか」をリアルタイムに検証します。
+
+フローを順を追って説明します。
+
+1. GitHub Actions ジョブが起動すると、GitHub の OIDC プロバイダーが **短命の JWT トークン**を発行します
+2. このトークンには検証可能なクレーム（`repo`、`ref`、`actor`、`event` など）が含まれます
+3. ワークフローが AWS STS の `AssumeRoleWithWebIdentity` を呼び出し、JWT を送信します
+4. AWS が GitHub の公開鍵でトークンを検証し、IAM ロールの信頼ポリシーの条件と照合します
+5. 条件を満たせば、**最大1時間の一時クレデンシャル**が返却されます
+6. ジョブ終了後、クレデンシャルは自動的に無効になります
+
+この方式では、リポジトリに保存される秘密情報はゼロです。仮にログに一時クレデンシャルが漏れても、ジョブ終了後は使えません。
+
+## AWS IAM Identity Provider の設定
+
+まず AWS 側で GitHub Actions を信頼するための OIDC プロバイダーを作成します。Terraform を使った実装を示します。
+
+```hcl
+# terraform/iam-oidc.tf
+
+# GitHub Actions の OIDC プロバイダーを AWS に登録
+resource "aws_iam_openid_connect_provider" "github" {
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+
+  # GitHub の OIDC エンドポイントの TLS 証明書サムプリント
+  # 定期的に変わる可能性があるため、以下コマンドで最新値を確認:
+  # openssl s_client -connect token.actions.githubusercontent.com:443 \
+  #   -showcerts < /dev/null 2>/dev/null | openssl x509 -fingerprint -noout -sha1
+  thumbprint_list = ["1b511abead59c6ce207077c0bf0e0043b1382612"]
+}
+
+# デプロイ用 IAM ロール
+resource "aws_iam_role" "github_actions_deploy" {
+  name        = "github-actions-deploy"
+  description = "GitHub Actions から AssumeRole するロール（OIDC 認証）"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Federated = aws_iam_openid_connect_provider.github.arn
+        }
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringEquals = {
+            # audience は必ず sts.amazonaws.com に固定
+            "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          }
+          StringLike = {
+            # main ブランチの特定リポジトリのみ許可
+            # 複数リポジトリを許可する場合は配列で指定
+            "token.actions.githubusercontent.com:sub" = "repo:your-org/your-repo:ref:refs/heads/main"
+          }
+        }
+      }
+    ]
+  })
+
+  # セッションの最大継続時間（秒）。デフォルトの 3600 秒で十分
+  max_session_duration = 3600
+}
+
+# ロールに付与する権限ポリシー（必要最小限に絞る）
+resource "aws_iam_role_policy" "github_actions_deploy" {
+  name = "deploy-permissions"
+  role = aws_iam_role.github_actions_deploy.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:ListBucket",
+          "s3:GetObject"
+        ]
+        Resource = [
+          "arn:aws:s3:::my-deployment-bucket",
+          "arn:aws:s3:::my-deployment-bucket/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "cloudfront:CreateInvalidation"
+        ]
+        Resource = "arn:aws:cloudfront::123456789012:distribution/*"
+      }
+    ]
+  })
+}
+```
+
+`thumbprint_list` は GitHub のルート CA 証明書のフィンガープリントです。AWS 公式ドキュメントでは現在 `1b511abead59c6ce207077c0bf0e0043b1382612` が使われていますが、定期的に確認することを推奨します。
+
+## GitHub Actions ワークフロー設定
+
+次に GitHub Actions 側を設定します。ポイントは `permissions` ブロックで `id-token: write` を明示的に許可することです。
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+
+# OIDC トークン発行に必要な権限を明示
+permissions:
+  id-token: write   # OIDC トークンの発行を許可
+  contents: read    # リポジトリのチェックアウトに必要
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production  # GitHub Environments と組み合わせるとさらに安全
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-actions-deploy
+          aws-region: ap-northeast-1
+          # role-session-name でセッションを識別しやすくする
+          role-session-name: github-actions-${{ github.run_id }}
+
+      # 認証確認（デバッグ時に便利）
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Build
+        run: npm ci && npm run build
+
+      - name: Deploy to S3
+        run: |
+          aws s3 sync ./dist s3://my-deployment-bucket --delete \
+            --cache-control "public, max-age=31536000" \
+            --exclude "index.html"
+          # index.html はキャッシュしない
+          aws s3 cp ./dist/index.html s3://my-deployment-bucket/index.html \
+            --cache-control "no-cache"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+```
+
+`aws-actions/configure-aws-credentials@v4` が OIDC トークンの取得と STS への交換をすべて処理します。ワークフロー側では `role-to-assume` にロールの ARN を指定するだけです。
+
+## 条件付きロール信頼ポリシーでブランチ制限
+
+`sub` クレームの条件指定は、セキュリティ上最も重要な設定です。パターンをいくつか示します。
+
+```hcl
+# パターン1：特定リポジトリの main ブランチのみ
+Condition = {
+  StringEquals = {
+    "token.actions.githubusercontent.com:sub" = "repo:your-org/your-repo:ref:refs/heads/main"
+  }
+}
+
+# パターン2：特定リポジトリの全ブランチ（開発環境向け）
+Condition = {
+  StringLike = {
+    "token.actions.githubusercontent.com:sub" = "repo:your-org/your-repo:*"
+  }
+}
+
+# パターン3：GitHub Environments を使った制限
+Condition = {
+  StringEquals = {
+    "token.actions.githubusercontent.com:sub" = "repo:your-org/your-repo:environment:production"
+  }
+}
+
+# パターン4：Pull Request からのアクセスを拒否（デプロイに PR からのトリガーを使わない）
+Condition = {
+  StringLike = {
+    "token.actions.githubusercontent.com:sub" = "repo:your-org/your-repo:ref:refs/heads/*"
+  }
+  StringNotEquals = {
+    "token.actions.githubusercontent.com:ref" = "refs/pull/*"
+  }
+}
+```
+
+`StringEquals` と `StringLike` の使い分けに注意してください。`StringLike` はワイルドカード（`*`）を使えますが、誤って広すぎる権限を与えるリスクがあります。本番環境のロールには可能な限り `StringEquals` で厳密に指定することを推奨します。
+
+## 複数環境への対応
+
+本番・ステージング・開発と環境が分かれている場合、環境ごとにロールを作成するのがベストプラクティスです。
+
+```hcl
+locals {
+  environments = {
+    production = {
+      branch = "main"
+      bucket = "my-app-prod"
+    }
+    staging = {
+      branch = "develop"
+      bucket = "my-app-staging"
+    }
+  }
+}
+
+resource "aws_iam_role" "github_actions" {
+  for_each = local.environments
+
+  name = "github-actions-${each.key}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Federated = aws_iam_openid_connect_provider.github.arn }
+        Action    = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringEquals = {
+            "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+            "token.actions.githubusercontent.com:sub" = "repo:your-org/your-repo:ref:refs/heads/${each.value.branch}"
+          }
+        }
+      }
+    ]
+  })
+}
+```
+
+## まとめ
+
+OIDC 認証への移行は、設定量は増えるものの、得られるセキュリティ上のメリットは大きいです。
+
+- **保存すべき長期シークレットがなくなる** ── GitHub Secrets から IAM キーを削除できます
+- **一時クレデンシャルは自動失効** ── 漏洩しても有効期間が短いため被害が限定されます
+- **ブランチ・環境単位で権限を分離できる** ── 本番環境のロールは main ブランチからしか assume できません
+- **CloudTrail で誰がどのブランチからロールを引き受けたか追跡できる** ── 監査ログの質が上がります
+
+既存のプロジェクトに導入する場合、まず OIDC プロバイダーと新しいロールを作成し、新しいワークフローで動作確認してから古いシークレットを削除するという手順を踏むことで、安全に移行できます。
+
+長期クレデンシャルの廃止は一度やれば終わりではなく、新しいサービスを追加するたびに「この権限は本当に必要か」を問い続ける習慣とセットで意味をなします。OIDC はその習慣を支える仕組みの一つです。

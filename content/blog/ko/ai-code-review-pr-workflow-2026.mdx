@@ -1,0 +1,237 @@
+---
+title: "PR 워크플로우에 AI 코드 리뷰 통합하기: GitHub Actions와 Claude API 실전 가이드"
+description: "GitHub Actions와 Anthropic Claude API를 연결해 Pull Request마다 자동 AI 코드 리뷰 Comment를 달아주는 방법을 구체적으로 설명합니다. YAML 설정, Node.js Script, 비용 추정, 운영 경험까지 담았습니다."
+date: "2026-04-07"
+status: published
+tags: ["AI", "code-review", "GitHub Actions", "LLM", "DevOps"]
+thumbnail: ""
+author: webhani
+slug: ai-code-review-pr-workflow-2026
+---
+
+## Code Review 병목 문제
+
+팀 규모가 커질수록 Code Review는 선형으로 확장되지 않습니다. Engineer가 5명에서 15명으로 늘면 PR 수는 세 배가 되지만, Reviewer의 가용 시간은 거의 늘지 않습니다. 결과는 예측 가능합니다. Review가 며칠씩 밀리고, 피드백 품질이 들쭉날쭉해지며, 시니어 Engineer가 같은 유형의 버그를 반복해서 잡느라 시간을 씁니다.
+
+AI 코드 리뷰는 사람 Reviewer를 대체하는 도구가 아닙니다. 설계 판단, 제품 트레이드오프, 미묘한 Logic 오류는 여전히 사람이 봐야 합니다. 하지만 SQL Injection 위험, 누락된 Error Handling, 명백한 N+1 Query, 하드코딩된 Secret처럼 반복적으로 등장하는 문제들은 자동화된 첫 번째 레이어가 충분히 걸러낼 수 있습니다. 이 글은 GitHub Actions와 Claude API를 연결하는 최소한의 실용적인 설정을 다룹니다.
+
+## 전체 구조
+
+동작 흐름은 단순합니다.
+
+1. PR이 열리거나 업데이트되면 GitHub Actions Workflow가 트리거됨
+2. `git diff`로 변경 사항을 Unified Diff 형식으로 추출
+3. Node.js Script가 Diff를 Claude API에 전송
+4. 응답을 `gh` CLI로 PR Comment에 게시
+
+별도 Infrastructure가 필요 없습니다. 필요한 것은 두 가지 Secret뿐입니다: `ANTHROPIC_API_KEY`와 GitHub이 자동 제공하는 `GITHUB_TOKEN`.
+
+## GitHub Actions Workflow 설정
+
+```yaml
+# .github/workflows/ai-code-review.yml
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Rate Limit 방지를 위해 Repository 단위로 직렬화
+concurrency:
+  group: ai-review-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    # 너무 큰 PR은 건너뜀 — 먼저 분할을 요청하는 게 맞음
+    if: github.event.pull_request.additions < 600
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Anthropic SDK 설치
+        run: npm install @anthropic-ai/sdk
+
+      - name: Diff 생성
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD \
+            -- "*.ts" "*.tsx" "*.js" "*.jsx" "*.py" "*.go" \
+            > diff.txt
+          echo "Diff 크기: $(wc -c < diff.txt) bytes"
+
+      - name: AI Review 실행
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node scripts/ai-review.mjs
+```
+
+설정 각 항목에 대한 설명입니다.
+
+**`additions < 600`**: 큰 Diff는 API 비용이 늘어날 뿐 아니라 Claude의 Review 품질도 떨어집니다. Context Window가 관련 없는 변경 사항으로 가득 차면 집중도가 낮아집니다. 500줄이 넘는 PR이라면 AI Review보다 "PR을 먼저 나눠 달라"는 피드백이 더 유용합니다.
+
+**`concurrency` 그룹**: 이 설정 없이 바쁜 Repository에서 동시에 여러 PR이 열리면 API 요청이 한꺼번에 몰려 Rate Limit에 걸립니다. `cancel-in-progress: false`로 설정하면 Queue에 쌓인 Job이 취소되지 않고 순서대로 처리됩니다.
+
+**`fetch-depth: 0`**: Base Branch 전체 History를 가져와야 `git diff`가 올바르게 동작합니다.
+
+## Review Script 구현
+
+```javascript
+// scripts/ai-review.mjs
+import Anthropic from "@anthropic-ai/sdk";
+import { readFileSync } from "fs";
+import { execFileSync } from "child_process";
+
+const client = new Anthropic();
+
+// 명확한 Prompt가 노이즈를 줄임
+const SYSTEM_PROMPT = `당신은 코드 리뷰어입니다. Style 문제가 아닌 실제 문제만 찾아내는 것이 목표입니다.
+
+다음 항목만 리뷰하세요:
+- 보안 취약점 (Injection, 인증 우회, 하드코딩된 Credential, 안전하지 않은 역직렬화)
+- 명확한 Logic 버그나 처리되지 않은 Error 경로
+- 실제 운영에서 문제가 될 수 있는 성능 이슈 (N+1, Full Table Scan, 무한 Loop)
+- TypeScript 코드의 Type 안전성 문제
+
+다음 항목은 코멘트하지 마세요:
+- 명명 규칙이나 Formatting (Linter가 처리)
+- 주석이나 문서 누락
+- 주관적인 Style 선호도
+
+문제가 없으면 정확히 이렇게 답하세요: "LGTM — 자동 리뷰에서 문제를 찾지 못했습니다."
+
+문제가 있으면 Markdown 목록 형식으로 각 항목에 파일명과 대략적인 줄 번호를 포함해 작성하세요.`;
+
+async function reviewPR() {
+  const diff = readFileSync("diff.txt", "utf-8");
+
+  if (diff.trim().length === 0) {
+    console.log("Diff가 비어 있어 리뷰를 건너뜁니다.");
+    return;
+  }
+
+  // 예측 가능한 Token 범위를 유지하기 위해 최대 12000자로 제한
+  const MAX_DIFF_CHARS = 12000;
+  const trimmedDiff = diff.slice(0, MAX_DIFF_CHARS);
+  const wasTrimmed = diff.length > MAX_DIFF_CHARS;
+
+  let response;
+  try {
+    response = await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1500,
+      system: SYSTEM_PROMPT,
+      messages: [
+        {
+          role: "user",
+          content: `다음 PR Diff를 리뷰해 주세요:\n\n\`\`\`diff\n${trimmedDiff}\n\`\`\``,
+        },
+      ],
+    });
+  } catch (err) {
+    console.error("Claude API 호출 실패:", err.message);
+    process.exit(1);
+  }
+
+  const reviewText =
+    response.content[0].type === "text" ? response.content[0].text : "";
+
+  const truncationNote = wasTrimmed
+    ? `> **참고**: Diff가 ${MAX_DIFF_CHARS}자를 초과하여 앞부분만 리뷰했습니다.\n\n`
+    : "";
+
+  const commentBody = [
+    "## AI 코드 리뷰 (Claude)",
+    "",
+    truncationNote + reviewText,
+    "",
+    "---",
+    "_이 Comment는 자동 생성되었습니다. 오탐 가능성이 있으니 판단은 직접 하세요._",
+  ].join("\n");
+
+  const prNumber = process.env.PR_NUMBER;
+  // Shell Injection을 피하기 위해 Body를 인자로 전달
+  execFileSync("gh", ["pr", "comment", prNumber, "--body", commentBody], {
+    stdio: "inherit",
+  });
+
+  console.log("Review Comment를 게시했습니다.");
+}
+
+reviewPR().catch((err) => {
+  console.error("처리되지 않은 오류:", err);
+  process.exit(1);
+});
+```
+
+`system` Parameter에 지시 사항을 넣고 `user` Message에는 Diff만 담는 방식이 모든 것을 하나의 Message에 합치는 것보다 일관된 결과를 냅니다. Claude는 System Level의 지시를 더 높은 우선순위로 처리하기 때문에, 긴 Diff에서도 지시 사항이 희석되지 않습니다.
+
+## 실제 Review Comment 예시
+
+TypeScript API 코드베이스에서 나온 실제 출력 예시입니다.
+
+```
+## AI 코드 리뷰 (Claude)
+
+- **`src/routes/users.ts:58`** — `req.params`의 `userId`가 Raw SQL 문자열에 직접
+  보간되고 있습니다. Injection을 방지하기 위해 Parameterized Query를 사용하세요.
+- **`src/middleware/auth.ts:34`** — Token 만료 확인에서 `>` 대신 `>=`를 사용해야
+  할 수 있습니다. 정확히 만료 시각과 일치하는 Token이 통과할 가능성이 있습니다.
+- **`src/jobs/sync.ts:102`** — 무한한 Result Set에 대해 `.map()` 내부에서
+  `Promise.all`을 호출하고 있습니다. 데이터가 많으면 수백 개의 Connection이 동시에
+  열릴 수 있습니다. Chunk 단위 Batch 처리를 고려하세요.
+
+---
+_이 Comment는 자동 생성되었습니다. 오탐 가능성이 있으니 판단은 직접 하세요._
+```
+
+실제 운용에서는 약 70% 정도가 이 수준의 유용한 결과를 냅니다. 나머지 30%는 깔끔한 PR에 대한 LGTM, 그리고 코드베이스의 다른 곳에서 이미 처리된 부분을 지적하는 오탐으로 나뉩니다. 첫 번째 레이어 도구로는 충분히 수용 가능한 비율입니다.
+
+## Prompt 튜닝 포인트
+
+Review 품질을 높이는 가장 효과적인 방법은 Prompt를 구체적으로 만드는 것입니다.
+
+**프로젝트 Context 추가**: Codebase에서 특정 ORM이나 Framework를 사용한다면 명시하세요. 예: "이 프로젝트는 Prisma를 사용합니다 — Raw SQL 패턴은 제안하지 마세요." 이것만으로 불필요한 제안이 크게 줄어듭니다.
+
+**신뢰도 기준 설정**: "확신이 있는 문제만 보고하세요. 추측성 Comment는 달지 마세요."를 추가하면 애매한 저신호 Comment의 빈도가 낮아집니다.
+
+**언어별 지시**: Go 코드베이스라면 "Error Return 값이 무시되는 경우를 주의 깊게 보세요"를 추가하면 해당 언어에서 흔한 버그 패턴을 더 잘 잡습니다.
+
+## 비용과 Rate Limit 관리
+
+Claude Sonnet 기준으로 12000자 Diff 하나당 약 $0.04–0.06의 비용이 발생합니다. 하루 30개 PR이 생성되는 팀이라면 월 $40–50 수준입니다. 대부분의 팀에서 Reviewer의 시간 절약 효과를 생각하면 납득할 수 있는 비용입니다.
+
+Rate Limit은 PR이 집중되는 시간대에 문제가 됩니다. Workflow의 `concurrency` 설정으로 대부분의 상황을 처리할 수 있습니다. Repository가 여러 개라면 API 호출 직전에 짧은 `sleep` (5–10초)을 추가하는 것도 유효한 방법입니다.
+
+## AI 리뷰로 커버되지 않는 영역
+
+몇 가지 한계는 명확히 인식해야 합니다.
+
+**파일 간 추론**: Claude는 Diff만 보고 전체 Codebase를 알지 못합니다. 개별 변경 사항은 맞아 보이지만 다른 파일의 계약을 깨는 경우는 잡히지 않습니다.
+
+**Business Logic 오류**: 명세가 잘못된 Logic은 Claude가 명세를 모르면 검출할 수 없습니다.
+
+**Test Coverage 부족**: 변경된 코드에 Test가 충분한지는 Review 대상이 아닙니다.
+
+이런 부분에서는 사람 Reviewer가 여전히 필요합니다. AI 레이어는 사람 Review를 대체하는 것이 아니라 보완하는 것입니다.
+
+## 정리
+
+여기서 소개한 설정은 GitHub에 이미 있는 것 외에 별도 Infrastructure가 필요 없고, 구축에 한 시간이 채 걸리지 않습니다. 잘 동작하게 만드는 핵심 원칙 세 가지입니다.
+
+- **범위를 제한한다.** Diff 크기 상한과 집중된 Prompt가 광범위한 Context와 막연한 Prompt보다 나은 Signal을 냅니다.
+- **조언으로만 활용한다.** CI는 Lint와 Test로 Block하고, AI Review는 Gate가 아닌 정보 제공으로만 씁니다.
+- **Prompt를 계속 개선한다.** 첫 버전이 완벽하지 않습니다. 오탐과 적중 사례를 기록해두고 몇 주에 한 번씩 Prompt를 조정하세요.
+
+결과는 크지 않지만 일관됩니다. Reviewer가 PR에 도달할 때 이미 기본 점검이 완료되어 있고, 그만큼 사람의 집중이 실제로 중요한 부분에 쏠립니다.

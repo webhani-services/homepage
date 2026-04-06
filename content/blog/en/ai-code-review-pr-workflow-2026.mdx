@@ -1,0 +1,239 @@
+---
+title: "AI-Powered Code Review in Your PR Workflow with GitHub Actions and Claude API"
+description: "A practical walkthrough of wiring Claude API into GitHub Actions to post automated code review comments on every pull request. Includes real YAML, a Node.js script, cost estimates, and lessons from running this in production."
+date: "2026-04-07"
+status: published
+tags: ["AI", "code-review", "GitHub Actions", "LLM", "DevOps"]
+thumbnail: ""
+author: webhani
+slug: ai-code-review-pr-workflow-2026
+---
+
+## The Problem With Code Review at Scale
+
+Code review does not scale linearly with team size. When a team grows from 5 to 15 engineers, PR volume often triples while reviewer bandwidth barely doubles. The result is familiar: reviews take days instead of hours, feedback quality becomes inconsistent, and senior engineers spend disproportionate time catching the same class of bugs that a static analysis tool could have flagged automatically.
+
+AI-assisted review is not a replacement for human judgment. Architecture decisions, product tradeoffs, and subtle logic errors still need a human. But there is a category of issues — SQL injection risks, missing error handling, obvious N+1 queries, hardcoded secrets — where an automated first pass genuinely saves time. The goal is to offload the repetitive first layer so reviewers arrive at a PR with the low-hanging fruit already addressed.
+
+This post walks through a minimal, production-ready setup using GitHub Actions and Anthropic's Claude API.
+
+## Architecture Overview
+
+The flow has four steps:
+
+1. A PR is opened or updated, triggering a GitHub Actions workflow
+2. The workflow generates a unified diff of the changes
+3. A Node.js script sends the diff to Claude with a focused prompt
+4. The response is posted as a PR comment via the `gh` CLI
+
+No external services, no custom infrastructure. Everything runs inside the Actions runner using two environment secrets: `ANTHROPIC_API_KEY` and the built-in `GITHUB_TOKEN`.
+
+## GitHub Actions Workflow
+
+```yaml
+# .github/workflows/ai-code-review.yml
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Serialize reviews per repo to avoid hitting rate limits
+concurrency:
+  group: ai-review-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    # Skip very large PRs — they should be split up anyway
+    if: github.event.pull_request.additions < 600
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Anthropic SDK
+        run: npm install @anthropic-ai/sdk
+
+      - name: Generate diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD \
+            -- "*.ts" "*.tsx" "*.js" "*.jsx" "*.py" "*.go" "*.rb" \
+            > diff.txt
+          echo "Diff size: $(wc -c < diff.txt) bytes"
+
+      - name: Run AI review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.base_ref }}
+        run: node scripts/ai-review.mjs
+```
+
+A few decisions worth explaining:
+
+**`additions < 600`**: Large diffs are expensive and Claude's review quality degrades when the context window is overloaded with unrelated changes. If a PR is that big, the right feedback is "please split this," not an AI review.
+
+**`concurrency` group**: Without this, a busy repository could fire off a dozen simultaneous API calls and hit Anthropic's rate limits. Serializing per repository costs a few minutes of delay but eliminates flaky failures.
+
+**`fetch-depth: 0`**: Required so `git diff` can see the full history of the base branch.
+
+## Review Script
+
+```javascript
+// scripts/ai-review.mjs
+import Anthropic from "@anthropic-ai/sdk";
+import { readFileSync } from "fs";
+import { execFileSync } from "child_process";
+
+const client = new Anthropic();
+
+// Focused prompt — broad prompts produce noisy reviews
+const SYSTEM_PROMPT = `You are a code reviewer. Your job is to catch real problems, not style issues.
+
+Review the provided diff and report only:
+- Security vulnerabilities (injection, auth bypass, hardcoded credentials, unsafe deserialization)
+- Clear logic bugs or unhandled error paths
+- Performance problems likely to matter in production (N+1, full table scans, unbounded loops)
+- Type safety issues in TypeScript code
+
+Do NOT comment on:
+- Naming conventions or formatting (a linter handles this)
+- Missing comments or documentation
+- Subjective style preferences
+
+If you find no issues, respond with exactly: "LGTM — no issues found in automated review."
+
+If you do find issues, respond with a Markdown bullet list. Each item must include the filename and approximate line number.`;
+
+async function reviewPR() {
+  const diff = readFileSync("diff.txt", "utf-8");
+
+  if (diff.trim().length === 0) {
+    console.log("Empty diff, skipping review.");
+    return;
+  }
+
+  // Cap at 12000 characters to stay within a predictable token budget
+  const MAX_DIFF_CHARS = 12000;
+  const trimmedDiff = diff.slice(0, MAX_DIFF_CHARS);
+  const wasTrimmed = diff.length > MAX_DIFF_CHARS;
+
+  let response;
+  try {
+    response = await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1500,
+      system: SYSTEM_PROMPT,
+      messages: [
+        {
+          role: "user",
+          content: `Please review this pull request diff:\n\n\`\`\`diff\n${trimmedDiff}\n\`\`\``,
+        },
+      ],
+    });
+  } catch (err) {
+    console.error("Claude API call failed:", err.message);
+    process.exit(1);
+  }
+
+  const reviewText =
+    response.content[0].type === "text" ? response.content[0].text : "";
+
+  const truncationNote = wasTrimmed
+    ? `> **Note**: This diff exceeded ${MAX_DIFF_CHARS} characters. Only the first portion was reviewed.\n\n`
+    : "";
+
+  const commentBody = [
+    "## AI Code Review (Claude)",
+    "",
+    truncationNote + reviewText,
+    "",
+    "---",
+    "_This comment is auto-generated. False positives are possible — use your judgment._",
+  ].join("\n");
+
+  const prNumber = process.env.PR_NUMBER;
+  // Pass body as an argument to avoid shell injection
+  execFileSync("gh", ["pr", "comment", prNumber, "--body", commentBody], {
+    stdio: "inherit",
+  });
+
+  console.log("Review comment posted.");
+}
+
+reviewPR().catch((err) => {
+  console.error("Unhandled error:", err);
+  process.exit(1);
+});
+```
+
+Using the `system` parameter to house the instructions and the `user` message purely for the diff content tends to produce more consistent output than combining both in a single message. Claude treats system-level instructions with higher authority, which reduces drift in longer diffs.
+
+## Sample Output
+
+Here is representative output from a TypeScript API codebase:
+
+```
+## AI Code Review (Claude)
+
+- **`src/routes/users.ts:58`** — `userId` from `req.params` is interpolated
+  directly into a raw SQL string. Use a parameterized query to prevent injection.
+- **`src/middleware/auth.ts:34`** — The token expiry check compares timestamps
+  using `>` rather than `>=`, which may allow a token that expires at the exact
+  current second to pass. Consider `>=` or adding a small buffer.
+- **`src/jobs/sync.ts:102`** — `Promise.all` is called with an array constructed
+  inside a `.map()` over an unbounded result set. If the dataset is large this
+  will open hundreds of concurrent connections. Consider batching with a chunk size.
+
+---
+_This comment is auto-generated. False positives are possible — use your judgment._
+```
+
+Real sessions produce this quality roughly 70% of the time. The other 30% is split between LGTM on genuinely clean PRs, and a handful of false positives where Claude flags something that is already handled elsewhere in the codebase. That ratio is acceptable for a first-pass tool.
+
+## Tuning the Prompt
+
+The single most effective lever for improving review quality is prompt specificity. A few adjustments that worked well in practice:
+
+**Add project context in the system prompt.** If the codebase uses a specific ORM or framework, naming it reduces spurious suggestions. For example: "This project uses Prisma for database access — do not suggest raw SQL patterns."
+
+**Set a confidence threshold.** Adding "Only report issues you are confident about. Do not speculate." reduces the rate of hedged, low-signal comments.
+
+**Language-specific instructions.** For Go codebases, adding "Pay attention to error return values being discarded" catches a common class of bugs that the prompt otherwise misses.
+
+## Cost and Rate Limits
+
+At current Claude Sonnet pricing, a 12000-character diff costs roughly $0.04–0.06 per review including the response. A team with 30 PRs per day runs about $1.50/day or $45/month. That is well within the range most engineering teams would accept for the time saved.
+
+Rate limits become a practical concern at higher PR volumes. The `concurrency` group in the workflow handles bursts well. If you have multiple repositories, consider adding a short `sleep` step (5–10 seconds) before the API call rather than hitting the limit and retrying.
+
+## What This Does Not Replace
+
+A few things AI review handles poorly:
+
+- **Cross-file reasoning**: Claude only sees the diff, not the full codebase. A change that looks correct in isolation but breaks a contract elsewhere will not be caught.
+- **Business logic errors**: If the logic is wrong by specification, the model cannot know that without the specification.
+- **Test coverage gaps**: The review does not check whether the changed code has corresponding test coverage.
+
+For these, human review remains the right tool. The AI layer is additive, not substitutive.
+
+## Takeaways
+
+The setup described here takes under an hour to wire up and requires no infrastructure beyond what you already have in GitHub. Key principles that make it work:
+
+- **Constrain the scope.** A diff cap and a focused prompt produce better signal than unlimited context with a vague prompt.
+- **Make it advisory.** Block CI on linting and tests, not on AI review. Reviews should inform, not gate.
+- **Iterate on the prompt.** The first version will not be perfect. Keep a running log of false positives and true catches, and adjust the prompt every few weeks.
+
+The payoff is small but consistent: reviewers arrive at PRs with a baseline check already done, which shortens the feedback loop and lets human attention go where it actually matters.
