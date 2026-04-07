@@ -1,0 +1,309 @@
+---
+title: "Eliminate Long-Lived AWS Credentials in GitHub Actions with OIDC"
+description: "Storing AWS_ACCESS_KEY_ID in GitHub Secrets is a liability. Learn how OIDC-based keyless authentication works, how to set it up with Terraform, and why it's the only sensible approach for CI/CD pipelines in 2026."
+date: "2026-04-07"
+status: published
+tags: ["GitHub Actions", "AWS", "security", "OIDC", "CI/CD"]
+thumbnail: ""
+author: webhani
+slug: github-actions-oidc-aws-keyless-2026
+---
+
+If your GitHub Actions workflows are still using `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` stored in repository secrets, you have a persistent credential sitting in your CI system that never expires. This post explains why that matters, how OpenID Connect (OIDC) eliminates the problem entirely, and how to set it up end-to-end with Terraform and a working workflow.
+
+## The Problem with Static IAM Access Keys in CI
+
+Long-lived IAM access keys have a fundamental property that makes them dangerous in automated systems: they don't expire unless you explicitly delete or disable them. In a CI context, this means:
+
+**Exposure surface is larger than you think.** GitHub's secret masking catches obvious patterns, but it can be bypassed with Base64 encoding, splitting output across multiple lines, or piping through tools that transform the value. Debug steps added during incident response frequently print environment variables to logs. Third-party Actions you include in your workflow run with access to the same environment.
+
+**Rotation is painful and often skipped.** Rotating an IAM key requires generating a new one, updating every secret store that holds it, verifying nothing broke, then deleting the old one. In practice this means keys used in CI are often months or years old. The older a key, the more places it may have been copied — Slack messages, incident notes, local `.env` files a developer took home.
+
+**A leaked key is immediately actionable.** Unlike a password tied to a user account, an IAM access key works from anywhere, at any time, with no MFA prompt. If it appears in a public git repository or log, automated scanners will find it within minutes. AWS itself now scans public GitHub repos for IAM keys and sends abuse alerts, but that notification comes after the key is already public.
+
+**Blast radius is hard to contain after the fact.** When a breach is detected, you need to know exactly what the key was used for. CloudTrail helps, but correlating access patterns across accounts and time zones under incident pressure is not fun.
+
+## How OIDC Token Exchange Works
+
+OIDC authentication replaces the stored secret with a real-time cryptographic proof of identity. The flow works as follows:
+
+1. A GitHub Actions job starts. GitHub's built-in OIDC provider issues a **short-lived signed JWT** specific to that job run.
+2. The JWT contains verifiable claims: `repo`, `ref`, `sha`, `actor`, `workflow`, `event_name`, `environment`, and others.
+3. The workflow calls AWS STS `AssumeRoleWithWebIdentity`, presenting the JWT.
+4. AWS fetches GitHub's public JWKS endpoint to verify the token's signature. No shared secret is involved in this verification.
+5. AWS checks the IAM role's trust policy conditions against the claims in the token.
+6. If conditions match, STS returns **temporary credentials** valid for up to one hour.
+7. When the job ends, the credentials expire. There is nothing to rotate, revoke, or clean up.
+
+The critical insight here is that at no point does any long-lived credential leave GitHub's systems. The IAM role ARN in your workflow is not a secret — it's a resource identifier, like a URL. Knowing the ARN gives an attacker nothing without also satisfying the trust policy conditions.
+
+## Setting Up the AWS IAM Identity Provider
+
+You need to register GitHub's OIDC endpoint with AWS once per account. After that, any number of roles can trust it. Using Terraform:
+
+```hcl
+# terraform/iam-oidc.tf
+
+resource "aws_iam_openid_connect_provider" "github" {
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+
+  # Thumbprint of the root CA certificate for token.actions.githubusercontent.com
+  # Verify with: openssl s_client -connect token.actions.githubusercontent.com:443 \
+  #   -showcerts < /dev/null 2>/dev/null | openssl x509 -fingerprint -noout -sha1
+  thumbprint_list = ["1b511abead59c6ce207077c0bf0e0043b1382612"]
+}
+
+# Deployment role for the main branch of a specific repository
+resource "aws_iam_role" "github_actions_deploy" {
+  name        = "github-actions-deploy"
+  description = "Assumed by GitHub Actions via OIDC. No static keys."
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Federated = aws_iam_openid_connect_provider.github.arn
+        }
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringEquals = {
+            # The audience must be sts.amazonaws.com — this is fixed
+            "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+            # Exact match: only the main branch of this specific repo
+            "token.actions.githubusercontent.com:sub" = "repo:your-org/your-repo:ref:refs/heads/main"
+          }
+        }
+      }
+    ]
+  })
+
+  max_session_duration = 3600
+}
+
+# Attach only the permissions this deployment actually needs
+resource "aws_iam_role_policy" "github_actions_deploy" {
+  name = "deploy-policy"
+  role = aws_iam_role.github_actions_deploy.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:ListBucket",
+          "s3:GetObject"
+        ]
+        Resource = [
+          "arn:aws:s3:::my-deployment-bucket",
+          "arn:aws:s3:::my-deployment-bucket/*"
+        ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["cloudfront:CreateInvalidation"]
+        Resource = "arn:aws:cloudfront::123456789012:distribution/*"
+      }
+    ]
+  })
+}
+```
+
+One OIDC provider per AWS account. Multiple roles can reference the same provider ARN, so you create it once and attach trust policies to as many roles as you need.
+
+## GitHub Actions Workflow Configuration
+
+The workflow side is straightforward. The key requirement is granting the `id-token: write` permission — without it, GitHub won't issue an OIDC token for the job.
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write  # Allows the job to request an OIDC token from GitHub
+  contents: read   # Needed for actions/checkout
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production  # Optional: use GitHub Environments for additional approval gates
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-actions-deploy
+          aws-region: ap-northeast-1
+          # Including the run ID makes sessions easy to find in CloudTrail
+          role-session-name: deploy-${{ github.run_id }}
+
+      # Useful for verifying the role assumption worked correctly
+      - name: Verify identity
+        run: aws sts get-caller-identity
+
+      - name: Build
+        run: npm ci && npm run build
+
+      - name: Sync to S3
+        run: |
+          # Versioned assets get long cache headers; HTML does not
+          aws s3 sync ./dist s3://my-deployment-bucket \
+            --delete \
+            --exclude "*.html" \
+            --cache-control "public, max-age=31536000, immutable"
+          aws s3 sync ./dist s3://my-deployment-bucket \
+            --exclude "*" \
+            --include "*.html" \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+```
+
+`aws-actions/configure-aws-credentials@v4` handles the OIDC token request and STS call internally. You do not write any token exchange logic yourself.
+
+Note that `CLOUDFRONT_DISTRIBUTION_ID` above is still a secret — distribution IDs are not sensitive enough to worry about, but they're not meaningfully public either. This is an appropriate use of secrets: a non-sensitive identifier, not a credential.
+
+## Restricting by Branch and Repository in the Trust Policy
+
+The `sub` claim is the primary control mechanism. Getting the condition wrong is the most common mistake.
+
+```hcl
+# Exact match — production deployments from main only
+Condition = {
+  StringEquals = {
+    "token.actions.githubusercontent.com:sub" = "repo:your-org/your-repo:ref:refs/heads/main"
+  }
+}
+
+# Wildcard — any branch in a specific repo (suitable for staging/dev roles)
+Condition = {
+  StringLike = {
+    "token.actions.githubusercontent.com:sub" = "repo:your-org/your-repo:*"
+  }
+}
+
+# Environment-scoped — requires the workflow to declare environment: production
+Condition = {
+  StringEquals = {
+    "token.actions.githubusercontent.com:sub" = "repo:your-org/your-repo:environment:production"
+  }
+}
+
+# Multiple repos — grant access to a shared infrastructure repo and app repo
+Condition = {
+  StringLike = {
+    "token.actions.githubusercontent.com:sub" = [
+      "repo:your-org/infra-repo:ref:refs/heads/main",
+      "repo:your-org/app-repo:ref:refs/heads/main"
+    ]
+  }
+}
+```
+
+Never use `"repo:your-org/*"` for production roles. If your organization has dozens of repositories, a misconfigured workflow in any one of them could assume your production deployment role.
+
+## Handling Multiple Environments
+
+For teams deploying to separate production, staging, and development AWS accounts (or just separate roles within one account), the cleanest pattern is one role per environment with branch-locked trust policies:
+
+```hcl
+locals {
+  deploy_targets = {
+    production = {
+      account_id = "111122223333"
+      branch     = "main"
+      bucket     = "my-app-prod"
+    }
+    staging = {
+      account_id = "444455556666"
+      branch     = "develop"
+      bucket     = "my-app-staging"
+    }
+  }
+}
+
+resource "aws_iam_role" "github_actions" {
+  for_each = local.deploy_targets
+
+  name = "github-actions-${each.key}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Federated = aws_iam_openid_connect_provider.github.arn }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub" = "repo:your-org/your-repo:ref:refs/heads/${each.value.branch}"
+        }
+      }
+    }]
+  })
+}
+```
+
+In the workflow, the role ARN can be stored in a GitHub Environment variable (not a secret — it is not sensitive):
+
+```yaml
+jobs:
+  deploy:
+    environment: production
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ap-northeast-1
+```
+
+## What You Gain in CloudTrail
+
+One underappreciated benefit of OIDC is the audit trail quality. Every `AssumeRoleWithWebIdentity` call records the `sub` claim from the token in CloudTrail:
+
+```
+"requestParameters": {
+  "roleArn": "arn:aws:iam::123456789012:role/github-actions-deploy",
+  "roleSessionName": "deploy-9876543210",
+  "webIdentityToken": "..."
+},
+"userIdentity": {
+  "sessionContext": {
+    "webIdFederationData": {
+      "federatedProvider": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com",
+      "attributes": {
+        "sub": "repo:your-org/your-repo:ref:refs/heads/main"
+      }
+    }
+  }
+}
+```
+
+You can query this to answer questions like "which workflow runs touched this S3 bucket last month" without needing to cross-reference separate CI logs.
+
+## Takeaways
+
+- Static IAM keys in CI are a persistent liability with no upside. OIDC has equivalent setup complexity and zero ongoing maintenance.
+- The OIDC provider is created once per AWS account. All roles share it.
+- The `sub` claim is your access control boundary. Use `StringEquals` for production roles, never wildcards.
+- Temporary credentials expire automatically. There is nothing to rotate.
+- `role-session-name` with the GitHub run ID gives you traceable sessions in CloudTrail.
+- Combine OIDC with GitHub Environments for manual approval gates on production deployments.
+
+If you're migrating an existing setup, the safe sequence is: create the OIDC provider and new role, test the new workflow in a branch, verify `aws sts get-caller-identity` returns the expected role, then remove the old secrets. Don't delete the old keys until you've confirmed the OIDC path works in production.
