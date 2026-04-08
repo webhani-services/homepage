@@ -1,0 +1,180 @@
+---
+title: "TypeScriptが標準になった時代: State of JavaScript 2025調査から見えるもの"
+description: "State of JavaScript 2025調査でTypeScriptを専用で使う開発者が40%に達しました。TypeScript 6.0の新機能とともに、現在のJavaScriptエコシステムの実態を整理します。"
+date: "2026-04-09"
+status: "published"
+tags: ["TypeScript", "JavaScript", "State of JS", "Frontend", "Developer Survey"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-dominance-state-of-js-2025"
+---
+
+State of JavaScript 2025調査の結果が公開され、エコシステムの成熟ぶりが改めて示されました。特に注目すべき数字は「TypeScriptのみを使う開発者が40%」という割合です。TypeScriptはもはや「JavaScriptの拡張」ではなく、多くの開発者にとってデフォルトの選択肢になっています。
+
+## 調査から見えるトレンド
+
+State of JavaScript 2025は世界中のJavaScript開発者を対象とした年次調査です。2025年度の結果から主要なポイントを抜粋します。
+
+**TypeScriptの浸透**
+- TypeScriptを専用で使う: **40%**
+- TypeScriptとJavaScriptを併用: 約45%
+- JavaScriptのみ: 約15%
+
+合わせると回答者の85%以上がTypeScriptを何らかの形で使用しています。3年前と比べると様変わりで、「TypeScriptを使うかどうか」ではなく「どこまで型を厳格にするか」が論点になっています。
+
+**フレームワーク動向**
+Next.jsは回答者の59%が使用していますが、満足度は中立に近く、「最もコメントが多いプロジェクト」という不名誉な結果も出ています。メタフレームワークへの依存が深まる一方で、その複雑さへの不満も蓄積されています。
+
+## TypeScript 6.0 の主要な変更点
+
+TypeScript 6.0ではいくつかの重要な改善が加えられました。実際のコードで確認してみます。
+
+**Isolated Declarations の安定化**
+
+```typescript
+// TypeScript 6.0では型推論を省略した明示的な型注釈が要求されるケースが増加
+// isolatedDeclarations: true の設定時
+
+// NG: 推論に依存している場合、isolatedDeclarationsモードでエラーになる
+export const getUser = () => ({ id: 1, name: "Alice" });
+
+// OK: 戻り値の型を明示する
+export const getUser = (): { id: number; name: string } => ({
+  id: 1,
+  name: "Alice"
+});
+```
+
+`isolatedDeclarations`オプションを有効にすると、各ファイルを独立して型チェックできるようになり、大規模なモノレポでのビルド並列化が改善されます。
+
+**改善されたNarrowingロジック**
+
+```typescript
+// TypeScript 6.0ではより正確なNarrowing
+type ApiResponse =
+  | { status: "ok"; data: string[] }
+  | { status: "error"; code: number };
+
+function handleResponse(res: ApiResponse) {
+  if (res.status === "ok") {
+    // res.data が string[] として正確に推論される
+    res.data.forEach((item) => console.log(item));
+  } else {
+    // res.code が number として正確に推論される
+    console.error(`Error code: ${res.code}`);
+  }
+}
+```
+
+**using宣言の実用化**
+
+```typescript
+// ECMAScript Explicit Resource Managementのサポートが安定
+class DatabaseConnection {
+  private conn: Connection;
+  
+  constructor(url: string) {
+    this.conn = openConnection(url);
+  }
+  
+  [Symbol.dispose]() {
+    this.conn.close();
+    console.log("Connection closed");
+  }
+}
+
+// usingを使うとスコープを抜けた際に自動でdisposeが呼ばれる
+function queryData() {
+  using db = new DatabaseConnection("postgres://localhost/mydb");
+  return db.query("SELECT * FROM users");
+  // スコープ終了時に db[Symbol.dispose]() が自動実行される
+}
+```
+
+## 実務でのTypeScript活用
+
+**strictモードの設定**
+
+新規プロジェクトは最初から`strict: true`で始めることを強く推奨します。
+
+```json
+// tsconfig.json
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true
+  }
+}
+```
+
+`noUncheckedIndexedAccess`は配列アクセスに`undefined`の可能性を加えるオプションで、実際のバグを未然に防ぐ効果があります。
+
+```typescript
+const items = ["a", "b", "c"];
+
+// noUncheckedIndexedAccess: true の場合
+const first = items[0]; // string | undefined
+if (first !== undefined) {
+  console.log(first.toUpperCase()); // OK
+}
+
+// これによって範囲外アクセスに起因するランタイムエラーを型レベルで検出できる
+```
+
+**型ガードの適切な使用**
+
+```typescript
+// 型アサーション(as)より型ガードを優先する
+interface AdminUser {
+  role: "admin";
+  permissions: string[];
+}
+
+interface RegularUser {
+  role: "user";
+}
+
+type User = AdminUser | RegularUser;
+
+// NG: 型アサーション（実行時に確認しない）
+function getPermissions(user: User): string[] {
+  return (user as AdminUser).permissions; // 危険
+}
+
+// OK: 型ガード（実行時にも安全）
+function isAdmin(user: User): user is AdminUser {
+  return user.role === "admin";
+}
+
+function getPermissions(user: User): string[] {
+  if (isAdmin(user)) {
+    return user.permissions; // 型安全
+  }
+  return [];
+}
+```
+
+## エコシステムの課題
+
+State of JS調査には良い面だけでなく、率直な課題も反映されています。
+
+**バンドルサイズと複雑性**: メタフレームワークが解決するはずだった問題の多くが、新たな形で開発者に戻ってきています。ルーティング、キャッシュ、レンダリング戦略の選択が増え、学習コストが上昇しています。
+
+**TypeScriptの設定複雑性**: プロジェクトによって`tsconfig.json`の設定が大きく異なり、共有・再利用が難しい状況が続いています。TypeScript 6.0の`extends`の改善でやや緩和されましたが、根本的な解決には至っていません。
+
+## webhaniの視点
+
+TypeScriptが実質的な標準になったことは、チーム開発の観点から見て明確にプラスです。型定義によってAPIの契約が明確になり、リファクタリングの安全性が上がり、新しいメンバーがコードベースを把握しやすくなります。
+
+一方で「TypeScriptを書いているからといって型安全なコードになるわけではない」という事実も重要です。`any`の乱用、`as`による型アサーション、型ガードの欠如は、コンパイルは通ってもランタイムエラーの温床になります。
+
+ツールとしてのTypeScriptを正しく使うには、`strict`モードの有効化と、型システムを迂回するパターンを避けるコードレビュー文化の両方が必要です。
+
+## まとめ
+
+State of JavaScript 2025が示すのは「JavaScriptエコシステムが成熟した」という事実です。TypeScriptは選択肢ではなくデフォルトになり、メタフレームワークは標準的な入り口になりました。TypeScript 6.0の`isolatedDeclarations`や`using`宣言のような機能は、大規模開発での実用性をさらに高めています。
+
+新規プロジェクトを始める際は、`strict: true`を出発点にすることを強くお勧めします。後から有効にしようとすると、修正コストが膨大になります。

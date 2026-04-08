@@ -1,0 +1,222 @@
+---
+title: "Kubernetes 1.35 DRA Beta: GPU Resource Management for AI/ML Workloads"
+description: "Dynamic Resource Allocation (DRA) reached Beta in Kubernetes 1.35. Here's what changes for GPU resource management in AI/ML workloads, with practical configuration examples."
+date: "2026-04-09"
+status: "published"
+tags: ["Kubernetes", "GPU", "AI/ML", "DevOps", "Cloud Native"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-35-dra-gpu-workloads"
+---
+
+Kubernetes 1.35 graduated Dynamic Resource Allocation (DRA) Binding Conditions to Beta. As GPUs become the standard hardware for AI/ML workloads, the traditional CPU-and-memory resource model shows its limits. DRA is designed to address this directly.
+
+## The Problem With Current GPU Management
+
+Today's standard approach uses NVIDIA's Device Plugin with a simple resource request:
+
+```yaml
+resources:
+  limits:
+    nvidia.com/gpu: 1
+```
+
+This works, but it can't express several requirements that matter for real AI/ML workloads:
+
+- Which GPU model or generation is needed (A100 vs H100 vs RTX 4090)
+- Minimum GPU memory requirements
+- Topology constraints — keeping GPUs connected via NVLink on the same node
+- Sharing a single GPU across multiple containers with defined boundaries
+
+DRA replaces this blunt instrument with a structured API for declaring hardware requirements.
+
+## DRA Core Concepts
+
+DRA introduces three main resource types:
+
+- **ResourceClass**: Defines a category of hardware and which driver manages it
+- **ResourceClaimTemplate**: Specifies what a Pod needs from that hardware category
+- **ResourceClaim**: The actual allocation — created from a template when a Pod is scheduled
+
+```yaml
+# ResourceClass: defines H100 GPUs managed by NVIDIA's DRA driver
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClass
+metadata:
+  name: nvidia-h100
+driverName: gpu.nvidia.com
+parametersRef:
+  apiGroup: gpu.nvidia.com
+  kind: GpuClassParameters
+  name: h100-parameters
+---
+apiVersion: gpu.nvidia.com/v1alpha1
+kind: GpuClassParameters
+metadata:
+  name: h100-parameters
+spec:
+  deviceSelector:
+    model: "H100"
+  sharing:
+    strategy: TimeSlicing
+    timeSlicingConfig:
+      interval: DEFAULT
+```
+
+## Using DRA in a Training Job
+
+Here's a complete example for an LLM training workload:
+
+```yaml
+# ResourceClaimTemplate: declare GPU requirements
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaimTemplate
+metadata:
+  name: h100-training-claim
+  namespace: ml-workloads
+spec:
+  spec:
+    resourceClassName: nvidia-h100
+    parametersRef:
+      apiGroup: gpu.nvidia.com
+      kind: GpuClaimParameters
+      name: training-params
+---
+apiVersion: gpu.nvidia.com/v1alpha1
+kind: GpuClaimParameters
+metadata:
+  name: training-params
+  namespace: ml-workloads
+spec:
+  count: 1
+  memory:
+    limit: "80Gi"
+  computeCapability:
+    minimum: "9.0"   # H100 and newer
+```
+
+```yaml
+# Pod referencing the claim template
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llm-training-job
+  namespace: ml-workloads
+spec:
+  resourceClaims:
+  - name: gpu
+    source:
+      resourceClaimTemplateName: h100-training-claim
+  containers:
+  - name: trainer
+    image: pytorch/pytorch:2.5-cuda12.4-cudnn9-runtime
+    command: ["python", "train.py", "--epochs", "100"]
+    resources:
+      claims:
+      - name: gpu
+    env:
+    - name: CUDA_VISIBLE_DEVICES
+      value: "0"
+```
+
+## Binding Conditions: The Key Beta Feature
+
+The Binding Conditions feature is the most practically significant addition in 1.35. It lets you specify conditions that must be satisfied before a ResourceClaim is bound — enabling topology-aware GPU scheduling.
+
+```yaml
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: multi-gpu-distributed
+  namespace: ml-workloads
+spec:
+  resourceClassName: nvidia-h100
+  allocationMode: WaitForFirstConsumer
+  parametersRef:
+    apiGroup: gpu.nvidia.com
+    kind: GpuClaimParameters
+    name: multi-gpu-params
+  bindingConditions:
+  - type: TopologyReady
+    minCount: 2          # require 2 GPUs on the same NVLink topology
+  - type: MemoryAvailable
+    threshold: "75Gi"    # only bind if this memory is free
+```
+
+For distributed training, placing GPUs on the same NVLink fabric can be the difference between training completing in hours versus days. Binding Conditions give you a declarative way to express that constraint.
+
+## DRA vs. Device Plugin: Practical Differences
+
+| Feature | Device Plugin | DRA |
+|---------|--------------|-----|
+| GPU selection | Count only | Model, memory, compute capability |
+| Topology awareness | Limited | Full via Binding Conditions |
+| Dynamic reconfiguration | Requires restart | Claim updates |
+| Multi-container sharing | Difficult | Managed via ResourceClaim |
+| Expressiveness | Low | High (custom parameters) |
+
+One important caveat: NVIDIA's DRA driver support is still catching up to the Device Plugin in terms of features. Before migrating production workloads, verify which capabilities are available in the version you're deploying.
+
+## Monitoring GPU Workloads
+
+When GPUs are primary resources, traditional Kubernetes metrics (CPU, memory) are insufficient. Add NVIDIA DCGM Exporter for GPU-specific metrics:
+
+```yaml
+# ServiceMonitor for DCGM Exporter
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gpu-metrics
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: dcgm-exporter
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+```
+
+Key metrics to track:
+
+| Metric | What it measures |
+|--------|-----------------|
+| `DCGM_FI_DEV_GPU_UTIL` | GPU compute utilization (%) |
+| `DCGM_FI_DEV_MEM_COPY_UTIL` | Memory bus utilization (%) |
+| `DCGM_FI_DEV_FB_USED` | Framebuffer memory in use |
+| `DCGM_FI_DEV_POWER_USAGE` | Power draw (watts) |
+| `DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL` | NVLink bandwidth |
+
+Low GPU utilization alongside high power draw is a common signal of poorly batched workloads. These metrics surface that pattern quickly.
+
+## Migration Strategy
+
+Moving from Device Plugin to DRA in production requires a phased approach:
+
+1. **Evaluate**: Enable DRA in dev/staging. Run your workloads against both systems and compare behavior.
+2. **Pilot**: Start new AI/ML projects with DRA from the beginning — don't migrate existing ones yet.
+3. **Incremental migration**: Move workloads one at a time, verifying metrics after each migration.
+4. **Consolidate**: Once confidence is high, deprecate Device Plugin usage.
+
+The Device Plugin and DRA can coexist in the same cluster during the transition period, which makes this gradual approach feasible.
+
+## Current Limitations
+
+DRA is Beta, not GA. For production use, be aware of:
+
+- NVIDIA's DRA driver support matrix — not all features are available in all driver versions
+- DRA adds complexity to debugging — scheduler logs and claim status inspection replace simpler device plugin troubleshooting
+- Some existing Helm charts and operators assume the Device Plugin model; they'll need updates
+
+## Summary
+
+Kubernetes 1.35 DRA Beta is the right direction for managing the increasingly heterogeneous hardware that AI/ML workloads require. Binding Conditions in particular solve a real problem: topology-aware GPU placement that directly affects distributed training performance.
+
+Practical next steps:
+- Test DRA in a development cluster now; don't wait until you need it in production
+- Set up DCGM Exporter + Prometheus for proper GPU observability
+- Track NVIDIA's DRA driver release notes for feature parity updates
+- Design new AI/ML infrastructure with DRA in mind, even if you start with Device Plugin
+
+The trend toward GPU-centric Kubernetes clusters isn't slowing down. Getting familiar with DRA now reduces operational risk when it becomes the standard approach.

@@ -1,0 +1,172 @@
+---
+title: "TypeScript가 표준이 된 시대: State of JavaScript 2025 조사 결과 분석"
+description: "State of JavaScript 2025 조사에서 TypeScript만 사용하는 개발자가 40%에 달했습니다. TypeScript 6.0 새 기능과 함께 현재 JavaScript 생태계의 실태를 정리합니다."
+date: "2026-04-09"
+status: "published"
+tags: ["TypeScript", "JavaScript", "State of JS", "Frontend", "Developer Survey"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-dominance-state-of-js-2025"
+---
+
+State of JavaScript 2025 조사 결과가 공개됐습니다. 가장 주목할 수치는 TypeScript만 사용하는 개발자 비율이 **40%** 에 달한다는 점입니다. TypeScript와 JavaScript를 혼용하는 개발자까지 합치면 85% 이상이 TypeScript를 사용하고 있습니다. 이제 "TypeScript를 쓸까"가 아니라 "얼마나 엄격하게 타입을 지정할까"가 핵심 질문이 됐습니다.
+
+## 조사 주요 결과
+
+**TypeScript 사용 현황:**
+- TypeScript만 사용: **40%**
+- TypeScript + JavaScript 혼용: 약 45%
+- JavaScript만 사용: 약 15%
+
+**프레임워크 동향:** Next.js는 응답자의 59%가 사용 중으로 메타 프레임워크의 표준 위치를 유지하고 있습니다. 그러나 부정적인 코멘트도 가장 많았는데, 복잡성에 대한 불만이 축적되고 있음을 보여줍니다.
+
+전반적인 흐름은 명확합니다. 메타 프레임워크(Next.js, Nuxt, SvelteKit)가 전문 웹 프로젝트의 표준 시작점이 됐고, 원시 React나 Vue를 단독으로 사용하는 것은 이제 의도적인 선택이 됐습니다.
+
+## TypeScript 6.0 주요 변경사항
+
+**Isolated Declarations**
+
+`isolatedDeclarations` 옵션이 실용적으로 개선됐습니다. 각 파일을 독립적으로 타입 검사할 수 있도록 내보내는 선언에 명시적 반환 타입을 요구합니다.
+
+```typescript
+// isolatedDeclarations: true 설정 시
+
+// 오류: 반환 타입을 명시해야 합니다
+export const getUser = () => ({ id: 1, name: "Alice" });
+
+// 정상: 반환 타입을 명시
+export const getUser = (): { id: number; name: string } => ({
+  id: 1,
+  name: "Alice"
+});
+```
+
+대규모 모노레포에서 파일 단위 병렬 타입 검사가 가능해져 빌드 시간을 크게 줄일 수 있습니다.
+
+**개선된 Narrowing**
+
+```typescript
+type ApiResponse =
+  | { status: "ok"; data: string[] }
+  | { status: "error"; code: number };
+
+function handleResponse(res: ApiResponse) {
+  if (res.status === "ok") {
+    // res.data가 string[]으로 정확히 추론됩니다
+    res.data.forEach((item) => console.log(item));
+  } else {
+    // res.code가 number로 정확히 추론됩니다
+    console.error(`오류 코드: ${res.code}`);
+  }
+}
+```
+
+**`using` 선언 (안정화)**
+
+Explicit Resource Management가 안정화됐습니다. 스코프를 벗어날 때 리소스를 자동으로 정리합니다.
+
+```typescript
+class DatabaseConnection {
+  private conn: Connection;
+
+  constructor(url: string) {
+    this.conn = openConnection(url);
+  }
+
+  [Symbol.dispose]() {
+    this.conn.close();
+  }
+}
+
+function queryData() {
+  using db = new DatabaseConnection("postgres://localhost/mydb");
+  return db.query("SELECT * FROM users");
+  // 스코프 종료 시 db[Symbol.dispose]()가 자동 호출됩니다
+}
+```
+
+데이터베이스 연결, 파일 핸들, 락 등 try/finally 블록이 필요했던 곳에서 유용합니다.
+
+## 실효성 있는 TypeScript 설정
+
+새 프로젝트를 시작할 때 권장하는 `tsconfig.json` 기본 설정입니다.
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true
+  }
+}
+```
+
+`noUncheckedIndexedAccess`는 활용도가 낮은 옵션이지만 실제 버그를 예방합니다. 배열 인덱스 접근 결과에 `undefined` 가능성을 추가합니다.
+
+```typescript
+const items = ["a", "b", "c"];
+
+// noUncheckedIndexedAccess: true 설정 시
+const first = items[0]; // string | undefined (string만이 아닙니다)
+
+if (first !== undefined) {
+  console.log(first.toUpperCase()); // 정상
+}
+```
+
+처음에는 불편하게 느껴지지만, 컴파일 타임에 런타임 오류를 방지할 수 있습니다.
+
+## 타입 단언보다 타입 가드를
+
+TypeScript 코드 품질에 가장 큰 영향을 미치는 습관 변화는 `as` 단언 대신 타입 가드를 사용하는 것입니다.
+
+```typescript
+type User = AdminUser | RegularUser;
+
+interface AdminUser {
+  role: "admin";
+  permissions: string[];
+}
+interface RegularUser {
+  role: "user";
+}
+
+// 지양: 런타임 검사 없음
+function getPermissions(user: User): string[] {
+  return (user as AdminUser).permissions; // 컴파일은 되지만 런타임 오류 가능
+}
+
+// 권장: 타입 가드로 런타임에도 안전
+function isAdmin(user: User): user is AdminUser {
+  return user.role === "admin";
+}
+
+function getPermissions(user: User): string[] {
+  if (isAdmin(user)) {
+    return user.permissions; // 타입 안전
+  }
+  return [];
+}
+```
+
+타입 단언(`as`)은 컴파일러에게 "내 말을 믿어"라고 하는 것이고, 타입 가드는 실제로 검증하는 것입니다.
+
+## 조사가 말해주지 않는 것
+
+TypeScript만 사용하는 개발자가 40%라는 수치는 긍정적이지만, 그 TypeScript의 품질에 대해서는 아무것도 말해주지 않습니다. `strict: false`에 `any`가 가득하고 `as`를 남발하는 코드베이스도 컴파일은 됩니다.
+
+규율 없는 TypeScript 도입은 문법이 복잡해진 JavaScript일 뿐입니다.
+
+더 의미 있는 지표는 "얼마나 많은 팀이 `strict: true`를 활성화하고 코드 리뷰에서 강제하고 있는가"입니다. 이 수치는 40%보다 훨씬 낮을 것입니다.
+
+## 실무 적용 포인트
+
+1. 새 프로젝트는 `strict: true`로 시작하세요 — 나중에 적용하면 비용이 큽니다
+2. `noUncheckedIndexedAccess`를 처음부터 활성화하세요
+3. 타입 단언 대신 타입 가드를 사용하세요
+4. 모노레포에서는 `isolatedDeclarations`로 빌드 병렬화를 고려하세요
+5. `using` 선언은 이제 안정화됐으므로 리소스 관리에 도입하세요
+
+TypeScript는 더 이상 차별화 요소가 아닌 기본값입니다. 타입 시스템을 완전히 활용하는 팀과, 컴파일러를 통과시키는 것에 그치는 팀 사이의 차이가 코드 품질을 결정합니다.
