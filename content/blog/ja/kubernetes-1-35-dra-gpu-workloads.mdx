@@ -1,0 +1,215 @@
+---
+title: "Kubernetes 1.35 DRA Beta: AI/MLワークロード向けGPUリソース管理の新標準"
+description: "Kubernetes 1.35でDynamic Resource Allocation (DRA)がBetaに昇格しました。AI/MLワークロードのGPUリソース管理がどう変わるか、実用的な設定例とともに解説します。"
+date: "2026-04-09"
+status: "published"
+tags: ["Kubernetes", "GPU", "AI/ML", "DevOps", "Cloud Native"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-35-dra-gpu-workloads"
+---
+
+Kubernetes 1.35でDynamic Resource Allocation (DRA) のBinding ConditionsがBetaに昇格しました。GPUがAI/MLワークロードの標準ハードウェアになりつつある今、従来のCPU・メモリ中心のリソース管理モデルでは対応しきれなくなっています。DRAはその課題に正面から対応する機能です。
+
+## なぜ今GPUリソース管理が重要か
+
+従来のKubernetesのリソース管理は`requests`と`limits`のシンプルなモデルを前提としていました。CPUやメモリはこのモデルで十分でしたが、GPUには異なる制約があります。
+
+- GPUは分割が難しい（MIG: Multi-Instance GPUを除く）
+- GPU間の通信帯域（NVLink等）が性能に直結する
+- 特定のGPUモデルや世代が必要なワークロードがある
+- 複数のPodで1つのGPUを共有したい場合がある
+
+従来の`nvidia.com/gpu: 1`という書き方では、こうした細かい要件を表現できません。DRAはこの問題を解決するために設計されています。
+
+## DRA (Dynamic Resource Allocation) の概要
+
+DRAはKubernetes 1.26でAlphaとして導入され、1.35でBetaに昇格しました。従来のDevice Pluginモデルとは異なり、ハードウェアリソースの要求をより柔軟に記述できます。
+
+主なコンポーネントは以下の通りです。
+
+- **ResourceClass**: デバイスの種類と提供者を定義
+- **ResourceClaimTemplate**: Podが必要とするリソースの要求を記述
+- **ResourceClaim**: 実際のリソース割り当て
+
+基本的な構造を確認します。
+
+```yaml
+# ResourceClass: GPUの種類を定義
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClass
+metadata:
+  name: nvidia-h100
+driverName: gpu.nvidia.com
+parametersRef:
+  apiGroup: gpu.nvidia.com
+  kind: GpuClassParameters
+  name: h100-parameters
+```
+
+```yaml
+# GpuClassParameters: H100固有の設定
+apiVersion: gpu.nvidia.com/v1alpha1
+kind: GpuClassParameters
+metadata:
+  name: h100-parameters
+spec:
+  deviceSelector:
+    model: "H100"
+  sharing:
+    strategy: TimeSlicing
+    timeSlicingConfig:
+      interval: DEFAULT
+```
+
+## PodでのDRA使用例
+
+AI/MLトレーニングジョブでのDRA使用例を示します。
+
+```yaml
+# ResourceClaimTemplate: GPUの要求を定義
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaimTemplate
+metadata:
+  name: gpu-claim-template
+  namespace: ml-workloads
+spec:
+  spec:
+    resourceClassName: nvidia-h100
+    parametersRef:
+      apiGroup: gpu.nvidia.com
+      kind: GpuClaimParameters
+      name: training-gpu-params
+---
+apiVersion: gpu.nvidia.com/v1alpha1
+kind: GpuClaimParameters
+metadata:
+  name: training-gpu-params
+  namespace: ml-workloads
+spec:
+  count: 1
+  memory:
+    limit: "80Gi"     # H100の最大メモリ
+  computeCapability:
+    minimum: "9.0"    # H100以降
+```
+
+```yaml
+# Pod: ResourceClaimTemplateを参照
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llm-training-job
+  namespace: ml-workloads
+spec:
+  resourceClaims:
+  - name: gpu
+    source:
+      resourceClaimTemplateName: gpu-claim-template
+  containers:
+  - name: trainer
+    image: pytorch/pytorch:2.5-cuda12.4-cudnn9-runtime
+    command: ["python", "train.py"]
+    resources:
+      claims:
+      - name: gpu
+    env:
+    - name: CUDA_VISIBLE_DEVICES
+      value: "0"
+```
+
+## Binding Conditionsの実用的な意味
+
+Kubernetes 1.35でBetaになった機能の中でも重要なのが**Binding Conditions**です。これにより、リソースの割り当て前に特定の条件が満たされているかを確認できます。
+
+```yaml
+# Binding Conditionsを使ったResourceClaim
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: multi-gpu-claim
+  namespace: ml-workloads
+spec:
+  resourceClassName: nvidia-h100
+  allocationMode: WaitForFirstConsumer
+  parametersRef:
+    apiGroup: gpu.nvidia.com
+    kind: GpuClaimParameters
+    name: multi-gpu-params
+  bindingConditions:
+  - type: TopologyReady
+    minCount: 2        # 同一NVLink topology内の2GPU確保を要求
+  - type: MemoryAvailable
+    threshold: "75Gi"  # 利用可能メモリの閾値
+```
+
+Binding Conditionsを使うと、例えば「NVLinkで接続された複数のGPUをまとめて確保する」というトポロジーを意識した割り当てが可能になります。これは分散トレーニングの性能に直接影響します。
+
+## 従来のDevice Pluginとの比較
+
+現在広く使われている`nvidia-device-plugin`との主な違いを整理します。
+
+| 機能 | Device Plugin | DRA |
+|------|-------------|-----|
+| GPU選択の粒度 | 数量のみ | モデル・メモリ・世代指定可 |
+| トポロジー対応 | 限定的 | Binding Conditionsで制御可 |
+| 動的な設定変更 | 再起動が必要 | Claimの更新で対応可 |
+| 複数コンテナ共有 | 困難 | ResourceClaimで管理 |
+| 設定の表現力 | 低 | 高（カスタムパラメータ対応）|
+
+ただし、DRAにはまだ成熟度の課題があります。既存のDevice Pluginエコシステムとの互換性、ドライバー側のDRA対応状況は確認が必要です。NVIDIAはDRAサポートを進めていますが、すべての機能が同等に提供されているわけではありません。
+
+## モニタリングの変化
+
+GPUが主要なリソースになると、従来のKubernetesの監視指標では不十分になります。
+
+```yaml
+# ServiceMonitor for GPU metrics (Prometheus)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gpu-metrics
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: dcgm-exporter  # NVIDIA DCGM Exporter
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+```
+
+GPU監視で押さえるべき指標は以下の通りです。
+
+- `DCGM_FI_DEV_GPU_UTIL`: GPU使用率
+- `DCGM_FI_DEV_MEM_COPY_UTIL`: メモリバス使用率
+- `DCGM_FI_DEV_FB_USED`: フレームバッファ使用量
+- `DCGM_FI_DEV_POWER_USAGE`: 消費電力
+- `DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL`: NVLink帯域幅
+
+Grafanaダッシュボードには[NVIDIA DCGM Exporter Dashboard (ID: 12239)](https://grafana.com/grafana/dashboards/12239)が参考になります。
+
+## 移行の現実的なアプローチ
+
+既存のワークロードをDevice PluginからDRAに移行する場合、段階的なアプローチが現実的です。
+
+1. **評価フェーズ**: 開発・ステージング環境でDRAを有効化してテスト
+2. **パイロット**: 新規のAI/MLワークロードのみDRAで立ち上げる
+3. **段階移行**: 既存ワークロードを1つずつDRAに移行
+4. **完全移行**: Device PluginとDRAの共存期間を経て統一
+
+焦って全面移行すると運用リスクが高まります。DRAはBetaですが、本番環境での採用には十分な検証が必要です。
+
+## まとめ
+
+Kubernetes 1.35のDRA Beta昇格は、AI/MLインフラ運用の観点で注目すべき進展です。特にBinding Conditionsによるトポロジー対応のGPU割り当ては、分散トレーニングの効率化に直接寄与します。
+
+現時点での推奨アクションは以下の通りです。
+
+- 開発環境でDRAの動作を確認しておく
+- NVIDIAのDRAドライバー対応状況を追跡する
+- GPU監視基盤(DCGM Exporter + Prometheus)を整備する
+- 従来のDevice Pluginと並行運用できる体制を確認する
+
+AIワークロードの増加に伴い、GPUリソース管理の複雑性は今後も増していきます。今のうちにDRAの仕組みを理解しておくことが、将来の運用コスト削減につながります。

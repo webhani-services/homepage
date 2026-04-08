@@ -1,0 +1,156 @@
+---
+title: "Meta Llama 4 Scout: 소비자용 GPU 한 장으로 구동하는 오픈소스 멀티모달 모델"
+description: "Meta가 오픈소스로 공개한 Llama 4 Scout는 24GB VRAM GPU 한 장 또는 Apple M4 Pro에서 동작하는 17B 파라미터 비전-언어 모델입니다. 로컬 추론의 실용적인 활용 방법을 정리합니다."
+date: "2026-04-09"
+status: "published"
+tags: ["AI", "LLM", "Meta", "Edge AI", "Open Source"]
+thumbnail: ""
+author: "webhani"
+slug: "llama-4-scout-edge-inference-2026"
+---
+
+Meta가 Llama 4 Scout를 오픈소스로 공개했습니다. 17B 파라미터의 비전-언어 모델로, 24GB VRAM GPU 한 장 또는 Apple M4 Pro에서 실행할 수 있습니다. 클라우드 API 없이 로컬에서 멀티모달 추론을 실용적인 품질로 수행할 수 있는 선택지가 생긴 것입니다.
+
+## Llama 4 Scout 개요
+
+Llama 4 Scout는 Meta의 Llama 4 시리즈 중 엣지 배포에 특화된 모델입니다.
+
+- **파라미터**: 17B
+- **모델 유형**: 비전-언어 모델 (텍스트 + 이미지 입력)
+- **권장 하드웨어**: NVIDIA GPU (VRAM 24GB 이상), Apple M4 Pro
+- **라이선스**: Meta Llama 4 Community License (상업적 사용 가능)
+
+문서 이해, 이미지 캡션 생성, 코드 생성 벤치마크에서 더 큰 모델과 경쟁력 있는 성능을 보여줍니다.
+
+## 로컬 추론이 필요한 이유
+
+클라우드 API는 편리하지만 다음과 같은 한계가 있습니다.
+
+- **레이턴시**: 네트워크 왕복 지연이 발생합니다
+- **비용**: 트래픽이 많을수록 토큰 과금이 누적됩니다
+- **프라이버시**: 민감한 데이터가 외부로 전송됩니다
+- **가용성**: API 장애와 Rate Limit의 영향을 받습니다
+
+로컬 추론은 이 문제들을 모두 해결하지만, 지금까지는 소비자용 GPU에서 충분한 품질을 얻기 어려웠습니다. Llama 4 Scout는 그 기준선을 현실적인 수준으로 끌어올렸습니다.
+
+## 환경 구성 및 실행
+
+가장 빠른 방법은 `ollama`를 활용하는 것입니다.
+
+```bash
+# ollama 설치 (macOS)
+brew install ollama
+
+# Llama 4 Scout 모델 다운로드 및 실행
+ollama pull llama4-scout
+ollama run llama4-scout
+```
+
+Python에서 프로그래밍 방식으로 호출하는 예시입니다.
+
+```python
+import ollama
+
+# 텍스트 전용 요청
+response = ollama.chat(
+    model="llama4-scout",
+    messages=[
+        {"role": "user", "content": "Python으로 이진 탐색을 구현해주세요."}
+    ]
+)
+print(response["message"]["content"])
+```
+
+이미지를 포함하는 멀티모달 요청 예시입니다.
+
+```python
+import ollama
+import base64
+from pathlib import Path
+
+def encode_image(path: str) -> str:
+    return base64.b64encode(Path(path).read_bytes()).decode()
+
+response = ollama.chat(
+    model="llama4-scout",
+    messages=[
+        {
+            "role": "user",
+            "content": "이 스크린샷에서 보이는 UI 컴포넌트를 설명해주세요.",
+            "images": [encode_image("screenshot.png")]
+        }
+    ]
+)
+print(response["message"]["content"])
+```
+
+## LangChain 통합
+
+LangChain 기반 애플리케이션에 통합할 때는 `langchain-ollama` 패키지를 사용합니다.
+
+```python
+from langchain_ollama import ChatOllama
+from langchain_core.prompts import ChatPromptTemplate
+
+llm = ChatOllama(model="llama4-scout", temperature=0.1)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "당신은 코드 리뷰 전문가입니다."),
+    ("human", "다음 코드를 리뷰하고 문제점을 지적해주세요:\n\n{code}")
+])
+
+chain = prompt | llm
+result = chain.invoke({"code": "def calculate(x, y): return x / y"})
+print(result.content)
+```
+
+## 실용적인 활용 사례
+
+**사내 문서 처리**: PDF나 스캔된 문서를 외부 API 없이 로컬에서 파싱합니다. 의료, 법률, 금융 등 컴플라이언스 요건이 엄격한 산업에서 특히 유용합니다.
+
+**PR 코드 리뷰 자동화**: Git diff를 로컬 모델에 전달해 초기 리뷰 코멘트를 생성합니다. API 키 없이 프라이빗 리포지토리에서도 사용할 수 있습니다.
+
+```python
+import subprocess
+import ollama
+
+def review_diff(branch: str) -> str:
+    diff = subprocess.check_output(
+        ["git", "diff", f"main...{branch}"],
+        text=True
+    )
+    
+    response = ollama.chat(
+        model="llama4-scout",
+        messages=[{
+            "role": "user",
+            "content": (
+                "다음 git diff를 리뷰해주세요. "
+                f"버그, 보안 위험, 개선 사항을 지적해주세요:\n\n{diff}"
+            )
+        }]
+    )
+    return response["message"]["content"]
+
+print(review_diff("feature/new-payment-flow"))
+```
+
+**Visual Regression 보조**: 스크린샷을 모델에 전달해 UI 상태를 자연어로 설명받으면 시각적 테스트 실패를 더 읽기 쉽게 만들 수 있습니다.
+
+## 성능 기준
+
+Apple M4 Pro (48GB 통합 메모리)에서는 텍스트 생성 기준 약 30~40 토큰/초 속도가 나옵니다. Streaming 응답 방식으로 인터랙티브한 사용이 가능합니다.
+
+NVIDIA RTX 4090 (24GB VRAM)에서는 50 토큰/초를 넘기는 경우가 많습니다.
+
+70B 모델과 비교하면 복잡한 다단계 추론이나 긴 컨텍스트 처리에서 차이가 납니다. 문서 파싱이나 코드 리뷰 같은 실무 작업에서는 17B로도 충분한 경우가 많습니다.
+
+## 정리
+
+Llama 4 Scout는 다음 상황에서 효과적입니다.
+
+- 데이터를 외부로 보낼 수 없는 프로젝트
+- API 비용이 부담되는 대용량 배치 처리
+- 네트워크 환경이 불안정한 곳에서의 추론
+
+오픈소스 라이선스 덕분에 도메인 특화 파인튜닝도 가능합니다. `ollama`로 빠르게 테스트해보고, 품질이 요건을 충족하는지 확인한 뒤 프로덕션 적용을 검토하는 순서를 권장합니다.

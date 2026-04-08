@@ -1,0 +1,174 @@
+---
+title: "TypeScript as the Default: What the State of JavaScript 2025 Survey Tells Us"
+description: "The State of JavaScript 2025 survey shows 40% of developers use TypeScript exclusively. Alongside TypeScript 6.0 improvements, here's what the current JavaScript ecosystem looks like in practice."
+date: "2026-04-09"
+status: "published"
+tags: ["TypeScript", "JavaScript", "State of JS", "Frontend", "Developer Survey"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-dominance-state-of-js-2025"
+---
+
+The State of JavaScript 2025 survey results are out, and the headline number is hard to ignore: 40% of respondents use TypeScript exclusively. Add in developers who use both TypeScript and JavaScript, and over 85% of surveyed developers are writing TypeScript in some capacity. The question has shifted from "should we use TypeScript?" to "how strictly should we type things?"
+
+## What the Survey Found
+
+**TypeScript adoption breakdown:**
+- TypeScript only: **40%**
+- TypeScript + JavaScript: ~45%
+- JavaScript only: ~15%
+
+**Framework landscape:** Next.js is used by 59% of respondents, making it the dominant meta-framework. However, it also generated the most negative comments of any project in the survey — a sign that the complexity it adds is becoming a real friction point for teams.
+
+The broader trend the survey confirms: meta-frameworks (Next.js, Nuxt, SvelteKit) have become the standard entry point for professional web projects. Choosing to use raw React or Vue without a meta-framework is increasingly a deliberate decision rather than a default.
+
+## TypeScript 6.0: What Changed
+
+TypeScript 6.0 shipped several improvements worth knowing about.
+
+**Isolated Declarations**
+
+The `isolatedDeclarations` option becomes more practical in 6.0. It requires explicit return types on exported declarations so each file can be type-checked independently:
+
+```typescript
+// With isolatedDeclarations: true
+
+// Error: return type must be explicit
+export const getUser = () => ({ id: 1, name: "Alice" });
+
+// OK: explicit return type
+export const getUser = (): { id: number; name: string } => ({
+  id: 1,
+  name: "Alice"
+});
+```
+
+In large monorepos, this unlocks parallel type-checking at the file level, which can cut build times meaningfully.
+
+**Improved Narrowing**
+
+```typescript
+type ApiResponse =
+  | { status: "ok"; data: string[] }
+  | { status: "error"; code: number };
+
+function handleResponse(res: ApiResponse) {
+  if (res.status === "ok") {
+    // res.data correctly inferred as string[]
+    res.data.forEach((item) => console.log(item));
+  } else {
+    // res.code correctly inferred as number
+    console.error(`Error code: ${res.code}`);
+  }
+}
+```
+
+**`using` Declarations (Stable)**
+
+Explicit Resource Management via `using` is now stable, cleaning up resources automatically when a scope exits:
+
+```typescript
+class DatabaseConnection {
+  private conn: Connection;
+
+  constructor(url: string) {
+    this.conn = openConnection(url);
+  }
+
+  [Symbol.dispose]() {
+    this.conn.close();
+  }
+}
+
+function queryData() {
+  using db = new DatabaseConnection("postgres://localhost/mydb");
+  return db.query("SELECT * FROM users");
+  // db[Symbol.dispose]() is automatically called when the scope exits
+}
+```
+
+This pattern is particularly useful for database connections, file handles, and locks — anywhere you'd otherwise need a try/finally block.
+
+## TypeScript Configuration That Actually Helps
+
+If you're starting a new project, the baseline `tsconfig.json` should look like this:
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true
+  }
+}
+```
+
+`noUncheckedIndexedAccess` is underused — it adds `undefined` to array index access results, which catches a whole class of runtime errors at compile time:
+
+```typescript
+const items = ["a", "b", "c"];
+
+// With noUncheckedIndexedAccess: true
+const first = items[0]; // string | undefined (not just string)
+
+if (first !== undefined) {
+  console.log(first.toUpperCase()); // OK
+}
+```
+
+This feels annoying at first but prevents real bugs, especially when array lengths are not known at compile time.
+
+## Type Guards Over Type Assertions
+
+The single most impactful TypeScript habit change: prefer type guards over `as` assertions.
+
+```typescript
+type User = AdminUser | RegularUser;
+
+interface AdminUser {
+  role: "admin";
+  permissions: string[];
+}
+interface RegularUser {
+  role: "user";
+}
+
+// Avoid: no runtime check
+function getPermissions(user: User): string[] {
+  return (user as AdminUser).permissions; // compiles, but may throw at runtime
+}
+
+// Prefer: type guard validates at runtime
+function isAdmin(user: User): user is AdminUser {
+  return user.role === "admin";
+}
+
+function getPermissions(user: User): string[] {
+  if (isAdmin(user)) {
+    return user.permissions; // type-safe
+  }
+  return [];
+}
+```
+
+Type assertions (`as`) tell the compiler to trust you. Type guards actually verify what you claim.
+
+## What the Survey Doesn't Say
+
+The 40% TypeScript-only number is encouraging, but it doesn't tell you anything about the quality of that TypeScript. Codebases with `strict: false`, pervasive `any`, and `as` assertions everywhere compile fine but don't get the benefits of the type system.
+
+TypeScript adoption without TypeScript discipline is just JavaScript with extra steps.
+
+The more meaningful metric is "how many teams have enabled `strict: true` and enforce it in code review?" That number is likely much lower than 40%.
+
+## Practical Takeaways
+
+1. Start new projects with `strict: true` — retrofitting it later is expensive
+2. Add `noUncheckedIndexedAccess` from day one; it catches real bugs
+3. Use type guards instead of type assertions wherever possible
+4. For monorepos, evaluate `isolatedDeclarations` to improve build parallelism
+5. The `using` declaration is now stable and worth adopting for resource management
+
+The JavaScript ecosystem has matured considerably. TypeScript isn't a differentiator anymore — it's the baseline. The teams getting the most value from it are the ones who use the type system to its full extent rather than just satisfying the compiler.
