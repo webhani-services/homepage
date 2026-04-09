@@ -1,0 +1,71 @@
+---
+title: "Istio Ambient Mode：Sidecarレスのサービスメッシュが本番環境へ"
+description: "IstioのAmbient ModeはSidecar Proxyを排除してMemory Overheadを最大90%削減します。KubeCon EU 2026の発表を受け、本番採用が本格化しています。"
+date: "2026-04-10"
+status: "published"
+tags: ["Kubernetes", "Istio", "サービスメッシュ", "クラウドネイティブ", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "istio-ambient-sidecarless-service-mesh-2026"
+---
+
+Service Meshの採用には常に根本的なトレードオフがありました。提供される機能（mTLS、Traffic管理、Observability）は確かに価値がある一方で、すべてのPod横にSidecar Proxyを動かすOperationalコストが障壁となり続けてきました。Memory Overhead、Injection設定の複雑さ、Upgradeの調整難易度、Debug困難さ——これらは実際のコストであり、多くのチームがIstioを本格的に採用することを阻んできた要因です。
+
+IstioのAmbient Modeはこの問題をArchitecture的に解決します。各PodにEnvoy Sidecarをinjectする代わりに、ノードごとのLayer 4 Proxy（`ztunnel`）と任意のNamespaceごとのLayer 7 Waypoint Proxyという2つの共有Componentを使用します。実際の効果として、Service Meshの機能をResourceコストの大幅削減で実現できます。
+
+2026年のKubeCon EU（Amsterdam）で、IstioプロジェクトはAmbient Modeをさらに本番環境に押し進める3つの新機能を発表しました：Ambient Multicluster Beta、Gateway API Inference Extension Beta、Agentgateway（Experimental）。これらは総合的に、Ambient Modeが実験的なトラックではなく、推奨Deployment Modelになりつつあることを示しています。
+
+## Ambient Modeの仕組み
+
+Architectureを理解することで、どこに適合してどこに適合しないかを判断できます。
+
+**ztunnel（Layer 4）**：各KubernetesノードはZeroTrustトンネルを意味する`ztunnel` Instanceを1つ実行します。これはNodeレベルで動作し、そのノード上のすべてのWorkloadのIdentity検証、mTLS暗号化、基本的なTraffic Routingを処理します。Podレベルではなくノードレベルで動作するため、per-pod InjectionなしにすべてのPod間通信にZero-Trust Networkingを適用できます。
+
+**Waypoint Proxy（Layer 7）**：HTTP Traffic管理（RoutingルールRetry、Header操作、高度なAuthorization Policy）が必要なServiceには、NamespaceレベルにWaypoint Proxyをdeployします。内部はEnvoyですが、Podごとに複製されるのではなくNamespace内のすべてのWorkloadで共有されます。
+
+**Resourceへの実際の影響**：Sidecar ModeではPodごとにフルのEnvoy Instanceが必要です。数百のServiceと複数のReplicaをもつClusterでは、Clusterを通じてGigabyteレベルのSteady-State Memoryを消費することになります。Ambient ModeではこれをChickをする大幅に削減します。本番環境の評価では、Sidecar Modeと比較してMemoryが90%以上、CPUが50%以上削減された事例が報告されています。
+
+## KubeCon EU 2026の発表
+
+3つの発表はAmbient Modeストーリーの異なるギャップそれぞれに対応しています。
+
+**Ambient Multicluster Beta**：以前のAmbient Modeは、複数のKubernetes Clusterにまたがるシナリオ（高可用性や地理的分散のための一般的なパターン）のサポートが限定的でした。Multicluster BetaはAmbient ModeのTraffic管理とmTLSをCross-Clusterトラフィックに拡張し、同じztunnel + Waypointモデルを使用します。
+
+**Gateway API Inference Extension Beta**：AI/MLワークロードを実行するチームに特に関連する機能です。GPU Backed Inference ServiceがKubernetes Clusterでより一般的になるにつれ、Inference EndpointのTraffic Routingには特有の要件があります——モデル対応のLoad Balancing、Request Priority、長時間実行Inference RequestのためのConnection Poolingです。Inference ExtensionはこれらをGateway API Resourceに追加し、IstioのAmbient ModeをAI Serving Infrastructureのより有力なPlatformにします。
+
+**Agentgateway（Experimental）**：AgentgatewayはAmbient ModeのTraffic管理をAI Agent間の通信に拡張します。Istioがエージェント間のトラフィックをRoute、認証、観察することを可能にします。これはまだ初期段階ですが、Agentic AIワークロードが本番環境に移行するにつれてKubernetes NetworkingがどこへEnableされているかを反映しています。
+
+## Sidecar ModeからのMigration Path
+
+現在SidecarでIstioを実行している場合、Ambient Modeへの移行はLift-and-Shiftではありません。2つのModeはMigration期間中にCluster内で共存できるため、段階的なMigrationが可能です。
+
+実践的なMigration手順：
+
+1. **Ambient ComponentのInstall**：`ztunnel`をDaemonSetとしてDeployし、Ambient Modeをサポートするバージョンのistiodをインストールします。
+2. **NamespaceをAmbient用にLabel**：Ambient Modeを有効にしたいNamespaceに`istio.io/dataplane-mode: ambient`を追加します。既存のSidecar Inject済みPodは引き続き動作します。
+3. **Waypoint Proxyの選択的Deploy**：L7 PolicyをもつServiceにはNamespaceにWaypoint Proxyをdeployします。L4のみの要件（mTLS、基本的なAuthorization）にはztunnelだけで十分です。
+4. **Sidecar Injectionの無効化**：NamespaceのすべてのWorkloadがAmbient Modeでカバーされたら、そのNamespaceのSidecar Injectionを無効にしてPodを再起動し、既存のSidecarを削除します。
+
+Red HatがOpenShift Service Mesh 3.2でAmbient ModeをGAとして含めたことは、ここで有用なシグナルを提供します。Enterprise Kubernetes DistributionがFeatureをGAとして出荷するということは、通常、Migration ToolingとOperational Playbookが本番使用に十分成熟しているを意味します。
+
+## 実際の考慮事項
+
+Ambient Modeを採用する前に確認すべきことがいくつかあります。
+
+**Istioのバージョン**：Ambient MulticlusterとLatestのFeatureにはIstio 1.22以降が必要です。現在のバージョンを確認し、必要に応じてUpgrade Pathを計画してください。
+
+**CNI互換性**：Ambient ModeのztunnelはeBPFベースのTraffic Interceptionを使用しており、CNI PluginとのCompatibility要件があります。Calico、Cilium、Flannel はすべてサポートされていますが、Istioの互換性Matrixで特定のバージョン組み合わせを確認してください。
+
+**L7 PolicyのInventory**：現在のIstio設定でLayer 7処理が必要なもの（VirtualService、HTTP Routingルール、Header Based Auth）を整理してください。これらはAmbient ModeではWaypoint Proxy DeploymentをSupportします。L4 Policy（mTLSのPeerAuthentication、基本的なAuthorizationPolicy）はztunnelのみで動作します。
+
+**Observabilityの継続性**：既存のKiali、Jaeger、Prometheus統合はAmbient Modeで引き続き動作するはずです——Telemetryモデルには互換性があります。ただし、DashboardのQueryがSidecar固有のMetrics LabelsのUse Caseに依存していないかを確認してください。
+
+## webhaniの見解
+
+Service Meshは多くのClientとのArchitectureの会話で繰り返し登場するトピックです——多くの場合、現在のScaleに対してOperationalコストがBenefitに見合わないとして先送りにされてきました。Ambient Modeはそのバランスを根本的に変えます。
+
+新しいKubernetes Deploymentについては、ServiceへのmTLSが必要なClusterであればAmbient Modeを標準の推薦として位置付けています。Resource節約は大きく、Operationalモデルはシンプルで、Feature Setは大多数の本番要件をカバーします。
+
+既存のSidecar Modeのアプリケーションについては、次のInfrastructureのサイクルでMigrationを計画することをお勧めします。Namespaceごとの段階的なMigration Pathにより、一括切り替えなしに対応できます。
+
+KubeCon EU 2026の発表、特にInference Extension、はIstio Ambientがいますぐ発表KubernetesのAI/MLワークロードの標準的なNetworking Layerとして位置付けられていることも示しています。InfrastructureのRoadmapにGPU Inference Serviceの拡大が含まれているなら、いまからAmbient Modeに慣れ親しんでおくことが後で役立つでしょう。
