@@ -5,26 +5,25 @@ import { useSearchParams, useRouter } from "next/navigation";
 import Fuse from "fuse.js";
 import BlogCard from "./BlogCard";
 import type { BlogFrontmatter } from "@/lib/blog";
+import { buildTagFilterModel } from "@/lib/blogTagFilters";
 
 const POSTS_PER_PAGE = 12;
+const DEFAULT_VISIBLE_TAGS = 10;
 
 type BlogListProps = {
   posts: BlogFrontmatter[];
-  allTags: string[];
   translations: {
     searchPlaceholder: string;
     allTags: string;
     noResults: string;
     prev: string;
     next: string;
+    showMoreTags: string;
+    showLessTags: string;
   };
 };
 
-export default function BlogList({
-  posts,
-  allTags,
-  translations: t,
-}: BlogListProps) {
+export default function BlogList({ posts, translations: t }: BlogListProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
 
@@ -33,6 +32,7 @@ export default function BlogList({
   const currentQuery = searchParams.get("q") ?? "";
 
   const [query, setQuery] = useState(currentQuery);
+  const [showAllTags, setShowAllTags] = useState(false);
 
   const fuse = useMemo(
     () =>
@@ -72,6 +72,17 @@ export default function BlogList({
 
     return result;
   }, [posts, currentQuery, currentTag, fuse]);
+
+  const tagModel = useMemo(
+    () =>
+      buildTagFilterModel({
+        posts,
+        currentTag,
+        defaultVisibleCount: DEFAULT_VISIBLE_TAGS,
+        expanded: showAllTags,
+      }),
+    [posts, currentTag, showAllTags]
+  );
 
   const totalPages = Math.max(1, Math.ceil(filteredPosts.length / POSTS_PER_PAGE));
   const safePage = Math.min(currentPage, totalPages);
@@ -136,30 +147,89 @@ export default function BlogList({
       </form>
 
       {/* Tag Filter */}
-      <div className="flex flex-wrap gap-2 mb-10">
-        <button
-          onClick={() => updateParams({ tag: "" })}
-          className={`px-3 py-1.5 text-sm rounded-lg transition-colors ${
-            !currentTag
-              ? "bg-amber-500 text-white"
-              : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"
-          }`}
-        >
-          {t.allTags}
-        </button>
-        {allTags.map((tag) => (
+      <div className="mb-10 rounded-2xl border border-amber-100 bg-white/80 p-4 shadow-sm shadow-amber-100/40 backdrop-blur-sm dark:border-gray-800 dark:bg-[var(--dark-surface-elevated)] dark:shadow-none">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-amber-600 dark:text-amber-400">
+            {t.allTags}
+          </p>
+          {tagModel.hiddenCount > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowAllTags((prev) => !prev)}
+              className="text-sm font-medium text-gray-500 transition-colors hover:text-amber-600 dark:text-gray-400 dark:hover:text-amber-400"
+            >
+              {showAllTags
+                ? t.showLessTags
+                : `${t.showMoreTags} (${tagModel.hiddenCount})`}
+            </button>
+          )}
+        </div>
+
+        <div className="flex flex-wrap gap-2">
           <button
-            key={tag}
-            onClick={() => updateParams({ tag: currentTag === tag ? "" : tag })}
+            onClick={() => updateParams({ tag: "" })}
             className={`px-3 py-1.5 text-sm rounded-lg transition-colors ${
-              currentTag === tag
+              !currentTag
                 ? "bg-amber-500 text-white"
                 : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"
             }`}
           >
-            #{tag}
+            {t.allTags}
           </button>
-        ))}
+          {tagModel.visibleTags.map((tag) => (
+            <button
+              key={tag.name}
+              onClick={() =>
+                updateParams({ tag: currentTag === tag.name ? "" : tag.name })
+              }
+              className={`px-3 py-1.5 text-sm rounded-lg transition-colors ${
+                currentTag === tag.name
+                  ? "bg-amber-500 text-white"
+                  : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"
+              }`}
+            >
+              #{tag.name}
+              <span
+                className={`ml-1.5 text-xs ${
+                  currentTag === tag.name
+                    ? "text-white/80"
+                    : "text-gray-400 dark:text-gray-500"
+                }`}
+              >
+                {tag.count}
+              </span>
+            </button>
+          ))}
+        </div>
+
+        {showAllTags && tagModel.hiddenTags.length > 0 && (
+          <div className="mt-3 flex flex-wrap gap-2 border-t border-gray-100 pt-3 dark:border-gray-800">
+            {tagModel.hiddenTags.map((tag) => (
+              <button
+                key={tag.name}
+                onClick={() =>
+                  updateParams({ tag: currentTag === tag.name ? "" : tag.name })
+                }
+                className={`px-3 py-1.5 text-sm rounded-lg transition-colors ${
+                  currentTag === tag.name
+                    ? "bg-amber-500 text-white"
+                    : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"
+                }`}
+              >
+                #{tag.name}
+                <span
+                  className={`ml-1.5 text-xs ${
+                    currentTag === tag.name
+                      ? "text-white/80"
+                      : "text-gray-400 dark:text-gray-500"
+                  }`}
+                >
+                  {tag.count}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Results count */}
