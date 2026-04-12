@@ -23,7 +23,6 @@ export default async function BlogListPage() {
   const posts = getPosts(locale);
 
   const frontmatters = posts.map((p) => p.frontmatter);
-  const allTags = Array.from(new Set(frontmatters.flatMap((p) => p.tags))).sort();
 
   const translations = {
     searchPlaceholder: t("searchPlaceholder"),
@@ -31,6 +30,8 @@ export default async function BlogListPage() {
     noResults: t("noResults"),
     prev: t("prev"),
     next: t("next"),
+    showMoreTags: t("showMoreTags"),
+    showLessTags: t("showLessTags"),
   };
 
   return (
@@ -55,11 +56,7 @@ export default async function BlogListPage() {
         </div>
 
         <Suspense fallback={null}>
-          <BlogList
-            posts={frontmatters}
-            allTags={allTags}
-            translations={translations}
-          />
+          <BlogList posts={frontmatters} translations={translations} />
         </Suspense>
       </div>
     </section>
