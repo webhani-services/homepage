@@ -1,0 +1,153 @@
+---
+title: "Docker Kanvas: Compose에서 Kubernetes로 자동 변환, Helm을 대체할 수 있을까"
+description: "Docker가 출시한 Kanvas는 Docker Compose 파일을 Kubernetes 매니페스트로 자동 변환합니다. 실제로 무엇을 해결하는지, 어디까지 활용할 수 있는지 살펴봅니다."
+date: "2026-04-20"
+status: "published"
+tags: ["Docker", "Kubernetes", "DevOps", "DeveloperTools", "Helm"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-k8s"
+---
+
+Docker가 Kanvas를 출시했습니다. 로컬 Docker Compose 개발 환경과 프로덕션 Kubernetes 클러스터 사이의 간극을 메우는 것을 목표로 한 플랫폼입니다.
+
+개발자가 Docker Compose로 로컬 환경을 정의하고 프로덕션에서는 Kubernetes를 사용하는 패턴은 널리 퍼져 있습니다. 이 두 환경 사이에는 설정의 중복과 변환 작업이 따르는데, Kanvas는 이 변환을 자동화합니다.
+
+## Docker Kanvas의 핵심 기능
+
+Kanvas의 핵심은 `docker-compose.yml`을 파싱해 Kubernetes 매니페스트를 생성하는 것입니다.
+
+다음 Compose 파일을 예로 들면:
+
+```yaml
+# docker-compose.yml
+services:
+  api:
+    image: myapp/api:latest
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://db:5432/myapp
+      REDIS_URL: redis://cache:6379
+    depends_on:
+      - db
+      - cache
+
+  db:
+    image: postgres:16
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+
+  cache:
+    image: redis:7-alpine
+
+volumes:
+  postgres_data:
+```
+
+Kanvas는 이를 다음과 같이 변환합니다:
+
+- `api` 서비스 → Deployment + Service
+- `db` (볼륨 포함) → StatefulSet + PersistentVolumeClaim + Service
+- `cache` → Deployment + Service
+- 환경 변수 → ConfigMap (민감 정보는 Secret으로 분리 표시)
+
+## 비주얼 에디터
+
+Kanvas에는 생성된 Kubernetes 리소스 간 의존 관계를 그래픽으로 보여주는 비주얼 에디터가 포함됩니다.
+
+실제로 유용한 시나리오:
+
+1. **Kubernetes 온보딩**: Compose는 알지만 Kubernetes를 처음 접하는 팀원이 Raw YAML 없이 리소스 구성을 이해할 수 있습니다.
+2. **아키텍처 문서화**: 서비스 간 의존 관계가 자동으로 다이어그램화되어 별도로 유지보수할 필요가 없습니다.
+
+## Helm, Kustomize와의 비교
+
+| 도구 | 주요 사용 케이스 | 한계 |
+|------|----------------|------|
+| **Helm** | Kubernetes 애플리케이션 패키징, 버전 관리, 배포 | 템플릿 문법 복잡성 |
+| **Kustomize** | 환경별 차이 관리 (overlay) | Compose 통합 없음 |
+| **Kanvas** | Compose → Kubernetes 변환, 리소스 시각화 | 복잡한 프로덕션 설정 커스터마이징 제한 |
+
+Helm의 에코시스템 — Artifact Hub의 풍부한 Chart, 롤백, 릴리스 히스토리 — 은 Kanvas가 대체하는 것이 아닙니다. 현실적인 활용 방식은 **Kanvas로 초기 마이그레이션**, **Helm 또는 Kustomize로 장기 관리**를 조합하는 것입니다.
+
+## Kanvas가 처리하지 않는 것
+
+생성된 매니페스트는 출발점일 뿐, 프로덕션에 바로 적용할 수 있는 완성품이 아닙니다. 수동으로 추가해야 하는 항목들:
+
+**Resource Requests/Limits**: Compose에는 이 개념이 없으므로 생성된 Deployment에 CPU/메모리 제한이 설정되지 않습니다.
+
+```yaml
+# Kanvas가 생성하는 것:
+containers:
+  - name: api
+    image: myapp/api:latest
+
+# 추가해야 하는 것:
+containers:
+  - name: api
+    image: myapp/api:latest
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
+```
+
+**Health Check**: Readiness/Liveness Probe는 Compose 정의에서 자동으로 추출되지 않습니다.
+
+```yaml
+# Kanvas 변환 후 수동 추가:
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 3000
+  initialDelaySeconds: 10
+  periodSeconds: 5
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 3000
+  initialDelaySeconds: 30
+  periodSeconds: 10
+```
+
+**Secret 관리**: 환경 변수를 Secret으로 표시하지만, AWS Secrets Manager, HashiCorp Vault, External Secrets Operator와의 연동은 수동 설정이 필요합니다.
+
+**Ingress 설정**: 기본 Port 매핑 이상의 트래픽 라우팅 설정은 수동 구성이 필요합니다.
+
+## 현실적인 활용 시나리오
+
+**시나리오 1: 처음으로 Kubernetes에 배포하는 팀**
+
+Docker Compose로 개발해온 앱을 Kubernetes에 처음 배포할 때, 모든 Kubernetes 리소스 타입을 동시에 학습하지 않고도 작동하는 시작점을 얻을 수 있습니다. 생성된 매니페스트 자체가 학습 자료가 되기도 합니다.
+
+**시나리오 2: 커스터마이징의 베이스 생성**
+
+Kubernetes YAML을 처음부터 작성하는 대신, Compose에서 변환한 매니페스트를 베이스로 HPA, NetworkPolicy, PodDisruptionBudget 등을 추가하는 방식은 효율적입니다.
+
+**시나리오 3: 마이크로서비스 아키텍처 시각화**
+
+여러 서비스로 구성된 아키텍처를 Kanvas로 시각화하면 서비스 간 의존 관계를 한눈에 파악할 수 있어 설계 리뷰나 문서화에 활용할 수 있습니다.
+
+## Helm 대체 논쟁에 대한 현실적 평가
+
+Docker가 Kanvas를 Helm의 대안으로 포지셔닝하는 부분은 혼란을 줄 수 있습니다. 두 도구는 다른 문제를 해결합니다:
+
+- **Helm**: "Kubernetes 애플리케이션을 패키징하고 버전 관리하고 배포하고 싶다"
+- **Kanvas**: "Compose 파일이 있는데 Kubernetes에서 실행하고 싶다"
+
+겹치는 부분은 "처음 Kubernetes용으로 정의하는 방법" 문제입니다. Kanvas는 개발자가 이미 있는 곳(Compose)에서 만난다는 장점이 있습니다. Helm은 처음부터 Kubernetes 관점으로 생각해야 합니다.
+
+대부분의 팀에게 현실적인 답은 **마이그레이션은 Kanvas, 지속적인 관리는 Helm 또는 Kustomize**입니다. 두 도구는 경쟁보다 상호 보완적입니다.
+
+## 정리
+
+Docker Kanvas는 기존 Compose 기반 애플리케이션을 Kubernetes로 마이그레이션하려는 팀에게 실용적인 도구입니다. 초기 마이그레이션 작업량을 줄이고, Kubernetes 리소스 관계를 시각적으로 이해하기 쉽게 만들어줍니다.
+
+패키지 관리는 여전히 Helm이, 환경별 차이 관리는 Kustomize가 더 적합합니다. 하지만 Compose에서 Kubernetes로 넘어가는 첫 단계를 크게 단순화한다는 점에서 주목할 만한 도구입니다.
