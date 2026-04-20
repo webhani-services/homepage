@@ -1,0 +1,130 @@
+---
+title: "Gemini 3.1 Pro: 2M Token Context and Document-Level Caching in Practice"
+description: "Google made Gemini 3.1 Pro generally available on Vertex AI with a 2-million token context window and document-level caching. Here's how these capabilities work and when they're worth using."
+date: "2026-04-21"
+status: "published"
+tags: ["Gemini", "Google AI", "LLM", "Context Window", "Enterprise AI"]
+thumbnail: ""
+author: "webhani"
+slug: "gemini-3-1-pro-2m-context-caching-2026"
+---
+
+Google recently made Gemini 3.1 Pro generally available on Vertex AI. Two capabilities stand out: a 2-million token context window and document-level caching — the ability to preload an entire book or codebase into a cached context that persists across multiple requests.
+
+These aren't incremental upgrades to an already-large context window. Two million tokens is enough to hold approximately 1,500 pages of text, or a medium-sized codebase, in a single prompt. Document-level caching means you pay the processing cost once, not on every request.
+
+This post examines what these capabilities mean for practical workloads and how to take advantage of them.
+
+## Understanding 2M Token Context in Practice
+
+The 2M token limit translates to roughly:
+- 1,500–2,000 pages of text
+- A full medium-sized codebase (50,000–100,000 lines)
+- A complete book series or technical documentation set
+- Several hours of video at 1 fps
+
+For context, GPT-4o has a 128K context window, and Claude Opus 4.7 supports 200K. Gemini 3.1 Pro at 2M tokens is in a different category for document-scale tasks.
+
+The practical implication: workloads that previously required chunking documents into segments, maintaining retrieval infrastructure, and stitching together partial results can now be handled in a single prompt. This eliminates an entire class of engineering complexity.
+
+## Document-Level Caching
+
+The caching feature is the more operationally interesting of the two. With context caching on Vertex AI, you can load a large document (code repo, technical manual, legal corpus) into a cached context, then run multiple queries against it without re-processing the full context each time.
+
+Here's a concrete example using the Vertex AI Python SDK:
+
+```python
+import vertexai
+from vertexai.generative_models import GenerativeModel, Content, Part
+from vertexai.preview.caching import CachedContent
+import datetime
+
+vertexai.init(project="your-project-id", location="us-central1")
+
+# Load a large codebase or document into cached context
+with open("codebase_context.txt", "r") as f:
+    large_document = f.read()
+
+# Create a cached content entry — processed once, reusable for 24 hours
+cached_content = CachedContent.create(
+    model_name="gemini-3.1-pro-002",
+    system_instruction="You are a senior software engineer analyzing this codebase.",
+    contents=[
+        Content(role="user", parts=[Part.from_text(large_document)])
+    ],
+    ttl=datetime.timedelta(hours=24),
+    display_name="codebase-analysis-cache",
+)
+
+# Run multiple queries against the cached content
+model = GenerativeModel.from_cached_content(cached_content=cached_content)
+
+queries = [
+    "What are the main entry points for the authentication flow?",
+    "Which modules have the most dependencies?",
+    "Are there any obvious N+1 query patterns in the database access layer?",
+    "What test coverage exists for the payment processing code?",
+]
+
+for query in queries:
+    response = model.generate_content(query)
+    print(f"Q: {query}")
+    print(f"A: {response.text}\n")
+
+# Cache persists for the TTL duration — no re-processing cost on each call
+```
+
+The key benefit: if you're running 20 queries against the same 500-page technical manual, you pay the input token cost once (for caching) rather than 20 times.
+
+Vertex AI pricing for cached content is typically 25–50% of the standard input token cost, making this economically significant for repetitive document analysis workflows.
+
+## Native Video Understanding at 1 fps
+
+Gemini 3.1 Pro also supports native video understanding at 1 frame per second. This isn't just image extraction — the model can reason about temporal sequences in video, understand actions and transitions, and answer questions about what happens across a video timeline.
+
+```python
+import vertexai
+from vertexai.generative_models import GenerativeModel, Part
+
+vertexai.init(project="your-project-id", location="us-central1")
+model = GenerativeModel("gemini-3.1-pro-002")
+
+# Process video from Google Cloud Storage
+video_part = Part.from_uri(
+    uri="gs://your-bucket/architecture-demo.mp4",
+    mime_type="video/mp4"
+)
+
+response = model.generate_content([
+    video_part,
+    "List all the services shown in this architecture walkthrough and describe how they interact."
+])
+
+print(response.text)
+```
+
+For practical applications: processing recorded architecture review meetings, analyzing video tutorials to extract structured information, or reviewing screen recordings of application flows for UI issues.
+
+## When to Use Gemini 3.1 Pro vs. Other Models
+
+Gemini 3.1 Pro makes sense for:
+
+**Document-heavy analysis**: If your workflow involves repeatedly querying large documents, the caching feature makes Gemini 3.1 Pro more cost-effective than Claude or GPT for this specific pattern.
+
+**Long-form code analysis**: The 2M token window lets you load entire codebases without chunking. For tasks like "find all places where X pattern is used across the entire repo," this eliminates the complexity of RAG-based approaches.
+
+**Video content processing**: No other major provider offers native video understanding at comparable context lengths.
+
+**GCP-integrated workloads**: If you're already running on Google Cloud, Vertex AI integration with IAM, VPC Service Controls, and existing infrastructure reduces operational overhead.
+
+For most general-purpose tasks (coding assistance, Q&A, summarization of smaller documents), Claude or GPT remains the simpler choice. The 2M context and caching features add value primarily for document-scale and repetitive query patterns.
+
+## Webhani's Perspective
+
+We tested Gemini 3.1 Pro for a client use case involving repeated analysis of large regulatory document corpora — the kind of work where you need to answer specific questions against hundreds of pages of policy documentation, multiple times per day.
+
+The caching feature genuinely changes the economics here. Running 50 queries per day against a 400-page regulatory corpus, the cached approach costs roughly 75% less than re-sending the full context each time. At scale, this isn't negligible.
+
+The 2M context window also eliminated the need for the RAG infrastructure we had previously built. For this specific workflow, the added complexity of chunking, embedding, and retrieval added latency and occasional retrieval failures. Replacing that with a simple document-in-context approach improved both reliability and developer experience.
+
+The caveat: context windows this large aren't always the right tool. Retrieval-augmented approaches still have advantages when you need to search across many documents or update content frequently without re-caching. Use the right architecture for your access pattern.

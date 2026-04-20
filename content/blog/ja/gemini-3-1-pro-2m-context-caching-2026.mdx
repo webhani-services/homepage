@@ -1,0 +1,129 @@
+---
+title: "Gemini 3.1 Pro: 200万 Token Context と Document Level Caching の実際"
+description: "Google が Vertex AI で Gemini 3.1 Pro を GA しました。200万 Token の Context Window と Document Level Caching により、大規模ドキュメント処理のコストと複雑さが大きく変わります。"
+date: "2026-04-21"
+status: "published"
+tags: ["Gemini", "Google AI", "LLM", "Context Window", "Enterprise AI"]
+thumbnail: ""
+author: "webhani"
+slug: "gemini-3-1-pro-2m-context-caching-2026"
+---
+
+Google が Vertex AI で Gemini 3.1 Pro を General Availability にしました。注目すべき機能は2つ——200万 Token の Context Window と Document Level Caching です。後者は、書籍全体やコードベースをキャッシュされた Context にプリロードし、複数のリクエストにわたって再利用できる機能です。
+
+これはただ Context Window が大きくなっただけではありません。200万 Token は約1,500ページ分のテキスト、あるいは中規模のコードベース全体を一つの Prompt に収められる規模です。Document Level Caching は、処理コストを一度払えばあとはリクエストのたびに払い直さなくて済むことを意味します。
+
+本記事では、これらの機能が実際のワークロードにどう影響するか、そしてどう活用するかを解説します。
+
+## 200万 Token Context の実際のスケール感
+
+200万 Token を具体的に表すと：
+
+- テキスト約1,500〜2,000ページ
+- 中規模のコードベース全体（5万〜10万行）
+- 技術ドキュメントセット全体
+- 1fps で数時間分の動画
+
+参考として、GPT-4o は128K、Claude Opus 4.7 は200K の Context をサポートしています。Gemini 3.1 Pro の200万 Token は、Document スケールのタスクにおいて別次元の選択肢です。
+
+実務上の意味は明確です。これまでドキュメントをチャンク分割し、Retrieval インフラを維持し、部分的な結果をつなぎ合わせる必要があったワークロードが、単一の Prompt で処理できるようになります。これは一種の Engineering 複雑さの丸ごとの排除です。
+
+## Document Level Caching
+
+運用面で特に価値があるのは Caching 機能の方です。Vertex AI の Context Caching では、大きなドキュメント（コードレポジトリ、技術マニュアル、法律文書）をキャッシュ済み Context にロードし、その後のクエリではフルコンテキストを毎回処理することなく利用できます。
+
+Vertex AI Python SDK での実装例：
+
+```python
+import vertexai
+from vertexai.generative_models import GenerativeModel, Content, Part
+from vertexai.preview.caching import CachedContent
+import datetime
+
+vertexai.init(project="your-project-id", location="us-central1")
+
+# 大規模コードベースまたはドキュメントをキャッシュ済み Context にロード
+with open("codebase_context.txt", "r") as f:
+    large_document = f.read()
+
+# Cache エントリを作成 — 一度処理すれば24時間再利用可能
+cached_content = CachedContent.create(
+    model_name="gemini-3.1-pro-002",
+    system_instruction="このコードベースを分析するシニアエンジニアとして動作してください。",
+    contents=[
+        Content(role="user", parts=[Part.from_text(large_document)])
+    ],
+    ttl=datetime.timedelta(hours=24),
+    display_name="codebase-analysis-cache",
+)
+
+# キャッシュされた Context に対して複数のクエリを実行
+model = GenerativeModel.from_cached_content(cached_content=cached_content)
+
+queries = [
+    "認証フローの主な Entry Point はどこですか？",
+    "最も依存関係が多いモジュールはどれですか？",
+    "データベースアクセス層に N+1 クエリパターンはありますか？",
+    "決済処理コードのテストカバレッジはどの程度ですか？",
+]
+
+for query in queries:
+    response = model.generate_content(query)
+    print(f"Q: {query}")
+    print(f"A: {response.text}\n")
+```
+
+主な利点：500ページの技術マニュアルに対して1日20回クエリを実行する場合、キャッシュなしでは20回分の Input Token コストが発生しますが、キャッシュを使えば1回分で済みます。
+
+Vertex AI での Cached Content の料金は通常の Input Token コストの約25〜50%で、繰り返しの Document Analysis ワークロードでは経済的に大きな意味を持ちます。
+
+## Native Video Understanding
+
+Gemini 3.1 Pro は1fps でのネイティブ動画理解もサポートしています。単なる画像抽出ではなく、動画内の時系列的なシーケンスを推論し、アクションやトランジションを理解し、動画全体にわたって何が起きているかを答えられます。
+
+```python
+import vertexai
+from vertexai.generative_models import GenerativeModel, Part
+
+vertexai.init(project="your-project-id", location="us-central1")
+model = GenerativeModel("gemini-3.1-pro-002")
+
+# Google Cloud Storage からの動画処理
+video_part = Part.from_uri(
+    uri="gs://your-bucket/architecture-demo.mp4",
+    mime_type="video/mp4"
+)
+
+response = model.generate_content([
+    video_part,
+    "このアーキテクチャ解説動画に登場するすべてのサービスを列挙し、それらの連携方法を説明してください。"
+])
+
+print(response.text)
+```
+
+実用例として、アーキテクチャレビューの録画処理、動画チュートリアルからの構造化情報の抽出、アプリケーションフローの画面録画を使った UI 問題の検出などが挙げられます。
+
+## 他の Model との使い分け
+
+Gemini 3.1 Pro が適しているケース：
+
+**大量ドキュメント分析**: 大きなドキュメントを繰り返しクエリするワークロードでは、Caching 機能により Gemini 3.1 Pro がこのパターンで最もコスト効率が良くなります。
+
+**コードベース全体の分析**: 200万 Token の Window でチャンク分割なしにコードベース全体をロードできます。「リポジトリ全体で X パターンが使われている箇所をすべて探す」といったタスクで、RAG ベースのアプローチの複雑さを排除できます。
+
+**動画コンテンツ処理**: 同等の Context 長でのネイティブ動画理解は他の主要プロバイダーには提供されていません。
+
+**GCP 統合ワークロード**: すでに Google Cloud 上で稼働している場合、Vertex AI と IAM・VPC Service Controls・既存インフラの統合により運用オーバーヘッドが下がります。
+
+一般的な用途（コーディング支援、Q&A、小規模ドキュメントの要約）では Claude や GPT がよりシンプルな選択です。200万 Context と Caching 機能は Document スケールや繰り返しクエリのパターンで主に価値を発揮します。
+
+## webhani の実例
+
+大規模な規制ドキュメント群を繰り返し分析するクライアントのユースケースで Gemini 3.1 Pro をテストしました。数百ページの方針文書に対して1日複数回特定の質問に答える作業です。
+
+Caching 機能は経済性を実際に変えました。400ページの規制ドキュメントに対して1日50クエリを実行する場合、キャッシュアプローチは毎回フルコンテキストを送る場合と比較して約75%のコスト削減になりました。スケールが大きくなるほど無視できない差です。
+
+200万 Token の Context Window は以前構築していた RAG インフラを不要にもしました。このワークロードでは、チャンク分割・Embedding・Retrieval の複雑さが Latency を増やし、時折 Retrieval の失敗も発生していました。それをシンプルなドキュメント・イン・コンテキストのアプローチに置き換えることで、信頼性と開発者体験の両方が改善しました。
+
+注意点として、これほど大きな Context Window が常に正解ではありません。複数のドキュメントを横断して検索する必要がある場合や、コンテンツを頻繁に更新してキャッシュを再作成したくない場合は、RAG が依然として優れたアーキテクチャです。アクセスパターンに合った設計を選ぶことが重要です。

@@ -1,0 +1,119 @@
+---
+title: "Llama 4 Maverick: 128 Expert MoE が示す Open Source AI の現在地"
+description: "Meta が2026年4月5日にリリースした Llama 4 Maverick は、128 Expert の Mixture-of-Experts Architecture を採用したオープンウェイトモデルです。GPT-4o を超える Multimodal 性能と、本番利用の実際を解説します。"
+date: "2026-04-21"
+status: "published"
+tags: ["Llama 4", "Meta AI", "Open Source", "MoE", "Multimodal AI"]
+thumbnail: ""
+author: "webhani"
+slug: "llama-4-maverick-multimodal-moe-2026"
+---
+
+Meta は2026年4月5日、Llama 4 Maverick を Llama 4 Scout と同時にリリースしました。注目すべきは Maverick です。128 Expert の Mixture-of-Experts Architecture、Native Multimodal 対応、有効パラメータ数170億という構成で、OpenAI や Google のモデルと同等以上の Benchmark 結果を示しています。
+
+本記事では Architecture の概要、前世代の Llama との違い、そして本番環境での運用方法について整理します。
+
+## MoE Architecture とは
+
+Llama 4 Maverick は Sparse Mixture-of-Experts Architecture を採用しています。全パラメータを毎回活性化するのではなく、各 Token を少数の「Expert」Sub-Network にルーティングする仕組みです。128 個の Expert と170億の有効パラメータという構成により、Forward Pass あたりの計算コストを大幅に抑えながら高い推論品質を実現しています。
+
+この設計には2つの利点があります。
+
+**効率性**: はるかに大きなモデルに匹敵する推論品質を、より小さなモデルの Inference コストで得られます。
+
+**専門性**: Expert が多いほど特化できる範囲が広がり、コード・自然言語・構造化データ・画像といった異なる Input タイプに対して適切な Expert を割り当てられます。
+
+16 Expert の Llama 4 Scout と比較すると、Scout は Token あたりのコストと速度に優れますが、Maverick の128 Expert の深さは複雑な Reasoning やコーディングタスクで明確に上回る性能を発揮します。
+
+## Maverick の主要機能
+
+主な性能特徴：
+
+- **Multimodal**: テキスト・画像・動画を Native に処理 — 別途 Vision Model を用意する必要がない
+- **Coding**: DeepSeek v3 と同等の Reasoning・Coding Benchmark 結果
+- **Multimodal 精度**: GPT-4o と Gemini 2.0 Flash を Multimodal 評価タスクで上回る
+- **Context Length**: Document レベルの処理に適した長いコンテキストをサポート
+
+これらは自己申告の数字ではなく、標準化された評価セットでの Third-Party Benchmark 結果です。
+
+## Maverick の実行方法
+
+Maverick は Hugging Face と llama.com でオープンウェイトとしてダウンロード可能です。Hugging Face `transformers` ライブラリの v4.51.0 以降で動作します。
+
+```python
+from transformers import AutoProcessor, Llama4ForConditionalGeneration
+import torch
+from PIL import Image
+import requests
+
+model_id = "meta-llama/Llama-4-Maverick-17B-128E-Instruct"
+
+processor = AutoProcessor.from_pretrained(model_id)
+model = Llama4ForConditionalGeneration.from_pretrained(
+    model_id,
+    attn_implementation="flex_attention",
+    device_map="auto",
+    torch_dtype=torch.bfloat16,
+)
+
+# テキスト + 画像での Inference
+url = "https://example.com/architecture-diagram.png"
+image = Image.open(requests.get(url, stream=True).raw)
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "image", "image": image},
+            {
+                "type": "text",
+                "text": "このダイアグラムに示されているアーキテクチャを説明し、潜在的なボトルネックを特定してください。"
+            }
+        ]
+    }
+]
+
+inputs = processor.apply_chat_template(
+    messages,
+    add_generation_prompt=True,
+    tokenize=True,
+    return_dict=True,
+    return_tensors="pt",
+).to(model.device)
+
+outputs = model.generate(**inputs, max_new_tokens=1024)
+response = processor.batch_decode(outputs[:, inputs["input_ids"].shape[-1]:])[0]
+print(response)
+```
+
+本番環境でのスケール運用の場合、大半のチームは Self-Hosting ではなく Inference Provider（Together AI、Fireworks、Groq 等）を通じて Maverick を利用するでしょう。128 Expert MoE を低 Latency で Serving するためのハードウェア要件は相当なものです。
+
+## Closed Model より Maverick を選ぶ理由
+
+GPT-4o や Claude Sonnet より Maverick を選ぶ実際的な理由：
+
+**Data Residency 要件**: 機密データを外部 API に送信できないユースケースでは、Maverick の Self-Hosting が有効な選択肢になります。フロンティア級の性能を外部 API なしで得られます。
+
+**大規模運用でのコスト**: 高頻度の呼び出しでは、低コストの Inference Provider 経由で Maverick を使うことで、Proprietary API 料金を大幅に下回るコストで運用できます。高頻度の Classification や Extraction タスクで特に効果的です。
+
+**Fine-Tuning**: Open Weights のため自社データでの Fine-Tuning が可能です。同等の能力を持つ Proprietary モデルにはこの選択肢がありません。
+
+**Vendor Lock-In の回避**: 複数の Provider をまたがるインフラを構築する場合、Open Weight モデルはアーキテクチャの柔軟性を提供します。
+
+## 把握しておくべき制約
+
+Maverick にも Trade-Off があります。
+
+- **インフラ負担**: 128 Expert MoE を効率的に Serving するにはほとんどのチームが持っていないハードウェアの専門知識が必要です
+- **Fine-Tuning の複雑さ**: MoE Architecture は Dense モデルより Fine-Tuning が難しく、標準的な LoRA アプローチも MoE Layer への適応が必要です
+- **Proprietary API との Latency 比較**: Proprietary API は低 Latency 向けに高度に最適化されています。専用インフラへの投資なしでは、Self-Hosted Maverick の初回 Token Latency は高くなる傾向があります
+
+## webhani の見解
+
+Llama 4 のリリースは、Open Weight モデルがほとんどの本番ユースケースで品質の妥協なく Proprietary モデルと真に競合できる転換点を示しています。
+
+Data Residency 要件がある、あるいは高頻度の Inference コストを重視する Client に対しては、Maverick は Proprietary モデルと並ぶ最初の評価対象になりました。同一モデルでテキストと画像を処理できる能力は、以前は別々の Vision・Language モデルを組み合わせる複雑さが必要だった Integration を大幅にシンプルにします。
+
+ただし、インフラの課題は残ります。フロンティア MoE モデルを自社ホストしようとするよりも、Managed Inference Provider を通じた利用が現実的です。Proprietary API チームが積み重ねてきた Latency 最適化は容易には再現できません。
+
+結論として、データセンシティブな、または高頻度でコストが重要なワークロードには Managed Provider 経由で Maverick を、Latency が重要なタスクには Proprietary API を使い続けることを推奨します。
