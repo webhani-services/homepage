@@ -1,0 +1,98 @@
+---
+title: "Model Context Protocol が LLM 統合の標準になりつつある"
+description: "MCP（Model Context Protocol）が LLM とツールをつなぐ共通インターフェースとして急速に普及しています。実装パターンと実務への適用方法を解説します。"
+date: "2026-04-24"
+status: "published"
+tags: ["LLM", "MCP", "AI", "Claude", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "model-context-protocol-llm-standard-2026"
+---
+
+## MCP とは何か
+
+Model Context Protocol（MCP）は、LLM アプリケーションと外部ツールやデータソースを接続するためのオープンプロトコルです。Anthropic が仕様を公開して以来、2026年に入ってから採用が急速に広がり、Database、クラウドインフラ管理、ブラウザ自動化など、多様な MCP Server が登場しています。
+
+簡単に言えば、MCP は LLM に「手」を与えるための共通言語です。以前は各ツールへのアクセスをアプリケーションコードで個別に実装する必要がありましたが、MCP によって LLM 側とツール側の両方が共通プロトコルを実装するだけで済むようになりました。
+
+## なぜ MCP が標準になりつつあるのか
+
+### Provider 非依存
+
+MCP は特定の LLM ベンダーに依存しません。Claude、GPT-5.5、Gemini のいずれを使う場合でも、同じ MCP Server に接続できます。ベンダーロックインを避けたいエンタープライズ環境では特に重要なポイントです。
+
+### Ecosystem の急速な拡大
+
+2026年4月時点で、主要な Database（PostgreSQL、MySQL、MongoDB）、クラウドサービス（AWS、GCP、Azure）、開発ツール（GitHub、Linear、Jira）に対応した MCP Server が公式または OSS として提供されています。新しいデータソースへの接続にかかる時間が「数日」から「数時間」に短縮されています。
+
+### 明確な権限スコープ
+
+MCP はツールがアクセスできる権限範囲を明示的に宣言させる設計になっています。LLM がどのリソースにアクセスできるかが明確なため、アドホックな Function Calling アプローチより監査がしやすくなります。
+
+## 実装パターン
+
+MCP Server の基本構造は比較的シンプルです。以下は Node.js での最小実装例です。
+
+```typescript
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+
+const server = new McpServer({
+  name: "internal-db-server",
+  version: "1.0.0",
+});
+
+server.tool(
+  "query_orders",
+  "顧客 ID と日付範囲で注文を検索する",
+  {
+    customerId: z.string(),
+    from: z.string().datetime(),
+    to: z.string().datetime(),
+  },
+  async ({ customerId, from, to }) => {
+    const orders = await db.orders.findByCustomer(customerId, { from, to });
+    return {
+      content: [{ type: "text", text: JSON.stringify(orders) }],
+    };
+  }
+);
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
+```
+
+LLM クライアント側では、MCP Server への接続設定を追加するだけでツールが利用可能になります。Claude Code では `.claude/settings.json` で MCP Server を管理できます。
+
+```json
+{
+  "mcpServers": {
+    "internal-db": {
+      "command": "node",
+      "args": ["./mcp-servers/db-server.js"],
+      "env": {
+        "DATABASE_URL": "${DATABASE_URL}"
+      }
+    }
+  }
+}
+```
+
+## MCP が最も効果を発揮する場面
+
+次のケースでは MCP を優先的に検討する価値があります。
+
+**複数の LLM Agent が同じツールを使う場合**: MCP Server を一度実装すれば、どの Agent からも呼び出せます。Agent ごとに個別の統合コードを書く必要がありません。
+
+**モデルの切り替えを想定している場合**: MCP はプロトコルレイヤーで抽象化されているため、Claude から GPT-5.5 に切り替えても、ツール統合コードは変更不要です。
+
+**監査可能性が求められる場合**: 金融や医療など規制の厳しい業種では、LLM がどのデータにアクセスしたかの追跡が必要です。MCP の明示的な権限モデルは、このような要件に適合しやすい設計です。
+
+## 単純な用途では過剰になることも
+
+単一目的のシンプルなチャットボットや、ツール呼び出しが 1〜2 種類しかない場合は、MCP の実装オーバーヘッドがメリットを上回ることもあります。まず既存の Function Calling で十分か検討し、複数 Agent や複数モデルが絡む場面で MCP を採用するというアプローチが現実的です。
+
+## まとめ
+
+MCP は REST API が 2010 年代初頭にカスタム統合を標準化したのと同様に、LLM のツール統合を標準化しようとしています。Ecosystem がすでに成熟しつつある今、新しく LLM アプリケーションを設計する際には MCP を基本アーキテクチャとして検討することを推奨します。再利用性とメンテナンス性が大きく向上します。

@@ -1,0 +1,128 @@
+---
+title: "Kubernetes v1.36과 GitOps — ArgoCD가 표준이 된 이유"
+description: "Kubernetes v1.36이 2026년 4월 말 출시됩니다. 더 중요한 변화는 GitOps가 표준 배포 패턴으로 자리잡았다는 사실입니다. ArgoCD가 주류가 된 배경과 실무 도입 방법을 정리했습니다."
+date: "2026-04-24"
+status: "published"
+tags: ["Kubernetes", "GitOps", "ArgoCD", "DevOps", "Cloud"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-v136-gitops-2026"
+---
+
+## Kubernetes v1.36 출시 임박
+
+Kubernetes v1.36이 2026년 4월 말 출시될 예정입니다. 이번 릴리즈는 많은 수의 Enhancement와 함께 일부 기능 삭제 및 Deprecation도 포함되어 있습니다. 프로덕션 클러스터를 운영 중인 팀이라면 지금 변경 내용을 확인해두는 것이 좋습니다.
+
+그런데 v1.36의 특정 기능보다 더 주목할 변화가 있습니다. 2026년의 Kubernetes 운영에서 GitOps가 사실상 표준 배포 패턴으로 자리잡았고, 그 중심에 ArgoCD가 있습니다.
+
+## GitOps가 기본값이 되다
+
+아직도 CI/CD Pipeline에서 `kubectl apply`를 직접 실행하거나 Build Job에서 클러스터에 직접 Push하는 방식으로 배포하고 있다면, 업계가 정착한 방향과 반대로 운영하고 있는 것입니다.
+
+GitOps의 원칙은 간단합니다. **Git 저장소를 클러스터 상태의 유일한 신뢰 소스(Single Source of Truth)로 사용하고, 실제 클러스터를 Git 상태와 지속적으로 일치시킵니다.**
+
+```
+Git 저장소 (원하는 상태)
+        ↓ 지속적인 동기화
+Kubernetes 클러스터 (실제 상태)
+```
+
+명령형(Imperative) 배포 방식 대비 GitOps의 실질적인 장점:
+
+- **감사 추적**: 모든 인프라 변경이 Git Commit으로 기록됨 (작성자, 시간, 변경 내용 포함)
+- **롤백**: `git revert`로 임의 시점의 인프라 상태로 복원 가능
+- **Drift 감지**: 실제 클러스터 상태가 원하는 상태와 다를 때 즉시 감지
+- **PR 기반 리뷰**: 인프라 변경도 일반 코드와 동일한 리뷰 프로세스로 관리
+
+## 왜 ArgoCD인가
+
+FluxCD도 유효한 대안이지만, 2026년 기준으로 ArgoCD가 더 넓은 채택률을 보입니다.
+
+### UI를 통한 가시성
+
+ArgoCD의 UI는 배포에 포함된 모든 리소스의 실시간 상태를 보여줍니다. 어떤 리소스가 Synced인지, 무엇이 OutOfSync인지, 전체 리소스 트리를 한눈에 파악할 수 있습니다. 새벽에 장애가 났을 때, `kubectl get` 명령어를 반복하는 대신 시각적으로 클러스터 상태를 확인할 수 있다는 점은 실무에서 큰 차이를 만듭니다.
+
+### ApplicationSet으로 멀티 환경 관리
+
+여러 클러스터나 환경(dev/staging/prod)을 관리할 때, ApplicationSet을 사용하면 하나의 템플릿에서 여러 ArgoCD Application을 자동 생성할 수 있습니다.
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: my-app
+  namespace: argocd
+spec:
+  generators:
+    - list:
+        elements:
+          - cluster: dev
+            url: https://dev.k8s.example.com
+          - cluster: staging
+            url: https://staging.k8s.example.com
+          - cluster: prod
+            url: https://prod.k8s.example.com
+  template:
+    metadata:
+      name: "my-app-{{cluster}}"
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/example/k8s-manifests
+        targetRevision: HEAD
+        path: "apps/my-app/{{cluster}}"
+      destination:
+        server: "{{url}}"
+        namespace: my-app
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+```
+
+이 설정 하나로 3개 환경에 대한 ArgoCD Application이 자동 생성되고, 각각 Git의 해당 경로를 추적합니다.
+
+### Project를 통한 멀티 테넌트 관리
+
+ArgoCD의 Project 개념은 애플리케이션을 팀별로 그룹화하고 접근 권한을 분리합니다. 여러 팀이 하나의 클러스터를 공유하는 환경에서도 적절한 권한 분리가 가능합니다.
+
+## Helm과 Kustomize 조합
+
+ArgoCD는 Helm과 Kustomize를 모두 네이티브로 지원합니다. 일반적인 패턴은 Helm Chart로 Base 설정을 관리하고, Kustomize Overlay로 환경별 차이를 적용하는 방식입니다.
+
+```
+k8s-manifests/
+├── base/
+│   └── my-app/
+│       ├── deployment.yaml
+│       └── service.yaml
+├── overlays/
+│   ├── dev/
+│   │   └── kustomization.yaml   # 개발 환경 차이점
+│   ├── staging/
+│   │   └── kustomization.yaml   # 스테이징 환경 차이점
+│   └── prod/
+│       └── kustomization.yaml   # 프로덕션 환경 차이점
+```
+
+각 Overlay는 해당 환경에만 적용되는 차이점(Replica 수, Resource 제한, Image 태그 등)만 포함하고, Base 설정은 중복 없이 유지됩니다.
+
+## 2026년 Kubernetes 생태계
+
+경쟁 관계로 여겨지던 세 기술이 이제 상호 보완 관계로 이해되고 있습니다.
+
+- **Docker**: 로컬 개발 환경의 표준 도구로 여전히 건재
+- **Kubernetes**: 프로덕션 오케스트레이션을 담당
+- **WebAssembly(Wasm)**: 컨테이너 오버헤드가 실용적이지 않은 Edge 환경에서 존재감 확대
+
+Platform Engineering도 성숙했습니다. 개발자가 Kubernetes의 복잡성을 의식하지 않고 인프라를 사용할 수 있도록 하는 내부 개발자 플랫폼(IDP) 구축이 보편화되었습니다.
+
+## GitOps 도입 시작하기
+
+CI/CD 직접 배포에서 GitOps로 전환할 때 리스크를 줄이는 순서입니다.
+
+1. **비프로덕션부터 시작**: 프로덕션 클러스터를 건드리기 전에 dev/staging에서 ArgoCD를 파일럿 운영
+2. **수동 Sync부터 시작**: Git 저장소 상태에 충분한 신뢰가 생기기 전까지는 자동 Sync를 활성화하지 않음
+3. **PR 워크플로우 먼저 확립**: 자동화를 진행하기 전에 인프라 변경의 리뷰 프로세스를 팀 내에서 합의
+
+GitOps 전환은 한 번에 전부 할 필요가 없습니다. 하나의 Application, 하나의 환경부터 시작해서 ArgoCD가 조직 내에서 어떻게 작동하는지 충분히 이해한 후 범위를 확장하는 것이 가장 안정적인 접근입니다.
