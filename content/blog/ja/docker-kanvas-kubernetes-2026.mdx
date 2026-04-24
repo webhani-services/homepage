@@ -1,0 +1,144 @@
+---
+title: "Docker Kanvas：ComposeからKubernetesへの移行を自動化する新アプローチ"
+description: "DockerがKanvasをリリース。Docker ComposeファイルをKubernetesマニフェストに自動変換し、HelmやKustomizeに挑戦します。実際の変換フローと注意点を解説します。"
+date: "2026-04-25"
+status: "published"
+tags: ["Docker", "Kubernetes", "DevOps", "Cloud", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-kubernetes-2026"
+---
+
+Dockerは2026年初頭に**Kanvas**をリリースしました。ローカルのDocker Compose環境とクラウドのKubernetes本番環境の間に存在するギャップを自動で埋めることを目指すプラットフォームです。HelmやKustomizeが担ってきた変換・テンプレート管理の領域に直接切り込んでいます。
+
+## 課題：ComposeとKubernetesの乖離
+
+多くの開発チームが直面する問題があります。ローカルでは`docker-compose.yml`で開発環境を管理しているにもかかわらず、本番のKubernetesにデプロイするには全く異なるマニフェストセットが必要になります。
+
+```yaml
+# docker-compose.yml（開発環境）
+version: "3.8"
+services:
+  api:
+    image: myapi:latest
+    ports:
+      - "4000:4000"
+    environment:
+      - DATABASE_URL=postgresql://db:5432/myapi
+    depends_on:
+      - db
+  db:
+    image: postgres:16
+    environment:
+      - POSTGRES_DB=myapi
+      - POSTGRES_PASSWORD=secret
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:
+```
+
+これをKubernetesに移行しようとすると、Deployment、Service、ConfigMap、PersistentVolumeClaim、Secretなど複数のリソースが必要になり、管理すべきYAMLが一気に増えます。
+
+## KanvasによるK8s変換
+
+KanvasはDocker ComposeファイルをKubernetesアーティファクトに自動変換します。変換後の構成の一例です。
+
+```yaml
+# Kanvasが生成するDeployment（api）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: myapi:latest
+          ports:
+            - containerPort: 4000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: api-secrets
+                  key: DATABASE_URL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 4000
+      targetPort: 4000
+```
+
+Kanvasはサービス間の依存関係（`depends_on`）をKubernetesのinit containerやreadiness probeに自動的に変換し、volumeをPersistentVolumeClaimとして作成します。環境変数として定義された機密情報はKubernetes Secretに移動されます。
+
+## HelmやKustomizeとの比較
+
+| 観点 | Helm | Kustomize | Kanvas |
+|------|------|-----------|--------|
+| 学習コスト | 高い（テンプレート言語） | 中程度 | 低い（Compose知識を活用） |
+| 既存プロジェクトへの適用 | Chart作成が必要 | overlay設定が必要 | Composeファイルがあれば開始可能 |
+| 複雑な環境への対応 | 高い柔軟性 | 高い柔軟性 | 制約あり（複雑な設定は手動調整） |
+| エコシステム | 成熟 | 成熟 | 初期段階 |
+
+Kanvasの強みは**既存のComposeファイルをそのままスタートポイントにできる**点です。一方、複雑なKubernetesの設定（カスタムRBACポリシー、Service Meshの設定等）が必要な場合は、生成されたYAMLを起点に手動で調整する必要があります。
+
+## 実務での活用シナリオ
+
+**既存プロジェクトのK8s移行の足がかり**
+生成されたマニフェストを出発点として活用します。KubernetesがComposeの概念をどのようにモデル化するかを学ぶ教育的な用途にも有効です。
+
+**小〜中規模のWebアプリケーション**
+10サービス未満でネットワーク構成がシンプルなチームは、Kanvas生成のマニフェストに軽量なカスタマイズを加えるだけで本番デプロイが可能です。
+
+**プロトタイプの迅速な環境展開**
+Composeでプロトタイプを素早く構築し、Kanvasを使って手動変換なしにステージング環境へデプロイします。
+
+## 本番利用前に必ず追加すべき設定
+
+Kanvasが生成するマニフェストは出発点であり、そのまま本番に使える「完成品」ではありません。以下は必ず確認・追加が必要です。
+
+```yaml
+# 全コンテイナーspecに追加
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 4000
+  initialDelaySeconds: 10
+  periodSeconds: 15
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 4000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+```
+
+さらに確認すべき事項: サービス間通信の制限のためのNetworkPolicy、外部トラフィックのためのIngress設定、動的スケーリングが必要な場合のHorizontalPodAutoscaler。
+
+## まとめ
+
+Docker Kanvasは「ComposeをそのままK8sで動かす」ギャップを縮める実用的なツールです。HelmやKustomizeの置き換えではなく、**K8sへの入り口（オンランプ）**として位置づけるのが適切です。
+
+Kubernetesの学習曲線を緩やかにするツールが増えることは、インフラ全体の標準化にとってポジティブな動きです。生成された出力は本番適用前に必ず検討・テスト・拡張してください。
