@@ -1,0 +1,143 @@
+---
+title: "Kubernetes v1.36 and AWS's Strategy to Make K8s Invisible"
+description: "What's coming in Kubernetes v1.36 and the practical takeaways from AWS's KubeCon Europe 2026 talk on reducing Kubernetes complexity with Karpenter, Kro, and Cedar."
+date: "2026-04-26"
+status: "published"
+tags: ["Kubernetes", "AWS", "Cloud", "DevOps", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-v136-simplification-2026"
+---
+
+Kubernetes v1.36 is due at the end of April 2026, with a substantial number of enhancements alongside some removals and deprecations. At KubeCon CloudNativeCon Europe 2026, AWS engineer Jesse Butler delivered a keynote on a complementary theme: "From Complexity to Clarity — Making Kubernetes Invisible." His focus was on how Karpenter, Kro, and Cedar address the operational burden that prevents teams from getting the most out of Kubernetes.
+
+## What's in Kubernetes v1.36
+
+Full details land with the official release, but a few points worth tracking ahead of upgrades:
+
+**API removals and deprecations**
+
+Every Kubernetes release cycle includes cleanup of deprecated APIs. If your cluster uses resources from older API versions, those need to be migrated before upgrading. Running detection tooling against your manifests before upgrading is straightforward:
+
+```bash
+# Check for deprecated API usage in manifests
+pluto detect-files -d ./manifests
+
+# Or check what's currently deployed in the cluster
+kubectl get --raw /apis | jq '.groups[].versions[].groupVersion' | sort
+```
+
+**Volume of enhancements**
+
+Kubernetes v1.36 was described as having "an impressive number of enhancements" — the specifics per SIG are worth reviewing in the final changelog once the release publishes.
+
+## Making Kubernetes Invisible: The AWS Approach
+
+Butler's framing at KubeCon resonates with a real problem. Kubernetes delivers genuine value for orchestration, but the learning curve and operational surface area add friction between intent and outcome. The combination he presented — Karpenter + Kro + Cedar — addresses three distinct layers of that complexity.
+
+### Karpenter: Abstract away node management
+
+Karpenter provisions nodes based on what workloads actually need, rather than requiring you to configure node groups in advance. It observes pending pods, calculates optimal instance types, and deprovisiones underutilized nodes automatically.
+
+```yaml
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+  limits:
+    cpu: "1000"
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
+```
+
+With this in place, you stop managing node groups as a separate concern. Karpenter handles it, and engineers focus on workload requirements instead.
+
+### Kro: Abstract away multi-resource deployments
+
+Kro (Kubernetes Resource Orchestrator) lets platform engineers compose multiple Kubernetes resources into a single custom resource definition. Application developers deploy a `WebApp` instead of managing the underlying Deployment, Service, HPA, NetworkPolicy, and whatever else your platform requires.
+
+```yaml
+apiVersion: kro.run/v1alpha1
+kind: ResourceGroup
+metadata:
+  name: webapp
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: WebApp
+    spec:
+      image: { type: string }
+      replicas: { type: integer, default: 2 }
+  resources:
+    - id: deployment
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        spec:
+          replicas: ${schema.spec.replicas}
+          # ...
+    - id: service
+      template:
+        apiVersion: v1
+        kind: Service
+        # ...
+```
+
+The abstraction reduces cognitive load for application teams and ensures platform-mandated best practices (security policies, resource limits) get applied consistently — because they're baked into the ResourceGroup, not left to individual teams.
+
+### Cedar: Make access policies readable
+
+Cedar is a policy language designed to express authorization rules in a way that's auditable and verifiable. Applied to Kubernetes, it addresses the common problem where RBAC configurations grow complex enough that nobody's confident what's actually permitted.
+
+Explicit, human-readable policies mean that security reviews become tractable and policy intent doesn't get lost in YAML accumulation.
+
+## How 2026 Kubernetes Looks in Practice
+
+Two trends from KubeCon worth noting:
+
+**GitOps is the default deployment model**
+
+GitOps — using Git repositories as the single source of truth for cluster state — has moved from "advanced practice" to standard operating procedure in 2026. ArgoCD and Flux are the dominant implementations. Infrastructure changes go through pull requests with the same review workflow as application code.
+
+**Docker, Kubernetes, and Wasm coexist**
+
+The Docker-vs-Kubernetes framing is outdated. In practice, development environments use Docker, production orchestration uses Kubernetes, and edge/lightweight workloads increasingly use WebAssembly. They address different problems in the same stack, and the three are converging rather than competing.
+
+## Practical Upgrade Checklist for v1.36
+
+If you're planning a v1.36 upgrade:
+
+```bash
+# 1. Identify deprecated API usage before upgrading
+pluto detect-files -d ./k8s-manifests
+pluto detect-helm -A  # Check Helm releases across all namespaces
+
+# 2. Review all Helm charts for outdated API versions
+helm list --all-namespaces -o json | \
+  jq -r '.[] | [.name, .namespace, .chart] | @csv'
+
+# 3. For EKS: upgrade control plane first, then node groups
+# Control plane upgrade can be done without draining nodes
+# Node group update: use --force or rolling update strategy
+```
+
+Managed Kubernetes services (EKS, GKE, AKS) handle much of the control plane upgrade complexity, but API compatibility between the control plane and node versions during the transition window still needs attention.
+
+## Takeaways
+
+Kubernetes v1.36 continues the platform's steady maturation. The more interesting story from KubeCon is the direction platform engineering is heading: Karpenter reduces node management to a policy concern, Kro lets platform teams define higher-level abstractions for application teams, and Cedar makes access control policies explicit and auditable.
+
+The result, in principle, is that application developers stop needing to become Kubernetes experts. The infrastructure complexity doesn't disappear — it gets managed by platform engineers who design it once, rather than distributed across every team that deploys on it.
+
+That's the "invisible Kubernetes" goal: not hiding complexity through magic, but concentrating it where it can be managed well.
