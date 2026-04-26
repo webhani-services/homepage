@@ -1,0 +1,178 @@
+---
+title: "Rust 1.83でAsync Closureが安定化 — 非同期コードの書き方が大きく変わる"
+description: "Rustの長年の課題だったAsync Closureが安定版に入りました。何が変わり、どんなコードが書けるようになったのかを具体例で解説します。"
+date: "2026-04-27"
+status: "published"
+tags: ["Rust", "async", "programming", "web-development", "backend"]
+thumbnail: ""
+author: "webhani"
+slug: "rust-async-closures-stable-2026"
+---
+
+Rust 1.83で **Async Closure** が安定版（stable）に追加されました。これはRustコミュニティが長年求めてきた機能であり、非同期コードの記述方法を根本的に改善します。`async/await`が安定化した2019年以降、最も大きな非同期エルゴノミクスの改善と言えます。
+
+## これまでの問題
+
+Rustで非同期コードを書く際、クロージャの中でawaitを使うのは長らく煩雑でした。
+
+```rust
+// これまでの書き方（非同期クロージャが使えなかった）
+let process = |item: &str| {
+    // ここでawaitを使いたいが、closureはasyncにできなかった
+    fetch_data(item) // Futureを返すだけで、awaitできない
+};
+
+// 回避策: Box<dyn Future>を使う
+let process = |item: &str| -> BoxFuture<'_, Result<String>> {
+    Box::pin(async move {
+        let data = fetch_data(item).await?;
+        Ok(data)
+    })
+};
+```
+
+`Box::pin(async move { ... })` という定型文は読みにくく、型の扱いも複雑でした。特にHigher-Kinded Lifetimes（HKT）が絡む場面では、型エラーに悩まされることが多かったのです。
+
+## Rust 1.83以降の書き方
+
+Async Closureが安定化したことで、以下のように書けます：
+
+```rust
+// async closureを直接使える
+let process = async |item: &str| -> Result<String> {
+    let data = fetch_data(item).await?;
+    Ok(data)
+};
+
+// 呼び出し側
+let result = process("hello").await?;
+```
+
+`Box::pin`も`move`も不要です。`async |args| { ... }` という直感的な構文で非同期クロージャを定義できます。
+
+## 実践的なユースケース
+
+### イテレータとの組み合わせ
+
+非同期処理をイテレータと組み合わせる場面で特に恩恵があります。
+
+```rust
+use futures::stream::{self, StreamExt};
+
+let items = vec!["item1", "item2", "item3"];
+
+// async closureをmap に渡す
+let results: Vec<Result<String>> = stream::iter(items)
+    .map(async |item| {
+        let processed = process_item(item).await?;
+        Ok(processed)
+    })
+    .buffer_unordered(5) // 最大5件を並列処理
+    .collect()
+    .await;
+```
+
+以前はこのパターンを実現するために複数の中間型を定義する必要がありました。
+
+### Middleware的なパターン
+
+Webフレームワークでの Middleware実装でも自然な書き方ができます：
+
+```rust
+// axumのmiddleware例
+async fn auth_middleware<B>(
+    State(db): State<Arc<Database>>,
+    req: Request<B>,
+    next: Next<B>,
+) -> Response {
+    // async closureを使った認証チェック
+    let check_auth = async |token: &str| -> bool {
+        db.validate_token(token).await.unwrap_or(false)
+    };
+
+    match req.headers().get("Authorization") {
+        Some(token) => {
+            if check_auth(token.to_str().unwrap_or("")).await {
+                next.run(req).await
+            } else {
+                StatusCode::UNAUTHORIZED.into_response()
+            }
+        }
+        None => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+```
+
+### エラーハンドリングとの統合
+
+`?`演算子もasync closure内で自然に使えます：
+
+```rust
+let fetch_and_parse = async |url: &str| -> Result<Config> {
+    let response = client.get(url).await?;
+    let text = response.text().await?;
+    let config: Config = serde_json::from_str(&text)?;
+    Ok(config)
+};
+```
+
+## trait境界での使い方
+
+Async Closureを引数として受け取る関数を書く場合、新しいtrait `AsyncFn`、`AsyncFnMut`、`AsyncFnOnce`を使います：
+
+```rust
+// async closureを引数に取る関数
+async fn retry<F, T, E>(
+    times: usize,
+    operation: F,
+) -> Result<T, E>
+where
+    F: AsyncFn() -> Result<T, E>,
+{
+    for i in 0..times {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(e) if i + 1 == times => return Err(e),
+            Err(_) => continue,
+        }
+    }
+    unreachable!()
+}
+
+// 使用例
+let result = retry(3, async || {
+    connect_to_database().await
+}).await?;
+```
+
+## 既存コードへの影響
+
+Async Closureは後方互換性を維持して追加されているため、既存コードは変更なしにコンパイルできます。ただし、新しいパターンに移行する際は以下の点に注意が必要です。
+
+**`move`セマンティクスの確認**: async closure内でキャプチャされた変数のlifetimeは以前と同様に明示する必要があります。
+
+```rust
+let db = Arc::clone(&database);
+let query = async move |id: u64| -> Result<User> {
+    db.find_user(id).await
+};
+```
+
+## webhaniとしての見解
+
+Async Closureの安定化は、Rustを使った非同期Webアプリケーション開発の参入障壁を下げる重要な一歩です。特にaxum、actix-web、tokioを使っているチームにとって、ボイラープレートの削減と可読性の向上は即座に恩恵があります。
+
+WebフレームワークとしてRustを採用している、あるいは採用を検討しているチームへの推奨：
+
+1. **新規コードから採用する**: 既存コードの一括移行より、新しく書く部分から適用するのが安全
+2. **`AsyncFn` trait境界を積極的に使う**: ライブラリコードを書く場合は特に
+3. **`clippy`の最新版でlintを確認する**: Async Closure周りの新しいlintルールに対応する
+
+Rustの非同期エコシステムは成熟が進んでいます。Python、Go、Node.jsとの性能比較で優位な場面がある一方で、学習コストはまだ他言語より高いです。Async Closureの安定化はそのコストを下げる方向への重要な進歩です。
+
+## まとめ
+
+- Rust 1.83でAsync Closureが安定化し、`async |args| { ... }` 構文が使える
+- `Box::pin(async move { ... })` という定型文が不要になり、コードが大幅に読みやすくなる
+- `AsyncFn`、`AsyncFnMut`、`AsyncFnOnce` traitで高階関数への受け渡しも自然に書ける
+- 既存コードへの破壊的変更はなく、段階的な移行が可能

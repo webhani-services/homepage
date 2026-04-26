@@ -1,0 +1,187 @@
+---
+title: "Rust 1.83에서 Async Closure 안정화 — 비동기 코드 작성 방식이 달라집니다"
+description: "Rust의 오랜 과제였던 Async Closure가 Stable에 포함되었습니다. 무엇이 바뀌었고 어떤 코드가 가능해졌는지 구체적인 예시로 설명합니다."
+date: "2026-04-27"
+status: "published"
+tags: ["Rust", "async", "programming", "web-development", "backend"]
+thumbnail: ""
+author: "webhani"
+slug: "rust-async-closures-stable-2026"
+---
+
+Rust 1.83에서 **Async Closure**가 Stable 버전에 포함되었습니다. 2019년 `async/await` 안정화 이후 가장 큰 비동기 에르고노믹스 개선으로 평가받는 기능입니다. 오랫동안 `Box::pin(async move { ... })` 패턴과 씨름해왔다면, 이 변화가 실무에 직접적인 영향을 미칩니다.
+
+## 기존의 문제
+
+Rust 1.83 이전에는 비동기 클로저를 작성하려면 우회 방법이 필요했습니다.
+
+```rust
+// 쓰고 싶었던 코드:
+let process = async |item: &str| -> Result<String> {
+    fetch_data(item).await
+};
+
+// 실제로 써야 했던 코드:
+use futures::future::BoxFuture;
+
+let process = |item: &str| -> BoxFuture<'_, Result<String>> {
+    Box::pin(async move {
+        fetch_data(item).await
+    })
+};
+```
+
+`Box::pin` 보일러플레이트는 코드 가독성을 해치고 힙 할당 오버헤드를 추가합니다. Higher-Kinded Lifetime이 개입되면 타입 에러가 경험 많은 Rust 개발자에게도 이해하기 어려운 형태로 나타났습니다.
+
+## Rust 1.83에서 가능한 코드
+
+이제 예상하는 대로 작성할 수 있습니다.
+
+```rust
+let process = async |item: &str| -> Result<String> {
+    let data = fetch_data(item).await?;
+    transform(data)
+};
+
+let result = process("example").await?;
+```
+
+힙 할당 없이, 보일러플레이트 없이 읽기 쉬운 코드가 됩니다.
+
+## 실용적인 패턴
+
+### 스트림 처리와의 조합
+
+즉각적인 효과가 가장 큰 영역은 스트림 처리입니다.
+
+```rust
+use futures::stream::{self, StreamExt};
+
+let urls = vec!["https://api.example.com/a", "https://api.example.com/b"];
+
+let responses: Vec<_> = stream::iter(urls)
+    .map(async |url| {
+        client.get(url).send().await?.json::<Response>().await
+    })
+    .buffer_unordered(4)  // 최대 4개 동시 요청
+    .collect()
+    .await;
+```
+
+이전에는 중간 Future 타입을 명명하거나 Boxing이 필요했습니다. 이제 자연스럽게 합성됩니다.
+
+### 재시도(Retry) 유틸리티
+
+비동기 클로저를 인수로 받는 고차 함수도 이제 간단하게 작성됩니다.
+
+```rust
+async fn retry<F, T, E>(attempts: usize, f: F) -> Result<T, E>
+where
+    F: AsyncFn() -> Result<T, E>,
+{
+    for i in 0..attempts {
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(e) if i + 1 == attempts => return Err(e),
+            Err(_) => {
+                tokio::time::sleep(
+                    Duration::from_millis(100 * (i as u64 + 1))
+                ).await;
+            }
+        }
+    }
+    unreachable!()
+}
+
+// 사용 예
+let result = retry(3, async || db.connect().await).await?;
+```
+
+`AsyncFn`, `AsyncFnMut`, `AsyncFnOnce` Trait이 동기 버전과 동일한 구조로 Generic 함수의 Trait Bound로 사용됩니다.
+
+### 상태를 캡처하는 경우
+
+클로저가 값을 소유해야 할 때는 `move`를 사용합니다.
+
+```rust
+let db = Arc::clone(&database);
+let user_id = request.user_id;
+
+let fetch_profile = async move || -> Result<Profile> {
+    db.get_profile(user_id).await
+};
+
+let profile = fetch_profile().await?;
+```
+
+동기 클로저의 `move` 키워드와 동일한 의미입니다.
+
+### Web Framework Middleware 패턴
+
+Axum 또는 Actix-web에서 비동기 로직을 인수로 전달하는 패턴도 간결해집니다.
+
+```rust
+async fn with_timeout<F, T>(duration: Duration, operation: F) -> Option<T>
+where
+    F: AsyncFn() -> T,
+{
+    tokio::time::timeout(duration, operation()).await.ok()
+}
+
+// 핸들러에서 사용
+let result = with_timeout(Duration::from_secs(5), async || {
+    external_api.fetch(request_id).await
+}).await;
+```
+
+## 새로운 Trait 계층
+
+세 가지 새로운 Trait이 Async Closure의 변형을 다룹니다.
+
+```rust
+// 캡처한 상태를 불변 참조로 빌림
+trait AsyncFn<Args>: AsyncFnMut<Args> { ... }
+
+// 캡처한 상태를 가변 참조로 빌림
+trait AsyncFnMut<Args>: AsyncFnOnce<Args> { ... }
+
+// 클로저를 소비
+trait AsyncFnOnce<Args> { ... }
+```
+
+Generic 함수를 작성할 때는 가장 덜 제한적인 Bound를 선택하는 것이 좋습니다.
+
+```rust
+// AsyncFn 대신 AsyncFnMut를 선택 (더 유연)
+async fn process_items<F>(items: Vec<String>, mut f: F) -> Vec<String>
+where
+    F: AsyncFnMut(String) -> String,
+{
+    let mut results = Vec::new();
+    for item in items {
+        results.push(f(item).await);
+    }
+    results
+}
+```
+
+## 기존 코드와의 호환성
+
+Async Closure는 추가적 기능이므로 기존 코드는 변경 없이 컴파일됩니다. `Box::pin` 패턴도 계속 동작하므로 즉시 전면 마이그레이션할 필요는 없습니다. 새로 작성하는 코드에는 Async Closure를 사용하고, 기존 코드는 해당 부분을 수정할 때 자연스럽게 이전하면 됩니다.
+
+참고: Rust 1.83의 `clippy`는 `Box::pin(async move { ... })`를 Async Closure로 단순화할 수 있는 경우를 감지하는 Lint를 추가했습니다.
+
+## webhani의 관점
+
+Async Closure 안정화는 Async Rust의 마지막 주요 에르고노믹스 격차 중 하나를 해소합니다. Tokio와 Axum으로 Backend 서비스를 구축하는 팀은 특히 Middleware와 스트림 처리 코드에서 보일러플레이트 감소를 체감할 수 있습니다.
+
+Rust를 새 Backend 프로젝트에 검토 중인 팀에게: 이 변화가 Rust의 학습 곡선을 없애지는 않지만, "개념적으로 쉬운데 타입 지식이 많이 필요한" 문제의 범주를 의미 있게 줄입니다. Async Rust가 Go나 JavaScript의 비동기 코드 사고 방식에 더 가까워지면서도 Rust의 안전 보장은 그대로 유지됩니다.
+
+기존 Async Rust 코드를 유지보수하고 있다면 마이그레이션 경로는 점진적입니다. Breaking Change가 없으므로 가독성이 개선되는 곳에서 새 패턴을 채택하면 됩니다.
+
+## 핵심 정리
+
+- Rust 1.83에서 `async |args| { ... }` 구문 안정화 — `Box::pin` 보일러플레이트 불필요
+- `AsyncFn`, `AsyncFnMut`, `AsyncFnOnce` Trait으로 Generic 고차 비동기 함수 작성 가능
+- 스트림 처리, Retry 유틸리티에서 즉각적인 효과
+- 완전한 하위 호환성 — 점진적 마이그레이션 가능
