@@ -1,156 +1,146 @@
 ---
-title: "React Compiler 2026: useMemo와 useCallback이 Legacy가 되는 시대"
-description: "React Compiler v1.0 안정화 이후 수동 Memoization의 필요성이 줄어들고 있습니다. 실무에서 무엇이 달라지는지 정리합니다."
-date: "2026-03-25"
+title: "React Compiler 실전: useMemo와 useCallback을 놓아주는 시대"
+description: "React Compiler v1.0 채택이 2026년에 가속화되고 있습니다. 수동 useMemo와 useCallback은 Legacy 패턴이 되어가고 있습니다. Compiler의 동작 원리와 기존 Codebase 도입 방법을 정리합니다."
+date: "2026-04-28"
 status: "published"
-tags: ["React", "React Compiler", "Frontend", "Performance", "TypeScript"]
+tags: ["React", "TypeScript", "performance", "web-development", "compiler"]
 thumbnail: ""
 author: "webhani"
 slug: "react-compiler-auto-memoization"
 ---
 
-2025년 10월 React Compiler v1.0이 안정 버전으로 출시된 지 약 6개월이 지났습니다. 2026년 초 개발 커뮤니티는 예고된 변화를 확인하고 있습니다. `useMemo`, `useCallback`, `React.memo`를 직접 작성하는 것이 대부분의 Component에서 불필요해졌습니다. 이는 React 코드를 작성하고 검토하는 방식에 실질적인 변화를 가져옵니다.
+React Compiler v1.0은 2025년 10월에 출시되었습니다. 2026년 초에는 React 19를 사용하는 신규 프로젝트의 표준 설정이 되어가고 있습니다. 실질적인 변화는 `useMemo`, `useCallback`, `React.memo` — 수년간 React 개발자의 통과의례였던 수동 Performance 최적화 도구들 — 이 점점 Legacy Pattern으로 취급되고 있다는 점입니다.
 
-## React Compiler가 하는 일
+이 글에서는 Compiler의 동작 원리, 기존 Codebase에서 안전하게 제거할 수 있는 코드, 그리고 여전히 수동 개입이 의미 있는 상황을 살펴보겠습니다.
 
-React Compiler는 Build 시점에 동작하는 Babel Plugin으로, Component 코드를 정적으로 분석하여 Memoization을 자동으로 삽입합니다. React의 규칙(순수 Render 함수, 안정적인 Reference, 의존성 추적)을 이해하고, 이전에는 개발자가 직접 작성하던 최적화를 Build 단계에서 처리합니다.
+## Compiler가 하는 일
 
-```tsx
-// 개발자가 작성하는 코드
-function ProductList({ products, onAddToCart }: Props) {
-  const filtered = products.filter(p => p.inStock);
+React Compiler는 Build 시 실행되는 Babel/SWC Plugin입니다. Component와 Hook을 정적으로 분석하고, 자동으로 Memoize해도 안전한 값을 식별한 후, 컴파일된 출력에 `useMemo`/`useCallback`에 해당하는 처리를 삽입합니다 — 개발자의 Annotation 없이도요.
 
-  return (
-    <ul>
-      {filtered.map(product => (
-        <ProductItem
-          key={product.id}
-          product={product}
-          onAdd={onAddToCart}
-        />
-      ))}
-    </ul>
-  );
-}
+Compiler가 분석하는 대상:
+- Props와 State에만 의존하는 순수한 계산
+- Event Handler나 Dependency로 전달되는 안정적인 Function Reference
+- 관련 없는 State 변경 시 재Render가 불필요한 Component Subtree
 
-// Compiler가 Build 시점에 자동으로 처리하는 것:
-// - products가 변경되지 않으면 filtered 계산을 Memoize
-// - 자식 Component에 전달하는 onAddToCart Reference 안정화
-// - 두 Props 모두 변경되지 않으면 ProductItem 재렌더링 방지
-```
+핵심은 React의 Rule을 따르는 코드(순수한 Rendering, Render 내 Side Effect 없음)라면 Compiler가 이를 정확하게 판단할 수 있다는 점입니다. Type System이나 Annotation 없이 코드 구조에서 추론합니다.
 
-직접 `useMemo`, `useCallback`, `React.memo`를 작성할 필요가 없습니다.
+## Before / After
 
-## 실제 코드의 변화
+React Compiler 도입 전 일반적인 패턴:
 
-Compiler 이전의 성능 최적화된 React 코드:
-
-```tsx
-// Compiler 이전 방식 (2024년 스타일)
-function ProductList({ products, onAddToCart }: Props) {
-  const filtered = useMemo(
-    () => products.filter(p => p.inStock),
+```typescript
+function ProductList({ products, onSelect }: Props) {
+  const sortedProducts = useMemo(
+    () => [...products].sort((a, b) => a.name.localeCompare(b.name)),
     [products]
   );
 
-  const handleAdd = useCallback(
-    (id: string) => onAddToCart(id),
-    [onAddToCart]
+  const handleSelect = useCallback(
+    (id: string) => onSelect(id),
+    [onSelect]
   );
 
   return (
     <ul>
-      {filtered.map(product => (
-        <MemoizedProductItem
-          key={product.id}
-          product={product}
-          onAdd={handleAdd}
-        />
+      {sortedProducts.map((p) => (
+        <ProductItem key={p.id} product={p} onSelect={handleSelect} />
       ))}
     </ul>
   );
 }
 ```
 
-Compiler를 활용하면 Annotation 없이 동일한 Component를 작성할 수 있습니다:
-
-```tsx
-// 2026년 스타일 — 로직에 집중, 최적화는 Compiler에게
-function ProductList({ products, onAddToCart }: Props) {
-  const filtered = products.filter(p => p.inStock);
-
-  return (
-    <ul>
-      {filtered.map(product => (
-        <ProductItem
-          key={product.id}
-          product={product}
-          onAdd={onAddToCart}
-        />
-      ))}
-    </ul>
-  );
-}
-```
-
-코드량이 줄고, 의존성 배열 실수(흔한 React Bug의 원인)가 사라지며, 가독성이 높아집니다.
-
-## 여전히 주의가 필요한 부분
-
-Compiler가 모든 최적화 문제를 해결하는 것은 아닙니다.
-
-**부작용이 있는 계산**: 파생 값 계산에 Side Effect(외부 Store 쓰기, Analytics Event 트리거 등)가 포함된 경우 Compiler는 안전을 위해 최적화를 건너뜁니다. 이런 케이스는 명시적으로 구조화가 필요합니다.
-
-**Third-party Library Hook**: Zustand, Jotai, TanStack Query 등 주요 Library는 Compiler 호환성을 확인했습니다. 오래된 Custom Hook이 많은 기존 코드베이스는 Compiler 활성화 후 예상치 못한 재렌더링이 발생하는지 검토가 필요합니다.
-
-**성능 측정 습관 유지**: Compiler가 특정 종류의 성능 문제를 해결해 주지만, 아키텍처 문제(과도한 데이터 Fetch, 깊은 Component 트리, 과도한 상태 구독)는 여전히 개발자의 책임입니다. React DevTools Profiler를 계속 활용하세요.
-
-## Compiler 활성화 방법
-
-Next.js 16에서는 기본적으로 활성화되어 있습니다. 명시적으로 설정하려면:
+React Compiler를 활성화하면 컴파일된 출력이 Memoization을 담당합니다. Source는 다음과 같이 됩니다:
 
 ```typescript
-// next.config.ts
-import type { NextConfig } from 'next';
+function ProductList({ products, onSelect }: Props) {
+  const sortedProducts = [...products].sort((a, b) =>
+    a.name.localeCompare(b.name)
+  );
 
-const nextConfig: NextConfig = {
+  return (
+    <ul>
+      {sortedProducts.map((p) => (
+        <ProductItem key={p.id} product={p} onSelect={onSelect} />
+      ))}
+    </ul>
+  );
+}
+```
+
+Performance 특성은 동일합니다. Source의 노이즈가 크게 줄어듭니다.
+
+## React Compiler Setup
+
+```bash
+npm install --save-dev babel-plugin-react-compiler
+```
+
+```json
+// babel.config.json
+{
+  "plugins": ["babel-plugin-react-compiler"]
+}
+```
+
+Next.js 15 이상에서는 `next.config.ts`에 기본 내장되어 있습니다:
+
+```typescript
+import type { NextConfig } from "next";
+
+const config: NextConfig = {
   experimental: {
     reactCompiler: true,
   },
 };
 
-export default nextConfig;
+export default config;
 ```
 
-기존 프로젝트에서 단계적으로 적용하려면 Annotation Mode를 사용합니다:
+Compiler는 기본적으로 Opt-in 모드로 동작합니다. 안전하게 최적화할 수 있는 Component만 처리하며, React의 Rule을 위반하는 Component는 건너뜁니다 — 앱이 깨지지 않습니다.
+
+## 기존 Codebase에서 제거할 수 있는 것
+
+기존 Codebase에 도입할 때의 현실적인 절차:
+
+1. Compiler를 활성화하고 Test Suite 실행 — 문제가 없는지 확인
+2. React Compiler의 ESLint Plugin으로 불필요한 수동 Memoization을 감지:
+
+```bash
+npm install --save-dev eslint-plugin-react-compiler
+```
+
+3. Props와 State에만 의존하는 순수 계산을 감싸는 `useMemo` 제거
+4. 컴파일된 Child Component에 전달되는 Handler의 `useCallback` 제거
+5. Compiler가 자동으로 처리하는 Component의 `React.memo` 제거
+
+수동 Memoization을 유지해야 하는 경우:
+- 참조 안정성이 필요한 외부 Library 연동 (복잡한 Chart Configuration 등)
+- 의도적으로 지연되는 무거운 계산 (On-demand 데이터 변환 등)
+- `"use no memo"` Directive로 Opt-out한 Component
+
+## Opt-out이 필요한 경우
+
+의도적으로 비순수한 동작을 하는 Component를 위한 Escape Hatch:
 
 ```typescript
-// next.config.ts — Component별 선택적 적용
-const nextConfig: NextConfig = {
-  experimental: {
-    reactCompiler: {
-      compilationMode: 'annotation',
-    },
-  },
-};
-```
-
-그런 다음 개별 Component 상단에 `"use memo"`를 추가해 선택적으로 최적화를 활성화합니다:
-
-```tsx
-"use memo";
-
-function MyComponent({ data }: Props) {
-  // Compiler 최적화가 이 Component에 적용됨
+function LegacyWidget({ data }: Props) {
+  "use no memo";
+  // 이 Component는 Compiler의 최적화 대상에서 제외됩니다.
+  // 특수한 참조 요구사항이 있는 Third-party 연동에 사용하세요.
 }
 ```
 
-이 방식으로 신뢰가 쌓이면 전체 프로젝트로 확장할 수 있습니다.
+## 실제 이점
 
-## 정리
+수동 Memoization을 제거하는 가장 큰 이점은 Raw Performance보다 가독성과 인지 부하 감소입니다. `useMemo`가 5개, `useCallback`이 3개 있는 Component는 읽는 사람이 Dependency Array를 추적하고 각 값의 재계산 시점을 추론해야 합니다.
 
-신규 프로젝트는 Memoization Annotation 없이 간단하게 Component를 작성하고 Compiler에 맡기는 방식을 권장합니다. React DevTools Profiler로 Regression이 없는지 확인하세요.
+Compiler가 이를 처리하면, Component 코드는 "어떻게 최적화할지"가 아니라 "무엇을 Render할지"를 표현하는 방향으로 돌아옵니다. 이는 버그 발생 가능성이 있는 Surface Area의 유의미한 감소입니다.
 
-기존 프로젝트는 서두를 필요가 없습니다. Annotation Mode로 먼저 활성화하여 몇 개의 Component를 검증한 후, 확신이 생기면 전체 적용을 고려하세요. 기존의 `useMemo`와 `useCallback`은 Compiler와 공존할 수 있으며, 단지 중복될 뿐입니다.
+## 요약
 
-가장 큰 이점은 코드 감소뿐만 아니라, 신규 개발자가 올바른 React를 작성하기 위한 전제 조건으로 `useMemo` 사용 시점을 학습할 필요가 없어진다는 점입니다. 인지적 부담이 줄고 Component가 로직 중심으로 읽기 쉬워집니다.
+- React Compiler v1.0은 Production 준비 완료, React 19 신규 프로젝트의 표준 경로로
+- React의 Rule을 따르는 Component에 대해 Memoization을 자동으로 처리
+- `useMemo`, `useCallback`, `React.memo`는 Edge Case에서 여전히 유효 — 단, 기본값이어선 안 됨
+- 기존 Codebase 도입은 ESLint Plugin과 Test Suite를 활용해 점진적으로 진행
+- 주요 이점은 더 깔끔하고 읽기 쉬운 코드 — Performance는 유지됨

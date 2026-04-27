@@ -1,0 +1,117 @@
+---
+title: "KubernetesとMCPサーバー：AI駆動のCluster管理が2026年に見せる実像"
+description: "DevOps MCP Serverを使うと、AIAgentが自然言語のPromptでKubernetes Clusterを照会・操作できるようになります。このPatternが今日可能にすることと、安全に扱う方法を整理します。"
+date: "2026-04-28"
+status: "published"
+tags: ["DevOps", "Kubernetes", "MCP", "AI", "cloud-infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "mcp-servers-kubernetes-devops"
+---
+
+Model Context Protocol（MCP）は、AIアシスタントのIntegrationからInfrastructure Toolingへと領域を広げています。2026年には、AI AgentがKubernetes Clusterに直接アクセスできるDevOps MCP Serverのカテゴリが成長しています。「このPodはなぜFailing？」「今週最も多くRestartしたDeploymentは？」といった自然言語による照会が、手動の`kubectl`コマンドなしで可能になっています。
+
+本記事では、DevOps MCP Serverとは何か、既存のKubernetes WorkflowにどのようにFitするか、そしてこのPatternが本当に価値を発揮する場面と、注意すべき場面を整理します。
+
+## MCPとDevOpsにおける意義
+
+MCPは、AI AgentがExternal ToolやData Sourceに接続する方法を標準化するOpen Protocolです。MCP Serverは、AI ModelがConversationやAgentic Workflowの中でInvokeできる一連のOperation（Tool CallとResource Read）を公開します。
+
+Kubernetesに適用すると、MCP ServerはKubernetes APIへのStructured Interfaceとして機能します。`kubectl`コマンドを書いたりYAML Manifestを手動でParseしたりする代わりに、AI Agentは`list_pods`、`get_events`、`describe_deployment`、`get_logs`といったMCP Toolを呼び出し、ServerがAPI Interactionを処理します。
+
+価値は利便性だけではありません。AI ModelがCluster StateをReasoning能力と組み合わせられることです。「このPodはなぜFailing？」と聞くと、MCP Serverが関連するEvent、Log、Resource Statusを取得します。Modelはそのデータを統合して一貫した診断を生成します——通常であれば複数の`kubectl`コマンドと手動の相関分析が必要な作業です。
+
+## 実際のワークフロー例
+
+ClusterにConnectされたMCP Serverを前提に、Claude Codeなどのクライアント内でのWorkflowは次のようになります:
+
+```
+User: stagingのapi-serviceのDeploymentが20分間Crashloopしています。何が起きていますか？
+
+Model: [get_pod_events("api-service-*", namespace="staging")を呼び出し]
+       [get_pod_logs("api-service-7f8d9b", namespace="staging", tail=50)を呼び出し]
+       [describe_deployment("api-service", namespace="staging")を呼び出し]
+
+Model: api-serviceのPodはOOMKilledシグナルで失敗しています。
+       Memory Requestは256Miに設定されていますが、
+       直近3回のRestart cycleでは一貫して400Miを超えています。
+       23分前の最新RolloutでResource Limitが厳しく設定されました。
+       推奨: Memory Limitを512Miに増やすか、Memory使用量の増加をProfilingしてください。
+```
+
+OOMKillシグナル、Logの出力、最近のDeployment変更を結びつけるこの相関分析は、通常数分の手動調査が必要です。MCPPatternはそれを1つのPromptに短縮します。
+
+## Kubernetes MCP ServerのSetup
+
+複数のOpen Source Kubernetes MCP Serverが利用可能です。Helmベースのサーバーを使った典型的なSetup:
+
+```bash
+helm repo add mcp-k8s https://charts.mcp-k8s.io
+helm install mcp-k8s mcp-k8s/mcp-k8s \
+  --namespace mcp-system \
+  --create-namespace \
+  --set rbac.readOnly=true
+```
+
+MCPクライアント（Claudeの`mcp_settings.json`など）での設定:
+
+```json
+{
+  "mcpServers": {
+    "kubernetes": {
+      "command": "kubectl",
+      "args": ["mcp-proxy", "--namespace", "production"],
+      "env": {
+        "KUBECONFIG": "/path/to/kubeconfig"
+      }
+    }
+  }
+}
+```
+
+## Access Control：まずRead-Onlyから
+
+最も重要な運用上の考慮事項はAccess Scopeです。Full ClusterのWrite権限を持つMCP ServerをAI Agentに接続することは、重大なRiskを生みます——ModelがNamespaceの削除、DeploymentのScale Down、RBACの変更を行うよう促される可能性があります。
+
+安全なDefaultのPattern:
+
+1. MCP ServerのService AccountにはRead-Only RBACから始める
+2. ユースケースに関連する特定のNamespaceにScopeを絞る
+3. 低Risk操作（ReplicaのScale、Deploymentの再起動）のみWrite Operationを追加し、明示的なConfirmationステップを設ける
+4. 破壊的な操作（削除、Namespace全体の変更）はMCP Serverから完全に除外する
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mcp-k8s-readonly
+rules:
+  - apiGroups: ["", "apps", "batch"]
+    resources: ["pods", "deployments", "services", "events", "replicasets", "jobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+```
+
+## このPatternが効果を発揮する場面
+
+Operational調査のユースケースが最も明確な勝ちどころです：Crashloopの診断、Rollout失敗の把握、リソース間のEvent相関分析。これらはRead Heavyで時間的制約があるタスクであり、Cluster StateとReasoningを組み合わせる能力が真に価値を持ちます。
+
+Resource Utilization ReviewもStrong UseCaseです——実際の使用データに基づいてUnder-Resourcedまたは過剰ProvisioningのWorkloadを特定し、調整案を提案させる使い方です。
+
+OnboardingとDocumentationはより軟らかい勝ちどころです：新メンバーが`kubectl`の全Surface Areaを即座に習得せずとも、自然言語でCluster Stateを照会できます。
+
+## 注意すべき場面
+
+明示的なConfirmationなしの自動Write Operation——一見安全に見えるものでも——は共有Clusterで重大なRiskを持ちます。現時点での適切な境界は、AIをIntelligent Query Interfaceとして使い、変更はHumanが承認することです。
+
+本番環境のMCP Server CallのAudit LoggingはEssentialです。ユーザー、Operation、Parameterを含めたすべてのTool Invocationをログに記録する——Privileged API Accessに適用するのと同じ基準です。
+
+## まとめ
+
+- DevOps MCP ServerはAI AgentにKubernetes Cluster StateへのStructured Accessを提供する
+- 主な価値はEvent、Log、Resource Stateを相関分析して実行可能な診断を生成すること
+- Read-Only RBACとNamespace-Scope AccessからStart；Write OperationはConfirmationステップとともに段階的に追加する
+- MCP Tool CallのAudit Loggingは本番Cluster利用前に必須
+- このPatternは調査時間を大幅に短縮するが、修正対応のOperator判断を代替するものではない

@@ -1,0 +1,84 @@
+---
+title: "Claude Opus 4.7: SWE-bench 87.6%가 AI 코딩 지원에 의미하는 것"
+description: "2026년 4월 출시된 Claude Opus 4.7은 SWE-bench Verified에서 87.6%를 달성하며 Claude Code의 기본 모델이 되었습니다. 이 수치가 실제 개발 워크플로우에 어떤 변화를 가져오는지 정리합니다."
+date: "2026-04-28"
+status: "published"
+tags: ["AI", "Claude", "LLM", "coding-assistant", "SWE-bench"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-opus-47-swebench-2026"
+---
+
+2026년 4월 16일, Anthropic이 Claude Opus 4.7을 출시했습니다. 일주일 후인 4월 23일에는 Claude Code의 기본 모델로 채택되었습니다. 핵심 수치는 SWE-bench Verified에서의 87.6% 점수입니다. 이 Benchmark는 모델이 실제 GitHub Issue를 자율적으로 해결할 수 있는지를 평가합니다.
+
+숫자만으로는 와닿지 않을 수 있으므로, 이 글에서는 SWE-bench가 실제로 무엇을 측정하는지, Opus 4.7의 점수가 갖는 의미, 그리고 일상적인 개발 워크플로우에 미치는 영향을 구체적으로 살펴보겠습니다.
+
+## SWE-bench가 측정하는 것
+
+SWE-bench Verified는 모델에게 실제 GitHub Issue와 Repository Context를 제공합니다. 모델은 Issue를 해결하는 코드를 작성하고, 기존 Test Suite를 통과시키며, 관련 없는 Test를 깨뜨리지 않아야 합니다. 중간에 사람의 개입은 없습니다.
+
+87.6%라는 수치는 약 10건 중 9건의 엔지니어링 Task를 자율적으로 해결한다는 의미입니다. 더 어려운 SWE-bench Pro에서는 64.3%를 기록하며, 공개 모델 중 1위를 유지하고 있습니다.
+
+평가에는 Django, scikit-learn, sympy, astropy 등 실제 운영 환경에서 사용되는 Python Open Source Repository가 활용됩니다. Codebase 이해, Test Infrastructure 파악, 정확한 Patch 작성이 요구되는 실무적인 문제들입니다.
+
+## Agentic Mode와 일상적인 변화
+
+Benchmark 성능은 Claude Code에 위임할 수 있는 Task 범위가 확장됨을 의미합니다. 기존에는 "Agent에게 맡긴다"는 것이 국소적이고 명확한 스코프의 Task에만 효과적이었습니다. Opus 4.7에서는 그 상한선이 크게 높아졌습니다.
+
+실제로 변화를 체감하기 쉬운 케이스:
+
+- **Module 경계를 넘는 다중 파일 Refactor**: 수정 라운드 수가 감소
+- **Debugging**: Stack Frame을 추적하고, Root Cause를 파악해 Fix를 작성 — "무엇이 잘못됐는지 설명"에서 벗어남
+- **Test 생성**: 구현 코드를 읽고 Edge Case를 추론해 명시적인 지시 없이 Test를 작성
+
+중요한 주의사항도 있습니다. SWE-bench는 "정확성"을 측정하지 "판단력"은 측정하지 않습니다. Task 경계가 불명확하거나 Test가 없는 복잡한 Monolith에서 작업하는 Agent는 여전히 어려움을 겪습니다.
+
+## Claude Mythos와 Security Research
+
+2026년 4월 7일, Anthropic은 Claude Mythos를 11개 조직에 프리뷰로 제공해 Cybersecurity 취약점 조사에 활용했습니다. Mozilla는 Mythos를 사용해 2주 만에 Firefox의 271개 취약점을 발견하고 패치했습니다.
+
+이는 중요한 패턴을 보여줍니다. LLM이 범용 Assistant가 아닌, 제한된 도메인에서 고정밀 Analysis Tool로 기능하는 영역이 확장되고 있습니다. Security Review, Formal Verification, Compliance Checking이 그 대표적인 사례입니다.
+
+## 실제 Integration
+
+Claude Code를 사용하는 팀은 기본값이 Opus 4.7로 변경된 것에 대한 별도 설정 변경이 필요하지 않습니다. 개선 사항은 자동으로 적용됩니다.
+
+API를 직접 사용하는 팀의 경우:
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+const response = await client.messages.create({
+  model: "claude-opus-4-7",
+  max_tokens: 4096,
+  messages: [
+    {
+      role: "user",
+      content:
+        "이 함수의 처리되지 않은 Edge Case를 찾아주세요:\n\n```typescript\nfunction parseDate(input: string): Date {\n  const parts = input.split('-');\n  return new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));\n}\n```",
+    },
+  ],
+});
+
+console.log(response.content[0]);
+```
+
+API Surface는 이전 Opus와 동일하며, 코드 분석 및 생성 Task에서 특히 명확한 개선이 나타납니다.
+
+## 앞으로 주목할 점
+
+Pricing(Input $5 / Output $25, 100만 Token)은 이전 세대와 동일합니다. 14개 Benchmark 중 12개에서 1위를 차지하면서도 가격이 유지된다는 점은 경쟁 모델들에게 압박이 되고 있습니다.
+
+2026년 AI Tooling을 평가하는 팀들에게, 질문은 "이게 작동하나요?"에서 "검토 및 수정 Overhead를 얼마나 줄일 수 있나요?"로 바뀌었습니다. Opus 4.7은 그 지표를 이전 어떤 릴리스보다 더 크게 움직이고 있습니다.
+
+## 요약
+
+- Claude Opus 4.7은 SWE-bench Verified에서 87.6% — 공개 모델 중 최고 점수
+- 2026년 4월 23일부터 Claude Code의 기본값으로, 설정 변경 불필요
+- 다중 파일 Refactor, Debugging, Test 생성에서 특히 효과를 체감하기 쉬움
+- Benchmark는 정확성을 측정 — 실무 성과는 Codebase 품질과 Task 정의 명확성에 달려 있음
+- Pricing은 이전 세대와 동일
+
+SWE-bench가 AI 협력자에게 원하는 모든 것을 완벽하게 대변하지는 않습니다. 하지만 87.6%라는 수치는 자율적인 코딩 Task의 신뢰성 상한선이 다시 높아졌음을 보여주는 의미 있는 신호입니다.
