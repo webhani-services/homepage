@@ -1,0 +1,141 @@
+---
+title: "Kubernetes v1.36과 AWS의 '보이지 않는 K8s' 전략"
+description: "4월 말 출시 예정인 Kubernetes v1.36 주요 변경 사항과 KubeCon Europe 2026에서 AWS가 제시한 Karpenter·Kro·Cedar 기반 복잡성 해소 접근법을 정리합니다."
+date: "2026-04-26"
+status: "published"
+tags: ["Kubernetes", "AWS", "Cloud", "DevOps", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-v136-simplification-2026"
+---
+
+Kubernetes v1.36이 4월 말 출시될 예정입니다. 다수의 기능 강화와 함께 일부 기능 삭제·비권장화도 포함되어 있습니다. 같은 시기 개최된 KubeCon CloudNativeCon Europe 2026에서 AWS의 Jesse Butler는 "복잡성에서 명확성으로 — Kubernetes를 보이지 않게 만들기"라는 키노트를 발표하며, Karpenter·Kro·Cedar를 조합한 운영 복잡성 해소 전략을 제시했습니다.
+
+## Kubernetes v1.36 주요 변경 사항
+
+공식 릴리즈 노트는 출시 시점에 확정되지만, 업그레이드 전 확인이 필요한 핵심 포인트를 미리 살펴봅니다.
+
+**API 삭제 및 비권장화**
+
+Kubernetes는 매 릴리즈 사이클마다 오래된 API 버전과 비권장 기능을 정리합니다. 클러스터에서 구버전 API를 사용 중이라면 업그레이드 전에 마이그레이션이 필요합니다. 사전 점검은 간단합니다.
+
+```bash
+# Manifest 파일에서 비권장 API 사용 여부 확인
+pluto detect-files -d ./manifests
+
+# 또는 현재 클러스터에 배포된 리소스 확인
+kubectl get --raw /apis | jq '.groups[].versions[].groupVersion' | sort
+```
+
+**기능 강화 규모**
+
+공식 설명에서 "인상적인 수의 기능 강화"가 포함되었다고 밝혔습니다. SIG별 세부 변경 사항은 최종 Changelog 공개 후 확인하는 것을 권장합니다.
+
+## '보이지 않는 Kubernetes'란 무엇인가
+
+Butler의 발표 핵심은 명확합니다. Kubernetes는 컨테이너 오케스트레이션에서 진정한 가치를 제공하지만, 학습 비용과 운영 복잡성이 비즈니스 가치 실현을 지연시킨다는 문제의식입니다.
+
+AWS가 제시한 해법은 Karpenter + Kro + Cedar의 세 가지 도구 조합입니다. 각각 서로 다른 복잡성 계층을 담당합니다.
+
+### Karpenter — 노드 관리 추상화
+
+Karpenter는 워크로드 요구 사항에 따라 최적의 노드를 자동으로 프로비저닝합니다. 기존 Cluster Autoscaler와 달리 사전에 Node Group을 설정할 필요가 없으며, 실제 Pod 스케줄링 요구에서 역산하여 인스턴스 타입을 선택합니다.
+
+```yaml
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+  limits:
+    cpu: "1000"
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
+```
+
+이 설정만으로 Karpenter가 최적의 EC2 인스턴스를 자동 선택하고 유휴 노드를 통합하여 비용을 최소화합니다. 엔지니어는 Node Group 관리 대신 워크로드 요구 사항 정의에 집중할 수 있습니다.
+
+### Kro — 다중 리소스 배포 추상화
+
+Kro(Kubernetes Resource Orchestrator)는 여러 Kubernetes 리소스를 하나의 커스텀 리소스로 정의·배포할 수 있게 해주는 오케스트레이터입니다. Platform Engineering 팀이 `WebApp`이라는 상위 수준 CRD를 한 번 정의해두면, 애플리케이션 개발자는 내부의 Deployment·Service·HPA·NetworkPolicy를 신경 쓰지 않아도 됩니다.
+
+```yaml
+apiVersion: kro.run/v1alpha1
+kind: ResourceGroup
+metadata:
+  name: webapp
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: WebApp
+    spec:
+      image: { type: string }
+      replicas: { type: integer, default: 2 }
+  resources:
+    - id: deployment
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        spec:
+          replicas: ${schema.spec.replicas}
+          # ...
+    - id: service
+      template:
+        apiVersion: v1
+        kind: Service
+        # ...
+```
+
+보안 정책, 리소스 제한 등 Platform이 강제해야 하는 모범 사례가 ResourceGroup에 내재화되어 팀별로 따로 설정할 필요가 없어집니다.
+
+### Cedar — 접근 정책의 가독성 확보
+
+Cedar는 인가 규칙을 감사 가능하고 검증 가능한 형식으로 표현하는 정책 언어입니다. Kubernetes에 적용하면 복잡해진 RBAC 설정을 명확하게 표현할 수 있습니다. 누가 무엇을 할 수 있는지 정책의 의도가 명시적으로 드러나므로 보안 리뷰가 훨씬 용이해집니다.
+
+## 2026년 Kubernetes 운영의 현실
+
+KubeCon Europe 2026에서 드러난 두 가지 주요 트렌드:
+
+**GitOps가 표준 배포 모델로 정착**
+
+Git 리포지토리를 클러스터 상태의 단일 진실 공급원(Single Source of Truth)으로 사용하는 GitOps는 2026년에 "고급 사례"에서 "표준 운영 절차"로 정착했습니다. ArgoCD와 Flux가 주요 구현체로 자리 잡았으며, 인프라 변경도 애플리케이션 코드와 동일한 Pull Request 리뷰 워크플로우를 거칩니다.
+
+**Docker + Kubernetes + Wasm 공존**
+
+"Docker냐 Kubernetes냐"라는 대립적 논의는 이미 과거의 일입니다. 2026년의 현실에서는 개발 환경에 Docker, 운영 오케스트레이션에 Kubernetes, 엣지·경량 워크로드에 WebAssembly를 조합하는 구성이 일반적입니다. 각자의 강점 영역에서 활용하는 것이 정답입니다.
+
+## v1.36 업그레이드 실전 체크리스트
+
+v1.36 업그레이드를 계획하고 있다면:
+
+```bash
+# 1. 업그레이드 전 비권장 API 사용 여부 확인
+pluto detect-files -d ./k8s-manifests
+pluto detect-helm -A  # 모든 네임스페이스의 Helm Release 확인
+
+# 2. Helm Chart의 구버전 API 사용 여부 확인
+helm list --all-namespaces -o json | \
+  jq -r '.[] | [.name, .namespace, .chart] | @csv'
+
+# 3. EKS의 경우: Control Plane 먼저 업그레이드 후 Node Group 업그레이드
+# Control Plane 업그레이드는 노드 드레인 없이 진행 가능
+# Node Group 업데이트: Rolling Update 전략 적용 권장
+```
+
+EKS·GKE·AKS 같은 Managed Kubernetes 서비스를 사용하면 Control Plane 업그레이드의 복잡성 대부분이 처리되지만, 업그레이드 전환 구간에서 Control Plane과 노드 버전 간 API 호환성에는 여전히 주의가 필요합니다.
+
+## 정리
+
+Kubernetes v1.36은 플랫폼의 꾸준한 성숙을 보여주는 릴리즈입니다. KubeCon에서 더 주목해야 할 흐름은 Platform Engineering의 방향성입니다. Karpenter가 노드 관리를 정책 관심사로 축소하고, Kro가 애플리케이션 팀을 위한 상위 수준 추상화를 제공하며, Cedar가 접근 제어 정책을 명시적이고 감사 가능하게 만듭니다.
+
+결과적으로 애플리케이션 개발자가 Kubernetes 전문가가 되지 않아도 배포할 수 있는 환경이 만들어집니다. 복잡성이 사라지는 것이 아니라, 그것을 잘 관리할 수 있는 Platform Engineering 팀에 집중되는 것입니다. 이것이 '보이지 않는 Kubernetes'의 본질입니다.
