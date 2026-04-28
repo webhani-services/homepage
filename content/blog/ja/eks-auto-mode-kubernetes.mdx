@@ -1,0 +1,117 @@
+---
+title: "Amazon EKS Auto Mode: Kubernetes 運用の自動化が変える Platform Engineering"
+description: "AWS が KubeCon Europe 2026 で披露した EKS Auto Mode は、Node のライフサイクル管理を自動化し、Kubernetes 運用の複雑さを大幅に削減します。Karpenter・Kro・Cedar との連携も解説します。"
+date: "2026-04-20"
+status: "published"
+tags: ["Kubernetes", "AWS", "EKS", "DevOps", "PlatformEngineering"]
+thumbnail: ""
+author: "webhani"
+slug: "eks-auto-mode-kubernetes"
+---
+
+KubeCon CloudNativeCon Europe 2026 で、AWS の Jesse Butler が「Kubernetes を見えなくする」というビジョンを語りました。その中心にあるのが Amazon EKS Auto Mode です。
+
+Kubernetes の価値は認められている一方で、その運用コストの高さは長年の課題です。Node のプロビジョニング、スケーリング、セキュリティパッチ、ライフサイクル管理 — これらのインフラ管理に時間を取られ、本来の開発に集中できないチームは少なくありません。
+
+## EKS Auto Mode とは
+
+EKS Auto Mode は、Kubernetes の Node ライフサイクル全体を AWS が管理する仕組みです。従来の EKS では、ノードグループの設定やスケーリングポリシーの調整はユーザーの責任でした。Auto Mode ではこの部分を AWS が引き受けます。
+
+具体的に自動化される範囲：
+
+- **Node のプロビジョニングと終了**: ワークロードの要求に応じて適切なインスタンスタイプを自動選択・起動・廃棄
+- **OS パッチ適用**: Node の OS を常に最新のセキュリティパッチが当たった状態に保持
+- **コスト最適化**: スポットインスタンスとオンデマンドインスタンスの自動混在
+- **スケーリング**: Pod のリソース要求に基づく自動スケールアウト / スケールイン
+
+## Karpenter との関係
+
+EKS Auto Mode の Node プロビジョニングは Karpenter をベースにしています。Karpenter は AWS が開発したオープンソースの Kubernetes Node 自動プロビジョナーで、従来の Cluster Autoscaler より高速かつ柔軟なスケーリングを実現します。
+
+Auto Mode では Karpenter の設定を直接触る必要がなくなりますが、より細かい制御が必要な場合は `NodePool` や `EC2NodeClass` で挙動をカスタマイズできます。
+
+```yaml
+# Auto Mode 有効化: eksctl での設定例
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: my-cluster
+  region: ap-northeast-1
+autoMode:
+  enabled: true
+  # Node の自動管理を有効化
+  # Karpenter が自動でインストール・設定される
+```
+
+## Kro: Kubernetes リソースの抽象化
+
+Auto Mode と合わせて注目されているのが Kro（Kube Resource Orchestrator）です。Kro は複数の Kubernetes リソースを組み合わせて、ビジネスロジックに近い抽象化レイヤーを定義できるツールです。
+
+例えば「Web Application」という概念を Kubernetes リソースとして定義し、それを適用するだけで Deployment・Service・Ingress・HPA が一括で作成される — という使い方ができます。
+
+```yaml
+# Kro による ResourceGroup の定義例
+apiVersion: kro.run/v1alpha1
+kind: ResourceGroup
+metadata:
+  name: web-application
+spec:
+  schema:
+    spec:
+      image: string
+      replicas: integer | default=2
+      host: string
+  resources:
+    - id: deployment
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        spec:
+          replicas: ${schema.spec.replicas}
+          template:
+            spec:
+              containers:
+                - image: ${schema.spec.image}
+    - id: service
+      template:
+        apiVersion: v1
+        kind: Service
+    - id: ingress
+      template:
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        spec:
+          rules:
+            - host: ${schema.spec.host}
+```
+
+## Cedar: Policy as Code
+
+AWS は Cedar という Policy 言語も Kubernetes エコシステムに統合しています。Cedar は元々 AWS の IAM に使われていた言語で、宣言的かつ検証可能なアクセス制御ポリシーを記述できます。
+
+Kubernetes への統合により、RBAC では表現しにくかった複雑なアクセス制御（「本番環境のリソースは営業時間外に変更できない」など）を型安全な方法で定義できるようになります。
+
+## Platform Engineering チームへの影響
+
+EKS Auto Mode + Kro + Cedar の組み合わせが目指しているのは、インフラエンジニアの仕事の変化です：
+
+**Before**: Node 管理・スケーリング設定・セキュリティパッチ適用に多くの時間
+
+**After**: ビジネスロジックに近い抽象化の設計、開発チームへの Self-Service Platform 提供
+
+実際の移行で注意が必要なのは、Auto Mode は完全な制御を AWS に委ねることを意味するため、特殊なカーネル設定やカスタム AMI が必要な要件とは相性が悪い点です。汎用的なワークロードには適していますが、要件の棚卸しが先決です。
+
+## 移行検討のポイント
+
+既存の EKS クラスターからの移行を検討する際のチェックリスト：
+
+1. **カスタム AMI への依存がないか** — Auto Mode は AWS 管理の AMI を使用
+2. **特定の Node ラベルへの依存がないか** — スケジューリングロジックの見直しが必要な場合がある
+3. **DaemonSet の利用状況** — Auto Mode の Node には制約があるため確認が必要
+4. **コスト影響の試算** — スポットインスタンス活用でコスト削減が期待できるケースが多い
+
+## まとめ
+
+EKS Auto Mode は「インフラ管理をクラウドに任せ、開発者体験の向上に集中する」という方向性の具体化です。完全な制御を手放すことへの懸念はありますが、汎用的なワークロードであれば、運用コストの大幅な削減が期待できます。
+
+Kubernetes を採用しているが Node 管理に課題を感じているチームは、まず開発環境や非本番環境での Auto Mode 検証から始めることをお勧めします。

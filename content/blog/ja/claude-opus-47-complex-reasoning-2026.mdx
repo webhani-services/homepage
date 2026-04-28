@@ -1,0 +1,125 @@
+---
+title: "Claude Opus 4.7: 長時間 Agent Workflow が変わる理由"
+description: "2026年4月16日にリリースされた Claude Opus 4.7 は SWE-bench Verified で80.8%を達成。長時間実行の Agent タスクで顕著な改善が見られます。実際の開発への影響を解説します。"
+date: "2026-04-21"
+status: "published"
+tags: ["Claude", "Anthropic", "AI Agent", "LLM", "Agentic AI"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-opus-47-complex-reasoning-2026"
+---
+
+Anthropic は2026年4月16日、Claude Opus 4.7 をリリースしました。Opus 4 系列の最新 Flagship Model です。SWE-bench Verified では80.8%を記録し、GPT-5.4 の約80%をわずかに上回り、現時点で Software Engineering Benchmark のトップに立っています。
+
+ただし、Benchmark の数値だけで Upgrade の判断をするのは早計です。本記事では Opus 4.7 で実際に何が変わったのか、どの場面で効果があるのか、そして Agent システムへの組み込み方を整理します。
+
+## Opus 4.7 の主な変更点
+
+Anthropic は Opus 4.7 を「複雑な Reasoning」と「長時間実行の Agent Workflow」に特化した Model として位置づけています。実際の改善は大きく2点です。
+
+**長い Task 実行での一貫性向上**: 以前の Model では、Tool Call が10回を超えるあたりから、Task 開始時に設定した制約条件を Model が「忘れる」ような挙動が見られました。Opus 4.7 ではこの問題が大幅に改善されており、20〜30ステップのタスクでも一貫した推論が維持できます。
+
+**Tool Chaining の信頼性向上**: ファイルを読み込み → 内容を分析 → Patch を生成 → Test を実行という一連の流れで、中間ステップが予期しない結果を返したときでも、Opus 4.7 は文脈を保ちながら適切に回復できます。
+
+これらは劇的な能力の飛躍ではありませんが、Edge Case が積み重なる本番 Agent システムでは大きな差になります。
+
+## SWE-bench について
+
+SWE-bench Verified は、実際の GitHub Repository の Issue を解決する能力を測定する Benchmark です。80.8%という Score は、5件に4件以上の割合で実際に動作するコードを生成できることを意味します。これには「コードの記述」「正しいファイルの特定」「既存のテストスイートの通過」が含まれます。
+
+Opus 4.6 が65.3%（2026年初頭）だったことを考えると、Opus 4.7 の80.8%は単なるインクリメンタルな改善ではありません。特に「大規模な Codebase のナビゲーション」「既存の Convention の推測」「最小限の差分による修正」の3点で改善が顕著です。
+
+Claude Code や自社の Coding Agent を使っているチームにとっては、タスクの失敗率低下と人間による修正の頻度減少という形で直接恩恵を受けられます。
+
+## Long-Running Agent の実装例
+
+以下は Anthropic SDK を使った Multi-Step Coding Agent の基本構成です。
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+tools = [
+    {
+        "name": "read_file",
+        "description": "ファイルの内容を読み込む",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "読み込むファイルパス"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "write_file",
+        "description": "ファイルに内容を書き込む",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"}
+            },
+            "required": ["path", "content"]
+        }
+    },
+    {
+        "name": "run_tests",
+        "description": "Test Suite を実行して結果を返す",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "test_path": {"type": "string", "description": "Test ファイルのパス（省略可）"}
+            }
+        }
+    }
+]
+
+def run_coding_agent(task: str, context: dict) -> str:
+    messages = [{"role": "user", "content": task}]
+
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=8096,
+            tools=tools,
+            messages=messages
+        )
+
+        if response.stop_reason == "end_turn":
+            return response.content[-1].text
+
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                result = execute_tool(block.name, block.input, context)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result
+                })
+
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+```
+
+Agent Loop の継続条件を `stop_reason == "end_turn"` にすることで、Model が自分でタスク完了を判断するまで処理を続けます。Opus 4.7 はこのループで状態を正確に把握し続ける能力が向上しています。
+
+## Upgrade すべきか
+
+次のような Task を実行している場合は Opus 4.7 への移行を検討する価値があります。
+
+- **10回以上の連続 Tool Call** を必要とするタスク
+- **大規模 Codebase の横断的な修正**（複数ファイル間の依存関係の把握）
+- **中間ステップでの失敗からの自律的な回復**が必要なタスク
+
+一方、単一ファイルの編集、要約、シンプルな Q&A であれば、Sonnet 4.6 のほうがコスト効率は良好です。2026年4月時点での Claude Pricing は Sonnet 4 が $3/$15 per million tokens で、Opus 系は higher tier になります。ワークロードの複雑さに応じた Model 選択が重要です。
+
+## webhani の視点
+
+webhani では過去1年間、Client Engagement において Claude ベースの Coding Agent を運用してきました。Opus 4.7 の信頼性向上は実際に効果があります。以前は4〜5ステップごとに人間の確認が必要だった自動化 Workflow が、10〜12ステップまで人間の介入なしで安定稼働するようになりました。
+
+ただし、Benchmark Score を自分たちのユースケースに直接当てはめるのは危険です。SWE-bench が測定するタスクは明確な成功条件を持つ Well-defined な問題です。実際の Production Agent Tasks は境界が曖昧で、仕様が不完全なことが多い。そういった状況では、Model のバージョンよりもタスク分解の設計やフォールバック処理のアーキテクチャが最終的な品質を左右します。
+
+最も demanding な Agent Task には Opus 4.7 を採用し、それ以外は問題を確実に解ける範囲で最もコストの低い Model を選ぶ。この原則は変わりません。

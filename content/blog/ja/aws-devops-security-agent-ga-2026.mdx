@@ -1,0 +1,131 @@
+---
+title: "AWS DevOps AgentとSecurity Agent GA：AIがクラウド運用を変える"
+description: "2026年4月にGAとなったAWS DevOps AgentとSecurity Agentの実像を解説します。インシデント対応の自動化から継続的なペネトレーションテストまで、AIがクラウド運用チームの働き方をどう変えるかを具体的に見ていきます。"
+date: "2026-04-23"
+status: "published"
+tags: ["AWS", "DevOps", "Security", "AI", "クラウド運用"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-devops-security-agent-ga-2026"
+---
+
+2026年4月6日、AWSは**AWS DevOps Agent**と**AWS Security Agent**の一般提供（GA）を発表しました。どちらもAIを活用したクラウド運用ツールで、United Airlines、T-Mobile、Western Governors Universityなどがすでに早期アクセスで活用しています。
+
+単なる監視ダッシュボードの進化ではありません。これらのエージェントは、人間の判断が必要だったタスクの一部を自律的に実行できるように設計されています。
+
+## AWS DevOps Agent：インシデント対応を自動化する
+
+AWS DevOps Agentは、クラウド運用における3つの主要なフローをカバーします。
+
+### インシデント調査
+
+従来、オンコール担当者がCloudWatchのアラートを受け取ってから根本原因を特定するまで、複数のサービスをまたいでログを追跡する作業に数十分かかることがありました。DevOps Agentはこのプロセスを自動化します。
+
+```bash
+# DevOps Agent がインシデントを受け取ったときの処理フロー（概念的）
+1. CloudWatch Alarm を受信
+2. 関連する Lambda / ECS / RDS のログを自動収集
+3. エラーパターンを分析して根本原因を推定
+4. Runbook から対応手順を選択
+5. 承認が必要な場合はSlackに通知、
+   自動修復可能な場合はそのまま実行
+```
+
+United Airlinesは、このエージェントを使ってインシデント解決時間を大幅に短縮したと報告しています。特に深夜帯のオンコール負荷軽減への効果が大きいようです。
+
+### 事前予防
+
+過去のインシデントパターンを学習し、異常の兆候を早期検知します。CPU使用率やメモリの単純な閾値監視ではなく、複数のメトリクスの組み合わせから「このパターンは過去に○○という障害の前兆だった」という文脈的な判断ができます。
+
+### 自動修復
+
+定義されたRunbookの範囲内であれば、承認なしに修復アクションを実行します。ECSサービスの再起動、Lambdaの同時実行数調整、RDSのフェイルオーバーなど、リスクが低く手順が確立されているオペレーションは自動化できます。
+
+```yaml
+# 自動修復の設定例（概念的）
+remediation:
+  auto_approve:
+    - action: restart_ecs_service
+      conditions:
+        - metric: task_failure_rate
+          threshold: "> 20%"
+          duration: 5m
+    - action: scale_out_asg
+      conditions:
+        - metric: cpu_utilization
+          threshold: "> 85%"
+          duration: 10m
+  require_approval:
+    - action: rds_failover
+    - action: modify_security_group
+```
+
+## AWS Security Agent：継続的なペネトレーションテスト
+
+AWS Security AgentはCI/CDパイプラインに統合する継続的なセキュリティテストを提供します。
+
+従来のペネトレーションテストは、外部のセキュリティベンダーに依頼して年に1〜2回実施する、というサイクルが一般的でした。Security Agentはこれを開発フローに組み込み、デプロイのたびにセキュリティチェックを実行します。
+
+```
+開発フローへの統合イメージ:
+
+コードプッシュ
+  → CI/CDパイプライン開始
+    → ユニットテスト / 統合テスト
+    → Security Agent によるセキュリティスキャン
+      ├── IAMポリシーの過剰権限チェック
+      ├── ネットワーク設定の脆弱性チェック
+      ├── 既知のCVEに対する依存関係スキャン
+      └── OWASP Top 10 に基づくAPIチェック
+    → (問題なし) デプロイ続行
+    → (問題あり) PR にコメントして修正を要求
+```
+
+人間のペネトレーションテスターと同様に、文脈を理解した上での評価が特徴です。たとえば「このS3バケットはパブリックアクセスが有効になっているが、これは意図的な設定か」という判断を、周辺のリソース構成や過去の変更履歴から行います。
+
+## 実際の使い方と制限
+
+GAとはいえ、現時点での制限も理解しておく必要があります。
+
+**できること**
+- 定義されたRunbook範囲内での自動修復
+- 継続的なセキュリティスキャンとCI/CD統合
+- インシデント後のPostmortemレポート生成
+
+**現時点での制限**
+- Runbookに定義されていない新しいタイプのインシデントへの対応は人間が必要
+- 複雑なマルチアカウント構成でのコンテキスト追跡はまだ改善中
+- カスタムアプリケーションのビジネスロジックレベルのバグ診断は範囲外
+
+```python
+# AWS DevOps Agent を SDK から利用するイメージ（仮）
+import boto3
+
+agent_client = boto3.client("devops-agent")
+
+response = agent_client.investigate_incident(
+    incident_id="INC-2026-04-23-001",
+    services=["ecs/my-api", "rds/my-db", "elasticache/my-cache"],
+    time_range={
+        "start": "2026-04-23T02:00:00Z",
+        "end":   "2026-04-23T02:30:00Z",
+    },
+)
+
+print(response["root_cause_analysis"])
+print(response["recommended_actions"])
+```
+
+## webhaniの視点
+
+AWS DevOps AgentとSecurity Agentは、クラウド運用チームの役割を「手を動かす作業者」から「エージェントを監督する設計者」へシフトさせるプロダクトです。
+
+私たちがクライアントのインフラ運用を支援する際に意識していることをいくつか共有します。
+
+**Runbook整備が先決**: エージェントの自動修復能力は、整備されたRunbookの質に依存します。「エージェントを入れれば運用が楽になる」ではなく、「現状の運用手順をRunbookとして明文化する作業がエージェント導入の前提」という認識が重要です。
+
+**段階的な自律化**: いきなりすべてを自動修復に任せるのではなく、まずは「調査と推奨アクションの提示のみ」でエージェントを動かし、推奨の精度を確認してから自動実行の範囲を広げるアプローチが安全です。
+
+**セキュリティエージェントはシフトレフトの延長**: Security AgentをCI/CDに組み込むことは、既存のSASTやDAST、依存関係スキャンと置き換えるものではなく、それらを補完するレイヤーとして位置づけるのが適切です。
+
+AIによるクラウド運用の自動化は、人間のオペレーターを不要にするのではなく、人間がより重要な判断に集中できる環境を作ることが本来の目的です。

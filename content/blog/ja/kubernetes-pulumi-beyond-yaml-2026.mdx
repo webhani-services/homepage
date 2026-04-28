@@ -1,0 +1,227 @@
+---
+title: "YAMLを超えて：PulumiとKubernetesで始めるインフラ自動化の現在地"
+description: "2026年、KubernetesのYAML管理からプログラマブルなインフラへの移行が加速しています。PulumiとTypeScript/Pythonで構成管理を書く利点、実際のコード例、HelmやKustomizeとの比較をまとめます。"
+date: "2026-04-23"
+status: "published"
+tags: ["Kubernetes", "Pulumi", "インフラ", "IaC", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-pulumi-beyond-yaml-2026"
+---
+
+Kubernetesの構成管理は長い間、YAMLと向き合う作業でした。Deployment、Service、ConfigMap——それぞれを手書きし、HelmチャートやKustomizeでDRYにしようとするものの、変数の扱いや条件分岐の表現に限界を感じることは多いです。
+
+2026年、この状況が変わりつつあります。PulumiブログのレポートはKubernetesの「2026年自動化時代」を宣言し、Docker Kanvasなどの新プラットフォームもHelmやKustomizeへの挑戦を明確にしています。YAML中心のインフラ管理から、汎用プログラミング言語でインフラを記述するアプローチへの移行が実用段階に入っています。
+
+## なぜYAMLに限界を感じるのか
+
+YAMLが構成管理に向いていない理由は、言語機能の欠如です。
+
+```yaml
+# HelmでDRYにしようとすると、こういうことになる
+{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "myapp.fullname" . }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "myapp.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+{{- end }}
+```
+
+Helmのテンプレート構文は「YAMLの上にGoテンプレートを乗せたもの」で、エディタのサポートも弱く、デバッグも難しい。複雑な条件分岐やループを書くと、可読性が急速に下がります。
+
+## Pulumi でKubernetesを記述する
+
+Pulumiは、TypeScript・Python・Go・C#などの汎用言語でインフラを記述するIaCツールです。Kubernetesリソースも同様に記述できます。
+
+```typescript
+import * as k8s from "@pulumi/kubernetes";
+
+const appLabels = { app: "api-server" };
+
+const deployment = new k8s.apps.v1.Deployment("api-server", {
+  metadata: { namespace: "production" },
+  spec: {
+    replicas: 3,
+    selector: { matchLabels: appLabels },
+    template: {
+      metadata: { labels: appLabels },
+      spec: {
+        containers: [{
+          name: "api",
+          image: "my-registry/api:v2.1.0",
+          ports: [{ containerPort: 8080 }],
+          resources: {
+            requests: { cpu: "100m", memory: "128Mi" },
+            limits:   { cpu: "500m", memory: "512Mi" },
+          },
+          env: [
+            {
+              name: "DATABASE_URL",
+              valueFrom: {
+                secretKeyRef: {
+                  name: "db-credentials",
+                  key:  "url",
+                },
+              },
+            },
+          ],
+        }],
+      },
+    },
+  },
+});
+
+const service = new k8s.core.v1.Service("api-server-svc", {
+  metadata: { namespace: "production" },
+  spec: {
+    selector: appLabels,
+    ports: [{ port: 80, targetPort: 8080 }],
+    type: "ClusterIP",
+  },
+});
+```
+
+TypeScriptで書くことの利点は明確です。型チェック、エディタの補完、リファクタリングツール——通常のコード開発と同じ体験でインフラを記述できます。
+
+## 条件分岐とループが自然に書ける
+
+PulumiでKubernetesを記述する最大の利点は、言語の力をそのまま使えることです。
+
+```typescript
+// 環境ごとに設定を変える
+const isProd = pulumi.getStack() === "production";
+
+const deployment = new k8s.apps.v1.Deployment("api-server", {
+  spec: {
+    replicas: isProd ? 3 : 1,
+    template: {
+      spec: {
+        containers: [{
+          name: "api",
+          image: `my-registry/api:${imageTag}`,
+          resources: isProd
+            ? { limits: { cpu: "500m", memory: "512Mi" } }
+            : { limits: { cpu: "200m", memory: "256Mi" } },
+        }],
+      },
+    },
+  },
+});
+
+// 複数のマイクロサービスを同じパターンで展開
+const services = ["auth", "payments", "notifications"];
+
+services.forEach((svcName) => {
+  new k8s.apps.v1.Deployment(`${svcName}-deployment`, {
+    spec: {
+      replicas: 2,
+      template: {
+        spec: {
+          containers: [{
+            name: svcName,
+            image: `my-registry/${svcName}:latest`,
+          }],
+        },
+      },
+    },
+  });
+});
+```
+
+Helmのテンプレート構文でこれと同等のことをしようとすると、`{{ range }}` や `{{ if }}` のネストが深くなり、可読性は大きく低下します。
+
+## Pulumi Stack Reference によるマルチ環境管理
+
+Pulumiは「Stack」という概念で複数環境を管理します。開発・ステージング・本番の構成を同じコードで管理しつつ、各Stackで異なる値を渡せます。
+
+```typescript
+// Pulumi.production.yaml
+config:
+  myapp:replicaCount: "3"
+  myapp:imageTag: "v2.1.0"
+  myapp:dbUrl:
+    secure: <encrypted-value>
+
+// Pulumi.staging.yaml
+config:
+  myapp:replicaCount: "1"
+  myapp:imageTag: "v2.1.0-rc1"
+```
+
+```typescript
+// index.ts — 同じコードで全環境に対応
+const config = new pulumi.Config();
+const replicaCount = config.getNumber("replicaCount") ?? 1;
+const imageTag = config.require("imageTag");
+```
+
+センシティブな値（パスワード、APIキー）は`pulumi config set --secret`で暗号化して管理でき、`pulumi preview`でインフラの変更点を`git diff`のように確認できます。
+
+## Helm/Kustomize との使い分け
+
+Pulumiが万能というわけではありません。現実的な判断基準を共有します。
+
+| シナリオ | 推奨ツール |
+|----------|-----------|
+| 既存のHelmチャートをそのまま使う | Helm |
+| 既存Helmチャートのカスタマイズのみ | Kustomize |
+| 新規インフラをコードで管理したい | Pulumi |
+| 複雑な条件分岐・ループが必要 | Pulumi |
+| チームがYAMLに慣れている | Helm/Kustomize |
+| 型安全性・テストを重視する | Pulumi |
+
+Pulumiは既存のKubernetesエコシステムとの互換性も持っており、`pulumi import`で既存リソースをコードに取り込むことも可能です。既存のHelmチャートをPulumiから呼び出すこともできます。
+
+```typescript
+// 既存のHelmチャートをPulumiから利用する
+import * as k8s from "@pulumi/kubernetes";
+
+const nginxIngress = new k8s.helm.v3.Chart("nginx-ingress", {
+  chart: "ingress-nginx",
+  fetchOpts: { repo: "https://kubernetes.github.io/ingress-nginx" },
+  values: {
+    controller: {
+      replicaCount: 2,
+      service: { type: "LoadBalancer" },
+    },
+  },
+});
+```
+
+## webhaniの視点
+
+クライアントのKubernetes環境の構成管理を支援する際、私たちはPulumiへの移行を以下のケースで推奨しています。
+
+**新規プロジェクトの立ち上げ**: YAMLの負債を最初から持ち込まない設計が可能。TypeScriptやPythonでチームが既に書いているなら、学習コストも低い。
+
+**マルチ環境の構成差異が多いプロジェクト**: 開発・ステージング・本番で異なる設定が多く、HelmのValuesファイルが複雑になっているケースでは、Pulumiの型安全な設定管理が大きな改善をもたらします。
+
+**インフラのテストを書きたいチーム**: Pulumiではインフラコードを通常のユニットテストでテストできます。YAMLのlintと比べて、はるかに表現力の高いテストが書けます。
+
+```typescript
+// Pulumiのインフラコードをテストする
+import * as pulumi from "@pulumi/pulumi";
+
+pulumi.runtime.setMocks({
+  newResource: (args) => ({ id: `${args.name}-id`, state: args.inputs }),
+  call: (args) => ({ outputs: {} }),
+});
+
+describe("Deployment configuration", () => {
+  it("should use 3 replicas in production", async () => {
+    process.env["PULUMI_CONFIG"] = JSON.stringify({ "myapp:replicaCount": "3" });
+    const infra = await import("./index");
+    const replicaCount = await infra.deployment.spec.replicas;
+    expect(replicaCount).toBe(3);
+  });
+});
+```
+
+2026年のKubernetes自動化の流れは、YAMLとの戦いをやめて汎用言語の力を借りることです。Pulumiはその実用的な選択肢として十分に成熟しています。

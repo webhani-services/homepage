@@ -1,0 +1,124 @@
+---
+title: "Kubernetes v1.36 と GitOps の現在地 — ArgoCD が主流になった理由"
+description: "Kubernetes v1.36 が 2026 年 4 月末にリリース予定です。2026 年の Kubernetes 運用を支える GitOps パターンと、ArgoCD が主流になった背景を解説します。"
+date: "2026-04-24"
+status: "published"
+tags: ["Kubernetes", "GitOps", "ArgoCD", "DevOps", "Cloud"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-v136-gitops-2026"
+---
+
+## Kubernetes v1.36 が間もなくリリース
+
+Kubernetes v1.36 が 2026 年 4 月末にリリース予定です。今回のリリースはエンハンスメントの数が多く、いくつかの機能削除・非推奨化も含まれています。本番クラスターを運用しているチームは早めに変更内容を把握しておく必要があります。
+
+ただし今回は特定の v1.36 の機能よりも、その背景にある「2026 年の Kubernetes 運用の主流パターン」に焦点を当てたいと思います。
+
+## GitOps が標準になった
+
+2026 年の Kubernetes 運用において、GitOps は標準的なデプロイメントパターンになっています。その中心にあるのが ArgoCD です。
+
+GitOps の考え方はシンプルです。**Git リポジトリをインフラの唯一の信頼できるソース（Single Source of Truth）として扱い、実際のクラスター状態と Git の状態を継続的に同期させる**。これだけです。
+
+```
+Git リポジトリ（期待状態）
+        ↓ 継続的な同期
+Kubernetes クラスター（実際の状態）
+```
+
+手動での `kubectl apply` や CI/CD から直接クラスターに push するパターンと比べて、GitOps にはいくつかの明確な利点があります。
+
+- **監査証跡**: すべての変更が Git コミットとして記録される
+- **ロールバック**: `git revert` でインフラを任意の状態に戻せる
+- **ドリフト検出**: 実際のクラスター状態と Git の差分を常に把握できる
+- **PR ベースのレビュー**: インフラ変更も通常のコードレビューと同じプロセスで管理できる
+
+## なぜ ArgoCD が選ばれるのか
+
+GitOps ツールとしては FluxCD も有力な選択肢ですが、2026 年時点では ArgoCD が最も広く採用されています。その理由を具体的に見ていきます。
+
+### 視覚的な状態管理
+
+ArgoCD の UI はクラスターの現在の状態を視覚的に表示します。どのリソースが Synced で、何が OutOfSync なのかが一目でわかります。これはトラブルシューティングの際に特に価値を発揮します。
+
+### ApplicationSet による大規模管理
+
+複数のクラスターや環境（dev/staging/prod）を管理する場合、ApplicationSet を使うと一つのテンプレートから複数の Application を自動生成できます。
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: my-app
+  namespace: argocd
+spec:
+  generators:
+    - list:
+        elements:
+          - cluster: dev
+            url: https://dev.k8s.example.com
+          - cluster: staging
+            url: https://staging.k8s.example.com
+          - cluster: prod
+            url: https://prod.k8s.example.com
+  template:
+    metadata:
+      name: "my-app-{{cluster}}"
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/example/k8s-manifests
+        targetRevision: HEAD
+        path: "apps/my-app/{{cluster}}"
+      destination:
+        server: "{{url}}"
+        namespace: my-app
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+```
+
+この設定一つで、3つの環境に対して ArgoCD Application が自動生成され、それぞれが対応する Git パスの状態を追跡します。
+
+### RBAC とマルチテナント
+
+ArgoCD は Project という概念でアプリケーションをグループ化し、チームごとのアクセス制御を実現します。複数チームが一つのクラスターを共有する環境でも、適切な権限分離が可能です。
+
+## Helm と Kustomize の組み合わせ
+
+ArgoCD は Helm と Kustomize の両方をネイティブサポートしています。一般的なパターンは、Helm Chart でベースの設定を管理し、Kustomize でそれぞれの環境固有の差分を適用する方法です。
+
+```
+k8s-manifests/
+├── base/
+│   └── my-app/
+│       ├── deployment.yaml
+│       └── service.yaml
+├── overlays/
+│   ├── dev/
+│   │   └── kustomization.yaml   # 開発環境の差分
+│   ├── staging/
+│   │   └── kustomization.yaml   # ステージング環境の差分
+│   └── prod/
+│       └── kustomization.yaml   # 本番環境の差分
+```
+
+## 2026 年の Kubernetes ランドスケープ
+
+2026 年時点での Kubernetes エコシステムのトレンドをまとめると：
+
+**Docker → Kubernetes → Wasm の共存**: Docker はローカル開発環境で依然として標準ツールですが、本番オーケストレーションは Kubernetes が担い、Edge Computing では WebAssembly（Wasm）が存在感を増しています。3つは競合ではなく、それぞれの適所で使われる補完関係にあります。
+
+**Platform Engineering の台頭**: 開発者がインフラの詳細を意識せずに Kubernetes を使えるようにする「内部開発者プラットフォーム（IDP）」の構築が普及しています。Backstage や Humanitec などのツールがこの領域をカバーしています。
+
+## 実務上の推奨事項
+
+Kubernetes を新たに導入する場合、あるいは既存の CI/CD 直接デプロイから移行を検討している場合、以下の順序でスタートすることを推奨します。
+
+1. **小さく始める**: まず非本番環境で ArgoCD を導入し、GitOps の感覚をつかむ
+2. **手動 Sync から始める**: 最初は `syncPolicy.automated` を有効化せず、手動での承認を経て同期する
+3. **PR ワークフローを整備する**: インフラ変更の PR レビュープロセスを確立してから自動化を進める
+
+GitOps への移行は一度に全部行う必要はありません。一つのアプリケーション、一つの環境から始めて、チームが慣れた段階で範囲を広げるアプローチが最も定着しやすいです。

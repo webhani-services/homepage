@@ -1,0 +1,131 @@
+---
+title: "AWS DevOps Agent and Security Agent Are Now GA"
+description: "AWS made its DevOps Agent and Security Agent generally available in April 2026. Here's what these AI-powered tools actually do — automated incident investigation, continuous penetration testing in CI/CD, and where the real limitations still are."
+date: "2026-04-23"
+status: "published"
+tags: ["AWS", "DevOps", "Security", "AI", "CloudOps"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-devops-security-agent-ga-2026"
+---
+
+On April 6, 2026, AWS announced general availability of two AI-powered operations tools: **AWS DevOps Agent** and **AWS Security Agent**. United Airlines, T-Mobile, and Western Governors University have already been using them through early access and are citing real reductions in incident response time.
+
+These aren't monitoring dashboards with better charts. They're agents designed to handle tasks that previously required a human on-call at 3 AM.
+
+## AWS DevOps Agent: Incident Automation
+
+The DevOps Agent covers three operational workflows:
+
+### Incident Investigation
+
+When a CloudWatch alarm fires, the traditional path involves an on-call engineer logging in, pulling logs across Lambda, ECS, RDS, and correlating them manually. That process can take 20-40 minutes before a root cause is even identified. The DevOps Agent automates the investigation leg of that journey.
+
+```
+Typical flow when the agent receives an incident:
+
+CloudWatch Alarm fires
+  → Agent collects logs: Lambda + ECS + RDS + ElastiCache
+  → Pattern analysis against known failure signatures
+  → Root cause estimate + confidence score
+  → Checks runbook for matching remediation
+  → Low-risk action: auto-executes
+  → Approval-required action: posts to Slack with one-click confirm
+```
+
+United Airlines specifically cited overnight on-call load reduction as a primary benefit — the agent handles investigation and routine remediation, while engineers are paged only when human judgment is genuinely required.
+
+### Predictive Prevention
+
+The agent learns from historical incident patterns and flags early warning signs before they escalate. This goes beyond simple threshold alerts. It correlates multiple metrics to surface patterns like "this combination of latency increase + database connection pool growth preceded a full outage three times in the past six months."
+
+### Automated Remediation
+
+Within the boundaries of your defined runbooks, the agent executes fixes without approval. ECS service restarts, Auto Scaling Group scale-outs, RDS parameter changes — anything with a well-understood procedure and low blast radius can be automated.
+
+```yaml
+# Remediation configuration example
+remediation:
+  auto_approve:
+    - action: restart_ecs_service
+      when:
+        metric: task_failure_rate
+        threshold: "> 20%"
+        for: 5m
+    - action: scale_out_asg
+      when:
+        metric: cpu_utilization
+        threshold: "> 85%"
+        for: 10m
+  require_approval:
+    - action: rds_failover
+    - action: modify_security_group_rules
+```
+
+## AWS Security Agent: Continuous Pen Testing in CI/CD
+
+The Security Agent integrates into your deployment pipeline and runs security checks on every deployment — not just annual third-party audits.
+
+```
+Pipeline integration:
+
+Code push
+  → Unit + integration tests
+  → Security Agent scan
+      ├── IAM overpermission analysis
+      ├── Network configuration vulnerability check
+      ├── Dependency CVE scan
+      └── OWASP Top 10 API checks
+  → Clean: proceed to deploy
+  → Issues found: comment on PR with findings + suggested fixes
+```
+
+What distinguishes it from static analysis tools is contextual awareness. The agent considers surrounding resource configuration and change history. "This S3 bucket has public access enabled — was this intentional given that it's referenced only from an internal VPC endpoint?" is the kind of judgment it applies.
+
+## Current Limitations
+
+GA doesn't mean complete. Understanding the boundaries matters before integrating:
+
+**What it handles well**
+- Automated remediation within defined runbook scope
+- Continuous security scanning with CI/CD integration
+- Post-incident analysis and postmortem report generation
+
+**Current gaps**
+- Novel incident types outside existing runbooks still require human response
+- Multi-account environment context tracking is still improving
+- Application-level business logic bugs are outside its scope
+
+```python
+# Interacting with DevOps Agent via SDK (illustrative)
+import boto3
+
+client = boto3.client("devops-agent")
+
+investigation = client.investigate_incident(
+    incident_id="INC-2026-04-23-001",
+    scope={
+        "services": ["ecs/api-service", "rds/primary-db"],
+        "time_range": {
+            "start": "2026-04-23T02:00:00Z",
+            "end":   "2026-04-23T02:30:00Z",
+        },
+    },
+)
+
+print(investigation["root_cause"])
+print(investigation["recommended_actions"])
+print(investigation["confidence_score"])
+```
+
+## How to Think About Adopting These Tools
+
+A few patterns worth considering before rolling these out:
+
+**Runbook quality is the actual input.** The agent's remediation capability is bounded by the quality of your runbooks. Teams that jump to "the agent will handle it" without first systematically documenting their operational procedures will be disappointed. Write the runbooks first; the agent amplifies them.
+
+**Start with assist mode.** Run the agent in investigation-and-recommend mode before enabling auto-remediation. Validate that its recommendations match what your team would actually do. Once confidence is established in a specific category of incidents, enable automation for that category incrementally.
+
+**Security Agent complements, doesn't replace.** Integrating the Security Agent into CI/CD sits alongside your existing SAST, dependency scanning, and DAST — it doesn't replace them. Think of it as an additional reasoning layer that understands infrastructure context, not a drop-in replacement for tools like Snyk or Semgrep.
+
+AWS is positioning these agents as a shift from operational firefighting to operational oversight. The goal is for engineers to spend more time on architecture and less on log correlation at 3 AM. Whether that goal is achieved depends less on the agents themselves and more on how well the surrounding operational processes are defined.

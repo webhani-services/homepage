@@ -1,0 +1,129 @@
+---
+title: "AWS DevOps Agent & Security Agent GA: AI가 클라우드 운영을 바꾼다"
+description: "2026년 4월 GA된 AWS DevOps Agent와 Security Agent의 실제 기능을 분석합니다. 인시던트 자동 조사부터 CI/CD 내 지속적 침투 테스트까지, AI 기반 클라우드 운영 도구의 현실적인 가능성과 한계를 살펴봅니다."
+date: "2026-04-23"
+status: "published"
+tags: ["AWS", "DevOps", "Security", "AI", "클라우드운영"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-devops-security-agent-ga-2026"
+---
+
+2026년 4월 6일, AWS가 **AWS DevOps Agent**와 **AWS Security Agent**의 일반 제공(GA)을 발표했습니다. United Airlines, T-Mobile, Western Governors University 등이 이미 얼리 액세스로 활용하며 인시던트 대응 시간을 실질적으로 단축했다고 보고하고 있습니다.
+
+단순히 더 좋은 모니터링 대시보드가 아닙니다. 이 에이전트들은 지금까지 새벽 3시에 온콜 엔지니어가 처리해야 했던 작업을 자율적으로 처리할 수 있도록 설계되어 있습니다.
+
+## AWS DevOps Agent: 인시던트 대응 자동화
+
+DevOps Agent는 클라우드 운영의 세 가지 핵심 워크플로우를 다룹니다.
+
+### 인시던트 조사
+
+CloudWatch 알람이 발생하면 온콜 엔지니어는 Lambda, ECS, RDS 등 여러 서비스에 걸쳐 로그를 추적하며 근본 원인을 파악하는 데 20~40분을 쓰는 경우가 많습니다. DevOps Agent는 이 조사 과정을 자동화합니다.
+
+```
+인시던트 수신 시 에이전트 처리 흐름:
+
+CloudWatch 알람 발생
+  → 관련 서비스 로그 자동 수집 (Lambda + ECS + RDS)
+  → 알려진 장애 패턴과 비교 분석
+  → 근본 원인 추정 + 신뢰도 점수
+  → 런북에서 대응 절차 조회
+  → 저위험 조치: 자동 실행
+  → 승인 필요 조치: Slack 알림 + 원클릭 승인
+```
+
+United Airlines는 야간 온콜 부하 감소를 가장 큰 효과로 꼽았습니다. 에이전트가 조사와 일상적인 복구를 담당하고, 진짜 판단이 필요한 상황에서만 엔지니어가 호출됩니다.
+
+### 사전 예방
+
+과거 인시던트 패턴을 학습해 문제가 커지기 전에 이상 징후를 감지합니다. 단순한 임계값 알람이 아닌, 여러 메트릭의 조합을 분석합니다. "지연 증가 + DB 커넥션 풀 소진의 이 조합은 과거 6개월간 3번의 전면 장애 전에 나타났다"는 문맥적 판단이 가능합니다.
+
+### 자동 복구
+
+정의된 런북 범위 내에서 승인 없이 수정 조치를 실행합니다. ECS 서비스 재시작, Auto Scaling 스케일아웃, RDS 파라미터 변경 등 절차가 확립되고 위험이 낮은 작업은 자동화할 수 있습니다.
+
+```yaml
+# 자동 복구 설정 예시
+remediation:
+  auto_approve:
+    - action: restart_ecs_service
+      when:
+        metric: task_failure_rate
+        threshold: "> 20%"
+        for: 5m
+    - action: scale_out_asg
+      when:
+        metric: cpu_utilization
+        threshold: "> 85%"
+        for: 10m
+  require_approval:
+    - action: rds_failover
+    - action: modify_security_group_rules
+```
+
+## AWS Security Agent: CI/CD 내 지속적 침투 테스트
+
+Security Agent는 배포 파이프라인에 통합되어 매 배포마다 보안 검사를 실행합니다. 연 1~2회 외부 벤더에 의뢰하는 전통적인 침투 테스트 사이클에서 벗어나, 개발 플로우에 보안을 녹여냅니다.
+
+```
+파이프라인 통합 흐름:
+
+코드 푸시
+  → 유닛 + 통합 테스트
+  → Security Agent 스캔
+      ├── IAM 과잉 권한 분석
+      ├── 네트워크 구성 취약점 검사
+      ├── 의존성 CVE 스캔
+      └── OWASP Top 10 API 검사
+  → 이상 없음: 배포 진행
+  → 문제 발견: PR에 코멘트 + 수정 방법 제안
+```
+
+일반 정적 분석 도구와 다른 점은 맥락 인식입니다. "이 S3 버킷은 퍼블릭 액세스가 활성화되어 있는데, 내부 VPC 엔드포인트에서만 참조되는 구조를 고려하면 의도적인 설정인가?"와 같은 판단을 주변 리소스 구성과 변경 이력을 바탕으로 수행합니다.
+
+## 현실적인 한계
+
+GA라고 해서 완벽하지는 않습니다. 도입 전에 한계를 이해하는 것이 중요합니다.
+
+**잘 처리하는 것**
+- 정의된 런북 범위 내 자동 복구
+- CI/CD 통합 지속적 보안 스캔
+- 인시던트 후 포스트모템 보고서 생성
+
+**현재 한계**
+- 기존 런북에 없는 새로운 유형의 인시던트는 여전히 사람이 필요
+- 복잡한 멀티 어카운트 환경에서의 컨텍스트 추적은 개선 중
+- 애플리케이션 비즈니스 로직 수준의 버그 진단은 범위 외
+
+```python
+# SDK를 통한 DevOps Agent 활용 예시 (개념적)
+import boto3
+
+client = boto3.client("devops-agent")
+
+investigation = client.investigate_incident(
+    incident_id="INC-2026-04-23-001",
+    scope={
+        "services": ["ecs/api-service", "rds/primary-db"],
+        "time_range": {
+            "start": "2026-04-23T02:00:00Z",
+            "end":   "2026-04-23T02:30:00Z",
+        },
+    },
+)
+
+print(investigation["root_cause"])
+print(investigation["recommended_actions"])
+print(investigation["confidence_score"])
+```
+
+## 도입 시 고려할 점
+
+**런북 품질이 실제 입력값입니다.** 에이전트의 자동 복구 능력은 런북의 품질에 의존합니다. "에이전트를 도입하면 운영이 편해진다"가 아니라, "현재 운영 절차를 런북으로 문서화하는 것이 도입의 전제 조건"이라는 인식이 필요합니다.
+
+**보조 모드로 시작합니다.** 자동 복구를 활성화하기 전에 먼저 조사 및 추천 모드로만 운영하세요. 에이전트의 추천이 실제 팀의 대응과 일치하는지 확인한 후, 신뢰가 쌓인 인시던트 카테고리부터 점진적으로 자동화 범위를 넓히는 것이 안전합니다.
+
+**Security Agent는 보완재입니다.** Security Agent를 CI/CD에 통합하는 것은 기존 SAST, 의존성 스캔, DAST 도구를 대체하는 것이 아닙니다. Snyk이나 Semgrep 같은 도구와 함께, 인프라 컨텍스트를 이해하는 추가적인 추론 레이어로 위치시키는 것이 적합합니다.
+
+AWS의 목표는 엔지니어가 새벽 3시에 로그 추적에 쓰는 시간을 아키텍처 설계에 투자할 수 있게 하는 것입니다. 그 목표가 달성되는지는 에이전트 자체보다 주변 운영 프로세스가 얼마나 잘 정의되어 있는지에 달려 있습니다.
