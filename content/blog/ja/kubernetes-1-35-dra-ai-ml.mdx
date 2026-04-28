@@ -1,0 +1,133 @@
+---
+title: "Kubernetes 1.35のDRAがBeta昇格 — AI/ML WorkloadのGPU管理が変わる"
+description: "Kubernetes 1.35でDynamic Resource Allocation (DRA)のBinding ConditionsがBeta昇格。GPU WorkloadのScheduling柔軟性が向上し、AI/ML開発環境の構築・運用が大きく改善されます。"
+date: "2026-04-28"
+status: "published"
+tags: ["Kubernetes", "AI/ML", "GPU", "DRA", "Cloud Native"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-35-dra-ai-ml"
+---
+
+## DRAとは何か
+
+Dynamic Resource Allocation (DRA) はKubernetesの拡張可能なリソース管理フレームワークです。CPU・メモリといった従来の汎用リソースとは異なり、GPUやFPGA、Network Acceleratorなどの特殊ハードウェアをより柔軟にSchedulingするために設計されました。
+
+Kubernetes 1.35でDRAのBinding ConditionsがBeta昇格（`DRAControlPlane`フィーチャーゲートで有効化）したことで、本番環境での利用を検討しているチームにとって現実的な選択肢になりました。
+
+## なぜ今DRAが重要なのか
+
+AI/ML Workloadの普及により、Kubernetesクラスタの要求が根本的に変化しています。従来のWebアプリケーション中心のクラスタでは、CPUとメモリの割り当てで大半のニーズを満たせました。しかしLLMの推論やモデルのFine-tuningタスクでは、GPUのアロケーションとSchedulingが決定的に重要です。
+
+既存の`nodeSelector`や`tolerations`を使ったGPUスケジューリングは、以下の点で限界があります。
+
+- **GPUの部分利用ができない**: Pod単位でGPU全体を占有するため、小さなモデルの推論で高価なGPUが遊んでしまう
+- **異種GPU環境への対応が複雑**: A100とH100が混在するクラスタでワークロードの要件に合わせた割り当てが難しい
+- **動的な解放・再割り当てが困難**: JobのライフサイクルとGPUリソースの解放が連動しにくい
+
+DRAはこれらの問題に対してより表現力の高いAPIを提供します。
+
+## Binding Conditionsの仕組み
+
+DRA 1.35のBinding Conditionsは、リソースのアロケーション要件をCEL（Common Expression Language）を使って記述できる機能です。
+
+```yaml
+# ResourceClaim with Binding Conditions
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: gpu-claim-for-inference
+spec:
+  devices:
+    requests:
+    - name: gpu
+      deviceClassName: nvidia.com/gpu
+      selectors:
+      - cel:
+          expression: >
+            device.attributes["nvidia.com/gpu"].vramGB >= 40 &&
+            device.attributes["nvidia.com/gpu"].architecture == "Hopper"
+      allocationMode: ExactCount
+      count: 1
+```
+
+Binding Conditionsを使うことで、「最低40GBのVRAMを持つHopperアーキテクチャのGPU」のような条件をPodレベルで宣言的に指定でき、Schedulerがその条件を満たすNodeを動的に選択します。
+
+以前はこのような制約を表現するためにカスタムScheduling WebhookやOperatorレベルのロジックが必要でした。
+
+## AI/ML Workloadへの具体的な影響
+
+### LLM推論ServiceのGPU効率化
+
+複数のモデルを同一クラスタで提供する場合、GPU割り当ての効率性がコストと遅延に直接影響します。DRAのBinding Conditionsにより以下が実現します。
+
+- 小さなモデルは低スペックGPUを対象に、大きなモデル用に高VRAMのGPUを温存できる
+- NVIDIA MIG（Multi-Instance GPU）などの部分割り当て技術との組み合わせが容易になる
+
+```yaml
+# 小規模モデル向けInference Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: small-model-inference
+spec:
+  template:
+    spec:
+      containers:
+      - name: model-server
+        image: inference-server:latest
+        resources:
+          claims:
+          - name: standard-gpu
+      resourceClaims:
+      - name: standard-gpu
+        resourceClaimTemplateName: 24gb-gpu-template
+```
+
+### Fine-tuningジョブのリソース管理
+
+Fine-tuningジョブはGPUの需要が大きく、かつ実行期間が明確に区切られています。DRAのリソースライフサイクル管理を使うことで、JobのResourceClaimはJob期間中のみ存在し、完了時にデバイスが確実に解放されます。この仕組みにより、GPUリソースの無駄な占有を防ぎながら次のジョブへのスムーズな引き渡しが実現します。
+
+### モニタリング体制の見直し
+
+GPUが主要なリソース信号になるに伴い、CPU・メモリ中心の従来のKubernetesモニタリングでは不十分になります。DRA導入と合わせてGPU特化のObservabilityを整備することを推奨します。
+
+```bash
+# NVIDIA DCGM Exporterのインストール (Prometheus連携)
+helm repo add gpu-helm-charts https://nvidia.github.io/dcgm-exporter/helm-charts
+helm install dcgm-exporter gpu-helm-charts/dcgm-exporter \
+  --namespace monitoring \
+  --set serviceMonitor.enabled=true
+```
+
+## 移行に向けた実際のステップ
+
+### Step 1: Feature Gateの有効化
+
+```yaml
+# kube-apiserver の featureGates 設定
+featureGates:
+  DRAControlPlane: true
+```
+
+### Step 2: 互換性の確認
+
+DRAには更新されたNVIDIA Device PluginとDriverが必要です。Feature Gateを有効化する前に、クラスタで使用しているドライバのバージョンとDRAの互換性マトリクスを必ず確認してください。
+
+### Step 3: 既存ワークロードの段階的移行
+
+既存のGPUワークロードをすべて一度に移行するのではなく、新規Jobからテスト的にDRAを使い始め、動作を確認しながら移行を進めることを推奨します。Device Plugin SchedulingとDRAは共存できるため、段階的な移行が可能です。
+
+## 注意点
+
+**Betaであることを念頭に置く**: Binding ConditionsはBeta段階にあり、APIは以前のAlphaよりも安定していますがまだ確定していません。プロダクションのCriticalワークロードに採用する前にリスク許容度を評価してください。
+
+**ドライバ・プラグインの互換性確認**: DRAは更新されたNVIDIA Device PluginとDriverが必要です。Feature Gate有効化前に互換性マトリクスの確認を怠らないでください。
+
+**段階的な採用**: 新規のGPUワークロードのみにResourceClassを定義することから始め、DRAの挙動を把握してから既存ワークロードの移行に進んでください。
+
+## まとめ
+
+KubernetesのDRA Binding ConditionsのBeta昇格は、現在のリリースサイクルにおいてAI/MLインフラにとって最も重要な進歩です。GPU要件を宣言的に表現し、Schedulerが自動的にマッチングする能力は、異種GPU環境を管理するために現在チームが維持しているカスタム自動化のオーバーヘッドを削減します。
+
+KubernetesでAIワークロードを運用しており、まだDRAを評価していないのであれば、1.35がAPIと挙動の理解を深め始める適切なタイミングです。今から準備しておくことが、AI/MLワークフローのスケールアップに向けた確実な投資になります。

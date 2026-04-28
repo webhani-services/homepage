@@ -1,0 +1,128 @@
+---
+title: "Kubernetes 1.35 DRA Binding Conditions Beta 승격 — AI/ML GPU 워크로드 관리가 달라진다"
+description: "Kubernetes 1.35에서 Dynamic Resource Allocation(DRA) Binding Conditions가 Beta로 승격됩니다. 커스텀 Webhook 없이 GPU 워크로드 스케줄링을 선언적으로 표현할 수 있게 됩니다."
+date: "2026-04-28"
+status: "published"
+tags: ["Kubernetes", "AI/ML", "GPU", "DRA", "Cloud Native"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-35-dra-ai-ml"
+---
+
+## Kubernetes 1.35에서 변경된 내용
+
+Dynamic Resource Allocation (DRA) Binding Conditions이 Kubernetes 1.35에서 Beta로 승격됩니다. `DRAControlPlane` Feature Gate로 활성화할 수 있으며, GPU, FPGA, 네트워크 가속기와 같은 특수 하드웨어를 스케줄링하기 위한 Kubernetes 프레임워크인 DRA가 Beta API를 수용할 의향이 있는 팀에게 프로덕션 적용 가능한 선택지가 됩니다.
+
+Beta 승격은 실제 환경에서의 충분한 사용 경험을 바탕으로 API 표면이 안정화되었음을 의미합니다. Alpha 단계에서 흔히 발생하던 Breaking Change는 더 이상 발생하지 않을 것입니다.
+
+## GPU 스케줄링에 더 나은 모델이 필요했던 이유
+
+기존 Kubernetes GPU 스케줄링은 `nodeSelector`, `tolerations`, Device Plugin에 의존합니다. 단순한 워크로드에는 충분하지만, AI/ML 프로덕션 환경에서는 의미 있는 한계가 있습니다.
+
+**GPU 전체 할당만 가능**: Pod가 A100을 요청하면 실제 사용량에 관계없이 전체 GPU를 점유합니다. 소규모 추론 모델이 40GB GPU에서 실행될 때 대부분의 메모리가 유휴 상태로 남습니다.
+
+**선택 표현력 제한**: "GPU가 있는 노드"는 지정할 수 있지만, "VRAM이 최소 40GB이고 Hopper 아키텍처를 사용하는 GPU"는 커스텀 Webhook이나 Operator 수준의 우회책 없이 표현하기 어렵습니다.
+
+**이기종 클러스터 처리가 불안정**: A100과 H100이 혼재하는 클러스터에서는 선언적 Capability 매칭 대신 수동 스케줄링 제약이 필요합니다.
+
+DRA는 이를 대체하여 리소스 요구사항을 표현하고 스케줄러가 CEL 표현식을 사용해 사용 가능한 Device와 매칭하는 구조적 API를 제공합니다.
+
+## 실제 Binding Conditions 활용
+
+1.35의 핵심 기능은 ResourceClaim에서 CEL(Common Expression Language)을 사용한 선언적 Device 요구사항 표현입니다.
+
+```yaml
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: inference-gpu
+spec:
+  devices:
+    requests:
+    - name: gpu
+      deviceClassName: nvidia.com/gpu
+      selectors:
+      - cel:
+          expression: >
+            device.attributes["nvidia.com/gpu"].vramGB >= 40 &&
+            device.attributes["nvidia.com/gpu"].architecture == "Hopper"
+      allocationMode: ExactCount
+      count: 1
+```
+
+이 ResourceClaim은 "VRAM 40GB 이상의 Hopper GPU 1개를 제공해 주세요"라고 명시합니다. 스케줄러가 이 표현식에 대해 사용 가능한 Device를 평가하고 가장 적합한 것을 바인딩합니다. 이전에는 이런 종류의 제약을 표현하기 위해 커스텀 스케줄링 Webhook이나 핵심 Kubernetes API 외부의 Operator 수준 로직이 필요했습니다.
+
+## AI/ML 워크플로우에 미치는 영향
+
+### LLM 추론 서빙
+
+동일한 클러스터에서 여러 모델을 실행할 때, GPU 할당 효율성은 비용과 지연 시간 모두에 직접적인 영향을 미칩니다. DRA를 통해 다음이 가능합니다.
+
+- 소규모 추론 모델은 낮은 등급의 GPU로 라우팅하고, 대형 모델을 위해 고 VRAM GPU를 남겨둘 수 있습니다
+- NVIDIA MIG(Multi-Instance GPU) 슬라이스와 Resource Claim을 결합하여 활용률 밀도를 높일 수 있습니다
+
+```yaml
+# 24GB GPU를 대상으로 하는 소규모 추론 모델 Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: small-model-inference
+spec:
+  template:
+    spec:
+      containers:
+      - name: model-server
+        image: inference-server:latest
+        resources:
+          claims:
+          - name: standard-gpu
+      resourceClaims:
+      - name: standard-gpu
+        resourceClaimTemplateName: 24gb-gpu-template
+```
+
+### Fine-tuning Job Lifecycle 관리
+
+Fine-tuning Job은 폭발적이고 시간이 제한된 GPU 수요를 가집니다. DRA의 리소스 Lifecycle 관리는 이 패턴을 더욱 안정적으로 만듭니다. ResourceClaim은 Job 기간 동안만 존재하며, Job이 완료되면 다음 스케줄링 사이클까지 기다리지 않고 즉시 Device가 해제됩니다.
+
+### 모니터링 체계 재정비
+
+GPU가 주요 리소스 신호가 됨에 따라, CPU와 메모리 중심의 기존 Kubernetes 모니터링은 충분하지 않게 됩니다. DRA 도입과 함께 GPU 특화 Observability를 구축하세요.
+
+```bash
+# DCGM Exporter를 사용한 Prometheus GPU Metric 수집
+helm repo add gpu-helm-charts https://nvidia.github.io/dcgm-exporter/helm-charts
+helm install dcgm-exporter gpu-helm-charts/dcgm-exporter \
+  --namespace monitoring \
+  --set serviceMonitor.enabled=true
+```
+
+워크로드별 GPU 활용률, 메모리 압력, 할당 대기 시간을 추적하세요. AI/ML 클러스터에서는 이 지표들이 CPU 포화도를 대체하는 주요 용량 신호가 됩니다.
+
+## 도입 경로
+
+**먼저 비프로덕션 환경에서 Feature Gate를 활성화하세요**:
+
+```yaml
+# kube-apiserver featureGates 설정
+featureGates:
+  DRAControlPlane: true
+```
+
+**드라이버와 플러그인 호환성을 확인하세요**: DRA는 업데이트된 NVIDIA Device Plugin과 드라이버가 필요합니다. 어떤 환경에서든 Feature Gate를 활성화하기 전에 호환성 매트릭스를 확인하세요.
+
+**새로운 워크로드부터 시작하세요**: 새로운 GPU 워크로드에만 ResourceClass를 정의하세요. Device Plugin 스케줄링을 사용하는 기존 워크로드는 DRA 동작에 익숙해질 때까지 공존할 수 있습니다. Device Plugin 스케줄링과 DRA는 동일한 클러스터 내에서 호환됩니다.
+
+**할당 정확도를 검증하세요**: 프로덕션에서 DRA를 사용하기 전에, Binding Conditions가 특정 하드웨어 구성에서 의도한 GPU 유형을 올바르게 대상으로 하는지 확인하세요. 클러스터 인벤토리와 Device 속성 보고는 드라이버 버전에 따라 다를 수 있습니다.
+
+## 주의사항
+
+**아직 Beta 단계**: API는 Alpha보다 안정적이지만 아직 확정되지 않았습니다. 특히 GPU 프로비저닝 파이프라인이 스케줄링 보장에 의존하는 경우, 프로덕션 Critical 워크로드에 도입하기 전에 리스크 허용 수준을 평가하세요.
+
+**커스텀 툴링 충돌 가능성**: Device Plugin 한계를 우회하기 위해 커스텀 스케줄링 Webhook이나 Operator를 구축했다면, 충돌하는 동작을 방지하기 위해 DRA를 활성화하기 전에 이를 감사하세요.
+
+## 핵심 정리
+
+DRA Binding Conditions의 Beta 승격은 현재 릴리스 사이클에서 AI/ML 인프라를 위한 가장 중요한 Kubernetes 발전입니다. GPU 요구사항을 선언적으로 표현하고 스케줄러가 자동으로 매칭하는 능력은, 현재 팀들이 이기종 GPU 클러스터를 처리하기 위해 유지하는 커스텀 자동화 오버헤드를 크게 줄여줍니다.
+
+Kubernetes에서 AI 워크로드를 실행하고 있고 아직 DRA를 평가하지 않았다면, 1.35가 API에 대한 이해를 구축하고 스테이징 환경에서 테스트를 시작하기에 적절한 시기입니다.

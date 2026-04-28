@@ -1,0 +1,127 @@
+---
+title: "Kubernetes 1.35 DRA Binding Conditions Hit Beta — What It Means for GPU Workloads"
+description: "Dynamic Resource Allocation binding conditions graduate to beta in Kubernetes 1.35, giving teams more expressive GPU scheduling for AI/ML workloads without custom webhook overhead."
+date: "2026-04-28"
+status: "published"
+tags: ["Kubernetes", "AI/ML", "GPU", "DRA", "Cloud Native"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-35-dra-ai-ml"
+---
+
+## What Changed in Kubernetes 1.35
+
+Dynamic Resource Allocation (DRA) binding conditions are graduating to beta in Kubernetes 1.35, enabled via the `DRAControlPlane` feature gate. This makes DRA — Kubernetes' framework for scheduling specialized hardware like GPUs, FPGAs, and network accelerators — production-viable for teams willing to accept beta-stage APIs.
+
+The graduation reflects enough real-world usage to stabilize the API surface. It won't receive the breaking changes that were common in alpha.
+
+## Why GPU Scheduling Needed a Better Model
+
+Traditional Kubernetes GPU scheduling relies on `nodeSelector`, `tolerations`, and device plugins. This works for simple workloads but has meaningful limitations in AI/ML production environments:
+
+**Whole-GPU allocation only**: A Pod claiming an A100 occupies the entire GPU regardless of how much it actually uses. A small inference model running on a 40GB GPU leaves most of that memory idle.
+
+**Limited selection expressiveness**: You can target "a node with a GPU" but expressing "a GPU with at least 40GB VRAM running Hopper architecture" requires custom webhooks or operator-level workarounds.
+
+**Heterogeneous cluster handling is fragile**: Clusters mixing A100s and H100s require manual scheduling constraints rather than declarative capability matching.
+
+DRA replaces this with a structured API for expressing resource requirements and letting the scheduler match them against available devices using CEL expressions.
+
+## Binding Conditions in Practice
+
+The key capability in 1.35 is using CEL (Common Expression Language) in ResourceClaims to express device requirements declaratively:
+
+```yaml
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: inference-gpu
+spec:
+  devices:
+    requests:
+    - name: gpu
+      deviceClassName: nvidia.com/gpu
+      selectors:
+      - cel:
+          expression: >
+            device.attributes["nvidia.com/gpu"].vramGB >= 40 &&
+            device.attributes["nvidia.com/gpu"].architecture == "Hopper"
+      allocationMode: ExactCount
+      count: 1
+```
+
+This claim says: "Give me one Hopper GPU with at least 40GB VRAM." The scheduler evaluates available devices against this expression and binds the best match. Previously, expressing this constraint required custom scheduling webhooks or operator logic outside the core Kubernetes API.
+
+## Impact on AI/ML Workflows
+
+### LLM Inference Serving
+
+When running multiple models in the same cluster, GPU allocation efficiency directly affects both cost and latency. DRA enables:
+
+- Routing small inference models to lower-tier GPUs while preserving high-VRAM GPUs for larger models
+- Combining resource claims with NVIDIA MIG (Multi-Instance GPU) slices for better utilization density
+
+```yaml
+# Deployment for a smaller inference model targeting 24GB GPUs
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: small-model-inference
+spec:
+  template:
+    spec:
+      containers:
+      - name: model-server
+        image: inference-server:latest
+        resources:
+          claims:
+          - name: standard-gpu
+      resourceClaims:
+      - name: standard-gpu
+        resourceClaimTemplateName: 24gb-gpu-template
+```
+
+### Fine-tuning Job Lifecycle Management
+
+Fine-tuning jobs have bursty, time-bounded GPU demand. DRA's resource lifecycle management makes this pattern more reliable: the ResourceClaim exists only for the duration of the job, and the device is released immediately when the job completes — rather than lingering until the next scheduling cycle.
+
+### Monitoring Implications
+
+As GPU becomes the primary resource signal, CPU and memory-centric Kubernetes monitoring becomes insufficient. Plan GPU-specific observability alongside DRA adoption:
+
+```bash
+# DCGM Exporter for Prometheus GPU metrics
+helm repo add gpu-helm-charts https://nvidia.github.io/dcgm-exporter/helm-charts
+helm install dcgm-exporter gpu-helm-charts/dcgm-exporter \
+  --namespace monitoring \
+  --set serviceMonitor.enabled=true
+```
+
+Track GPU utilization per workload, memory pressure, and allocation wait times — these replace CPU saturation as the primary capacity signals in AI/ML clusters.
+
+## Adoption Path
+
+**Enable the feature gate first in non-production**:
+```yaml
+# kube-apiserver featureGates config
+featureGates:
+  DRAControlPlane: true
+```
+
+**Verify driver and plugin compatibility**: DRA requires updated NVIDIA device plugins and drivers. Check compatibility matrices before enabling the feature gate in any environment.
+
+**Start with new workloads only**: Define ResourceClasses for new GPU workloads. Existing workloads on device plugin scheduling can coexist until you're confident in DRA behavior. Device plugin scheduling and DRA are compatible within the same cluster.
+
+**Validate allocation accuracy**: Before using DRA in production, confirm that binding conditions correctly target the intended GPU types in your specific hardware configuration. Cluster inventory and device attribute reporting can vary by driver version.
+
+## Caveats
+
+**Still beta**: The API is more stable than alpha but not yet frozen. Evaluate your risk tolerance before adopting in production critical-path workloads, particularly if your GPU provisioning pipeline depends on scheduling guarantees.
+
+**Custom tooling may conflict**: If you've built custom scheduling webhooks or operators to work around device plugin limitations, audit them before enabling DRA to avoid conflicting behavior.
+
+## Takeaway
+
+DRA binding conditions reaching beta is the most consequential Kubernetes advancement for AI/ML infrastructure in the current release cycle. The ability to express GPU requirements declaratively — and have the scheduler match them automatically — eliminates much of the custom automation overhead teams currently maintain to handle heterogeneous GPU clusters.
+
+If you're running AI workloads on Kubernetes and haven't evaluated DRA yet, 1.35 is the right time to build familiarity with the API and test it in a staging environment.
