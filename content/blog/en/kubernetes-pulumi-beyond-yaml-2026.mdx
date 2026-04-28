@@ -1,0 +1,209 @@
+---
+title: "Beyond YAML: Managing Kubernetes with Pulumi in 2026"
+description: "YAML-based Kubernetes configuration has real limits. Pulumi lets you write infrastructure in TypeScript or Python — with type checking, loops, conditionals, and unit tests. Here's a practical look at where it shines and when to stick with Helm."
+date: "2026-04-23"
+status: "published"
+tags: ["Kubernetes", "Pulumi", "IaC", "DevOps", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-pulumi-beyond-yaml-2026"
+---
+
+Kubernetes configuration management has always meant wrestling with YAML. Deployments, Services, ConfigMaps — each written by hand, then DRYed up with Helm templates or Kustomize overlays. The result is often readable enough at small scale, but grows unwieldy when you need real conditionals, loops, or type safety.
+
+A Pulumi blog post earlier this year declared 2026 the "Kubernetes Automation Era," and Docker Kanvas has explicitly positioned itself as a challenger to Helm and Kustomize. The shift from YAML-centric infrastructure to code-based configuration is past the experimental phase.
+
+## The Core Problem with YAML for Infrastructure
+
+YAML is a data serialization format. It has no functions, no types, no loops, and no conditionals. Every workaround — Helm's Go template syntax, Kustomize's patch overlays — is an attempt to bolt on what's missing.
+
+```yaml
+# Helm template: what DRY looks like in YAML
+{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "myapp.fullname" . }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "myapp.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+{{- end }}
+```
+
+Go template syntax inside YAML has weak editor support, cryptic error messages when something is malformed, and no type checking. For simple charts it's manageable. For complex multi-environment setups, it becomes a maintenance liability.
+
+## Writing Kubernetes Resources in TypeScript
+
+Pulumi lets you describe infrastructure — including Kubernetes resources — in TypeScript, Python, Go, or C#. The same resource, written in TypeScript:
+
+```typescript
+import * as k8s from "@pulumi/kubernetes";
+
+const labels = { app: "api-server" };
+
+const deployment = new k8s.apps.v1.Deployment("api-server", {
+  metadata: { namespace: "production" },
+  spec: {
+    replicas: 3,
+    selector: { matchLabels: labels },
+    template: {
+      metadata: { labels },
+      spec: {
+        containers: [{
+          name: "api",
+          image: "registry.example.com/api:v2.1.0",
+          ports: [{ containerPort: 8080 }],
+          resources: {
+            requests: { cpu: "100m", memory: "128Mi" },
+            limits:   { cpu: "500m", memory: "512Mi" },
+          },
+          env: [{
+            name: "DATABASE_URL",
+            valueFrom: {
+              secretKeyRef: { name: "db-credentials", key: "url" },
+            },
+          }],
+        }],
+      },
+    },
+  },
+});
+```
+
+Your editor autocompletes field names, catches typos at save time, and highlights missing required fields. That alone eliminates a large class of deployment errors.
+
+## Conditionals and Loops Without Templates
+
+The most practical advantage of Pulumi over Helm is using the host language directly for logic:
+
+```typescript
+const isProd = pulumi.getStack() === "production";
+
+// Different replicas and resource limits per environment
+const deployment = new k8s.apps.v1.Deployment("api-server", {
+  spec: {
+    replicas: isProd ? 3 : 1,
+    template: {
+      spec: {
+        containers: [{
+          name: "api",
+          image: `registry.example.com/api:${imageTag}`,
+          resources: isProd
+            ? { limits: { cpu: "500m", memory: "512Mi" } }
+            : { limits: { cpu: "200m", memory: "256Mi" } },
+        }],
+      },
+    },
+  },
+});
+
+// Deploy a set of microservices with a shared pattern
+const services = ["auth", "payments", "notifications"];
+
+for (const svcName of services) {
+  new k8s.apps.v1.Deployment(`${svcName}`, {
+    spec: {
+      replicas: isProd ? 2 : 1,
+      template: {
+        spec: {
+          containers: [{ name: svcName, image: `registry/${svcName}:latest` }],
+        },
+      },
+    },
+  });
+}
+```
+
+Achieving the same result in Helm requires nested `{{ range }}` and `{{ if }}` blocks that quickly become difficult to read and test.
+
+## Multi-Environment Configuration with Pulumi Stacks
+
+Pulumi's Stack system handles per-environment configuration cleanly:
+
+```yaml
+# Pulumi.production.yaml
+config:
+  myapp:replicaCount: "3"
+  myapp:imageTag: "v2.1.0"
+  myapp:databaseUrl:
+    secure: AAABAAxxxxEncryptedxxxxxx
+
+# Pulumi.staging.yaml
+config:
+  myapp:replicaCount: "1"
+  myapp:imageTag: "v2.1.0-rc1"
+```
+
+```typescript
+// index.ts — one codebase, all environments
+const config = new pulumi.Config();
+const replicas = config.getNumber("replicaCount") ?? 1;
+const imageTag  = config.require("imageTag");
+const dbUrl     = config.requireSecret("databaseUrl");
+```
+
+Sensitive values are encrypted at rest. `pulumi preview` gives you a diff of what will change before you apply — analogous to `terraform plan`, but for Kubernetes.
+
+## Testing Infrastructure Code
+
+This is where Pulumi genuinely beats YAML-based tools. You can unit test your infrastructure definitions:
+
+```typescript
+import * as pulumi from "@pulumi/pulumi";
+
+pulumi.runtime.setMocks({
+  newResource: (args) => ({ id: `${args.name}-id`, state: args.inputs }),
+  call: () => ({ outputs: {} }),
+});
+
+describe("Production deployment", () => {
+  it("runs 3 replicas in production stack", async () => {
+    process.env["PULUMI_CONFIG"] = JSON.stringify({
+      "myapp:replicaCount": "3",
+    });
+    const { deployment } = await import("./index");
+    const replicas = await (deployment.spec as any).replicas;
+    expect(replicas).toBe(3);
+  });
+});
+```
+
+YAML linting catches syntax errors. Pulumi tests catch logic errors — including the kind that only appear under specific environment configurations.
+
+## When to Keep Using Helm
+
+Pulumi isn't the right tool for every situation:
+
+| Scenario | Better choice |
+|----------|--------------|
+| Using an existing community Helm chart as-is | Helm |
+| Minor patches to an existing Helm chart | Kustomize |
+| New infrastructure written from scratch | Pulumi |
+| Multiple environments with complex config differences | Pulumi |
+| Team unfamiliar with TypeScript/Python | Helm |
+| Need infrastructure unit tests | Pulumi |
+
+Pulumi can also call existing Helm charts, so adoption doesn't require rewriting everything:
+
+```typescript
+// Use an existing Helm chart from Pulumi
+const nginxIngress = new k8s.helm.v3.Chart("nginx-ingress", {
+  chart: "ingress-nginx",
+  fetchOpts: { repo: "https://kubernetes.github.io/ingress-nginx" },
+  values: {
+    controller: { replicaCount: 2, service: { type: "LoadBalancer" } },
+  },
+});
+```
+
+## Practical Takeaways
+
+Our recommendation: if you're starting a new Kubernetes project, or if your Helm values files have grown into a maintenance burden, Pulumi is worth evaluating seriously. The learning curve is shallow if your team already writes TypeScript or Python.
+
+If you're maintaining existing Helm charts with minimal custom logic, the migration cost likely outweighs the benefit. Kustomize remains a pragmatic choice for patching existing charts.
+
+The broader shift the Pulumi team is describing is real: treating infrastructure configuration as code — with the same tooling, testing, and review standards as application code — is the direction the industry is heading. The question is which project justifies being the place you start.

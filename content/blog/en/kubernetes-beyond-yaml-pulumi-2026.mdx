@@ -1,0 +1,199 @@
+---
+title: "Beyond YAML: Managing Kubernetes with Pulumi and Typed Infrastructure Code"
+description: "YAML-based Kubernetes management breaks down at scale. Pulumi's code-native IaC approach — using TypeScript, Python, or Go — offers type safety, reuse, and better maintainability. Here's when to make the switch."
+date: "2026-04-22"
+status: "published"
+tags: ["Kubernetes", "Pulumi", "IaC", "DevOps", "Cloud Native"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-beyond-yaml-pulumi-2026"
+---
+
+# Beyond YAML: Managing Kubernetes with Pulumi and Typed Infrastructure Code
+
+Kubernetes infrastructure starts with YAML. At tens of resources, it's manageable. At hundreds or thousands, YAML's limits become the primary maintenance burden. In 2026, code-native IaC tools like Pulumi have matured to the point where the switch is worth evaluating seriously.
+
+## Where YAML Falls Short
+
+YAML is readable and universally supported. It also has no type system, no abstractions, and no way to express logic — three things that matter at scale.
+
+**No DRY**
+
+The same container configuration, resource limits, and annotation sets repeat across Deployments. When something changes, you're doing find-and-replace across files and hoping nothing is missed.
+
+**No type safety**
+
+```yaml
+resources:
+  limits:
+    memory: "128Mi"
+    cpu: "500m"
+```
+
+YAML has no concept of what `"500m"` means. Invalid units or values aren't caught until `kubectl apply` — sometimes not until runtime.
+
+**Conditional logic requires workarounds**
+
+Environment-specific configuration in YAML requires Helm templates or Kustomize overlays. These work, but they add a layer of complexity that exists only because YAML lacks native conditionals.
+
+## Pulumi's Approach
+
+Pulumi lets you define infrastructure in TypeScript, Python, Go, or C#. Not templates — actual code, with the full type system and tooling of the language.
+
+```typescript
+import * as pulumi from "@pulumi/pulumi";
+import * as k8s from "@pulumi/kubernetes";
+
+const config = new pulumi.Config();
+const replicas = config.getNumber("replicas") ?? 2;
+const namespace = config.get("namespace") ?? "default";
+
+function createDeployment(
+  name: string,
+  image: string,
+  port: number,
+  opts?: pulumi.ResourceOptions
+): k8s.apps.v1.Deployment {
+  return new k8s.apps.v1.Deployment(
+    name,
+    {
+      metadata: { namespace },
+      spec: {
+        replicas,
+        selector: { matchLabels: { app: name } },
+        template: {
+          metadata: { labels: { app: name } },
+          spec: {
+            containers: [
+              {
+                name,
+                image,
+                ports: [{ containerPort: port }],
+                resources: {
+                  requests: { memory: "64Mi", cpu: "250m" },
+                  limits: { memory: "128Mi", cpu: "500m" },
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+    opts
+  );
+}
+
+const apiDeployment = createDeployment("api", "myapp/api:v1.2.3", 8080);
+const workerDeployment = createDeployment("worker", "myapp/worker:v1.2.3", 9090);
+```
+
+Your IDE catches invalid field names and types before you ever run `pulumi up`. Common patterns become functions. The duplication problem disappears.
+
+## Environment-Specific Configuration
+
+Pulumi uses stack configuration files for environment-specific values:
+
+```yaml
+# Pulumi.staging.yaml
+config:
+  myapp:replicas: 1
+  myapp:namespace: staging
+
+# Pulumi.production.yaml
+config:
+  myapp:replicas: 3
+  myapp:namespace: production
+```
+
+The program is identical across environments; only the injected values differ. This is cleaner than Kustomize overlays because logic and data are explicitly separated.
+
+## Incremental Migration from Helm
+
+If you have existing Helm charts, Pulumi can wrap them as Helm releases. You don't need to rewrite everything at once.
+
+```typescript
+import * as k8s from "@pulumi/kubernetes";
+
+// Use existing Helm charts as-is
+const nginxIngress = new k8s.helm.v3.Release("nginx-ingress", {
+  chart: "ingress-nginx",
+  repositoryOpts: {
+    repo: "https://kubernetes.github.io/ingress-nginx",
+  },
+  version: "4.10.0",
+  values: {
+    controller: {
+      replicaCount: 2,
+      service: { type: "LoadBalancer" },
+    },
+  },
+});
+
+// New resources in native Pulumi
+const myApp = new k8s.apps.v1.Deployment("my-app", {
+  // ...
+}, { dependsOn: [nginxIngress] });
+```
+
+You can run Helm releases and Pulumi-native resources side by side, migrating gradually.
+
+## State Management
+
+Pulumi tracks infrastructure state, similar to Terraform. Default is Pulumi Cloud, but self-hosted backends on S3 or GCS are supported.
+
+```bash
+# Use S3 as backend
+pulumi login s3://my-pulumi-state-bucket
+
+pulumi stack init production
+pulumi preview --diff
+pulumi up
+```
+
+Decide your state backend early — it's harder to migrate later. Treat state files with the same access controls as your production credentials.
+
+## Testing Infrastructure Code
+
+Pulumi supports unit tests for infrastructure definitions — something YAML simply cannot do.
+
+```typescript
+import * as pulumi from "@pulumi/pulumi";
+
+pulumi.runtime.setMocks({
+  newResource: (args) => ({
+    id: `${args.name}_id`,
+    state: args.inputs,
+  }),
+  call: (args) => args.inputs,
+});
+
+describe("Kubernetes Deployment", () => {
+  it("production stack uses 3 replicas", async () => {
+    process.env.PULUMI_CONFIG = JSON.stringify({
+      "myapp:replicas": "3",
+      "myapp:namespace": "production",
+    });
+
+    const { apiDeployment } = await import("./index");
+    const spec = await apiDeployment.spec.promise();
+    expect(spec.replicas).toBe(3);
+  });
+});
+```
+
+## Decision Framework
+
+**Consider switching to Pulumi when:**
+- You have 100+ YAML files and change impact is hard to predict
+- Kustomize overlays are becoming difficult to reason about
+- Your infra team has TypeScript/Python/Go experience
+- You want testable infrastructure code
+
+**Stay with YAML/Helm when:**
+- Your cluster is small (tens of resources, low change frequency)
+- Your team is Helm-native and current tooling works well
+- GitOps tooling (ArgoCD, Flux) is already tightly integrated
+
+## The Underlying Point
+
+The "beyond YAML" movement isn't about YAML being wrong for simple cases. It's about recognizing that infrastructure configuration is software engineering — and software engineering benefits from type safety, abstraction, and testability. Pulumi brings those properties to Kubernetes management without requiring a new DSL. The language you already use for application code is the same one that defines your infrastructure.

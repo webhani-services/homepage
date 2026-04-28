@@ -1,0 +1,138 @@
+---
+title: "Kubernetes v1.36 と「複雑さを見えなくする」AWS の戦略"
+description: "4月末リリース予定の Kubernetes v1.36 の概要と、KubeCon Europe 2026 で AWS が提示した Karpenter・Kro・Cedar による複雑性解消のアプローチを解説します。"
+date: "2026-04-26"
+status: "published"
+tags: ["Kubernetes", "AWS", "Cloud", "DevOps", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-v136-simplification-2026"
+---
+
+Kubernetes v1.36 が 4 月末にリリース予定です。今回のリリースはいくつかの機能削除・非推奨化を含むとともに、注目度の高い機能強化も複数含まれています。同じ時期に開催された KubeCon CloudNativeCon Europe 2026 では、AWS の Jesse Butler が「Kubernetes を見えなくすること（Making Kubernetes Invisible）」というテーマで講演し、Karpenter・Kro・Cedar を組み合わせた複雑性解消の具体的なアプローチを示しました。
+
+## Kubernetes v1.36 の主な変更点
+
+リリースノートの詳細は公式ブログで確認できますが、今回のサイクルで注目すべき方向性は次の通りです。
+
+**機能削除と非推奨化**
+
+Kubernetes は定期的に古い API バージョンや非推奨機能の削除を実施します。v1.36 でも削除されるリソースや API バージョンがあるため、アップグレード前に自分のクラスターが該当リソースを使用していないか確認が必要です。
+
+```bash
+# 削除予定の API を使用しているリソースの確認
+kubectl get --raw /apis | jq '.groups[].versions[].groupVersion' | sort
+# または pluto などのツールを活用
+pluto detect-files -d ./manifests
+```
+
+**エンハンスメントの数**
+
+「かなりの数のエンハンスメントを含む」という表現が公式から出ており、SIG ごとの変更は v1.36 のチェンジログが確定してから確認することをお勧めします。
+
+## 「Kubernetes を見えなくする」とはどういうことか
+
+AWS の Butler が KubeCon Europe 2026 で提示した課題意識はシンプルです。Kubernetes の本質的な価値はコンテナオーケストレーションにありますが、その学習コストと運用複雑性がビジネス価値の実現を遅らせているという問題があります。
+
+これを解決するために AWS が組み合わせるのが、Karpenter・Kro・Cedar の三つです。
+
+### Karpenter — ノード管理の抽象化
+
+Karpenter は Pod のスケジューリング要求に応じて、最適なノードタイプを自動的にプロビジョニングするノードオートスケーラーです。従来の Cluster Autoscaler と違い、Node Group の事前設定が不要で、ワークロードの要件から逆算してノードを選択します。
+
+```yaml
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+  limits:
+    cpu: "1000"
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
+```
+
+この設定で、Karpenter はワークロードに最適な EC2 インスタンスを自動選択し、使われていないノードを統合してコストを最小化します。
+
+### Kro (Kubernetes Resource Orchestrator) — 複数リソースの抽象化
+
+Kro は複数の Kubernetes リソースをひとつのカスタムリソースとして定義・デプロイできるオーケストレーターです。例えば、「フロントエンドアプリ」を表す CRD を作成し、その中に Deployment、Service、HorizontalPodAutoscaler、NetworkPolicy などをまとめて定義できます。
+
+```yaml
+apiVersion: kro.run/v1alpha1
+kind: ResourceGroup
+metadata:
+  name: webapp
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: WebApp
+    spec:
+      image: { type: string }
+      replicas: { type: integer, default: 2 }
+  resources:
+    - id: deployment
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        spec:
+          replicas: ${schema.spec.replicas}
+          # ...
+    - id: service
+      template:
+        apiVersion: v1
+        kind: Service
+        # ...
+```
+
+アプリケーション開発者は Kubernetes の内部詳細を意識せず、シンプルな `WebApp` リソースをデプロイするだけで必要なインフラが揃います。
+
+### Cedar — ポリシーによるアクセス制御
+
+Cedar はポリシー言語で、Kubernetes の RBAC 制御を宣言的かつ検証可能な形式で記述できます。RBAC の設定が複雑化して理解しにくくなりがちな問題に対し、明確な意図が読み取れるポリシー定義を実現します。
+
+## 2026 年の Kubernetes 運用トレンド
+
+KubeCon Europe 2026 の議論からも見えてくるトレンドがあります。
+
+**GitOps の定着**
+
+Git リポジトリをクラスターの状態の Single Source of Truth とする GitOps は、2026 年では「主流の手法」として定着しています。ArgoCD や Flux を使った宣言的デプロイが標準化されており、インフラ変更も Pull Request を通じてレビュー可能になっています。
+
+**Docker + Kubernetes + Wasm の共存**
+
+「Docker か Kubernetes か」という対立的な議論は過去のものです。現実の 2026 年では、開発環境に Docker、本番オーケストレーションに Kubernetes、エッジ処理に WebAssembly を組み合わせる構成が一般的になっています。それぞれの得意領域で使い分けることが最適解です。
+
+## アップグレード時の実践的な注意点
+
+v1.36 へのアップグレードを計画している場合の注意点をまとめます。
+
+```bash
+# 1. 現在のクラスターで削除予定 API の使用状況を確認
+kubectl api-resources --verbs=list -o name | \
+  xargs -I{} kubectl get {} --all-namespaces -o name 2>/dev/null
+
+# 2. Helm Chart が古い API バージョンを使用していないか確認
+helm list --all-namespaces -o json | jq '.[].chart'
+
+# 3. ステージング環境で動作確認してから本番適用
+# (EKS の場合) マネージドノードグループを段階的にアップグレード
+```
+
+マネージドな Kubernetes サービス（EKS、GKE、AKS）を使用している場合でも、制御プレーンのアップグレード後にノードグループを更新するまでの間、API の互換性に注意が必要です。
+
+## まとめ
+
+Kubernetes v1.36 と AWS の「見えない Kubernetes」戦略が示しているのは、プラットフォームエンジニアリングの成熟です。Karpenter でノード管理を隠蔽し、Kro でリソース定義を抽象化し、Cedar でポリシーを明示化する — このアプローチにより、アプリケーション開発者が Kubernetes の複雑さに向き合う必要性を下げることができます。
+
+webhani では EKS を中心とした Kubernetes 環境の設計・構築支援を行っています。GitOps 導入や Karpenter 設定の最適化についてもお気軽にご相談ください。

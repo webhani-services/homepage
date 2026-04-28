@@ -1,0 +1,201 @@
+---
+title: "YAML을 넘어서: Pulumi와 코드 기반 Kubernetes 인프라 관리"
+description: "규모가 커질수록 YAML 기반 Kubernetes 관리의 한계가 드러납니다. TypeScript, Python, Go로 인프라를 정의하는 Pulumi의 코드 네이티브 접근법이 타입 안전성과 재사용성을 제공합니다. 전환 시점과 실전 패턴을 정리합니다."
+date: "2026-04-22"
+status: "published"
+tags: ["Kubernetes", "Pulumi", "IaC", "DevOps", "Cloud Native"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-beyond-yaml-pulumi-2026"
+---
+
+# YAML을 넘어서: Pulumi와 코드 기반 Kubernetes 인프라 관리
+
+Kubernetes 인프라는 YAML로 시작합니다. 리소스가 수십 개일 때는 관리가 가능합니다. 수백, 수천 개가 되면 YAML의 한계가 주요 유지보수 부담이 됩니다. 2026년, Pulumi 같은 코드 네이티브 IaC 도구가 성숙하면서 전환을 진지하게 검토할 시점이 됐습니다.
+
+## YAML의 한계
+
+YAML은 읽기 쉽고 범용적으로 지원됩니다. 하지만 타입 시스템도, 추상화도, 로직 표현 방법도 없습니다. 규모가 커지면 이 세 가지가 핵심 문제가 됩니다.
+
+**DRY 원칙 불가**
+
+동일한 컨테이너 설정, 리소스 제한, Annotation 세트가 여러 Deployment에 반복됩니다. 변경이 필요할 때 어떤 파일을 어떻게 바꿔야 하는지 사람이 직접 추적해야 합니다.
+
+**타입 안전성 없음**
+
+```yaml
+resources:
+  limits:
+    memory: "128Mi"
+    cpu: "500m"
+```
+
+YAML은 `"500m"`의 의미를 알지 못합니다. 잘못된 단위나 값을 작성해도 `kubectl apply`할 때까지, 때로는 런타임까지 오류가 발생하지 않습니다.
+
+**조건 분기가 어려움**
+
+환경별 설정을 분리하려면 Helm Template이나 Kustomize overlay를 사용해야 합니다. 이것들이 작동하기는 하지만, YAML에 기본 조건문이 없기 때문에 존재하는 복잡성입니다.
+
+## Pulumi의 접근법
+
+Pulumi는 TypeScript, Python, Go, C#으로 인프라를 정의합니다. 템플릿이 아닌 실제 코드입니다.
+
+```typescript
+import * as pulumi from "@pulumi/pulumi";
+import * as k8s from "@pulumi/kubernetes";
+
+const config = new pulumi.Config();
+const replicas = config.getNumber("replicas") ?? 2;
+const namespace = config.get("namespace") ?? "default";
+
+function createDeployment(
+  name: string,
+  image: string,
+  port: number,
+  opts?: pulumi.ResourceOptions
+): k8s.apps.v1.Deployment {
+  return new k8s.apps.v1.Deployment(
+    name,
+    {
+      metadata: { namespace },
+      spec: {
+        replicas,
+        selector: { matchLabels: { app: name } },
+        template: {
+          metadata: { labels: { app: name } },
+          spec: {
+            containers: [
+              {
+                name,
+                image,
+                ports: [{ containerPort: port }],
+                resources: {
+                  requests: { memory: "64Mi", cpu: "250m" },
+                  limits: { memory: "128Mi", cpu: "500m" },
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+    opts
+  );
+}
+
+const apiDeployment = createDeployment("api", "myapp/api:v1.2.3", 8080);
+const workerDeployment = createDeployment("worker", "myapp/worker:v1.2.3", 9090);
+```
+
+IDE가 `pulumi up` 실행 전에 잘못된 필드명과 타입을 잡아냅니다. 공통 패턴을 함수로 추상화할 수 있어 중복이 사라집니다.
+
+## 환경별 설정 관리
+
+Pulumi는 Stack 설정 파일로 환경별 값을 관리합니다.
+
+```yaml
+# Pulumi.staging.yaml
+config:
+  myapp:replicas: 1
+  myapp:namespace: staging
+
+# Pulumi.production.yaml
+config:
+  myapp:replicas: 3
+  myapp:namespace: production
+```
+
+프로그램은 환경에 관계없이 동일하고, 주입되는 값만 다릅니다. Kustomize overlay보다 로직과 데이터의 분리가 명확합니다.
+
+## Helm에서 Pulumi로 단계적 이전
+
+기존 Helm Chart가 있다면 Pulumi가 Helm Release로 감쌀 수 있어 모든 것을 다시 작성할 필요가 없습니다.
+
+```typescript
+import * as k8s from "@pulumi/kubernetes";
+
+// 기존 Helm Chart를 그대로 활용
+const nginxIngress = new k8s.helm.v3.Release("nginx-ingress", {
+  chart: "ingress-nginx",
+  repositoryOpts: {
+    repo: "https://kubernetes.github.io/ingress-nginx",
+  },
+  version: "4.10.0",
+  values: {
+    controller: {
+      replicaCount: 2,
+      service: { type: "LoadBalancer" },
+    },
+  },
+});
+
+// 새 리소스는 Pulumi 네이티브로 작성
+const myApp = new k8s.apps.v1.Deployment("my-app", {
+  // ...
+}, { dependsOn: [nginxIngress] });
+```
+
+Helm Release와 Pulumi 네이티브 리소스를 혼용하며 점진적으로 이전할 수 있습니다.
+
+## State 관리
+
+Pulumi는 Terraform과 유사하게 인프라 State를 추적합니다. 기본은 Pulumi Cloud이지만, S3나 GCS 같은 자체 호스팅 Backend도 지원합니다.
+
+```bash
+# S3를 Backend로 사용
+pulumi login s3://my-pulumi-state-bucket
+
+pulumi stack init production
+pulumi preview --diff
+pulumi up
+```
+
+State Backend는 초기에 결정해야 합니다. 나중에 이전하기가 어렵습니다. State 파일은 프로덕션 자격 증명과 동일한 수준의 접근 제어가 필요합니다.
+
+## 인프라 코드 테스트
+
+Pulumi는 인프라 정의에 대한 Unit Test를 지원합니다. YAML로는 불가능한 부분입니다.
+
+```typescript
+import * as pulumi from "@pulumi/pulumi";
+
+pulumi.runtime.setMocks({
+  newResource: (args) => ({
+    id: `${args.name}_id`,
+    state: args.inputs,
+  }),
+  call: (args) => args.inputs,
+});
+
+describe("Kubernetes Deployment", () => {
+  it("Production Stack은 3개의 Replica를 사용합니다", async () => {
+    process.env.PULUMI_CONFIG = JSON.stringify({
+      "myapp:replicas": "3",
+      "myapp:namespace": "production",
+    });
+
+    const { apiDeployment } = await import("./index");
+    const spec = await apiDeployment.spec.promise();
+    expect(spec.replicas).toBe(3);
+  });
+});
+```
+
+## 전환 판단 기준
+
+**Pulumi로 전환을 고려해야 하는 경우:**
+- YAML 파일이 100개 이상이고 변경 영향 범위 파악이 어려운 경우
+- Kustomize overlay가 복잡해져서 추론하기 어려워진 경우
+- 인프라팀이 TypeScript/Python/Go 경험 보유
+- Test 가능한 인프라 코드를 작성하고 싶은 경우
+
+**YAML/Helm을 유지해도 되는 경우:**
+- 클러스터 규모가 작고 변경 빈도가 낮은 경우
+- 팀이 Helm에 익숙하고 현재 도구가 잘 작동하는 경우
+- ArgoCD, Flux 같은 GitOps 도구와의 통합이 이미 잘 구축된 경우
+
+## 핵심 관점
+
+"YAML을 넘어서"라는 흐름은 YAML이 잘못됐다는 게 아닙니다. 인프라 설정이 소프트웨어 엔지니어링이라는 인식에서 출발합니다. 소프트웨어 엔지니어링은 타입 안전성, 추상화, 테스트 가능성에서 이득을 얻습니다. Pulumi는 새로운 DSL을 배우지 않고도 이런 특성을 Kubernetes 관리에 가져다줍니다. 애플리케이션 코드에 이미 사용하는 언어가 인프라를 정의하는 언어가 됩니다.
+
+Kubernetes 클러스터 관리나 IaC Architecture 설계에 대해 궁금한 점이 있다면 webhani에 문의해 주세요.

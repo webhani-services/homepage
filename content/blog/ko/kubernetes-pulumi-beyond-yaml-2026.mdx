@@ -1,0 +1,213 @@
+---
+title: "YAML을 넘어서: 2026년 Pulumi로 Kubernetes 인프라 관리하기"
+description: "Helm 템플릿과 Kustomize의 한계를 넘어, TypeScript와 Python으로 Kubernetes 리소스를 코드로 관리하는 Pulumi의 실용적인 접근을 살펴봅니다. 조건 분기, 루프, 유닛 테스트까지 가능한 IaC의 현재 수준을 정리합니다."
+date: "2026-04-23"
+status: "published"
+tags: ["Kubernetes", "Pulumi", "IaC", "DevOps", "인프라"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-pulumi-beyond-yaml-2026"
+---
+
+Kubernetes 구성 관리는 오랫동안 YAML과 씨름하는 작업이었습니다. Deployment, Service, ConfigMap을 손으로 작성하고, Helm 차트나 Kustomize로 중복을 줄이려 하지만, 복잡한 조건 분기와 루프 표현에 한계가 있습니다.
+
+2026년, Pulumi 블로그가 Kubernetes의 "자동화 시대"를 선언하고 Docker Kanvas가 Helm과 Kustomize의 대안으로 등장하면서, YAML 중심의 인프라 관리에서 범용 프로그래밍 언어로의 전환이 실용 단계에 접어들었습니다.
+
+## YAML 기반 구성 관리의 핵심 한계
+
+YAML은 데이터 직렬화 포맷입니다. 함수도, 타입도, 루프도, 조건 분기도 없습니다. Helm의 Go 템플릿 문법이나 Kustomize의 패치 오버레이는 모두 이 부재를 메우려는 시도입니다.
+
+```yaml
+# Helm 템플릿: YAML에서 DRY를 구현하면 이렇게 됩니다
+{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "myapp.fullname" . }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "myapp.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+{{- end }}
+```
+
+YAML 위에 Go 템플릿을 얹은 이 구문은 에디터 지원이 약하고, 오류 메시지가 불친절하며, 타입 체크가 없습니다. 간단한 차트는 괜찮지만 복잡한 멀티 환경 설정에서는 유지 관리 부담이 급격히 커집니다.
+
+## TypeScript로 Kubernetes 리소스 작성하기
+
+Pulumi는 TypeScript, Python, Go, C# 등 범용 언어로 인프라를 기술할 수 있는 IaC 도구입니다. 동일한 Deployment를 TypeScript로 작성하면 다음과 같습니다.
+
+```typescript
+import * as k8s from "@pulumi/kubernetes";
+
+const labels = { app: "api-server" };
+
+const deployment = new k8s.apps.v1.Deployment("api-server", {
+  metadata: { namespace: "production" },
+  spec: {
+    replicas: 3,
+    selector: { matchLabels: labels },
+    template: {
+      metadata: { labels },
+      spec: {
+        containers: [{
+          name: "api",
+          image: "registry.example.com/api:v2.1.0",
+          ports: [{ containerPort: 8080 }],
+          resources: {
+            requests: { cpu: "100m", memory: "128Mi" },
+            limits:   { cpu: "500m", memory: "512Mi" },
+          },
+          env: [{
+            name: "DATABASE_URL",
+            valueFrom: {
+              secretKeyRef: { name: "db-credentials", key: "url" },
+            },
+          }],
+        }],
+      },
+    },
+  },
+});
+```
+
+에디터가 필드명을 자동 완성하고, 오타를 저장 시점에 잡아내며, 필수 필드 누락을 즉시 알려줍니다. 이것만으로도 배포 오류의 상당 부분을 사전에 방지할 수 있습니다.
+
+## 조건 분기와 루프를 자연스럽게
+
+Pulumi의 가장 큰 실용적 장점은 언어의 기능을 그대로 활용할 수 있다는 점입니다.
+
+```typescript
+const isProd = pulumi.getStack() === "production";
+
+// 환경별로 레플리카 수와 리소스 제한을 다르게 설정
+const deployment = new k8s.apps.v1.Deployment("api-server", {
+  spec: {
+    replicas: isProd ? 3 : 1,
+    template: {
+      spec: {
+        containers: [{
+          name: "api",
+          image: `registry.example.com/api:${imageTag}`,
+          resources: isProd
+            ? { limits: { cpu: "500m", memory: "512Mi" } }
+            : { limits: { cpu: "200m", memory: "256Mi" } },
+        }],
+      },
+    },
+  },
+});
+
+// 여러 마이크로서비스를 동일한 패턴으로 배포
+const services = ["auth", "payments", "notifications"];
+
+for (const svcName of services) {
+  new k8s.apps.v1.Deployment(svcName, {
+    spec: {
+      replicas: isProd ? 2 : 1,
+      template: {
+        spec: {
+          containers: [{ name: svcName, image: `registry/${svcName}:latest` }],
+        },
+      },
+    },
+  });
+}
+```
+
+Helm 템플릿에서 이와 동일한 결과를 내려면 `{{ range }}`와 `{{ if }}`의 중첩이 깊어지고 가독성이 빠르게 저하됩니다.
+
+## Pulumi Stack으로 멀티 환경 관리
+
+Pulumi의 Stack 시스템은 환경별 설정을 깔끔하게 처리합니다.
+
+```yaml
+# Pulumi.production.yaml
+config:
+  myapp:replicaCount: "3"
+  myapp:imageTag: "v2.1.0"
+  myapp:databaseUrl:
+    secure: AAABAAxxxxEncryptedxxxxxx
+
+# Pulumi.staging.yaml
+config:
+  myapp:replicaCount: "1"
+  myapp:imageTag: "v2.1.0-rc1"
+```
+
+```typescript
+// index.ts — 하나의 코드베이스로 모든 환경 대응
+const config = new pulumi.Config();
+const replicas = config.getNumber("replicaCount") ?? 1;
+const imageTag  = config.require("imageTag");
+const dbUrl     = config.requireSecret("databaseUrl");
+```
+
+민감한 값은 암호화되어 저장됩니다. `pulumi preview`는 적용 전에 변경 사항을 diff 형태로 보여줍니다. `terraform plan`과 유사하지만 Kubernetes를 대상으로 합니다.
+
+## 인프라 코드의 유닛 테스트
+
+YAML 기반 도구에 비해 Pulumi가 진정으로 앞서는 지점입니다. 인프라 정의를 유닛 테스트로 검증할 수 있습니다.
+
+```typescript
+import * as pulumi from "@pulumi/pulumi";
+
+pulumi.runtime.setMocks({
+  newResource: (args) => ({ id: `${args.name}-id`, state: args.inputs }),
+  call: () => ({ outputs: {} }),
+});
+
+describe("프로덕션 Deployment", () => {
+  it("프로덕션 Stack에서 레플리카 3개로 실행", async () => {
+    process.env["PULUMI_CONFIG"] = JSON.stringify({
+      "myapp:replicaCount": "3",
+    });
+    const { deployment } = await import("./index");
+    const replicas = await (deployment.spec as any).replicas;
+    expect(replicas).toBe(3);
+  });
+});
+```
+
+YAML 린팅은 문법 오류를 잡습니다. Pulumi 테스트는 로직 오류를 잡습니다. 특정 환경 설정에서만 나타나는 문제도 사전에 발견할 수 있습니다.
+
+## Helm을 계속 사용해야 할 때
+
+Pulumi가 모든 상황에 맞는 도구는 아닙니다.
+
+| 상황 | 더 나은 선택 |
+|------|------------|
+| 기존 커뮤니티 Helm 차트를 그대로 사용 | Helm |
+| 기존 Helm 차트의 소폭 커스터마이징 | Kustomize |
+| 새 인프라를 코드로 처음부터 작성 | Pulumi |
+| 멀티 환경 복잡한 설정 차이가 많음 | Pulumi |
+| 팀이 TypeScript/Python에 익숙하지 않음 | Helm |
+| 인프라 유닛 테스트가 필요 | Pulumi |
+
+Pulumi는 기존 Helm 차트도 호출할 수 있어 전부 재작성하지 않아도 됩니다.
+
+```typescript
+// Pulumi에서 기존 Helm 차트 사용
+const nginxIngress = new k8s.helm.v3.Chart("nginx-ingress", {
+  chart: "ingress-nginx",
+  fetchOpts: { repo: "https://kubernetes.github.io/ingress-nginx" },
+  values: {
+    controller: { replicaCount: 2, service: { type: "LoadBalancer" } },
+  },
+});
+```
+
+## webhani의 관점
+
+클라이언트의 Kubernetes 환경 구성 관리를 지원할 때, 다음 상황에서 Pulumi 전환을 권장합니다.
+
+**신규 프로젝트**: YAML 부채 없이 시작할 수 있습니다. 팀이 TypeScript나 Python을 이미 사용한다면 학습 비용도 낮습니다.
+
+**멀티 환경 설정 차이가 많은 프로젝트**: 개발·스테이징·프로덕션 간 설정 차이가 많아 Helm Values 파일이 복잡해진 경우, Pulumi의 타입 안전한 설정 관리가 큰 개선을 가져옵니다.
+
+**인프라 테스트를 도입하려는 팀**: 인프라도 애플리케이션 코드와 동일한 테스트 기준으로 검증하고 싶은 팀에게 Pulumi는 현실적인 선택지입니다.
+
+2026년 Kubernetes 자동화의 흐름은 명확합니다. 인프라 구성을 애플리케이션 코드와 동일한 도구, 테스트, 리뷰 기준으로 관리하는 방향입니다. Pulumi는 그 전환을 시작하기에 충분히 성숙한 도구입니다.
