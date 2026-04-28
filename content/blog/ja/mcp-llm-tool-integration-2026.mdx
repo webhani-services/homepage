@@ -1,0 +1,152 @@
+---
+title: "MCP（Model Context Protocol）がDevOpsの標準インターフェースになりつつある"
+description: "Model Context ProtocolがLLMと外部ツールを繋ぐ標準として普及中。Database、Cloud Infrastructure、Browser AutomationのMCP Server実装例を解説します。"
+date: "2026-04-25"
+status: "published"
+tags: ["MCP", "LLM", "DevOps", "AI", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "mcp-llm-tool-integration-2026"
+---
+
+2026年4月時点で、Model Context Protocol（MCP）はLLMと外部ツールを繋ぐ事実上の標準インターフェースとして普及が進んでいます。データベースアクセス、クラウドインフラ管理、ブラウザ自動化など、あらゆる領域でMCP Serverの実装が登場しています。
+
+MCPが普及した理由はシンプルです。LLMに外部ツールを使わせる際の「接続方法」を標準化することで、モデルを替えてもツールを替えても同じ接続層が使えるようになりました。
+
+## MCPのアーキテクチャ概要
+
+MCPはクライアント・サーバーモデルです。LLMがMCP Clientとして動作し、各ツールはMCP Serverとして提供されます。
+
+```
+LLM (MCP Client)
+    ↓ JSON-RPC over stdio / HTTP
+MCP Server
+    ↓
+外部ツール (DB / API / ブラウザ等)
+```
+
+MCP Serverが公開するリソースは3種類です。
+
+- **Tools**: LLMが呼び出せる関数（クエリ実行、ファイル操作等）
+- **Resources**: LLMが参照できるデータ（スキーマ、ドキュメント等）
+- **Prompts**: 再利用可能なプロンプトテンプレート
+
+## シンプルなMCP Serverの実装例
+
+TypeScriptで読み取り専用のPostgreSQL MCP Serverを実装する例です。
+
+```typescript
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { Pool } from "pg";
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+const server = new Server(
+  { name: "postgres-readonly", version: "1.0.0" },
+  { capabilities: { tools: {} } }
+);
+
+server.setRequestHandler("tools/list", async () => ({
+  tools: [
+    {
+      name: "query",
+      description: "Execute a read-only SQL query",
+      inputSchema: {
+        type: "object",
+        properties: {
+          sql: { type: "string", description: "SQL SELECT statement" },
+        },
+        required: ["sql"],
+      },
+    },
+  ],
+}));
+
+server.setRequestHandler("tools/call", async ({ params }) => {
+  if (params.name !== "query") throw new Error("Unknown tool");
+
+  const sql = params.arguments.sql as string;
+  // SELECT文のみ許可
+  if (!/^\s*SELECT\b/i.test(sql)) {
+    return { content: [{ type: "text", text: "SELECT クエリのみ許可されています" }] };
+  }
+
+  const result = await pool.query(sql);
+  return {
+    content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }],
+  };
+});
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
+```
+
+## 2026年のMCPエコシステム
+
+2026年4月時点でのMCP Serverの広がりを分類すると以下のようになります。
+
+**Database**
+- PostgreSQL / MySQL / SQLite
+- MongoDB / Redis
+- Supabase / PlanetScale
+
+**Cloud Infrastructure**
+- AWS（EC2、S3、CloudWatch、EKS）
+- Kubernetes（Pod管理、ログ取得）
+- Terraform State読み取り
+
+**Browser & Web**
+- Playwright / Puppeteer
+- Web scraping
+- Form自動入力
+
+**Developer Tools**
+- GitHub / GitLab（Issue、PR操作）
+- Jira / Linear
+- Slack / Discord
+
+DevOps分野だけで18種類以上のMCP Serverが公開されており、CI/CDパイプラインへのLLM統合が現実的な選択肢になっています。
+
+## Claude CodeでのMCP活用
+
+Claude CodeはMCP Serverに対応しており、設定ファイルで有効化できます。
+
+```json
+// .claude/settings.json
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-postgres"],
+      "env": {
+        "POSTGRES_CONNECTION_STRING": "postgresql://localhost/mydb"
+      }
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_TOKEN": "ghp_***"
+      }
+    }
+  }
+}
+```
+
+この設定により、Claude Code がデータベースのスキーマを直接参照しながらクエリを生成したり、GitHubのIssueを確認しながらコードを修正したりできます。コンテキストをコピー&ペーストする手間がなくなります。
+
+## セキュリティ上の注意点
+
+MCP Serverへの接続はLLMが影響を与えられる範囲を広げるため、アクセス制御が重要です。
+
+- **最小権限の原則**: DatabaseはREAD ONLYユーザーを使用する
+- **シークレット管理**: 接続情報は環境変数で管理し、設定ファイルに含めない
+- **入力バリデーション**: LLMが生成したSQLをパース・検証せずにDBへ直接渡さない
+- **監査ログ**: MCP経由の操作は元のプロンプトとともに記録する
+
+## まとめ
+
+MCPの役割はLLMエコシステムにおいて、HTTPがWeb APIにしたことと類似しています。共通インターフェースが確立されることで、ツール側の開発者はモデルを意識せずにMCP Serverを書けば良く、Agent開発者はツールを意識せずに構築できます。
+
+この関心事の分離が、エコシステムの成長速度を加速させる理由です。AIワークフローを構築するなら、MCP経由の統合がカスタム実装より長期的なメンテナンスに有利です。
