@@ -1,0 +1,125 @@
+---
+title: "Claude Opus 4.7: 장기 실행 Agent Workflow에서 무엇이 달라졌나"
+description: "Anthropic이 2026년 4월 16일 출시한 Claude Opus 4.7은 SWE-bench Verified 80.8%를 달성했습니다. 실제 Agent 시스템 개발에 미치는 영향을 분석합니다."
+date: "2026-04-21"
+status: "published"
+tags: ["Claude", "Anthropic", "AI Agent", "LLM", "Agentic AI"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-opus-47-complex-reasoning-2026"
+---
+
+Anthropic이 2026년 4월 16일 Claude Opus 4.7을 출시했습니다. Opus 4 시리즈의 최신 Flagship Model입니다. SWE-bench Verified에서 80.8%를 기록하며 GPT-5.4의 약 80%를 근소하게 앞서 현재 소프트웨어 엔지니어링 Benchmark 1위를 차지했습니다.
+
+하지만 Benchmark 수치만으로 Upgrade를 결정하는 것은 섣부릅니다. 이 글에서는 Opus 4.7에서 실제로 무엇이 변했는지, 어떤 상황에서 효과적인지, 그리고 Agent 시스템에 어떻게 통합할지를 정리합니다.
+
+## Opus 4.7의 주요 변경사항
+
+Anthropic은 Opus 4.7을 **복잡한 Reasoning**과 **장기 실행 Agent Workflow**에 특화된 모델로 포지셔닝했습니다. 실질적인 개선사항은 크게 두 가지입니다.
+
+**장기 Task 실행에서의 일관성 향상**: 이전 모델에서는 Tool Call이 10회를 넘어서면 Task 시작 시 설정한 제약 조건을 모델이 "잊어버리는" 현상이 발생했습니다. Opus 4.7에서는 이 문제가 크게 개선되어 20~30 스텝의 Task에서도 일관된 추론을 유지합니다.
+
+**Tool Chaining의 신뢰성 향상**: 파일 읽기 → 내용 분석 → Patch 생성 → Test 실행이라는 일련의 흐름에서, 중간 단계가 예상치 못한 결과를 반환해도 Opus 4.7은 컨텍스트를 유지하며 적절히 복구할 수 있습니다.
+
+이것이 극적인 능력 향상은 아니지만, Edge Case가 쌓이는 프로덕션 Agent 시스템에서는 큰 차이를 만들어냅니다.
+
+## SWE-bench의 의미
+
+SWE-bench Verified는 실제 GitHub Repository의 Issue를 해결하는 능력을 측정하는 Benchmark입니다. 80.8%라는 Score는 5건 중 4건 이상의 비율로 실제 동작하는 코드를 생성할 수 있다는 의미입니다. 여기에는 코드 작성, 올바른 파일 식별, 기존 Test Suite 통과가 포함됩니다.
+
+Opus 4.6이 65.3%(2026년 초)였던 것을 감안하면, Opus 4.7의 80.8%는 단순한 점진적 개선이 아닙니다. 특히 **대규모 Codebase 탐색**, **기존 Convention 추론**, **최소한의 Diff로 수정하기** 세 가지 영역에서 두드러진 개선이 보입니다.
+
+Claude Code나 자체 Coding Agent를 사용하는 팀이라면 Task 실패율 감소와 사람의 개입 빈도 감소라는 형태로 직접 효과를 얻을 수 있습니다.
+
+## Long-Running Agent 구현 예시
+
+Anthropic SDK를 사용한 Multi-Step Coding Agent의 기본 구성입니다.
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+tools = [
+    {
+        "name": "read_file",
+        "description": "파일 내용을 읽어옵니다",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "읽을 파일 경로"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "write_file",
+        "description": "파일에 내용을 씁니다",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"}
+            },
+            "required": ["path", "content"]
+        }
+    },
+    {
+        "name": "run_tests",
+        "description": "Test Suite를 실행하고 결과를 반환합니다",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "test_path": {"type": "string", "description": "테스트 파일 경로 (선택사항)"}
+            }
+        }
+    }
+]
+
+def run_coding_agent(task: str, context: dict) -> str:
+    messages = [{"role": "user", "content": task}]
+
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=8096,
+            tools=tools,
+            messages=messages
+        )
+
+        if response.stop_reason == "end_turn":
+            return response.content[-1].text
+
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                result = execute_tool(block.name, block.input, context)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result
+                })
+
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+```
+
+Agent Loop의 종료 조건을 `stop_reason == "end_turn"`으로 설정하여, 모델이 스스로 Task 완료를 판단할 때까지 처리를 계속합니다. Opus 4.7은 이 루프에서 상태를 정확하게 파악하는 능력이 향상되었습니다.
+
+## Upgrade 시점
+
+다음과 같은 Task를 실행하고 있다면 Opus 4.7로 전환을 고려할 만합니다.
+
+- **10회 이상의 연속 Tool Call**이 필요한 Task
+- **대규모 Codebase의 광범위한 수정** (여러 파일 간 의존관계 파악)
+- **중간 단계 실패로부터의 자율적 복구**가 필요한 Task
+
+반면 단일 파일 편집, 요약, 단순 Q&A라면 Sonnet 4.6이 비용 효율이 좋습니다. 2026년 4월 기준 Claude Pricing은 Sonnet 4가 $3/$15 per million tokens이며 Opus 계열은 더 높은 요금이 적용됩니다. 워크로드 복잡도에 맞는 모델 선택이 중요합니다.
+
+## webhani의 관점
+
+webhani는 지난 1년간 Client Engagement에서 Claude 기반 Coding Agent를 운영해왔습니다. Opus 4.7의 신뢰성 향상은 실제로 효과적입니다. 이전에는 4~5 스텝마다 사람의 확인이 필요했던 자동화 Workflow가 이제 10~12 스텝까지 개입 없이 안정적으로 동작합니다.
+
+다만 Benchmark Score를 자신의 Use Case에 직접 대입하는 것은 위험합니다. SWE-bench가 측정하는 Task는 명확한 성공 기준이 있는 Well-defined 문제입니다. 실제 Production Agent Task는 경계가 모호하고 명세가 불완전한 경우가 많습니다. 그런 상황에서는 모델 버전보다 Task 분해 설계와 Fallback 처리 아키텍처가 최종 품질을 결정합니다.
+
+가장 demanding한 Agent Task에는 Opus 4.7을 사용하고, 그 외에는 문제를 안정적으로 해결할 수 있는 가장 저렴한 모델을 선택하는 원칙은 변하지 않습니다.
