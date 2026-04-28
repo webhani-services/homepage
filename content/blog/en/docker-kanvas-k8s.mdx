@@ -1,0 +1,157 @@
+---
+title: "Docker Kanvas: Does It Actually Replace Helm and Kustomize?"
+description: "Docker launched Kanvas to automate the conversion of Docker Compose files into Kubernetes manifests. We examine what it actually solves, where it falls short, and how it fits alongside existing tools like Helm and Kustomize."
+date: "2026-04-20"
+status: "published"
+tags: ["Docker", "Kubernetes", "DevOps", "DeveloperTools", "Helm"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-k8s"
+---
+
+Docker launched Kanvas to bridge the gap between local Docker Compose development and production Kubernetes deployments. The core idea: take a `docker-compose.yml`, parse it, and output Kubernetes manifests — without requiring developers to understand Kubernetes YAML from scratch.
+
+Docker positions Kanvas as a challenger to Helm and Kustomize. Let's look at what that claim actually means in practice.
+
+## What Kanvas Does
+
+The main function is Compose-to-Kubernetes conversion. Given a Compose file, Kanvas generates the corresponding Kubernetes resources:
+
+- Services with `ports` → Deployment + Service
+- Services with persistent volumes → StatefulSet or Deployment + PersistentVolumeClaim
+- Environment variables → ConfigMap (with sensitive values flagged for Secret extraction)
+- Service dependencies → appropriate labels and DNS references
+
+Starting with this Compose file:
+
+```yaml
+# docker-compose.yml
+services:
+  api:
+    image: myapp/api:latest
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://db:5432/myapp
+      REDIS_URL: redis://cache:6379
+    depends_on:
+      - db
+      - cache
+
+  db:
+    image: postgres:16
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+
+  cache:
+    image: redis:7-alpine
+
+volumes:
+  postgres_data:
+```
+
+Kanvas outputs manifests for each service, with the `db` volume mapped to a PersistentVolumeClaim and the `POSTGRES_PASSWORD` flagged for Secret management.
+
+## The Visual Editor
+
+Beyond conversion, Kanvas includes a visual editor that renders the relationship graph between Kubernetes resources. This is genuinely useful in two scenarios:
+
+1. **Onboarding teams to Kubernetes**: Engineers who know Compose but not Kubernetes can review the generated resource graph without reading raw YAML
+2. **Architecture documentation**: The dependency graph between services becomes a generated diagram rather than something maintained separately
+
+For complex microservices with many inter-service dependencies, being able to visualize the Kubernetes topology is a legitimate time saver.
+
+## How It Compares to Helm and Kustomize
+
+These tools solve different problems:
+
+| Tool | Primary Use Case | Weakness |
+|------|-----------------|----------|
+| **Helm** | Package, version, and distribute Kubernetes applications | Template syntax complexity; steep learning curve |
+| **Kustomize** | Manage environment-specific overlays on top of base manifests | No Compose integration |
+| **Kanvas** | Convert Compose to Kubernetes; visualize resource relationships | Limited customization for complex production configs |
+
+Helm's ecosystem — thousands of charts on Artifact Hub, rollback, release history — isn't something Kanvas replaces. Kanvas is better understood as a migration accelerator than a package manager.
+
+A practical workflow: use Kanvas to generate the initial Kubernetes manifests, then adopt Helm or Kustomize for ongoing management.
+
+## What Kanvas Doesn't Handle
+
+The generated manifests are a starting point, not production-ready configs. You'll still need to add:
+
+**Resource requests and limits**: Compose has no equivalent concept. Generated Deployments won't have CPU/memory constraints, which can cause issues on shared clusters.
+
+```yaml
+# Kanvas generates this:
+containers:
+  - name: api
+    image: myapp/api:latest
+
+# You need to add:
+containers:
+  - name: api
+    image: myapp/api:latest
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
+```
+
+**Health checks**: Readiness and Liveness probes aren't derived from Compose definitions.
+
+```yaml
+# Add after Kanvas conversion:
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 3000
+  initialDelaySeconds: 10
+  periodSeconds: 5
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 3000
+  initialDelaySeconds: 30
+  periodSeconds: 10
+```
+
+**Secret management**: Kanvas flags environment variables for Secret extraction but doesn't integrate with external secret stores (AWS Secrets Manager, HashiCorp Vault, External Secrets Operator). That wiring is manual.
+
+**Ingress configuration**: Traffic routing details beyond basic port mapping require manual configuration.
+
+## Realistic Use Cases
+
+**Case 1: First Kubernetes deployment from Compose**
+
+Teams moving from Docker Compose to Kubernetes for the first time get a working starting point without needing to learn all Kubernetes resource types simultaneously. The generated manifests also serve as learning material.
+
+**Case 2: Generating a base for customization**
+
+Instead of writing Kubernetes YAML from scratch, generate from Compose and layer in production-specific configuration. This is faster than starting blank, especially for stateless API services.
+
+**Case 3: Multi-service architecture visualization**
+
+For a microservices architecture already defined in Compose, Kanvas can generate a relationship diagram of all the Kubernetes resources involved — useful for documentation or design reviews.
+
+## The Helm Competition Framing
+
+Docker's positioning of Kanvas against Helm creates some confusion. They're not solving the same problem:
+
+- Helm: "I have a Kubernetes application I want to package, version, and distribute"
+- Kanvas: "I have a Compose file and I want to run it on Kubernetes"
+
+Where they overlap is in the initial "how do I define this for Kubernetes" problem. Kanvas has the advantage of meeting developers where they already are (Compose). Helm requires you to think in Kubernetes terms from the start.
+
+In practice, the answer for most teams is: Kanvas for migration, Helm or Kustomize for ongoing management. They're complementary.
+
+## Takeaway
+
+Docker Kanvas is a practical tool for teams with existing Compose-based applications looking to move to Kubernetes. It reduces the initial migration effort and provides a visual interface that makes Kubernetes resource relationships approachable.
+
+Don't expect it to replace Helm for package management or Kustomize for environment management. Do expect it to save several hours of YAML writing when starting a Kubernetes migration from a known Compose configuration.

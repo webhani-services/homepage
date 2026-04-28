@@ -1,0 +1,160 @@
+---
+title: "EKS Auto Mode: Kubernetes 운영 부담을 AWS에 위임하는 새로운 방식"
+description: "KubeCon CloudNativeCon Europe 2026에서 공개된 EKS Auto Mode는 Node 라이프사이클 관리를 자동화합니다. Karpenter, Kro, Cedar와 함께 Kubernetes 운영 복잡도를 줄이는 방법을 살펴봅니다."
+date: "2026-04-20"
+status: "published"
+tags: ["Kubernetes", "AWS", "EKS", "DevOps", "PlatformEngineering"]
+thumbnail: ""
+author: "webhani"
+slug: "eks-auto-mode-kubernetes"
+---
+
+KubeCon CloudNativeCon Europe 2026에서 AWS의 Jesse Butler가 "Kubernetes를 보이지 않게 만들겠다"는 비전을 제시했습니다. 이를 구현하는 핵심이 Amazon EKS Auto Mode입니다.
+
+Kubernetes의 가치는 널리 인정받고 있지만, 운영 비용 문제는 오랜 숙제였습니다. Node 프로비저닝, 스케일링 설정, OS 패치 적용, 라이프사이클 관리 — 이러한 인프라 관리에 시간을 빼앗겨 실제 개발에 집중하지 못하는 팀이 많습니다.
+
+## EKS Auto Mode란
+
+EKS Auto Mode는 Kubernetes Node 라이프사이클 전체를 AWS가 관리하는 방식입니다. 기존 EKS에서는 Node Group 설정과 스케일링 정책 조정이 사용자 책임이었지만, Auto Mode는 이 부분을 AWS가 담당합니다.
+
+자동화되는 범위:
+
+- **Node 프로비저닝과 종료**: 워크로드 요구에 맞는 Instance Type을 자동 선택·실행·폐기
+- **OS 패치 적용**: Node OS를 항상 최신 보안 패치 상태로 유지
+- **비용 최적화**: Spot Instance와 On-Demand Instance 자동 혼용
+- **스케일링**: Pod 리소스 요청 기반 자동 Scale-out / Scale-in
+
+Node 프로비저닝 레이어는 AWS가 개발한 오픈소스 Karpenter를 기반으로 합니다.
+
+## Auto Mode 활성화
+
+```yaml
+# eksctl을 사용한 EKS Auto Mode 설정
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: production-cluster
+  region: ap-northeast-2
+autoMode:
+  enabled: true
+```
+
+Auto Mode를 활성화하면 Karpenter가 자동으로 설치·설정됩니다. 세밀한 제어가 필요한 경우 `NodePool`과 `EC2NodeClass` 리소스로 동작을 커스터마이징할 수 있습니다.
+
+```yaml
+# Auto Mode에서 Node 동작 커스터마이징
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-workloads
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["p3", "p4"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]  # GPU 워크로드: Spot 미사용
+```
+
+## Kro: 고수준 리소스 추상화
+
+Auto Mode와 함께 주목받는 것이 Kro(Kube Resource Orchestrator)입니다. Kro는 여러 Kubernetes 리소스를 묶어 비즈니스 로직에 가까운 추상화 레이어를 정의할 수 있는 도구입니다.
+
+예를 들어 "Web Application"이라는 개념을 하나의 Kubernetes 리소스로 정의하면, 적용 시 Deployment, Service, Ingress, HPA가 한 번에 생성됩니다.
+
+```yaml
+# Kro ResourceGroup 정의 예시
+apiVersion: kro.run/v1alpha1
+kind: ResourceGroup
+metadata:
+  name: web-app
+spec:
+  schema:
+    spec:
+      image: string
+      replicas: integer | default=2
+      host: string
+  resources:
+    - id: deployment
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        spec:
+          replicas: ${schema.spec.replicas}
+          template:
+            spec:
+              containers:
+                - name: app
+                  image: ${schema.spec.image}
+    - id: service
+      template:
+        apiVersion: v1
+        kind: Service
+    - id: ingress
+      template:
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        spec:
+          rules:
+            - host: ${schema.spec.host}
+```
+
+Application 개발자는 이렇게 단순화된 API를 사용합니다:
+
+```yaml
+apiVersion: kro.run/v1alpha1
+kind: WebApp
+metadata:
+  name: checkout-service
+spec:
+  image: "123456789.dkr.ecr.ap-northeast-2.amazonaws.com/checkout:v2.1"
+  replicas: 3
+  host: "checkout.example.com"
+```
+
+## Cedar: Kubernetes를 위한 Policy as Code
+
+Cedar는 원래 AWS IAM을 위해 설계된 선언적 Policy 언어입니다. AWS는 이를 Kubernetes에 통합해 RBAC으로 표현하기 어려운 복잡한 접근 제어를 가능하게 합니다.
+
+```cedar
+// Cedar 정책: 프로덕션 변경을 업무 시간으로 제한
+permit(
+  principal in Group::"platform-engineers",
+  action in [k8s::Action::"update", k8s::Action::"delete"],
+  resource in Namespace::"production"
+) when {
+  context.request.time.hour >= 9 &&
+  context.request.time.hour < 18 &&
+  context.request.time.dayOfWeek != "Saturday" &&
+  context.request.time.dayOfWeek != "Sunday"
+};
+```
+
+속성 기반 접근 제어, 시간 기반 제한, 여러 리소스 타입에 걸친 정책 등 RBAC이 어색하게 처리하던 케이스를 Cedar로 명확하게 표현할 수 있습니다.
+
+## Platform Engineering 팀에 미치는 영향
+
+Auto Mode + Kro + Cedar의 조합이 목표하는 것은 Platform Engineering 업무의 전환입니다:
+
+**Before**: Node Group 설정, 스케일링 튜닝, OS 패치 적용, 스케줄링 문제 디버깅에 많은 시간 소요
+
+**After**: Application 팀이 사용할 Self-Service Platform 추상화 설계, Policy 관리에 집중
+
+## 마이그레이션 전 확인 사항
+
+Auto Mode가 모든 워크로드에 적합한 것은 아닙니다:
+
+- **Custom AMI 의존성**: Auto Mode는 AWS 관리 AMI를 사용합니다. 특수한 커널 파라미터나 커스텀 패키지가 필요하다면 적합하지 않습니다.
+- **DaemonSet 제약**: Auto Mode Node에는 DaemonSet 관련 제약이 있습니다. 마이그레이션 전 호환성 확인이 필요합니다.
+- **특정 Node 레이블 의존**: 스케줄링 로직에서 특정 레이블을 사용하고 있다면 조정이 필요할 수 있습니다.
+
+일반적인 웹 서비스와 API 워크로드라면 Auto Mode가 Node Group을 직접 관리하는 것보다 더 나은 기본값이 될 가능성이 높습니다.
+
+## 정리
+
+EKS Auto Mode, Kro, Cedar는 Kubernetes 복잡도에 대한 AWS의 실용적인 답변입니다. 인프라가 배경으로 사라지는 비전은 대부분의 팀에게 올바른 방향입니다.
+
+Kubernetes를 사용하고 있지만 Node 관리에 피로감을 느끼는 팀이라면 개발 환경이나 비프로덕션 환경에서 Auto Mode를 먼저 검증해보는 것을 권장합니다.
