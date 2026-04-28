@@ -1,0 +1,95 @@
+---
+title: "TypeScript 6.0과 2026년 Full-Stack 아키텍처"
+description: "TypeScript 6.0이 Full-Stack 개발의 아키텍처를 어떻게 바꾸는지 정리합니다. Next.js 16 Server Action과 타입 공유 패턴을 중심으로 실무 적용법을 설명합니다."
+date: "2026-04-28"
+status: "published"
+tags: ["TypeScript", "Next.js", "Full-Stack", "Architecture", "Type Safety"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-6-fullstack-evolution-2026"
+---
+
+TypeScript는 2026년 현재 전문 개발자의 38%가 주요 언어로 사용하고 있으며, 프론트엔드 채용 공고의 72%에서 필수 스킬로 요구하고 있습니다. TypeScript 6.0과 Next.js 16의 조합은 Full-Stack 개발의 아키텍처를 근본적으로 변화시키고 있습니다.
+
+## TypeScript 6.0의 실질적인 변화
+
+TypeScript 6.0은 Server Action과 API Route 주변의 타입 시스템을 강화하여, Client와 Server 간 타입 공유가 훨씬 간결해졌습니다. 이전에는 우회 방법이 필요했던 Strict 모드 에러들이 선언 시점에 바로 드러납니다.
+
+```typescript
+// TypeScript 6.0 + Zod를 활용한 타입 안전 Server Action
+"use server";
+
+import { z } from "zod";
+
+const CreateProductSchema = z.object({
+  name: z.string().min(1).max(200),
+  price: z.number().positive(),
+  category: z.enum(["electronics", "clothing", "food"]),
+  stock: z.number().int().min(0),
+});
+
+type CreateProductInput = z.infer<typeof CreateProductSchema>;
+
+export async function createProduct(
+  input: CreateProductInput
+): Promise<{ id: string }> {
+  const validated = CreateProductSchema.parse(input);
+  const product = await db.products.create({ data: validated });
+  return { id: product.id };
+}
+```
+
+Zod와 조합하면 Runtime Validation이 Static 타입과 일치하는 단일 Schema로 두 레이어의 안전성을 확보할 수 있습니다. 중복 없이, 두 가지 보호 장치를 동시에.
+
+## 타입 공유 아키텍처
+
+2026년 Full-Stack 프로젝트의 표준 패턴은 Client와 Server가 공유하는 타입 모듈입니다:
+
+```typescript
+// shared/types/api.ts
+export interface ApiResponse<T> {
+  data: T;
+  error: string | null;
+  requestId: string;
+}
+
+export interface PagedResult<T> {
+  items: T[];
+  cursor: string | null;
+  hasMore: boolean;
+}
+
+// Server Component에서 공유 타입 활용
+import type { PagedResult } from "@/shared/types/api";
+import type { Product } from "@/shared/types/domain";
+
+async function getProducts(cursor?: string): Promise<PagedResult<Product>> {
+  const res = await fetch(`/api/products?cursor=${cursor ?? ""}`, {
+    cache: "no-store",
+  });
+  return res.json() as Promise<PagedResult<Product>>;
+}
+```
+
+Client와 Server가 동일한 타입 정의를 공유하면, API Contract 불일치가 런타임 버그 대신 컴파일 에러로 잡힙니다.
+
+## Turbopack의 역할
+
+Next.js 16은 Turbopack을 기본 Bundler로 채택하여 빌드 속도가 2~5배 빨라졌습니다. 타입 에러가 빠르게 피드백되면서 수정 사이클이 짧아지고, 이전에 느린 피드백 때문에 Strict 모드를 피했던 대규모 Codebase에서도 TypeScript Strict 모드가 현실적인 선택이 됩니다.
+
+Turbopack의 병렬 처리가 TypeScript 6.0의 강화된 타입 검사를 지연 없이 처리합니다.
+
+## 마이그레이션 접근법
+
+기존 프로젝트를 TypeScript 6.0으로 전환할 때 권장하는 순서:
+
+1. `strict: true`를 활성화하고 전체 에러 목록 추출
+2. `// @ts-expect-error`로 기존 에러를 임시 억제 — 한 번에 모두 수정하려 하지 말 것
+3. Runtime Validator(Zod/Valibot)와 Static 타입 정의를 정렬
+4. API 타입을 공유 모듈로 이동 — 트래픽이 많은 Route부터 시작
+
+한 번에 완벽을 추구하기보다 점진적으로 타입 안전성을 높이는 것이 현실적입니다. 타입을 지정한 Route 하나하나가 불형식 입력을 차단하는 보호된 Surface가 됩니다.
+
+## 정리
+
+TypeScript 6.0과 Next.js 16의 조합은 Client-Server Contract를 컴파일 타임에 강제할 수 있는 아키텍처 전환을 가능하게 합니다. 신규 프로젝트는 처음부터 Strict 설정에 투자하고, 기존 프로젝트는 API 경계의 공유 타입부터 시작하는 것을 권장합니다. 그 투자 효과는 런타임 에러 감소로 즉시 나타납니다.

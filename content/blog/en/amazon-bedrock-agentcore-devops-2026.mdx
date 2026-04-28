@@ -1,0 +1,94 @@
+---
+title: "Amazon Bedrock AgentCore CLI: AI Agents Enter the DevOps Loop"
+description: "AWS released the Bedrock AgentCore CLI in late April 2026, enabling AI agents to automate infrastructure incident investigation end-to-end. Here's how to think about integrating it."
+date: "2026-04-28"
+status: "published"
+tags: ["AWS", "Bedrock", "DevOps", "AI Agent", "MCP"]
+thumbnail: ""
+author: "webhani"
+slug: "amazon-bedrock-agentcore-devops-2026"
+---
+
+AWS's April 27, 2026 weekly roundup included the Bedrock AgentCore CLI — a tool that connects AI agents to external services via MCP (Model Context Protocol) and automates the full lifecycle of infrastructure incident investigation. The launch demo integrated it with the Salesforce MCP Server to show a complete triage-to-resolution workflow.
+
+## What AgentCore Actually Does
+
+AgentCore is a runtime environment for AI agents running on Bedrock. The CLI exposes MCP-based tool connectivity, letting agents pull data from monitoring systems, execute runbooks, and hand off to on-call engineers when human judgment is required.
+
+The incident automation flow:
+
+1. Alert fires → AgentCore agent picks it up
+2. Agent queries logs, metrics, and traces across connected systems
+3. Root cause analysis with correlated evidence
+4. Proposed remediation steps surfaced to the on-call engineer
+5. Approved actions executed automatically
+
+This is not fully autonomous — the agent handles data gathering and analysis while humans retain control over destructive operations.
+
+## Pairing AgentCore with EKS Auto Mode
+
+EKS Auto Mode, which GA'd the same week, automates Kubernetes networking infrastructure: VPC CNI configuration, load balancer provisioning, and DNS management.
+
+```yaml
+# EKS Auto Mode node configuration
+apiVersion: eks.amazonaws.com/v1
+kind: NodePool
+metadata:
+  name: general-purpose
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        name: default
+      requirements:
+        - key: "karpenter.sh/capacity-type"
+          operator: In
+          values: ["on-demand"]
+        - key: "kubernetes.io/arch"
+          operator: In
+          values: ["amd64"]
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+    consolidateAfter: 30s
+```
+
+EKS Auto Mode reduces operational overhead at the infrastructure layer. AgentCore handles the remaining cognitive overhead of incident response. Together they push toward a model where engineers focus on architecture decisions, not firefighting.
+
+## MCP as the Integration Layer
+
+MCP (Model Context Protocol) — originally proposed by Anthropic — is becoming the de facto standard for agent-to-tool communication. AWS adopting it in AgentCore signals that MCP is moving from a novelty to infrastructure-level expectation.
+
+```python
+# Conceptual Bedrock Agent invocation
+import boto3
+
+agent_runtime = boto3.client("bedrock-agent-runtime", region_name="us-east-1")
+
+response = agent_runtime.invoke_agent(
+    agentId="your-agent-id",
+    agentAliasId="TSTALIASID",
+    sessionId="incident-session-001",
+    inputText=(
+        "Production API latency spiked 300% in the last 10 minutes. "
+        "Investigate the root cause and propose remediation steps."
+    ),
+)
+
+for event in response.get("completion", []):
+    if chunk := event.get("chunk"):
+        print(chunk["bytes"].decode("utf-8"), end="")
+```
+
+## What to Watch For
+
+The main risk in agent-driven DevOps is misplaced confidence. Agents can produce plausible-sounding root cause analyses that are wrong. Practical mitigations:
+
+- **Read-only first**: Start with agents that can only observe, not modify anything
+- **Explicit approval gates**: Require human sign-off before any write operation
+- **Audit logging**: Every agent action and decision must be traceable after the fact
+
+At webhani, we're piloting AgentCore for initial incident triage — agents surface evidence, engineers make the call on remediation. That boundary is where we're staying until we've validated diagnostic accuracy against a real incident backlog.
+
+## Takeaway
+
+AgentCore CLI is the most concrete step AWS has taken toward agentic DevOps. Start with read-only triage automation, validate the accuracy of agent diagnoses against your real incident history, and expand scope only as trust builds. The tooling is ready; the validation work is on you.

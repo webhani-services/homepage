@@ -1,0 +1,93 @@
+---
+title: "Amazon Bedrock AgentCore CLI: AI Agent で変わる DevOps の現場"
+description: "AWS が発表した Bedrock AgentCore CLI は、インフラのインシデント対応を AI Agent で自動化します。MCP を基盤とした新しい DevOps ワークフローを解説します。"
+date: "2026-04-28"
+status: "published"
+tags: ["AWS", "Bedrock", "DevOps", "AI Agent", "MCP"]
+thumbnail: ""
+author: "webhani"
+slug: "amazon-bedrock-agentcore-devops-2026"
+---
+
+2026 年 4 月 27 日の AWS 週刊ラウンドアップにて、Amazon Bedrock AgentCore CLI のリリースが発表されました。このツールは Salesforce MCP Server と統合し、インフラインシデントの調査から解決までのライフサイクルを AI Agent で自動化します。
+
+## AgentCore CLI とは
+
+AgentCore は Bedrock 上で動作する AI Agent のランタイム環境です。CLI ツールを通じて、MCP (Model Context Protocol) ベースのツール接続を利用し、様々なサービスと連携した Agentic なワークフローを構築できます。
+
+今回の Salesforce との統合例では、インフラ障害が発生した際に Agent が自動的に以下を実行します:
+
+1. Log と Metrics の収集
+2. 相関関係分析による根本原因の特定
+3. 対応手順の立案と担当者への提示
+4. 承認された操作の自動実行
+
+完全な自律化ではなく、Agent がデータ収集と分析を担当し、重要な判断は人間が行う構造です。
+
+## EKS Auto Mode との相乗効果
+
+同週に GA となった EKS Auto Mode は、VPC CNI 設定、ロードバランサープロビジョニング、DNS 管理を自動化します。
+
+```yaml
+# EKS Auto Mode での Node Pool 設定例
+apiVersion: eks.amazonaws.com/v1
+kind: NodePool
+metadata:
+  name: general-purpose
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        name: default
+      requirements:
+        - key: "karpenter.sh/capacity-type"
+          operator: In
+          values: ["on-demand"]
+        - key: "kubernetes.io/arch"
+          operator: In
+          values: ["amd64"]
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+    consolidateAfter: 30s
+```
+
+EKS Auto Mode でインフラ層の運用負荷を下げつつ、AgentCore で残る Ops タスクを自動化する組み合わせは、エンジニアがアーキテクチャ設計に集中できる環境を作ります。
+
+## MCP の役割
+
+MCP (Model Context Protocol) は Anthropic が提唱したオープンな標準プロトコルで、AI Agent が外部ツールやサービスと安全に連携するための仕様です。AWS が AgentCore で MCP を採用したことは、このプロトコルが業界標準として定着しつつあることを示しています。
+
+```python
+# Bedrock Agent 呼び出しの概念的な実装例
+import boto3
+
+agent_runtime = boto3.client("bedrock-agent-runtime", region_name="us-east-1")
+
+response = agent_runtime.invoke_agent(
+    agentId="your-agent-id",
+    agentAliasId="TSTALIASID",
+    sessionId="incident-session-001",
+    inputText=(
+        "本番環境の API レスポンスタイムが 10 分間で 300% 急増しています。"
+        "根本原因を分析して対応策を提示してください。"
+    ),
+)
+
+for event in response.get("completion", []):
+    if chunk := event.get("chunk"):
+        print(chunk["bytes"].decode("utf-8"), end="")
+```
+
+## 導入時の注意点
+
+Agent 駆動の DevOps における主な課題は「信頼性」です。Agent が誤った根本原因分析を行うリスクへの対応策:
+
+- **読み取り専用から開始**: 最初は観察のみの Agent から始める
+- **明示的な承認ゲート**: すべての書き込み操作に人間の承認を必要とする
+- **監査ログ**: Agent のすべての行動と判断を追跡可能にする
+
+webhani では現在、インシデントの初期トリアージに AgentCore を試験運用しており、Agent が証拠を提示して人間が最終判断を下す構造を維持しています。完全な自動化より、AI が提案し人間が承認するワークフローから始めることを推奨します。
+
+## まとめ
+
+AgentCore CLI は AWS が Agentic DevOps の方向に踏み出した最も具体的な一歩です。まずは読み取り専用のインシデント調査タスクから試し、実際のインシデント履歴と照合して Agent 診断の精度を検証してから、段階的に自動化の範囲を広げていくアプローチが現実的です。
