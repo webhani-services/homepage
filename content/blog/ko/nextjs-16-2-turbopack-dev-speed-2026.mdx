@@ -1,0 +1,83 @@
+---
+title: "Next.js 16.2와 Turbopack: 400% 빠른 Dev Server가 실제로 의미하는 것"
+description: "Next.js 16.2의 Turbopack 개선으로 dev 서버 시작 속도가 약 400% 향상되었습니다. 실제 변화 내용과 업그레이드 시 주의사항을 정리합니다."
+date: "2026-04-29"
+status: "published"
+tags: ["Next.js", "Turbopack", "React", "성능최적화", "프론트엔드"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-2-turbopack-dev-speed-2026"
+---
+
+Next.js 16.2가 2026년 3월 18일 출시되었고, 4월 1일 패치 릴리즈 16.2.2가 이어졌습니다. 가장 주목할 변화는 개발 경험의 대폭 향상입니다. `next dev` 시작 시간이 이전 버전 대비 약 400% 빨라지고, 렌더링 속도도 약 50% 개선되었다고 보고되고 있습니다.
+
+큰 숫자처럼 들리지만, 규모가 있는 프로젝트에서 직접 체감하는 차이는 분명합니다. 이 글에서는 변화의 핵심 내용과 실제 프로젝트 적용 방법을 정리합니다.
+
+## 16.2에서 무엇이 바뀌었나
+
+### Server Fast Refresh
+
+이전까지 Fast Refresh는 Client Component에만 적용되었습니다. Server Component 코드를 변경하면 풀 리로드가 발생했고, 레이아웃이나 서버 측 데이터 fetch를 수정할 때마다 개발 흐름이 끊겼습니다.
+
+16.2부터 Fast Refresh가 Server Component에도 적용됩니다. Component 유형에 관계없이 일관된 개발 루프가 가능해졌습니다.
+
+### Turbopack 출력에 대한 Subresource Integrity 지원
+
+Turbopack이 생성하는 Script와 Stylesheet에 SRI 해시가 자동으로 부여됩니다. Content Security Policy를 엄격하게 설정한 프로젝트에서, Asset이 변경될 때마다 해시를 수동으로 업데이트하는 작업이 사라집니다.
+
+### 파일 시스템 Cache 개선
+
+시작 시간 단축의 주요 원인입니다. Turbopack의 캐시 粒도가 세밀해져 Bundle 단위가 아닌 Module 단위로 변경을 추적합니다. 100페이지 규모의 프로젝트에서 Cold Start가 이전 25~40초에서 5~8초로 줄어듭니다.
+
+### TypeScript v6 대응
+
+TypeScript v6의 Deprecation 경고를 적절히 처리해 업그레이드 시 터미널을 가득 채우던 경고들이 억제됩니다. Server Action 인수도 요청당 1,000개로 제한되어 잠재적인 남용 벡터 하나가 차단됩니다.
+
+## 실제 성능 차이
+
+| 상황 | Webpack | Turbopack (16.2) |
+|---|---|---|
+| Cold Start (100페이지 규모) | 25~40초 | 5~8초 |
+| Hot Reload (소규모 변경) | 800~1500ms | 100~300ms |
+| Production Build | 변화 없음 | 변화 없음 (Turbopack은 dev 전용) |
+
+Turbopack은 현재 dev 환경 전용입니다. Production Build는 여전히 webpack을 사용합니다. 이는 의도적인 단계적 출시로, Production용 Turbopack은 로드맵에 있지만 아직 제공되지 않습니다.
+
+## 업그레이드 방법
+
+```bash
+npm install next@16.2.2
+```
+
+16.2에서 Turbopack은 기본으로 활성화됩니다. 대부분의 프로젝트는 추가 설정 없이 바로 이점을 누릴 수 있습니다. Custom webpack loader가 있다면 `next.config.ts`에서 Turbopack용 동등 설정을 지정해야 합니다:
+
+```typescript
+import type { NextConfig } from "next";
+
+const config: NextConfig = {
+  experimental: {
+    turbo: {
+      rules: {
+        "*.svg": {
+          loaders: ["@svgr/webpack"],
+          as: "*.js",
+        },
+      },
+    },
+  },
+};
+
+export default config;
+```
+
+## 업그레이드 전 확인사항
+
+**Custom webpack loader 확인**: 가장 큰 마찰 지점입니다. `next.config`에서 webpack을 커스터마이징하고 있다면 (SVGR, 커스텀 CSS 처리기, Raw 파일 로딩 등), 각각에 Turbopack 호환 대체 방법이 있는지 확인합니다. Next.js 공식 문서에 호환성 테이블이 있습니다.
+
+**CSS 출력 차이**: 일부 PostCSS 설정에서 Turbopack과 webpack 간 출력에 미묘한 차이가 있을 수 있습니다. Visual Regression Test가 있다면 업그레이드 후 실행하세요.
+
+**Monorepo 환경**: 대규모 Monorepo에서 패키지 Resolution 관련 Edge Case가 보고되고 있습니다. 전체를 한번에 업그레이드하기보다 단계적으로 검증하는 것을 권장합니다.
+
+## 마무리
+
+Next.js 16.2의 Turbopack 개선은 활성 프로젝트 대부분에서 업그레이드할 가치가 있습니다. 시작 시간 단축만으로도 개발팀의 일일 워크플로우에서 의미 있는 시간을 절약합니다. 주요 작업은 Custom loader 호환성 확인이며, 표준 Next.js 기능만 사용하는 프로젝트라면 업그레이드는 간단합니다.

@@ -1,0 +1,116 @@
+---
+title: "Kubernetes v1.36とDocker Kanvas：コンテナ運用の複雑さに向き合う2026年の選択肢"
+description: "Kubernetes v1.36のGA機能とDocker Kanvasの登場を通じて、2026年のコンテナオーケストレーションの現状と実践的な選択指針を整理します。"
+date: "2026-04-29"
+status: "published"
+tags: ["Kubernetes", "Docker", "クラウドインフラ", "DevOps", "コンテナ"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-36-docker-kanvas-2026"
+---
+
+2026年4月24日、Kubernetes v1.36がリリースされました。今回の目玉の一つは**fine-grained kubelet API authorization**のGeneral Availability（GA）です。同じ時期にDockerはKanvasをDocker Hub経由のExtensionとして正式公開し、Docker ComposeからKubernetesへの橋渡しを試みています。
+
+Cast AIの「2026 State of Kubernetes Optimization Report」によると、KubernetesクラスターのCPU平均稼働率は8%で、前年比2ポイント低下しています。これはAIワークロードの急増でクラスター規模が拡大する一方、実際の使用効率が追いついていない現状を示しています。
+
+## Kubernetes v1.36の主な変更点
+
+### Fine-grained kubelet API AuthorizationのGA
+
+kubelet APIへのアクセス制御が細粒度で設定できるようになりました。以前はkubelet APIへのアクセスは「all or nothing」に近い状態でしたが、v1.36からはNodeおよびPod単位での詳細な権限設定が可能です。
+
+```yaml
+# kubelet authorization設定例
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+authorization:
+  mode: Webhook
+  webhook:
+    cacheAuthorizedTTL: 5m
+    cacheUnauthorizedTTL: 30s
+```
+
+この変更はマルチテナント環境やセキュリティ要件の厳しい本番クラスターで直接的な恩恵があります。
+
+### KarpenterとKroによるノード管理の簡素化
+
+KubeCon CloudNativeCon Europe 2026でAWSはKarpenter、Kro、Cedarの組み合わせでKubernetesの複雑さを減らす方向性を示しました。
+
+Karpenterはノードのライフサイクル管理を担い、リアルタイムでのプロビジョニングを実現します。事前に定義したNode Groupではなく、Podの要求に応じて動的にノードを追加・削除する方式です。
+
+```yaml
+# Karpenter NodePool例
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+      nodeClassRef:
+        apiVersion: karpenter.k8s.aws/v1
+        kind: EC2NodeClass
+        name: default
+  limits:
+    cpu: 1000
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+```
+
+## Docker Kanvasとは何か
+
+Docker Kanvasは、Docker Composeの構文を維持したままKubernetesへのデプロイを管理するプラットフォームです。Helmのような宣言的な設定ファイルを別途学ぶ必要なく、既存のComposeファイルをベースにKubernetesマニフェストへの変換・デプロイを処理します。
+
+既存のDocker Composeファイルが以下のような構成なら：
+
+```yaml
+# docker-compose.yml
+services:
+  app:
+    image: myapp:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+  db:
+    image: postgres:16
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:
+```
+
+KanvasはこれをKubernetesのDeployment、Service、PersistentVolumeClaimに変換してデプロイする流れを提供します。
+
+## どちらを選ぶべきか
+
+Kanvasは「ローカル開発はDockerで、本番はKubernetes」という移行期にあるチームに適しています。HelmやKustomizeへの投資コストなしにKubernetesを試せます。
+
+ただし、以下のケースでは従来のアプローチが依然として有効です：
+
+- 複雑なカスタムリソース（CRD）を多用するプロジェクト
+- 既にHelmチャートやKustomizeで成熟した運用をしているチーム
+- マルチクラスター・マルチリージョン構成が必要な場合
+
+## Kubernetesの効率化問題
+
+CPU稼働率8%という数字は課題を示しています。AIワークロードのGPU稼働率は平均5%と、さらに低い水準です。
+
+この問題への実践的なアプローチ：
+
+1. **Karpenterのconsolidation設定**：`WhenEmptyOrUnderutilized`ポリシーでアイドルノードを自動削除
+2. **VPAの活用**：Vertical Pod AutoscalerでPodのリソース要求を実際の使用量に基づいて自動調整
+3. **Spot Instanceの混在**：ステートレスワークロードにSpot/Preemptibleインスタンスを組み合わせる
+
+## まとめ
+
+Kubernetes v1.36のkubelet認可のGAは、特にセキュリティ要件の高い環境で即座に適用を検討する価値があります。Docker KanvasはHelmへの移行コストを下げる選択肢として興味深いですが、成熟したKubernetes運用をすでに持つチームが切り替える理由は現時点では限定的です。
+
+クラスターの稼働率向上は、Karpenterのconsolidation機能とVPAの組み合わせが最も費用対効果の高いアプローチです。インフラコストを実際の使用量に近づけることが、2026年のKubernetes運用の主要テーマになっています。
