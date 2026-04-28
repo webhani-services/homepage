@@ -1,0 +1,66 @@
+---
+title: "OpenAI Responses API：本番で動くAgentを構築するための新機能"
+description: "Shell Tool、hosted containerワークスペース、Agent Skills、Context Compactionの追加により、OpenAI Responses APIがAgent開発のインフラ基盤として大きく進化しました。"
+date: "2026-04-04"
+status: "published"
+tags: ["AI", "OpenAI", "Agent", "LLM", "API"]
+thumbnail: ""
+author: "webhani"
+slug: "openai-responses-api-agentic-2026"
+---
+
+OpenAIはResponses APIに、自律型Agentを構築する開発者向けの新機能をいくつか追加しました。Shell Tool、hosted containerワークスペース、再利用可能なAgent Skills、そしてContext Compactionです。これらは、Agent開発における代表的なインフラの課題に直接対処するものです。
+
+## Shell Toolで広がる実行範囲
+
+従来のResponses APIはPython専用のCode Interpreterのみをサポートしていました。新しいShell Toolはそれを大幅に拡張し、Go、Java、Node.js、bashスクリプトなど任意のコマンドを実行できます。これにより、テストスイートの実行、データベース操作、CLIツールの呼び出しといった実務的なタスクをAgentに担わせることが可能になります。
+
+Shell ToolはOpenAIのhosted containerワークスペース上で動作します。このコンテナはAgentのステップをまたいで状態を保持し、以下をプラットフォームが管理します：
+
+- ファイルとデータベースのステップ間での永続化
+- Policy制御によるNetwork accessの管理
+- Timeoutの処理と自動Retry
+
+これまで独自のSandbox環境（Docker-in-Docker、Firecracker VM等）を自前で構築していたチームにとっては、インフラの管理コストを大幅に削減できます。
+
+## Agent Skills：Workflowを再利用可能なUnitに
+
+Agent Skillsは「Workflowテンプレート」の考え方を形式化したものです。1つのSkillは以下を含むディレクトリです：
+
+- `SKILL.md` — 指示内容、メタデータ、実行ステップ
+- リソースファイル：API仕様、UIアセット、Shell Script等
+
+```
+project/
+├── skills/
+│   ├── check-ci/
+│   │   ├── SKILL.md        # "CIパイプラインの失敗を確認する"
+│   │   └── github-api.yaml # Tool call用のAPI仕様
+│   └── deploy-preview/
+│       ├── SKILL.md
+│       └── deploy.sh
+```
+
+SkillはComposable（組み合わせ可能）で、Agent内で順次または並列に呼び出せます。反復的なMulti-stepワークフローをバージョン管理可能なUnitとして切り出すことで、Agentのプロンプトの肥大化を防ぎ、再利用性を高めます。
+
+## Context Compactionで長時間稼働を実現
+
+Agentがステップを重ねるにつれ、Contextは増大します。Context Windowが埋まると、過去の状態を失うか（Truncation）、処理が停止するかのどちらかになります。Context Compactionはこの問題に対処するため、過去のステップを要約した圧縮表現に変換しつつ、継続に必要な重要な状態を保持します。
+
+OpenAIがCodexに組み込んだ仕組みと同様のアプローチで、意思決定に関連する過去ステップを識別し、それ以外を圧縮します。結果として、手動のCheckpointなしに多くのIterationにわたってAgentを稼働させることができます。
+
+## 実際のところ
+
+このUpdateは、単発のText生成ではなく、実際のMulti-stepタスクを実行するAgentの開発コストを下げます：
+
+- **インフラ管理の削減**：hosted containerが独自Sandbox構築を代替
+- **パターンの再利用**：Skillsで実装の重複を削減
+- **長時間稼働**：CompactionでAgentの有効稼働時間を延長
+
+一方で、OpenAIのhosted環境への依存度が高まるというトレードオフがあります。Sensitive dataや本番システムに触れるAgentについては、Network policyの制御とExecution isolationの保証を事前に確認することをお勧めします。特にShell Toolは、Sandboxed Python InterpreterよりもAttack surfaceが広がります。
+
+## 評価のタイミング
+
+Chat Completions APIを使用しているチームは、OpenAI公式のMigration guideに従ってResponses APIへ移行できます。既存のResponses APIユーザーにとっては、新機能はAdditive（追加的）であり、既存のコードは変更なく動作します。
+
+Shell Tool、Container、Skills、CompactionはまとめてLLM APIの意味を変えつつあります——モデルのEndpointではなく、Agent Runtimeとしての位置づけです。実際のタスクを実行するものを構築しているチームにとって、今このタイミングでの評価は価値があります。

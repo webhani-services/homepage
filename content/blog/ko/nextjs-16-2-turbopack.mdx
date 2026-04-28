@@ -1,0 +1,68 @@
+---
+title: "Next.js 16.2: Turbopack 성능 개선이 개발 경험에 미치는 영향"
+description: "Next.js 16.2는 컴파일 시간 400-900% 개선과 Server Fast Refresh를 제공합니다. 무엇이 바뀌었고, 일상적인 개발에 어떤 영향을 주는지 정리합니다."
+date: "2026-04-04"
+status: "published"
+tags: ["Next.js", "Turbopack", "React", "Performance", "웹 개발"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-2-turbopack"
+---
+
+Next.js 16.2가 2026년 3월 18일에 출시되었습니다. Turbopack이 기본 번들러가 된 이후 두 번째 릴리스로, 주요 수치가 눈에 띕니다: 16.1 대비 시작 속도 87% 향상, 컴파일 시간 400-900% 개선, Server Component 새로고침 67-100% 개선입니다. 실제로 무엇이 바뀌었고 일상적인 개발에 어떤 영향을 주는지 정리합니다.
+
+## 성능 수치의 맥락
+
+이 수치들은 webpack이나 Turbopack 도입 전 기준이 아닌 Next.js 16.1 대비입니다. Turbopack은 Next.js 16.0에서 안정화된 기본값이 되었으므로, 16.2는 이미 빠른 기반 위에 구축된 것입니다.
+
+**시작 시간** (16.1 대비 87% 향상): `next dev` 실행부터 Ready 프롬프트가 표시되기까지의 시간입니다. 기본 애플리케이션 기준으로 수 초에서 거의 즉시로 단축됩니다.
+
+**컴파일 시간** (400-900% 개선): Route 트리의 첫 번째 컴파일에 걸리는 시간입니다. 범위가 있는 것은 프로젝트 크기와 모듈 그래프 복잡도에 따라 다르기 때문입니다. Dynamic import가 많은 대규모 프로젝트일수록 효과가 더 큽니다.
+
+**서버 새로고침** (67-100% 개선): Server Component 파일을 저장하고 브라우저에 반영되기까지의 시간입니다. 16.2에서 새로 추가된 Server Fast Refresh로 변경된 서버 서브트리만 다시 렌더링되고, 페이지 전체의 서버 측 재컴파일이 트리거되지 않습니다.
+
+## Server Fast Refresh
+
+클라이언트 측 Fast Refresh는 Next.js에 수년 전부터 있었습니다. Server Fast Refresh는 이를 Server Components로 확장한 것입니다. 서버 파일을 저장하면 전체 페이지가 아닌 영향을 받은 컴포넌트 서브트리만 무효화되고 다시 가져옵니다.
+
+실제 영향: 데이터 패칭이나 서버 측 로직 수정을 포함한 깊게 중첩된 Server Component 개발이 클라이언트 컴포넌트 편집과 비슷한 속도로 이루어질 수 있습니다.
+
+## Web Worker Origin (WASM 지원 개선)
+
+Web Worker Origin은 Web Worker 내에서 실행되는 WASM 라이브러리 지원을 향상시키는 새로운 Turbopack 기능입니다. 기존에는 Worker 내 WASM 파일이 특정 브라우저 환경의 Cross-origin 제한으로 올바르게 로드되지 않는 경우가 있었습니다. 이번 수정으로 수동 Workaround 없이도 Worker + WASM 조합이 안정적으로 동작합니다.
+
+WASM을 Worker 내에서 사용하지 않는 프로젝트에는 영향이 없습니다. 사용하는 경우 이 수정이 디버깅하기 어려운 로딩 오류를 해소할 가능성이 있습니다.
+
+## Dynamic Import의 Tree Shaking
+
+```typescript
+// Before: 일부만 사용해도 모든 Export가 번들에 포함
+const { HeavyComponent } = await import('./heavy-module')
+
+// After: 미사용 Export는 청크에서 제외
+const { LightComponent } = await import('./shared-module')
+```
+
+이 변경으로 동적으로 Import된 모듈에서 사용되지 않는 Export가 제거됩니다. 공유 의존성이 큰 Route Segment에서는 청크 크기를 의미 있게 줄일 수 있습니다. 많은 항목을 Export하는 모듈에서 일부만 사용하는 패턴에서 가장 효과적입니다.
+
+## TypeScript PostCSS Config
+
+작지만 실용적인 개선: `postcss.config.ts`가 `postcss.config.js`와 함께 지원됩니다. TypeScript 중심 코드베이스를 운영하는 경우, Plain JavaScript로 유지해야 했던 설정 파일이 하나 줄어듭니다.
+
+## React Server Components Payload 성능
+
+Next.js 팀의 React 코어 기여: Server Component Payload Deserialization이 최대 350% 빨라졌습니다. RSC를 사용하는 모든 프레임워크에 혜택을 주는 React 수준의 변경입니다. 데이터가 많은 대시보드나 콘텐츠가 풍부한 Route에서 Time-to-interactive 개선을 체감할 수 있습니다.
+
+## 업그레이드 방법
+
+16.2 업그레이드는 대부분의 프로젝트에서 큰 어려움 없이 가능합니다. 200개 이상의 버그 수정이 Changelog에 포함되어 있습니다. 업그레이드 전 확인 사항:
+
+1. 커스텀 Webpack Configuration 검토 — 일부 Escape hatch가 Turbopack에서 다르게 동작할 수 있습니다
+2. WASM Worker 테스트 — Worker Origin 수정이 로딩 동작을 변경합니다
+3. Tree Shaking 정확성 확인 — Dynamic import 코드 경로가 모듈 그래프에서 올바르게 동작하는지 확인
+
+Breaking Change는 `nextjs.org/docs/app/guides/upgrading/version-16`에서 확인할 수 있습니다.
+
+## 정리
+
+16.2는 좋은 의미의 유지보수 및 성능 릴리스입니다: 핵심 기능 세트가 안정화되었고, 그 안정성을 활용해 컴파일 속도를 대폭 향상시켰습니다. Server Component를 자주 수정하는 팀이라면 Server Fast Refresh만으로도 업그레이드 가치가 있습니다.

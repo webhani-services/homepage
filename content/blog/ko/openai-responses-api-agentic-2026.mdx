@@ -1,0 +1,66 @@
+---
+title: "OpenAI Responses API: 프로덕션 Agent 워크플로우 구축하기"
+description: "Shell Tool, hosted container 워크스페이스, Agent Skills, Context Compaction 추가로 OpenAI Responses API가 Agent 개발의 인프라 기반으로 크게 발전했습니다."
+date: "2026-04-04"
+status: "published"
+tags: ["AI", "OpenAI", "Agent", "LLM", "API"]
+thumbnail: ""
+author: "webhani"
+slug: "openai-responses-api-agentic-2026"
+---
+
+OpenAI가 Responses API에 자율 Agent 구축을 위한 새로운 기능들을 추가했습니다: Shell Tool, hosted container 워크스페이스, 재사용 가능한 Agent Skills, 그리고 Context Compaction입니다. 이 기능들은 프로덕션 Agent 개발에서 가장 자주 마주치는 인프라 문제들을 직접 해결합니다.
+
+## Shell Tool이 바꾸는 실행 범위
+
+기존 Responses API의 Code Interpreter는 Python 전용이었습니다. 새로운 Shell Tool은 Go, Java, Node.js, bash 스크립트 등 임의의 명령어를 실행할 수 있습니다. 덕분에 테스트 스위트 실행, 데이터베이스 조작, CLI 도구 호출 같은 실무적인 작업을 Agent에게 맡길 수 있게 됩니다.
+
+Shell Tool은 OpenAI의 hosted container 워크스페이스 위에서 동작합니다. 이 컨테이너는 Agent의 단계를 걸쳐 상태를 유지하며, 플랫폼이 다음을 관리합니다:
+
+- 단계 간 파일 및 데이터베이스 상태 유지
+- 정책 기반 네트워크 접근 제어
+- Timeout 처리 및 자동 재시도
+
+자체 Sandbox 환경(Docker-in-Docker, Firecracker VM 등)을 직접 구축하던 팀이라면 인프라 관리 부담을 크게 줄일 수 있습니다.
+
+## Agent Skills: 워크플로우를 재사용 가능한 단위로
+
+Agent Skills는 "워크플로우 템플릿" 개념을 형식화한 것입니다. 하나의 Skill은 다음을 포함하는 디렉터리입니다:
+
+- `SKILL.md` — 지시 사항, 메타데이터, 실행 단계
+- 지원 리소스: API 스펙, UI 에셋, 셸 스크립트 등
+
+```
+project/
+├── skills/
+│   ├── check-ci/
+│   │   ├── SKILL.md        # "CI 파이프라인 실패 확인"
+│   │   └── github-api.yaml # Tool call용 API 스펙
+│   └── deploy-preview/
+│       ├── SKILL.md
+│       └── deploy.sh
+```
+
+Skills는 순차적 또는 병렬로 호출할 수 있습니다. 반복적인 멀티 스텝 워크플로우를 버전 관리 가능한 단위로 분리하면 Agent 프롬프트의 비대화를 막고 재사용성을 높일 수 있습니다.
+
+## Context Compaction으로 장시간 실행 지원
+
+Agent가 단계를 거듭할수록 Context가 쌓입니다. Context Window가 가득 차면 이전 상태를 잃거나(Truncation) 처리가 멈추게 됩니다. Context Compaction은 이 문제를 해결하기 위해 과거 단계를 압축된 표현으로 요약하면서도 계속 실행에 필요한 핵심 상태를 보존합니다.
+
+OpenAI가 Codex에 적용한 방식과 유사하게, 의사 결정과 관련된 과거 단계를 식별하고 나머지를 압축합니다. 결과적으로 수동 체크포인트 없이도 더 많은 반복을 통해 Agent를 실행할 수 있습니다.
+
+## 실질적인 의미
+
+이번 업데이트는 단순한 텍스트 생성이 아닌, 실제 멀티 스텝 작업을 수행하는 Agent 개발의 장벽을 낮춥니다:
+
+- **인프라 관리 감소**: hosted container가 자체 Sandbox 구축을 대체
+- **패턴 재사용**: Skills로 구현 중복 감소
+- **장시간 실행**: Compaction으로 Agent 유효 실행 시간 연장
+
+반면 OpenAI의 hosted 환경에 대한 의존도가 높아진다는 트레이드오프가 있습니다. 민감한 데이터나 프로덕션 시스템에 접근하는 Agent라면, 네트워크 정책 제어와 실행 격리 보장을 미리 확인하는 것이 중요합니다. 특히 Shell Tool은 Sandboxed Python Interpreter보다 공격 표면이 넓어집니다.
+
+## 평가 시점
+
+Chat Completions API를 사용 중인 팀은 OpenAI 공식 마이그레이션 가이드를 따라 Responses API로 전환할 수 있습니다. 기존 Responses API 사용자에게는 새 기능이 추가적으로 제공되며, 기존 코드는 그대로 동작합니다.
+
+Shell Tool, Container, Skills, Compaction은 함께 LLM API의 의미를 바꾸고 있습니다 — 모델 엔드포인트가 아닌 Agent Runtime으로서의 위상입니다. 실제 작업을 실행하는 무언가를 구축하는 팀이라면, 지금 평가해볼 가치가 충분합니다.
