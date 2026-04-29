@@ -1,0 +1,117 @@
+---
+title: "42% of React Code Is AI-Generated: What This Means for TypeScript and Code Review"
+description: "A 2026 report puts AI-generated code at 42% of committed React code in enterprise projects. That number changes what TypeScript is useful for and what human code reviewers should focus on."
+date: "2026-04-30"
+status: "published"
+tags: ["React", "TypeScript", "AI", "Code Review", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "ai-generated-code-typescript-review-2026-04"
+---
+
+A 2026 industry report (Belitsoft) puts AI-generated code at 42% of committed code in enterprise React projects, with the figure projected to reach 65% by 2027. Whether those exact numbers hold up, the directional trend matches what development teams are observing: AI coding tools have moved from "used occasionally" to "used on most tasks."
+
+This changes the role of both TypeScript and code review — not because they matter less, but because the failure modes they need to address have shifted.
+
+## How AI-generated code fails
+
+AI coding tools are reliably good at some things and reliably bad at others.
+
+**Reliable strengths:**
+- Standard API patterns (CRUD, auth flows, data fetching)
+- Boilerplate and utility functions
+- Test case generation
+- Known design pattern application
+
+**Common failure modes:**
+- Project-specific conventions that aren't captured in the prompt
+- Subtle performance issues (unnecessary re-renders, missing cleanup in effects)
+- Misinterpreted business logic requirements
+- Overuse of `any` and type assertions to satisfy the compiler without fixing the underlying issue
+
+The last point is particularly relevant for TypeScript. AI-generated code often compiles and looks correct while silently weakening the type system — using `as any` or `as SomeType` to avoid the actual type work.
+
+## TypeScript as a quality gate for AI output
+
+TypeScript's traditional value proposition was developer productivity and catching runtime errors before production. In a world where 42% of code is AI-generated, it takes on a second role: **validating that AI-generated code actually fits the codebase's type contracts**.
+
+```typescript
+// Common AI output: compiles, but semantically weak
+async function getOrder(id: any) {
+  const data = await fetch(`/api/orders/${id}`).then(r => r.json());
+  return data as any;
+}
+
+// What the type system should enforce
+type OrderId = string & { readonly _brand: "OrderId" };
+type Order = {
+  id: OrderId;
+  status: "pending" | "fulfilled" | "cancelled";
+  lineItems: LineItem[];
+};
+
+async function getOrder(id: OrderId): Promise<Order> {
+  const response = await fetch(`/api/orders/${id}`);
+  if (!response.ok) throw new ApiError(response.status, "getOrder");
+  return response.json() as Promise<Order>;
+}
+```
+
+Stricter types don't just catch bugs — they constrain what AI can generate without triggering errors. Branded types, discriminated unions, and template literal types are worth adopting more aggressively in an AI-assisted codebase. They make it harder for generated code to compile with incorrect assumptions, and they give reviewers a clearer signal when something is wrong.
+
+## Shifting code review priorities
+
+When AI generates routine implementation, the bottleneck in code review shifts from "does this code do what it says?" to "does this code do what the product actually needs?"
+
+**What to automate (and stop reviewing manually):**
+- Style and formatting — Prettier handles this
+- Type correctness — the TypeScript compiler handles this
+- Common bug patterns — static analysis handles this
+- Test coverage thresholds — CI handles this
+
+**Where human review time should go:**
+
+```
+1. Business logic accuracy
+   Does this edge case handling match the actual spec,
+   not the AI's reasonable-but-wrong interpretation?
+
+2. Performance impact
+   Unnecessary re-renders, missing memoization, or premature memoization —
+   these don't always surface in tests.
+
+3. Security boundaries
+   Is auth being checked at the right layer? Is user input being sanitized?
+   Is this endpoint accessible to the right roles?
+
+4. Cross-file consistency
+   AI generates code per-file; humans maintain consistency across files.
+   Does this follow patterns in adjacent components?
+```
+
+## Practical changes to the review process
+
+Update your PR template to reflect where AI mistakes actually occur:
+
+```markdown
+## AI-generated code checklist
+- [ ] Business logic matches the ticket spec (not just a reasonable interpretation)
+- [ ] Error handling follows the project pattern (not a generic catch-all)
+- [ ] No unnecessary `any` or type assertions that widen the type
+- [ ] No render-blocking effects or incorrect dependency arrays
+- [ ] Auth/permission checks are at the correct layer
+```
+
+This checklist is shorter than a traditional review checklist, but it targets the actual failure modes of AI-generated code. The automation layer handles everything else.
+
+## The build speed multiplier
+
+Next.js 16.2's approximately 400% faster dev server startup via deep Turbopack integration compounds with AI code generation. The feedback loop — generate code, build, verify in browser — now takes seconds instead of tens of seconds.
+
+This is net positive for productivity. The constraint that remains is review quality, which doesn't scale automatically with faster builds. Faster tooling and AI generation are a powerful combination for implementation speed; the quality floor is set by what humans check and what automated gates enforce.
+
+## The practical implication
+
+The 42% figure is about volume of code, not about architectural decisions or product direction. As AI handles more implementation, human engineering judgment concentrates on the decisions AI can't reliably make: what to build, how to design the system, what tradeoffs to accept.
+
+TypeScript strictness and a realigned review process are the most practical levers for maintaining quality in an AI-assisted codebase. The goal isn't to block AI-generated code — it's to design quality gates that AI-generated code has to pass through regardless of its origin.
