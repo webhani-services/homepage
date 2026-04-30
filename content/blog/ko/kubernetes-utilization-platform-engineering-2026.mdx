@@ -1,0 +1,129 @@
+---
+title: "CPU 사용률 8%: Kubernetes 낭비 문제와 Platform Engineering의 부상"
+description: "CAST AI의 2026년 보고서에 따르면 Kubernetes 클러스터의 평균 CPU 사용률은 8%, GPU 사용률은 5%에 불과합니다. 왜 이런 낭비가 발생하고, VPA·Karpenter·Platform Engineering으로 어떻게 해결하는지 살펴봅니다."
+date: "2026-05-01"
+status: "published"
+tags: ["Kubernetes", "DevOps", "Platform Engineering", "Cloud", "Cost Optimization"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-utilization-platform-engineering-2026"
+---
+
+## 8% 문제
+
+2026년 CAST AI의 「State of Kubernetes Optimization Report」는 평균 CPU 사용률 8%, GPU 사용률 5%라는 수치를 제시했습니다. 예약된 리소스가 대부분 유휴 상태로 방치되고 있습니다.
+
+이것은 Kubernetes의 기술적 문제가 아니라 인센티브 구조의 문제입니다. 팀은 장애를 피하기 위해 리소스를 과도하게 요청합니다. Scheduler는 그 요청을 그대로 반영합니다. Node는 크고 대부분 비어있는 채로 남습니다.
+
+## 왜 과도한 프로비저닝이 계속되는가
+
+메커니즘은 단순합니다. Kubernetes 리소스 설정은 `requests`와 `limits`로 이루어집니다.
+
+```yaml
+resources:
+  requests:
+    cpu: "500m"    # Scheduler가 Node 배치에 사용하는 값
+    memory: "512Mi"
+  limits:
+    cpu: "2000m"   # 컨테이너가 실제로 사용할 수 있는 최대값
+    memory: "2Gi"
+```
+
+프로덕션에서 OOMKilled 이벤트가 발생하면 자연스럽게 Memory Limit을 올립니다. CPU 스파이크로 지연이 생기면 Requests를 높입니다. 각 장애마다 여유 마진이 쌓입니다. 그 버퍼를 나중에 제거하는 사람은 없습니다. 프로덕션 안정성이 비용 효율성보다 당연히 우선시되기 때문입니다.
+
+결과적으로 Requests는 계속 증가하고, 실제 사용량은 정체되며, Scheduler가 부풀어 오른 Requests를 수용하기 위해 Node가 계속 추가됩니다.
+
+## VPA로 해결하기
+
+Vertical Pod Autoscaler(VPA)는 실제 리소스 사용량을 모니터링하고 더 적절한 Requests/Limits를 권장하거나 자동 적용합니다.
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: api-server-vpa
+spec:
+  targetRef:
+    apiVersion: "apps/v1"
+    kind: Deployment
+    name: api-server
+  updatePolicy:
+    updateMode: "Off"  # 여기서 시작 — 변경 없이 권장값만 확인
+```
+
+`updateMode: "Off"`으로 시작하여 권장값을 관찰하세요. `"Initial"`(새 Pod에만 적용)로 이동한 후 `"Auto"`를 활성화하세요. 간헐적으로 급증하는 워크로드에 대해 VPA가 과소 권장할 수 있으므로 관찰 단계가 중요합니다.
+
+## Karpenter로 Node 효율 개선
+
+AWS Karpenter(동등한 기능: GKE Node Autoprovision)는 실제 대기 중인 Pod Requests를 기반으로 인스턴스 유형을 동적으로 선택합니다.
+
+```yaml
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: general
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["c5.large", "c5.xlarge", "m5.large", "m5.xlarge"]
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+    consolidateAfter: 30s
+```
+
+`consolidationPolicy: WhenUnderutilized`는 Karpenter에게 워크로드를 더 적은 Node로 적극적으로 통합하고 유휴 Node를 종료하도록 지시합니다. Cluster Autoscaler의 Scale-down 동작보다 더 적극적입니다.
+
+## Platform Engineering이 구조적 해결책인 이유
+
+VPA와 Karpenter는 증상을 해결합니다. 근본 원인은 Kubernetes 설정이 대부분의 개발자가 일관되게 올바르게 설정하기에는 너무 복잡하다는 것입니다.
+
+Internal Developer Platform(IDP)은 그 복잡성을 추상화합니다. 개발자는 배포를 위한 셀프 서비스 인터페이스를 얻고, Platform 팀은 합리적인 기본값을 가진 표준화된 템플릿을 유지합니다. 2026년 추정치에 따르면 80% 이상의 기업이 IDP를 프로덕션에서 운영 중이거나 개발 중입니다. 몇 년 전 45%에서 크게 증가한 수치입니다.
+
+Backstage가 가장 일반적인 오픈소스 기반입니다.
+
+```typescript
+// Backstage 내부에 비용 데이터 노출 예시
+import { createPlugin, createRoutableExtension } from '@backstage/core-plugin-api'
+
+export const costInsightsPlugin = createPlugin({
+  id: 'cost-insights',
+})
+
+export const CostInsightsPage = costInsightsPlugin.provide(
+  createRoutableExtension({
+    name: 'CostInsightsPage',
+    component: () =>
+      import('./components/CostInsightsPage').then(m => m.CostInsightsPage),
+    mountPoint: rootRouteRef,
+  }),
+)
+```
+
+비용을 Platform 팀의 Dashboard에서만이 아니라 Developer Portal 내부에서 가시화하면 대화 자체가 달라집니다. 개발자가 자신의 리소스 요청이 비용에 미치는 영향을 직접 확인할 수 있게 됩니다.
+
+## Docker Kanvas
+
+Docker의 2026년 1월 Kanvas 출시는 다른 각도에서 접근합니다. 로컬 Docker 아키텍처를 Kubernetes 배포 아티팩트로 직접 연결합니다. `docker-compose.yml`이 Kubernetes Manifest나 Helm Chart를 생성하는 출발점이 되어 로컬-프로덕션 간격을 줄입니다.
+
+아직 초기 단계이지만, 로컬에서 Docker를 사용하고 프로덕션에서 Kubernetes를 운영하는 팀의 실제 마찰 지점을 타겟으로 합니다.
+
+## webhani에서의 현재 접근 방식
+
+webhani에서 Kubernetes 비용 관리를 위한 현재 기준은 다음과 같습니다.
+
+- **먼저 VPA Recommend 모드로** — 권장값을 적용하기 전 2주간의 데이터 수집
+- **주간 리소스 리뷰** — Namespace별 Requests 대비 실제 사용량 비교
+- **개발/스테이징 자동 Scale-down** — 야간 및 주말 자동 축소 스케줄 설정
+- **모든 리소스 변경을 GitOps로** — 모든 변경사항 추적 및 검토 가능
+
+8% 수치는 시스템 수준의 평균입니다. 개별 워크로드는 잘 최적화될 수 있습니다. 목표는 과도한 프로비저닝이 예외가 되도록 하는 체계적인 가시성과 피드백 루프를 만드는 것입니다.
+
+## 정리
+
+Kubernetes 낮은 사용률은 기술 문제가 아니라 습관 문제입니다. VPA와 Karpenter가 메커니즘을 자동화하고, Platform Engineering이 조직적 레이어를 해결합니다. 가시성부터 시작하세요. 볼 수 없는 것은 고칠 수 없습니다.

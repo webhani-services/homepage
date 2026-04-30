@@ -1,0 +1,117 @@
+---
+title: "멀티 모델 라우팅: AI Agent에서 최적의 LLM을 선택하는 설계 패턴"
+description: "6주 동안 6개의 프론티어 모델이 출시되었습니다. 단일 LLM에 의존하는 시대는 끝났습니다. 각 태스크에 최적화된 모델을 동적으로 선택하는 멀티 모델 라우팅 아키텍처를 살펴봅니다."
+date: "2026-05-01"
+status: "published"
+tags: ["AI", "LLM", "Agent", "Architecture", "Python"]
+thumbnail: ""
+author: "webhani"
+slug: "multi-model-routing-ai-agents-2026"
+---
+
+## 단일 모델 시대의 종말
+
+2026년 3월 중순부터 4월 말 사이, 주요 AI 연구소들이 플래그십 모델을 잇달아 출시했습니다. Claude Opus 4.7(4월 16일), GPT-5.5(4월 23일), DeepSeek V4 Preview(4월 24일), 그리고 Llama 4, Qwen 3, Gemma 4까지 — 모두 6주라는 짧은 기간에 집중되었습니다.
+
+이제 중요한 질문은 "어떤 모델이 가장 좋은가"가 아닙니다. 핵심은 단일 Provider에 고정하는 것 자체가 설계상의 제약이 된다는 점입니다. 태스크 특성에 따라 최적의 모델을 동적으로 선택하는 **멀티 모델 라우팅**이 표준 관행이 되고 있습니다.
+
+## 왜 단일 모델로는 부족한가
+
+각 모델은 서로 다른 강점을 가지고 있습니다.
+
+| 모델 | 강점 | 약점 |
+|---|---|---|
+| Claude Opus 4.7 | 장기 Agent 워크플로, 지시 수행, 구조화 출력 | 높은 Token 비용 |
+| GPT-5.5 | Tool 중심 Agent 작업, SWE-bench Pro 57.7% | 기본 티어 Context 제한 |
+| DeepSeek V4 | 비용 효율적 코드 생성 | 복잡한 추론에서 일관성 부족 |
+| Llama 4 / GLM-5.1 | On-premise, 데이터 주권 | 설정 오버헤드 |
+
+하나의 모델에 고정하면 그 모델의 약점을 모든 태스크에서 감수해야 합니다.
+
+## 라우팅 패턴
+
+### 태스크 유형 기반 라우팅
+
+가장 단순한 방식으로, 태스크 카테고리에 따라 모델을 배정합니다.
+
+```python
+from litellm import completion
+
+ROUTING_TABLE = {
+    "code_generation": "deepseek/deepseek-chat",
+    "structured_output": "anthropic/claude-opus-4-7",
+    "tool_use_agent": "openai/gpt-5.5",
+    "local_inference": "ollama/llama4",
+}
+
+def route(task_type: str, messages: list, **kwargs):
+    model = ROUTING_TABLE.get(task_type, "anthropic/claude-sonnet-4-6")
+    return completion(model=model, messages=messages, **kwargs)
+```
+
+### 복잡도 기반 라우팅
+
+입력 프롬프트의 복잡도를 점수화하여 단순한 태스크는 저비용 모델로 라우팅합니다.
+
+```python
+def complexity_score(prompt: str) -> float:
+    checks = [
+        len(prompt) > 2000,
+        any(kw in prompt.lower() for kw in ["implement", "refactor", "analyze"]),
+        prompt.count("\n") > 10,
+        "```" in prompt,  # 코드 포함 여부
+    ]
+    return sum(checks) / len(checks)
+
+def select_model(prompt: str) -> str:
+    score = complexity_score(prompt)
+    if score >= 0.75:
+        return "anthropic/claude-opus-4-7"
+    elif score >= 0.4:
+        return "openai/gpt-5.5"
+    return "deepseek/deepseek-chat"
+```
+
+### Fallback Chain
+
+Primary 모델이 Rate Limit이나 Timeout으로 실패할 경우 자동으로 다음 모델로 전환합니다.
+
+```python
+import litellm
+
+response = litellm.completion(
+    model="anthropic/claude-opus-4-7",
+    messages=[{"role": "user", "content": prompt}],
+    fallbacks=["openai/gpt-5.5", "deepseek/deepseek-chat"],
+    timeout=30,
+)
+```
+
+## 실무에서 주의할 점
+
+**Provider별 파라미터 차이** — `temperature`와 `max_tokens`는 대부분의 Provider에서 호환됩니다. 반면 `tool_choice`, `response_format`, Extended Thinking 관련 옵션은 Provider마다 다릅니다. 이런 설정은 애플리케이션 로직에 분산하지 말고 라우팅 설정에 집중시키세요.
+
+**비용 추적을 처음부터** — 멀티 모델 환경에서는 어떤 모델에 얼마를 쓰는지 파악하기 어려워집니다. LiteLLM은 호출별 비용 추정을 제공합니다.
+
+```python
+cost = litellm.completion_cost(completion_response=response)
+```
+
+태스크 유형별로 비용을 태깅하고, 첫 프로덕션 배포 전에 Dashboard를 구축해두세요.
+
+**Provider 중립적 Prompt 작성** — "Claude로서" 또는 "GPT 모델로서"와 같은 표현은 라우팅을 방해합니다. 시스템 프롬프트는 역할과 태스크 중심으로 작성하세요.
+
+## webhani에서의 현재 모델 배정
+
+webhani가 구축하는 AI Agent Pipeline에서 현재 잘 동작하는 조합은 다음과 같습니다.
+
+- **기획 및 요건 분석**: Claude Opus 4.7 — 긴 Context 처리와 복잡한 지시 수행
+- **코드 생성 태스크**: DeepSeek V4 — 낮은 비용으로 높은 코드 품질
+- **Tool 중심 오케스트레이션 루프**: GPT-5.5 — 가장 안정적인 Tool Call 실행
+- **On-premise 또는 Air-gapped 환경**: Llama 4 — 데이터가 네트워크 밖으로 나갈 수 없는 경우
+
+이 배정은 고정이 아닙니다. Benchmark와 가격 변화에 따라 매월 재검토합니다.
+
+## 정리
+
+멀티 모델 라우팅은 조기 최적화가 아닙니다. 실제로 존재하는 모델 능력과 가격의 차이에 대응하는 현실적인 접근입니다. 간단한 라우팅 테이블부터 시작해서, 비용을 조기에 계측하고, Provider별 코드를 추상화 레이어 뒤에 두세요. 목표는 애플리케이션 로직을 건드리지 않고 모델을 교체할 수 있게 하는 것입니다.
