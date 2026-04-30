@@ -1,0 +1,129 @@
+---
+title: "Kubernetesインフラの使用率問題とPlatform Engineeringの台頭"
+description: "CAST AIの2026年レポートによれば、Kubernetesクラスタの平均CPU使用率はわずか8%、GPU使用率は5%です。この非効率の構造的原因と、Internal Developer Platformによる解決策を実践的な視点で解説します。"
+date: "2026-05-01"
+status: "published"
+tags: ["Kubernetes", "DevOps", "Platform Engineering", "Cloud", "Cost Optimization"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-utilization-platform-engineering-2026"
+---
+
+## Kubernetesを使っているのに8%しか使えていない理由
+
+CAST AIが2026年に発表した「State of Kubernetes Optimization Report」は、業界に一石を投じました。平均CPU使用率8%、GPU使用率5%——大量のリソースが予約されながら、実際にはほとんど使われていないという実態です。
+
+これはKubernetes固有の技術的問題ではなく、インセンティブ構造の問題です。チームは障害を避けるためにリソースを多めに要求します。Schedulerはその要求を忠実に反映します。Nodeは大きく、かつほとんど空いたまま残ります。
+
+## 過剰プロビジョニングの構造
+
+仕組みはシンプルです。Kubernetesのリソース設定は`requests`と`limits`で行います。
+
+```yaml
+resources:
+  requests:
+    cpu: "500m"    # Schedulerがノード選択に使う値
+    memory: "512Mi"
+  limits:
+    cpu: "2000m"   # コンテナが実際に使える上限
+    memory: "2Gi"
+```
+
+本番でOOMKilledが起きると`memory`を増やします。CPUスパイクでレイテンシが上がると`requests`を増やします。各インシデントごとにマージンが積み重なります。後でそのバッファを削除する人はいません。プロダクションの安定性はコスト効率より正当に優先されるからです。
+
+結果として、requestsは増加し続け、実際の使用量は横ばいで、Schedulerが増えたrequestsを収容するためにNodeが増え続けます。
+
+## 対処1: Vertical Pod Autoscaler (VPA)
+
+VPAは実際のリソース消費を監視し、より適切なrequests/limitsを推薦または自動適用します。
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: api-server-vpa
+spec:
+  targetRef:
+    apiVersion: "apps/v1"
+    kind: Deployment
+    name: api-server
+  updatePolicy:
+    updateMode: "Off"  # まずここから——変更なしで推薦値を確認
+```
+
+`updateMode: "Off"`から始めて推薦値を観察し、`"Initial"`（新規Pod作成時のみ適用）を経て`"Auto"`に進むのが安全な流れです。バースト性のあるワークロードではVPAが過少推薦することがあるため、観察フェーズが重要です。
+
+## 対処2: KarpenterによるNode効率化
+
+AWS環境ではKarpenter（GKE相当はNode Autoprovision）が、実際の保留中Podのrequestsに基づいてインスタンスタイプを動的に選択します。
+
+```yaml
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: general
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["c5.large", "c5.xlarge", "m5.large", "m5.xlarge"]
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+    consolidateAfter: 30s
+```
+
+`consolidationPolicy: WhenUnderutilized`により、Karpenterはワークロードをできるだけ少ないNodeに統合し、アイドル状態のNodeを積極的に終了します。Cluster Autoscalerよりもアグレッシブなコスト最適化が可能です。
+
+## Platform Engineeringが構造的解決策である理由
+
+VPAやKarpenterは症状に対処します。根本原因は、Kubernetesの設定が複雑すぎて、多くの開発者が一貫して正しく設定することが難しい点にあります。
+
+**Internal Developer Platform（IDP）**はその複雑さを抽象化します。開発者はデプロイのためのセルフサービスインターフェースを持ち、Platformチームは合理的なデフォルト値を持った標準化されたテンプレートを維持します。2026年時点で企業の80%以上がIDPを本番稼働中または開発中とされています（数年前の45%から増加）。
+
+最も一般的なオープンソース基盤はBackstageです。
+
+```typescript
+// Backstageのコスト可視化プラグイン例
+import { createPlugin, createRoutableExtension } from '@backstage/core-plugin-api'
+
+export const costInsightsPlugin = createPlugin({
+  id: 'cost-insights',
+})
+
+export const CostInsightsPage = costInsightsPlugin.provide(
+  createRoutableExtension({
+    name: 'CostInsightsPage',
+    component: () =>
+      import('./components/CostInsightsPage').then(m => m.CostInsightsPage),
+    mountPoint: rootRouteRef,
+  }),
+)
+```
+
+コスト情報をPlatformチームだけのDashboardでなく、Developer Portal内で可視化することで、開発者が自分のリソース消費を意識できるようになります。
+
+## Docker Kanvas：別のアプローチ
+
+Dockerが2026年1月にリリースしたKanvasは異なる角度からアプローチします。ローカルのDockerアーキテクチャをKubernetesデプロイメントアーティファクトに直接変換することで、「ローカルと本番の乖離」という長年の課題に取り組みます。
+
+`docker-compose.yml`を起点にKubernetes ManifestやHelm chartを生成するフローが、より少ない摩擦で実現できます。まだ初期段階ですが、ローカルでDockerを使い本番でKubernetesを使うチームにとっての実際の摩擦地点を標的にしています。
+
+## webhaniとして何をしているか
+
+webhaniのKubernetesコスト管理における現在の基準は以下の通りです。
+
+- **VPAをRecommendモードから導入**: 推薦値を適用する前に2週間のデータを収集
+- **週次のリソースレビュー**: NamespaceごとのRequests対実使用量を比較
+- **開発・Staging環境は自動スケールダウン**: 夜間・週末にスケールダウンするスケジュールを設定
+- **すべてのリソース変更をGitOpsで管理**: すべての変更を追跡・レビュー可能な状態に
+
+8%という数字はシステムレベルの平均です。個別のワークロードは適切に最適化されている場合もあります。目標は、過剰プロビジョニングが例外になるような体系的な可視性とフィードバックループを構築することです。
+
+## まとめ
+
+Kubernetesの低使用率は技術的な失敗ではなく、組織的な習慣の問題です。VPAとKarpenterがメカニズムを自動化し、Platform Engineeringが組織レイヤーを解決します。まず可視化から始めてください。見えないものは直せません。
