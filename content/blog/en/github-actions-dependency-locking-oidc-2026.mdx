@@ -1,0 +1,108 @@
+---
+title: "GitHub Actions 2026 Security: Dependency Locking and OIDC Custom Property Claims"
+description: "GitHub's 2026 security roadmap introduces workflow dependency locking and OIDC custom property claims (GA in April). Here's what they protect against and how to implement them."
+date: "2026-05-02"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "Security", "DevSecOps", "OIDC"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-dependency-locking-oidc-2026"
+---
+
+CI/CD pipelines remain a high-value target for supply chain attacks. GitHub's 2026 security roadmap addresses this with several new features — the two most actionable right now are workflow dependency locking and OIDC custom property claims, which reached GA in April 2026.
+
+These operate at a different layer than the Egress Firewall, and together they form a more complete supply chain defense.
+
+## Workflow Dependency Locking
+
+The problem with current action references is that tags are mutable. `actions/checkout@v4` can point to different commit SHAs over time, which means a compromised action repository could serve malicious code to workflows that look unchanged.
+
+Dependency Locking brings a `go.sum` equivalent to GitHub Actions: a `dependencies:` section in the workflow YAML locks every direct and transitive dependency to a specific commit SHA.
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on: [push, pull_request]
+
+dependencies:
+  actions/checkout:
+    version: "v4"
+    sha: "11bd71901bbe5b1630ceea73d27597364c9af68"
+  actions/setup-node:
+    version: "v4"
+    sha: "49933ea5288caeca8642d1e84afbd3f7d6820020"
+  actions/cache:
+    version: "v4"
+    sha: "5a3ec84eff668545956fd18022ec81e4c5de7fe6"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci && npm test
+```
+
+If a SHA doesn't match, the job fails before any code runs. Dependency updates appear as diffs in pull requests, making them subject to normal code review rather than silent side effects.
+
+## OIDC Custom Property Claims (Now GA)
+
+The standard OIDC token from GitHub Actions includes basic claims — repository name, branch, job name. That's enough for simple allow-lists, but it doesn't let you express attribute-based access control based on what a repository *is*, rather than just what it's named.
+
+Custom Property Claims fix this: organization and enterprise admins can include repository custom properties as claims in the OIDC token. A repository tagged `team=backend` and `env=production` emits those values as token claims.
+
+```yaml
+# .github/workflows/deploy.yml
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789:role/BackendProdRole
+          aws-region: us-east-1
+```
+
+On the cloud side, this enables condition-based trust policies:
+
+```json
+{
+  "Condition": {
+    "StringEquals": {
+      "token.actions.githubusercontent.com:sub":
+        "repo:myorg/myrepo:ref:refs/heads/main",
+      "token.actions.githubusercontent.com:custom_property_team": "backend",
+      "token.actions.githubusercontent.com:custom_property_env": "production"
+    }
+  }
+}
+```
+
+The IAM role trust policy controls access based on repository properties, not hardcoded repository names. Adding a new repository to the `backend` team automatically grants it access to the corresponding AWS role — and removing the property revokes it immediately.
+
+## Prioritizing Implementation
+
+Not all security features need immediate adoption. A rough priority ordering:
+
+| Feature | What It Protects | Setup Cost | When to Prioritize |
+|---------|-----------------|------------|-------------------|
+| SHA pinning (existing) | Action tampering | Low | Do it now |
+| Dependency Locking | Transitive dependency tampering | Medium | Track roadmap |
+| OIDC Custom Claims | Attribute-based cloud access | Medium | Multiple teams sharing infra |
+| Egress Firewall | Exfiltration from runner | High | High-risk environments |
+
+The most immediate action is replacing tag references with SHA pins in existing workflows. Tools like `step-security/harden-runner` can automate this audit.
+
+## Takeaway
+
+Dependency Locking closes the mutable-tag gap in CI supply chain security. OIDC Custom Property Claims enable attribute-based cloud access control that scales better than hardcoded repository allow-lists.
+
+OIDC Custom Claims is available now. If you manage access across multiple repositories with different trust levels, it's worth implementing before the rest of the 2026 security roadmap ships.
