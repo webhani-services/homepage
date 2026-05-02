@@ -1,0 +1,143 @@
+---
+title: "React Compiler が React 19.2 で Stable に — 自動メモ化の実態と移行ポイント"
+description: "React 19.2 で React Compiler が stable リリースとなりました。手動の useMemo / useCallback が不要になるとされますが、実際の挙動と既存コードへの影響を整理します。"
+date: "2026-05-03"
+status: "published"
+tags: ["React", "ReactCompiler", "TypeScript", "Performance", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "react-compiler-stable-react-19-2026"
+---
+
+React 19.2 のリリースに合わせて、React Compiler が stable ステータスに到達しました。2024 年から実験的機能として開発が続いていたコンパイラが、ついて本番利用可能な状態になりました。「`useMemo` と `useCallback` を書かなくてよくなる」というのが大きな売り文句ですが、実際には何が変わり、何が変わらないのかを整理します。
+
+## React Compiler が解決する問題
+
+React のレンダリングは、コンポーネントの props や state が変化したときに再実行されます。問題は、親コンポーネントが再レンダリングされると、子コンポーネントも変化がなくても再レンダリングされることです。
+
+従来の対策は手動のメモ化でした。
+
+```tsx
+// 従来: 手動でメモ化する必要があった
+const ExpensiveList = memo(({ items, onSelect }: Props) => {
+  return <ul>{items.map(item => <li key={item.id}>{item.name}</li>)}</ul>;
+});
+
+function Parent() {
+  const [count, setCount] = useState(0);
+  
+  // onSelect を毎回生成するとメモ化が無意味になる
+  const handleSelect = useCallback((id: string) => {
+    console.log(id);
+  }, []);
+
+  const sortedItems = useMemo(() => 
+    items.sort((a, b) => a.name.localeCompare(b.name)),
+    [items]
+  );
+
+  return <ExpensiveList items={sortedItems} onSelect={handleSelect} />;
+}
+```
+
+このパターンの問題は、依存配列の管理が複雑になること、メモ化のし忘れがパフォーマンス劣化を引き起こすこと、そしてコードが本来のロジックより冗長になることです。
+
+## React Compiler が何をするか
+
+React Compiler はビルド時に JavaScript の AST を解析し、コンポーネントと Hook の参照同一性を自動的に保証します。開発者が `useMemo` / `useCallback` / `memo` を書かなくても、コンパイラが必要な箇所に挿入します。
+
+```tsx
+// React Compiler 導入後: シンプルに書ける
+function Parent() {
+  const [count, setCount] = useState(0);
+  
+  const handleSelect = (id: string) => {
+    console.log(id);
+  };
+
+  const sortedItems = items.sort((a, b) => a.name.localeCompare(b.name));
+
+  return <ExpensiveList items={sortedItems} onSelect={handleSelect} />;
+}
+```
+
+コンパイラは `handleSelect` と `sortedItems` が `count` の変化に依存しないと判断し、自動的にメモ化します。
+
+## 導入方法
+
+Next.js アプリへの導入は `next.config.ts` の設定変更で完了します。
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next';
+
+const nextConfig: NextConfig = {
+  experimental: {
+    reactCompiler: true,
+  },
+};
+
+export default nextConfig;
+```
+
+Vite や他のバンドラーでは Babel プラグインを使います。
+
+```bash
+npm install babel-plugin-react-compiler
+```
+
+```javascript
+// babel.config.js
+module.exports = {
+  plugins: [
+    ['babel-plugin-react-compiler', {}],
+  ],
+};
+```
+
+## 既存コードへの影響
+
+React Compiler は **React のルール（Rules of React）** に従ったコードのみを最適化します。つまり、以下のようなパターンがあると最適化をスキップします。
+
+```tsx
+// コンパイラが最適化をスキップするケース
+function BadComponent({ data }: { data: number[] }) {
+  // 直接ミューテーションは React のルール違反
+  data.push(42);
+  return <div>{data.length}</div>;
+}
+```
+
+既存プロジェクトに導入すると、コンパイラが最適化できないコンポーネントを報告してくれます。これはコードの品質問題を可視化する副産物になります。
+
+## 手動メモ化は完全に不要になるか
+
+すべての `useMemo` / `useCallback` が不要になるわけではありません。
+
+**コンパイラが自動処理するケース**
+- プリミティブ値の計算
+- オブジェクト・配列の生成
+- コールバック関数の参照
+
+**引き続き手動が必要なケース**
+- 非常に重い計算処理（意図的なキャッシュ）
+- 外部ライブラリへの参照同一性の保証が必要なケース
+
+コンパイラ導入後も既存の `useMemo` / `useCallback` はそのまま動作します。段階的に削減していくアプローチが安全です。
+
+## webhani の導入推奨
+
+新規プロジェクトには積極的に採用を推奨します。既存プロジェクトでは以下の手順が現実的です。
+
+1. `eslint-plugin-react-compiler` を導入してルール違反を検出
+2. 違反箇所を修正してから Compiler を有効化
+3. パフォーマンスプロファイリングで効果を確認
+
+React Compiler は React の書き方を変えるものではなく、正しく書かれたコードを自動最適化するものです。「ルールを守って書く」という習慣自体が、チームのコード品質を高める機会になります。
+
+## まとめ
+
+- React 19.2 で React Compiler が stable リリース、本番利用が可能になった
+- `useMemo` / `useCallback` の多くを自動化し、コードをシンプルに保てる
+- React のルールに従ったコードのみが最適化対象
+- 新規プロジェクトは即時採用、既存プロジェクトは lint チェック後の段階的導入が推奨

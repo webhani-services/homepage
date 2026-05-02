@@ -1,0 +1,115 @@
+---
+title: "MCP Hits 97 Million Installs as Linux Foundation Takes Over Governance"
+description: "Anthropic's Model Context Protocol has crossed 97 million installs and moved to Linux Foundation governance. Every major AI provider now ships MCP-compatible tooling. Here's what this transition means for developers building AI agents."
+date: "2026-05-03"
+status: "published"
+tags: ["MCP", "AI", "LLM", "OpenSource", "AgentDevelopment"]
+thumbnail: ""
+author: "webhani"
+slug: "mcp-linux-foundation-open-governance-2026"
+---
+
+Anthropic's Model Context Protocol (MCP) crossed 97 million installs as of March 2026. Around the same time, the Linux Foundation announced it would take over governance of the protocol — moving MCP from a single-vendor project to neutral, community-managed infrastructure.
+
+## What MCP Actually Does
+
+MCP is a communication protocol that standardizes how LLMs connect to tools and data sources: file systems, databases, APIs, and internal services. Before MCP, each integration required custom glue code per model and per tool. MCP separates responsibilities into three layers: **Host**, **Client**, and **Server**.
+
+```
+┌────────────────────────────────────────────────┐
+│  Host Application  (Claude Desktop, IDE, etc.) │
+│  ┌──────────────┐                              │
+│  │  MCP Client  │ ──── JSON-RPC 2.0 ─────────► │ MCP Server
+│  └──────────────┘                              │ (tools / resources / prompts)
+└────────────────────────────────────────────────┘
+```
+
+MCP Servers expose **tools** (executable operations) and **resources** (readable data). The LLM calls these through a uniform interface, regardless of which model or host is in use. That portability is what drove rapid ecosystem adoption.
+
+## Why 97 Million Installs Matters
+
+The growth is largely explained by how quickly the surrounding ecosystem converged on MCP:
+
+- **IDEs**: VS Code, JetBrains, Cursor, and others shipped native MCP support
+- **AI providers**: OpenAI, Google DeepMind, Mistral, and others released MCP-compatible tooling
+- **Cloud vendors**: AWS Bedrock added support for MCP servers
+
+The notable signal here is not just the install count — it's that **competing AI providers adopted the same protocol**. When rivals converge on an interface, it tends to stick.
+
+## What Linux Foundation Governance Changes
+
+The governance transfer is not a technical change. It's a structural one.
+
+| Before | After |
+|--------|-------|
+| Anthropic decides the roadmap | Multi-stakeholder RFC process |
+| Competitors hesitate to depend on Anthropic-owned spec | Neutral ground, easier to adopt |
+| Single point of organizational risk | Foundation-backed long-term stewardship |
+
+This pattern is familiar: Kubernetes moved to CNCF, OpenTelemetry moved to CNCF, and both became durable industry standards. MCP is following the same trajectory.
+
+## Minimal MCP Server Example (TypeScript)
+
+Here's a stripped-down MCP server that exposes a single file-reading tool:
+
+```typescript
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import { readFile } from "fs/promises";
+
+const server = new Server(
+  { name: "file-reader", version: "1.0.0" },
+  { capabilities: { tools: {} } }
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: "read_file",
+      description: "Read a file at the given path",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Absolute file path" },
+        },
+        required: ["path"],
+      },
+    },
+  ],
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  if (req.params.name === "read_file") {
+    const { path } = req.params.arguments as { path: string };
+    const content = await readFile(path, "utf-8");
+    return { content: [{ type: "text", text: content }] };
+  }
+  throw new Error(`Unknown tool: ${req.params.name}`);
+});
+
+await server.connect(new StdioServerTransport());
+```
+
+The `@modelcontextprotocol/sdk` v1.0 ships SDKs for TypeScript, Python, Kotlin, and Swift. Local servers run over stdio; remote servers use HTTP with SSE.
+
+## When to Use MCP — A Practical Guide
+
+**Good fit:**
+- You need an LLM to access internal tools, databases, or APIs
+- You want to swap AI providers without rewriting integration code
+- You are building multi-agent systems where components need to call each other's tools
+
+**Watch out for:**
+- The security model for remote MCP servers is still solidifying. Trust boundaries between hosts and remote servers need explicit design decisions before production deployment
+- stdio-based and HTTP-based servers have different attack surfaces — treat them differently
+
+## Takeaways
+
+- MCP has crossed a threshold where it functions as shared infrastructure, not just one company's SDK
+- Linux Foundation governance removes the single-vendor dependency risk
+- All major AI providers have shipped MCP support, making cross-provider tooling practical today
+- Start with internal tools or data sources where access control is well-defined, then expand
