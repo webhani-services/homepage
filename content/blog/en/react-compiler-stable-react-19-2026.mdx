@@ -1,0 +1,145 @@
+---
+title: "React Compiler Reaches Stable in React 19.2"
+description: "React Compiler hit stable status with React 19.2, promising automatic memoization without manual useMemo/useCallback. Here's what changed, what still needs attention, and how to adopt it in an existing codebase."
+date: "2026-05-03"
+status: "published"
+tags: ["React", "ReactCompiler", "TypeScript", "Performance", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "react-compiler-stable-react-19-2026"
+---
+
+React Compiler reached stable status alongside React 19.2. After over a year in experimental territory, it's now production-ready. The headline claim is that you no longer need to manually write `useMemo`, `useCallback`, or `memo` — the compiler handles it. Here's what that actually means in practice.
+
+## The Problem React Compiler Solves
+
+React re-renders a component when its state or props change. The catch: when a parent re-renders, all its children re-render too, even if their inputs haven't changed.
+
+The conventional solution was manual memoization:
+
+```tsx
+// Before: manual memoization scattered throughout the codebase
+const ExpensiveList = memo(({ items, onSelect }: Props) => {
+  return <ul>{items.map(item => <li key={item.id}>{item.name}</li>)}</ul>;
+});
+
+function Parent() {
+  const [count, setCount] = useState(0);
+
+  // Without useCallback, a new function reference on every render
+  // would break ExpensiveList's memo() optimization
+  const handleSelect = useCallback((id: string) => {
+    console.log(id);
+  }, []);
+
+  const sortedItems = useMemo(() =>
+    items.sort((a, b) => a.name.localeCompare(b.name)),
+    [items]
+  );
+
+  return <ExpensiveList items={sortedItems} onSelect={handleSelect} />;
+}
+```
+
+This works, but the dependency arrays add cognitive overhead, a missed `useCallback` silently breaks memoization, and the optimizations clutter what should be straightforward code.
+
+## What the Compiler Does
+
+React Compiler analyzes JavaScript AST at build time and automatically preserves referential identity for values and functions that don't change between renders. You write the straightforward version:
+
+```tsx
+// After: the compiler handles memoization automatically
+function Parent() {
+  const [count, setCount] = useState(0);
+
+  const handleSelect = (id: string) => {
+    console.log(id);
+  };
+
+  const sortedItems = items.sort((a, b) => a.name.localeCompare(b.name));
+
+  return <ExpensiveList items={sortedItems} onSelect={handleSelect} />;
+}
+```
+
+The compiler determines that `handleSelect` and `sortedItems` don't depend on `count`, and memoizes them automatically. `ExpensiveList` doesn't need `memo()` either — the compiler handles that too.
+
+## How to Enable It
+
+**Next.js** (App Router or Pages Router):
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next';
+
+const nextConfig: NextConfig = {
+  experimental: {
+    reactCompiler: true,
+  },
+};
+
+export default nextConfig;
+```
+
+**Vite / other bundlers** via Babel plugin:
+
+```bash
+npm install babel-plugin-react-compiler
+```
+
+```javascript
+// babel.config.js
+module.exports = {
+  plugins: [
+    ['babel-plugin-react-compiler', {}],
+  ],
+};
+```
+
+## What the Compiler Won't Optimize
+
+React Compiler only optimizes components that follow the [Rules of React](https://react.dev/reference/rules). Code that mutates props or state directly, accesses external mutable variables, or otherwise breaks React's assumptions is skipped:
+
+```tsx
+// Compiler skips this — direct mutation violates Rules of React
+function BadComponent({ data }: { data: number[] }) {
+  data.push(42); // mutation of a prop
+  return <div>{data.length}</div>;
+}
+```
+
+The compiler reports what it skips. In an existing codebase, this report often surfaces code quality issues that were previously invisible.
+
+## Does This Eliminate Manual Memoization?
+
+Not entirely. Most `useMemo` / `useCallback` usage becomes unnecessary, but a few cases remain:
+
+**Still useful manually:**
+- Explicitly controlling cache lifetime for expensive computations
+- Guaranteeing referential stability for third-party libraries that depend on it for correctness
+- Debugging — a manual `useMemo` makes the optimization visible and intentional
+
+Existing `useMemo` / `useCallback` calls are not broken by the compiler; they coexist fine. You can remove them incrementally after verifying the compiler covers those cases.
+
+## Migration Approach for Existing Projects
+
+1. Install `eslint-plugin-react-compiler` and fix reported violations first
+2. Enable the compiler with `{ compilationMode: 'annotation' }` to opt-in per component with `'use memo'` directives
+3. Switch to full compilation once the codebase is clean
+
+```tsx
+// Opt-in mode: compiler only processes components with this directive
+function MyComponent() {
+  'use memo';
+  // ... compiler-optimized code
+}
+```
+
+This lets you adopt incrementally without requiring a full codebase audit upfront.
+
+## Takeaways
+
+- React Compiler is production-ready as of React 19.2 — no longer experimental
+- It automates the memoization patterns most developers apply manually, making code simpler
+- Only components that follow the Rules of React are optimized; violations are reported but not broken
+- New projects: enable immediately. Existing projects: lint first, then enable incrementally
