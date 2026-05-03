@@ -1,0 +1,81 @@
+---
+title: "Vite 8 + Rolldown: Rust 기반 번들러로 빌드 속도 10~30배 향상"
+description: "2026년 3월 출시된 Vite 8은 Rust로 작성된 번들러 Rolldown을 통합하여 프로덕션 빌드 속도를 10~30배 개선했습니다. 변경 사항과 마이그레이션 방법을 정리합니다."
+date: "2026-05-04"
+status: "published"
+tags: ["Vite", "Rolldown", "Frontend", "Build Tools", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "vite8-rolldown-faster-builds"
+---
+
+2026년 3월 출시된 Vite 8은 Rolldown이라는 Rust 기반 번들러를 기본 프로덕션 번들러로 통합했습니다. 주간 6,500만 다운로드를 기록하는 Vite에서 빌드 속도가 10~30배 빨라진다는 것은 대규모 코드베이스와 CI/CD 파이프라인에 실질적인 변화를 가져옵니다.
+
+## Rolldown이란?
+
+Rolldown은 Rollup을 Rust로 재구현한 번들러입니다. 기존 Rollup Plugin과의 호환성을 유지하면서, Rust의 네이티브 성능으로 JavaScript 기반 번들러의 한계를 극복합니다.
+
+SWC, OXC, Biome이 이미 이 방향을 제시했습니다. JavaScript 툴체인의 핵심 컴포넌트를 Rust로 재작성하여 단일 스레드 JS 실행과 Garbage Collection 오버헤드를 우회하는 접근입니다. Rolldown은 이 흐름이 번들러 영역에 적용된 결과입니다.
+
+## 실제 빌드 속도 측정값
+
+중규모 React 프로젝트(1,000~5,000 모듈) 기준 공개 Benchmark:
+
+| 모듈 수 | Rollup (Vite 7) | Rolldown (Vite 8) | 개선 배율 |
+|--------|----------------|-------------------|---------|
+| 1,000개 | ~4.2초 | ~0.4초 | ~10배 |
+| 3,000개 | ~18초 | ~0.8초 | ~22배 |
+| 5,000개 | ~45초 | ~1.5초 | ~30배 |
+
+Monorepo 환경에서 여러 패키지를 순차 빌드하는 경우 효과가 더욱 큽니다.
+
+## Vite 8 마이그레이션
+
+대부분의 프로젝트는 단 한 줄로 업그레이드할 수 있습니다.
+
+```bash
+npm install vite@8 --save-dev
+```
+
+Rolldown은 Vite 8의 기본 번들러입니다. 별도 설정 없이 기존 `vite.config.ts`가 그대로 동작합니다.
+
+```typescript
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  build: {
+    rollupOptions: {
+      // 기존 Rollup 옵션은 Rolldown에서도 유효합니다
+      output: {
+        manualChunks: {
+          vendor: ["react", "react-dom"],
+        },
+      },
+    },
+  },
+});
+```
+
+### 확인이 필요한 경우
+
+**커스텀 Rollup Plugin**: 대부분의 Rollup Plugin은 Rolldown과 호환되지만, 저수준 Hook을 사용하는 Plugin은 사전 확인이 필요합니다. 프로덕션 마이그레이션 전 Rolldown 호환성 표를 확인하세요.
+
+**CommonJS 상호 운용성**: Rolldown은 더 엄격한 ESM 처리를 수행합니다. Node.js 모듈 해석 방식에 의존하는 레거시 CJS 패키지는 호환성 Wrapper(`@rollup/plugin-commonjs` 등)가 필요할 수 있습니다.
+
+**Source Map 형식**: 디버깅 설정이 특정 Source Map 출력에 의존한다면 마이그레이션 후 모든 환경에 적용하기 전에 명시적으로 테스트하세요.
+
+## CI 외 개발 환경에 미치는 영향
+
+빌드 속도 개선은 개발 루프 전반에도 영향을 미칩니다.
+
+- **Vite 개발 서버 시작**: 초기 의존성 사전 번들링의 Cold Start 속도 향상
+- **vitest 실행**: Vitest를 함께 사용하는 경우 Test 실행에도 혜택
+- **`vite build && vite preview` 사이클**: 대부분의 프로젝트에서 로컬 프로덕션 Preview가 거의 즉시 가능
+
+## 정리
+
+Rolldown은 실험적 기능이 아니라 Vite 8의 기본값입니다. 새 프로젝트라면 Vite 8이 명확한 선택입니다. 기존 Vite 7 프로젝트도 표준 설정이라면 마이그레이션 위험이 낮고, 수백 개 이상의 모듈을 가진 코드베이스에서는 그 효과가 명확합니다.
+
+번들 단계에서 30초 이상 걸리는 CI 빌드가 있다면, 이 업그레이드만으로도 상당한 시간을 단축할 수 있습니다. 대규모 Monorepo를 운영하는 팀이라면 그 효과는 더욱 두드러질 것입니다.
