@@ -1,0 +1,115 @@
+---
+title: "React Compiler安定版：useMemo/useCallbackを手動で書く時代の終わり"
+description: "React 19.2でReact Compilerが安定版になりました。手動メモ化からの解放がコードの書き方とチームのレビュープロセスにどう影響するか、実際のコード例を交えて解説します。"
+date: "2026-05-05"
+status: "published"
+tags: ["React", "React Compiler", "Performance", "TypeScript", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "react-compiler-stable-react-19"
+---
+
+React 19.2でReact Compilerが安定版になりました。これは「使えるかもしれないオプトイン機能」から「フロントエンドチームが対応を検討すべきデフォルト機能」への移行を意味します。
+
+## React Compilerが解決する問題
+
+Reactの再レンダリング最適化は長年の課題でした。コンポーネントが不必要に再レンダリングされるのを防ぐため、開発者は`useMemo`、`useCallback`、`React.memo`を手動で配置する必要がありました。
+
+問題は、この手動メモ化が本質的にエラーを起こしやすいという点です。
+
+```tsx
+// 以前の典型的なコード
+const SearchResults = ({ query, filters }: { query: string; filters: Filter[] }) => {
+  const filteredResults = useMemo(
+    () => expensiveFilter(allResults, query, filters),
+    [allResults, query, filters] // 依存配列を間違えると古いデータ、過剰追加では効果なし
+  );
+
+  const handleSelect = useCallback((id: string) => {
+    onSelect(id);
+  }, [onSelect]); // onSelectは安定しているか？親次第
+
+  return <ResultList items={filteredResults} onSelect={handleSelect} />;
+};
+```
+
+依存配列の管理は、計算が依存する値を正確に追跡しなければなりません。間違えると古いデータか不要な再計算のどちらかが発生し、どちらも静かな失敗です。コードレビュー時間の相当部分がこの種の確認に費やされていました。
+
+## React Compilerが行うこと
+
+React Compilerはビルド時にコンポーネント関数を解析し、必要な箇所に自動でメモ化を挿入します。開発者はシンプルなコードを書くだけで、Compilerが最適化された出力を生成します。
+
+```tsx
+// React Compilerを使用した場合
+const SearchResults = ({ query, filters }: { query: string; filters: Filter[] }) => {
+  // useMemo不要 — Compilerが処理
+  const filteredResults = expensiveFilter(allResults, query, filters);
+
+  // useCallback不要 — Compilerが処理
+  const handleSelect = (id: string) => {
+    onSelect(id);
+  };
+
+  return <ResultList items={filteredResults} onSelect={handleSelect} />;
+};
+```
+
+Compilerは依存グラフを静的に完全に把握し、手動メモ化版と同等の性能の出力を生成します。
+
+## 導入方法
+
+React 19.2と`babel-plugin-react-compiler`が必要です。
+
+```bash
+npm install react@19.2 react-dom@19.2 babel-plugin-react-compiler
+```
+
+Babel設定への追加：
+
+```json
+{
+  "plugins": ["babel-plugin-react-compiler"]
+}
+```
+
+Next.js 16以降では`next.config.ts`で有効化できます：
+
+```typescript
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  experimental: {
+    reactCompiler: true,
+  },
+};
+
+export default nextConfig;
+```
+
+## 移行時に気をつける点
+
+**Strict Modeが前提条件です**: Compilerは副作用のないレンダー関数と冪等なレンダリングというStrict Modeのセマンティクスを前提とします。すでにStrict Modeを使用しているプロジェクトであれば、影響は最小限です。
+
+**既存の`useMemo`/`useCallback`はそのまま**: Compilerは既存のメモ化コードを削除しません。段階的な移行が可能ですが、移行期間中は一部のコードで二重にメモ化が適用される箇所が生じる場合があります。
+
+**ESLintプラグインで非互換パターンを事前確認**: Compilerを有効にする前に`eslint-plugin-react-compiler`を実行し、Compilerが安全に最適化できないパターン（直接変更、非標準の副作用など）を持つコンポーネントを特定しましょう。
+
+```bash
+npm install --save-dev eslint-plugin-react-compiler
+```
+
+**外部ライブラリとの相互作用**: Compilerはあなたのコードを変換しますが、ライブラリの内部は変換しません。ライブラリレベルの副作用や非標準のRefパターンに大きく依存するコンポーネントは手動での確認が必要です。
+
+## コードレビューへの影響
+
+Compiler導入前：レビュー時間の相当部分が依存配列の検証とコンポーネント境界での`React.memo`適用確認に使われていました。
+
+Compiler導入後：これらの確認はビルドパイプラインへ移行します。レビューはロジックの正確性とコンポーネント設計に集中できます。残る知識的な要求事項は「なぜCompilerがこのパターンを最適化できないのか」を理解することであり、依存配列の検証よりはるかに本質的な問題です。
+
+## パフォーマンスの上限と下限
+
+React Compilerの性能上限は手動最適化と同じです。しかし下限は高くなります。誤った依存配列によって引き起こされるバグのクラスを排除するからです。新規プロジェクトでは安定版Compilerを有効にして始めることを推奨します。既存コードベースへの適用はESLintプラグインで変更コストを可視化してから判断してください。
+
+## まとめ
+
+React Compilerの安定化は、新規プロジェクトでは即日有効化する価値があります。既存コードベースの場合、ESLintプラグインが変更をコミットせずにマイグレーションコストの具体的な答えを提供してくれます。手動メモ化の廃止は一日では起きませんが、これはReactエコシステムにとって実質的な変化です。

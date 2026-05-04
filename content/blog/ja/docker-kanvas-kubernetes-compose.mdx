@@ -1,0 +1,92 @@
+---
+title: "Docker Kanvas：Docker Compose構文でKubernetesにデプロイする新しいアプローチ"
+description: "Dockerが発表したKanvasは、馴染みのあるDocker Compose構文をそのままKubernetesデプロイに活用できるプラットフォームです。ローカル開発とクラウド本番環境のギャップを埋める仕組みを解説します。"
+date: "2026-05-05"
+status: "published"
+tags: ["Docker", "Kubernetes", "DevOps", "Cloud", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-kubernetes-compose"
+---
+
+Dockerエコシステムに新しいプロダクトが加わりました。Docker Kanvasは、Docker Compose構文を維持したままKubernetesへのデプロイを実現するプラットフォームです。ローカル開発ワークフローの延長線上でクラウド本番環境を扱うというアプローチは、開発チームとインフラチームの間に長年存在してきた摩擦に対する一つの回答です。
+
+## 問題の構造
+
+ほとんどの開発チームはローカル環境でDocker Composeを使います。理由はシンプルです。数行のYAMLでマルチコンテナ環境が立ち上がり、`.env`ファイルでの設定も直感的です。
+
+しかし本番環境はKubernetesが主流です。Deployment、Service、Ingress、ConfigMap、PersistentVolumeClaimといったリソースをそれぞれ定義する必要があり、概念モデルが大きく異なります。この「ローカルはCompose、本番はKubernetes」という分断が、開発者に余分な認知コストをかけ、デプロイの失敗を増やす原因のひとつになっています。
+
+## Kanvasが取るアプローチ
+
+KanvasはこのギャップをレイヤーとしてDocker Composeの上に構築します。開発者は既存の`docker-compose.yml`でローカル開発を続けながら、Kanvasがそれをクラウド環境向けのKubernetes Manifestへと変換・管理します。
+
+```yaml
+# 既存のdocker-compose.ymlの例
+services:
+  api:
+    image: myapp-api:latest
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+    depends_on:
+      - db
+      - cache
+
+  db:
+    image: postgres:16
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  cache:
+    image: redis:7-alpine
+
+volumes:
+  pg_data:
+```
+
+このComposeファイルをKanvasが解析し、対応するKubernetesリソースを生成します。HelmやKustomizeのような独自のテンプレート言語を学ばなくても、Composeの知識だけで出発点を作れます。
+
+## HelmやKustomizeとの関係
+
+KanvasはHelmやKustomizeの代替ではなく、エントリーポイントの簡略化です。
+
+**Helm**：チャートによるパッケージング、リリース管理に強みがあります。学習曲線が高く、チャートテンプレートやValuesファイルの管理は非自明です。
+
+**Kustomize**：`kubectl`に組み込まれておりベースとオーバーレイで環境差分を管理しやすいですが、Docker Composeではなくkubernetes Manifestから出発します。
+
+**Kanvas**：ほとんどの開発者がすでにいる場所から始まります。プロジェクトが成熟してKubernetes固有の要件（カスタムリソース定義、細かいネットワークポリシー）が出てきた場合は、Compose基盤の上にKubernetesネイティブの設定を重ねるか、Helmへ移行することもできます。
+
+## 現時点での制限
+
+Kanvasは比較的新しいプロダクトです。重要なワークロードへの導入前に把握すべき実際の限界があります。
+
+**ステートフルサービスの扱い**: Composeの`volumes`はKubernetesのPersistentVolumeClaimに対応しますが、Storage Classの選択やAccess Modeの設定は自動変換だけでは本番データベースに不十分なケースがあります。自動変換が本番品質のPersistence設定を生成すると思い込まないようにしてください。
+
+**マルチクラスター対応**: 現時点では単一クラスターへのデプロイが主な対象です。マルチリージョンや連合クラスター構成には別途対策が必要です。
+
+**CI/CD統合の成熟度**: GitHub ActionsやArgo CDとの統合パターンは存在しますが、コミュニティのエコシステムはHelmほど成熟していません。既存パイプラインへの組み込みには追加の手動設定が必要です。
+
+**複雑なネットワーキング**: Composeの`ports`と`networks`は単純なケースではKubernetesのServiceとNetworkPolicyに合理的にマップされますが、高度なトラフィック管理（加重ルーティング、Circuit Breaking、mTLS）はKanvasが抽象化しないService Meshの設定が引き続き必要です。
+
+## 実際の活用シーン
+
+Kanvasが特に価値を発揮するのは次のような状況です。
+
+- 自前のデプロイを管理する必要があるが、Kubernetesの深い知識がないアプリケーションチーム
+- 専任のインフラエンジニアがいないスタートアップや小規模チーム
+- 大きな運用投資なしにクラスターで動かしたい内部Toolingや非重要サービス
+
+大規模なマイクロサービスや規制が厳しい本番環境では、KanvasをCompose→Kubernetes変換の入口として使い、その上にKubernetesネイティブの設定を重ねるハイブリッドアプローチが現実的です。
+
+## Platform Engineeringとの接続
+
+2026年のクラウドインフラトレンドとして顕著なのがPlatform Engineeringの台頭です。インフラチームがInternal Developer Platform（IDP）を構築し、アプリケーション開発者がKubernetesを直接意識しなくても開発できる環境を整備するアプローチです。
+
+KanvasはこのトレンドとKubernetesへの変換・デプロイレイヤーとして自然に組み合わせられます。Docker Composeを「開発者向けのインターフェース」として維持しながら、Kanvasが「実際のインフラへの変換層」を担う構造は、カスタム抽象化レイヤーを自前で構築せずにPlatform Engineeringを始める小中規模組織の出発点になり得ます。
+
+## まとめ
+
+Docker KanvasはKubernetesの複雑さをゼロにするものではありません。一部を先延ばしにし、進入点を低くするものです。すでにDocker Composeをローカルで動かし、Kubernetesへのデプロイで摩擦を感じているなら、まず非重要なサービスでKanvasを評価してみる価値があります。変換後の出力を理解し、どこまで連れて行ってくれるかを把握してから、本番採用の判断を下してください。

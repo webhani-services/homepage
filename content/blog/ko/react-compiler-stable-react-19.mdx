@@ -1,0 +1,116 @@
+---
+title: "React Compiler 안정화: useMemo/useCallback 수동 관리 시대의 종말"
+description: "React 19.2에서 React Compiler가 안정 버전으로 출시되었습니다. 수동 메모이제이션이 사실상 선택적이 된 지금, 실제로 무엇이 달라지고 어떻게 마이그레이션할지 정리합니다."
+date: "2026-05-05"
+status: "published"
+tags: ["React", "React Compiler", "Performance", "TypeScript", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "react-compiler-stable-react-19"
+---
+
+React Compiler가 React 19.2에서 안정 버전이 되었습니다. 이는 단순한 버전 업이 아니라, 선택적 실험 기능에서 팀이 적극적으로 검토해야 할 표준 기능으로의 전환을 의미합니다.
+
+## 어떤 문제를 해결하는가
+
+React의 렌더링 모델은 상태나 props가 변경될 때마다 컴포넌트 함수를 재실행합니다. 불필요한 재연산과 자식 컴포넌트의 불필요한 리렌더링을 방지하기 위해 개발자들은 `useMemo`, `useCallback`, `React.memo`를 수동으로 배치해야 했습니다.
+
+문제는 이 수동 메모이제이션이 오류를 유발하기 쉽다는 점입니다.
+
+```tsx
+// Compiler 도입 전 전형적인 코드
+const SearchResults = ({ query, filters }: { query: string; filters: Filter[] }) => {
+  const filteredResults = useMemo(
+    () => expensiveFilter(allResults, query, filters),
+    [allResults, query, filters] // 의존성 누락 시 오래된 결과, 과도한 추가 시 효과 없음
+  );
+
+  const handleSelect = useCallback((id: string) => {
+    onSelect(id);
+  }, [onSelect]); // onSelect가 안정적인가? 부모에 따라 다름
+
+  return <ResultList items={filteredResults} onSelect={handleSelect} />;
+};
+```
+
+의존성 배열은 계산이 의존하는 값들을 정확히 추적해야 합니다. 틀리면 오래된 데이터나 불필요한 재계산 중 하나가 발생하는데, 둘 다 조용한 오류입니다. 코드 리뷰 시간의 상당 부분이 의존성 배열 검증에 소비되는 것이 현실입니다.
+
+## Compiler가 하는 일
+
+React Compiler는 빌드 시점에 컴포넌트 함수를 분석하여 필요한 곳에 자동으로 메모이제이션을 삽입합니다. 개발자는 단순한 코드를 작성하고, Compiler가 최적화된 출력을 생성합니다.
+
+```tsx
+// React Compiler 활성화 후
+const SearchResults = ({ query, filters }: { query: string; filters: Filter[] }) => {
+  // useMemo 불필요 — Compiler가 처리
+  const filteredResults = expensiveFilter(allResults, query, filters);
+
+  // useCallback 불필요 — Compiler가 처리
+  const handleSelect = (id: string) => {
+    onSelect(id);
+  };
+
+  return <ResultList items={filteredResults} onSelect={handleSelect} />;
+};
+```
+
+Compiler는 의존성 그래프를 정적으로 완전히 파악하여, 수동으로 메모이제이션한 버전과 동등한 성능의 출력을 생성합니다.
+
+## 설정 방법
+
+React 19.2와 `babel-plugin-react-compiler`가 필요합니다.
+
+```bash
+npm install react@19.2 react-dom@19.2 babel-plugin-react-compiler
+```
+
+Babel 설정에 추가:
+
+```json
+{
+  "plugins": ["babel-plugin-react-compiler"]
+}
+```
+
+Next.js 16의 경우:
+
+```typescript
+// next.config.ts
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  experimental: {
+    reactCompiler: true,
+  },
+};
+
+export default nextConfig;
+```
+
+## 마이그레이션 시 고려사항
+
+**Strict Mode가 전제조건입니다.** Compiler는 React Strict Mode 시맨틱(부작용 없는 렌더 함수, 멱등성 렌더링)을 가정합니다. 이미 Strict Mode를 사용 중인 프로젝트 — 대부분이어야 합니다 — 는 준비가 잘 된 상태입니다.
+
+**기존 `useMemo`/`useCallback`은 그대로 유지됩니다.** Compiler는 기존 메모이제이션 코드를 제거하지 않습니다. 점진적 마이그레이션이 가능하지만, 전환 기간 중에는 일부 코드에서 이중 메모이제이션이 발생할 수 있습니다.
+
+**ESLint Plugin으로 비호환 패턴을 미리 파악하세요.** Compiler를 활성화하기 전에 `eslint-plugin-react-compiler`를 실행하여 Compiler가 안전하게 최적화할 수 없는 패턴(직접 변형, 비표준 부작용 등)을 가진 컴포넌트를 식별하세요.
+
+```bash
+npm install --save-dev eslint-plugin-react-compiler
+```
+
+**서드파티 라이브러리와의 상호작용.** Compiler는 여러분의 코드를 변환하지만 라이브러리 내부는 변환하지 않습니다. 라이브러리 수준의 부작용이나 비표준 Ref 패턴에 크게 의존하는 컴포넌트는 수동 검토가 필요합니다.
+
+## 코드 리뷰에서 달라지는 점
+
+Compiler 도입 전: 리뷰 시간의 상당 부분이 의존성 배열 검증과 컴포넌트 경계에서 `React.memo` 적용 여부 확인에 사용되었습니다.
+
+Compiler 도입 후: 이런 확인은 빌드 파이프라인으로 이동합니다. 리뷰는 로직의 정확성과 컴포넌트 설계에 집중할 수 있습니다. 남은 지식 요구사항은 "왜 Compiler가 이 패턴을 최적화할 수 없는가"를 이해하는 것으로, 의존성 배열 검증보다 훨씬 본질적인 문제입니다.
+
+## 성능 상한선과 하한선
+
+React Compiler의 성능 상한선은 수동 최적화와 동일합니다. 하지만 하한선은 더 높습니다. 잘못된 의존성 배열로 인한 버그 유형을 제거하기 때문입니다. 성능 계약에서 트레이드오프는 없습니다. 수동 작업 없이 신중한 수동 작업만큼의 최적화를 얻을 수 있습니다.
+
+## 결론
+
+React Compiler 안정화는 신규 프로젝트에서는 즉시 활성화할 가치가 있습니다. 기존 코드베이스의 경우 ESLint Plugin이 변경 사항을 커밋하지 않고도 마이그레이션 비용에 대한 구체적인 답을 제공합니다. 수동 메모이제이션이 하루아침에 사라지지는 않겠지만, 이는 React 에코시스템에 있어 실질적인 변화입니다. 좋은 React 코드가 어떻게 생겼는지, 코드 리뷰가 무엇에 집중해야 하는지를 바꾸는 변화입니다.
