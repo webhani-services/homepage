@@ -1,0 +1,123 @@
+---
+title: "Supply Chain Attacks on CI/CD Pipelines — What to Fix Right Now"
+description: "Attackers are stealing GitHub tokens and poisoning npm packages to compromise CI/CD pipelines. Here's a practical checklist of defenses you should apply today."
+date: "2026-05-06"
+status: "published"
+tags: ["Security", "CI/CD", "DevOps", "GitHub Actions", "Supply Chain"]
+thumbnail: ""
+author: "webhani"
+slug: "cicd-supply-chain-security-2026"
+---
+
+Supply chain attacks against CI/CD pipelines are a persistent and growing threat. Several significant incidents have been reported in 2026 — stolen GitHub tokens, compromised npm packages, and exploited workflow vulnerabilities. This post covers what's actually happening and which defenses are worth implementing.
+
+## What Attacks Look Like
+
+### Workflow Token Theft via Pwn Request
+
+A "Pwn Request" vulnerability in Kubernetes CI workflows allowed attackers to trigger malicious workflow runs via pull request events, stealing repository tokens in the process. The root cause: workflows that executed untrusted code with excessive permissions.
+
+### Package Poisoning
+
+Two common patterns have emerged:
+
+1. **Typosquatting**: publishing packages with names similar to popular ones
+2. **Account takeover**: compromising maintainer accounts to inject malicious code into legitimate packages
+
+Several incidents have affected enterprise-adjacent packages, including SAP-related libraries.
+
+### Credential Exposure
+
+Secrets accidentally committed to repositories — `.env` files, AWS credentials, API tokens — are scraped by automated tools within minutes of exposure. This remains one of the most common initial access vectors.
+
+## Defenses Worth Implementing
+
+### 1. Restrict Workflow Permissions
+
+```yaml
+# .github/workflows/ci.yml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Only if using OIDC
+    steps:
+      - uses: actions/checkout@v4
+```
+
+Set `permissions` explicitly at the job level. GitHub's default is broader than most workflows need. Least privilege applies here.
+
+### 2. Pin Third-Party Actions by SHA
+
+```yaml
+# Risky: tag can be rewritten
+- uses: actions/setup-node@v4
+
+# Safe: commit SHA is immutable
+- uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8
+```
+
+Tags in GitHub Actions are mutable — a compromised action maintainer can push malicious code under an existing tag. SHA pinning prevents this.
+
+### 3. Enable Secret Scanning
+
+GitHub's built-in secret scanning catches common credential patterns before they reach the repository. Supplement it with a pre-commit hook:
+
+```bash
+pip install detect-secrets
+detect-secrets scan > .secrets.baseline
+```
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.4.0
+    hooks:
+      - id: detect-secrets
+        args: ['--baseline', '.secrets.baseline']
+```
+
+### 4. Audit Dependencies Continuously
+
+```bash
+# Run in CI
+npm audit --audit-level=high
+
+# For ongoing monitoring
+npx snyk monitor
+```
+
+Commit `package-lock.json` so that unexpected dependency changes are visible in pull requests.
+
+### 5. Replace Long-Lived Credentials with OIDC
+
+```yaml
+- name: Configure AWS Credentials
+  uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: arn:aws:iam::123456789012:role/GitHubActions
+    aws-region: us-east-1
+```
+
+OIDC eliminates the need to store `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` as GitHub secrets. The workflow receives short-lived credentials that cannot be reused outside the job.
+
+## Priority Checklist
+
+| Item | Status |
+|------|--------|
+| Explicit `permissions` set on all workflows | □ |
+| Third-party Actions pinned to SHA | □ |
+| Secret scanning enabled | □ |
+| `npm audit` in CI pipeline | □ |
+| AWS auth migrated to OIDC | □ |
+| `GITHUB_TOKEN` scope minimized | □ |
+
+## Our Take
+
+CI/CD pipelines are high-value targets because they sit at the intersection of code, credentials, and production access. A compromised pipeline is often a complete compromise.
+
+Most teams defer CI/CD security because it feels like infrastructure overhead rather than product work. But the fixes listed here are largely one-time configuration changes — low implementation cost, persistent protection.
+
+Start with permissions and Action pinning. These two changes alone eliminate a broad class of supply chain risk with minimal workflow disruption.

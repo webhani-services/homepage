@@ -1,0 +1,115 @@
+---
+title: "Next.js 16 Beta と Turbopack — 開発体験が本格的に変わる"
+description: "Next.js 16 Beta では Turbopack がデフォルト Bundler となり、大規模コードベースで最大 700 倍の高速化を実現。TypeScript の型安全性向上も含め、実際の開発への影響を解説します。"
+date: "2026-05-06"
+status: "published"
+tags: ["Next.js", "TypeScript", "Frontend", "Performance", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-turbopack-performance"
+---
+
+Next.js 16 Beta がリリースされ、Turbopack が正式なデフォルト Bundler として採用されました。また、TypeScript の型安全性向上として Typed Routes と Route Export Validation が安定版となっています。これらの変更は、日常的な開発作業の速度と品質に直接影響します。
+
+## Turbopack とは何か
+
+Turbopack は Rust で実装された Bundler で、webpack の後継として Vercel が開発しています。Next.js 15 では実験的オプションとして提供されていましたが、Next.js 16 Beta からはデフォルト設定になります。
+
+主な性能改善の数値としては、大規模コードベースで最大 700 倍の高速化が報告されています。日常的な使用ではここまでの差が出るわけではありませんが、プロジェクト規模が大きくなるほど恩恵は明確です。
+
+### 実際の体験差
+
+```bash
+# Next.js 15 (webpack) — 大規模プロジェクトでの起動
+$ next dev
+  ▲ Next.js 15.5.0
+  - Local: http://localhost:3000
+  Ready in 8.3s  # ← ファイル数が多いほど遅くなる
+
+# Next.js 16 (Turbopack) — 同一プロジェクトでの起動
+$ next dev
+  ▲ Next.js 16.0.0-beta
+  - Local: http://localhost:3000
+  Ready in 0.9s  # ← コードベースサイズに依存しにくい
+```
+
+Hot Module Replacement（HMR）の速度差も体感しやすく、保存からブラウザ反映までの時間が大幅に短縮されます。
+
+## TypeScript 型安全性の強化
+
+Next.js 16 では Typed Routes と Route Export Validation が安定版になりました。
+
+### Typed Routes
+
+```typescript
+// next.config.ts
+import type { NextConfig } from "next";
+
+const config: NextConfig = {
+  experimental: {
+    typedRoutes: true, // Next.js 16 では stable
+  },
+};
+
+export default config;
+```
+
+有効にすると、`href` に型チェックが適用されます。
+
+```typescript
+import Link from "next/link";
+
+// ✅ 型チェックが通る
+<Link href="/blog/my-post">記事へ</Link>
+
+// ❌ 存在しないルートはコンパイルエラーになる
+<Link href="/blg/my-post">記事へ</Link>
+//              ↑ TypeScript が誤りを検出
+```
+
+### Route Export Validation
+
+ページコンポーネントから不正な export をすると、ビルド時にエラーが出るようになります。
+
+```typescript
+// app/blog/[slug]/page.tsx
+
+// ✅ 正しい export
+export default function Page() { ... }
+export async function generateStaticParams() { ... }
+
+// ❌ 無効な export (ビルド時エラー)
+export const invalidExport = "something";
+```
+
+これによりルート設定の誤りを本番デプロイ前に確実に検出できます。
+
+## 移行の考え方
+
+Next.js 15 から 16 への移行は、基本的には破壊的変更が少ないアップグレードです。
+
+```bash
+npm install next@beta react@latest react-dom@latest
+```
+
+ただし、カスタム webpack 設定を多用しているプロジェクトでは、Turbopack 互換性の確認が必要です。すべての webpack プラグインが Turbopack に対応しているわけではないため、移行前に確認してください。
+
+```js
+// turbopack 非対応の webpack 設定がある場合
+// next.config.ts で webpack フォールバックが可能
+const config: NextConfig = {
+  // turbopack: {} — 設定なしでデフォルト有効
+  webpack: (config) => {
+    // webpack 固有の設定（Turbopack では無視される）
+    return config;
+  },
+};
+```
+
+## webhani の見解
+
+Turbopack のデフォルト化は、開発者の「待ち時間」を実質的に削減するという点で意義があります。特にコードベースが大きくなってから「開発が遅くなった」という問題に後から対処するより、最初から高速な環境で始められる点がポイントです。
+
+Typed Routes については、内部リンクの typo によるランタイムエラーは実際にわかりにくいバグの原因になります。型チェックでこれを防げるのは、チーム開発において具体的な価値があります。
+
+現在 Next.js 15 を使用しているプロジェクトでは、Beta ではなく安定版のリリースを待ってからの移行を推奨します。ただし、新規プロジェクトや実験的な環境であれば、今すぐ試す価値があります。

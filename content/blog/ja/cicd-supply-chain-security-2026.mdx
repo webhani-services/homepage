@@ -1,0 +1,123 @@
+---
+title: "CI/CD パイプラインを狙うサプライチェーン攻撃 — 今すぐ対処すべき対策"
+description: "GitHub Actions の Token 窃取や npm パッケージへの悪意ある混入など、CI/CD を標的にしたサプライチェーン攻撃が増加中。実際の攻撃パターンと具体的な防御手順を整理します。"
+date: "2026-05-06"
+status: "published"
+tags: ["Security", "CI/CD", "DevOps", "GitHub Actions", "Supply Chain"]
+thumbnail: ""
+author: "webhani"
+slug: "cicd-supply-chain-security-2026"
+---
+
+CI/CD パイプラインを標的にしたサプライチェーン攻撃が継続して報告されています。2026 年に入ってからも、GitHub Token の窃取、npm パッケージへの悪意あるコードの混入、ワークフロー脆弱性の悪用といったインシデントが複数発生しています。本記事では実際の攻撃パターンと、優先度の高い防御手段を解説します。
+
+## 実際の攻撃パターン
+
+### Pwn Request による Token 窃取
+
+Kubernetes の CI ワークフローで確認された "Pwn Request" 攻撃では、Pull Request イベントを悪用して悪意のあるワークフローを実行させ、リポジトリ Token を窃取しました。根本原因は、信頼できないコードを過剰な権限で実行するワークフロー設定でした。
+
+### パッケージの汚染
+
+インシデントの典型的な手口は 2 種類あります。
+
+1. **タイポスクワッティング**: 人気パッケージと似た名前の偽パッケージを公開する
+2. **アカウント乗っ取り**: メンテナーのアカウントを侵害し、正規パッケージに悪意あるコードを混入する
+
+SAP 関連のパッケージを含む複数のエンタープライズ向けライブラリでも類似の事例が報告されています。
+
+### シークレットの漏洩
+
+`.env` ファイルや AWS クレデンシャルがリポジトリに誤ってコミットされると、自動スキャンツールにより数分以内に悪用されます。これはいまだに最も多い初期侵入経路の一つです。
+
+## 優先度の高い防御手段
+
+### 1. ワークフローの権限を最小化する
+
+```yaml
+# .github/workflows/ci.yml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read       # 必要最小限に絞る
+      id-token: write      # OIDC 認証が必要な場合のみ
+    steps:
+      - uses: actions/checkout@v4
+```
+
+GitHub のデフォルト権限は多くのワークフローが必要とするより広い設定になっています。`permissions` を Job レベルで明示することが最低限の対策です。
+
+### 2. サードパーティ Action を SHA でピン留めする
+
+```yaml
+# 危険: タグは書き換え可能
+- uses: actions/setup-node@v4
+
+# 安全: Commit SHA は不変
+- uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8
+```
+
+GitHub Actions のタグはミュータブルです。侵害されたメンテナーが既存タグに悪意あるコードを push できます。SHA ピン留めでこのリスクを排除できます。
+
+### 3. シークレットスキャンを有効にする
+
+GitHub の組み込みシークレットスキャン機能に加え、`pre-commit` フックでローカル検出も追加します。
+
+```bash
+pip install detect-secrets
+detect-secrets scan > .secrets.baseline
+```
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.4.0
+    hooks:
+      - id: detect-secrets
+        args: ['--baseline', '.secrets.baseline']
+```
+
+### 4. 依存関係を継続的に監査する
+
+```bash
+# CI でのチェック
+npm audit --audit-level=high
+
+# 継続的なモニタリング
+npx snyk monitor
+```
+
+`package-lock.json` を必ずコミットし、予期しない依存関係の変更を Pull Request で検出できるようにしてください。
+
+### 5. 長期クレデンシャルを OIDC に置き換える
+
+```yaml
+- name: Configure AWS Credentials
+  uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: arn:aws:iam::123456789012:role/GitHubActions
+    aws-region: ap-northeast-1
+```
+
+OIDC（OpenID Connect）を使用することで、`AWS_ACCESS_KEY_ID` などの長期クレデンシャルを GitHub Secret として保存する必要がなくなります。ワークフローは Job の外で再利用できない短期クレデンシャルを受け取ります。
+
+## 優先チェックリスト
+
+| 対策 | 状態 |
+|------|------|
+| 全ワークフローに明示的な `permissions` を設定 | □ |
+| サードパーティ Action を SHA でピン留め | □ |
+| シークレットスキャンを有効化 | □ |
+| CI パイプラインに `npm audit` を組み込み | □ |
+| AWS 認証を OIDC に移行 | □ |
+| `GITHUB_TOKEN` のスコープを最小化 | □ |
+
+## webhani の見解
+
+CI/CD パイプラインはコード、クレデンシャル、本番環境へのアクセスが交差するポイントに位置するため、攻撃者にとって非常に価値のあるターゲットです。パイプラインが侵害されると、多くの場合、システム全体の侵害につながります。
+
+多くのチームは CI/CD のセキュリティをプロダクト開発ではなくインフラの運用オーバーヘッドとして後回しにする傾向があります。しかし、ここに挙げた対策の大半は一度きりの設定変更であり、実装コストが低く、継続的な保護を提供します。
+
+まずは権限の制限と Action の SHA ピン留めから始めることをお勧めします。この 2 つの変更だけで、ワークフローへの影響を最小限に抑えながら広範なサプライチェーンリスクを削減できます。
