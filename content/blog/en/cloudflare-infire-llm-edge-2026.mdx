@@ -1,0 +1,133 @@
+---
+title: "Cloudflare Infire: How They Built an LLM Inference Engine for the Edge"
+description: "Cloudflare has detailed Infire, their custom AI inference engine powering Workers AI. Here is the technical approach and what it means for developers building AI-powered apps on Cloudflare."
+date: "2026-05-07"
+status: "published"
+tags: ["Cloudflare", "AI", "LLM", "Edge Computing", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "cloudflare-infire-llm-edge-2026"
+---
+
+Cloudflare has published details on Infire, the custom AI inference engine powering Cloudflare Workers AI. The core problem Infire solves is running large language models efficiently across Cloudflare's globally distributed network — a different engineering challenge than running inference in a centralized data center.
+
+## The Edge Inference Problem
+
+Running LLM inference at the edge introduces constraints that are absent in a single-region data center:
+
+**Fragmented GPU resources**: Each edge location has limited GPU capacity. Standard inference engines do not handle model sharding across sparse, geographically distributed GPU clusters efficiently.
+
+**Cold start latency**: Language models are slow to load. A 30-second cold start is acceptable in batch processing; it is not acceptable for a user-facing web application.
+
+**Memory efficiency at scale**: GPU memory is expensive. An engine serving multiple tenants and models needs to use that memory efficiently across concurrent workloads, not dedicate it to a single tenant per instance.
+
+## What Infire Does Differently
+
+### Optimized tensor parallelism for edge GPU clusters
+
+Infire implements tensor parallelism — splitting model weights across multiple GPUs — with communication overhead tuned for the smaller, less-connected GPU clusters typical of edge deployments. Standard tensor parallel implementations assume high-bandwidth interconnects; Infire reduces the synchronization footprint to fit the edge hardware profile.
+
+### KV Cache sharing across requests
+
+In LLM inference, the KV (key-value) cache stores previously computed attention states, enabling faster processing of repeated context. Infire shares KV cache across requests that share the same system prompt:
+
+```python
+import httpx
+
+async def query_assistant(user_message: str, account_id: str, token: str):
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/"
+            "@cf/meta/llama-4-scout-17b-16e-instruct",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "messages": [
+                    # Shared system prompts benefit from KV cache reuse
+                    {"role": "system", "content": "You are a helpful support agent."},
+                    {"role": "user", "content": user_message}
+                ]
+            }
+        )
+    return response.json()["result"]["response"]
+```
+
+For a multi-tenant product where many users hit the same assistant endpoint, this reduces GPU memory consumption and improves response times.
+
+### Hot model standby
+
+Infire keeps frequently-used model weights resident in memory rather than loading them per-request. This drops cold start latency from tens of seconds down to hundreds of milliseconds — the difference between a usable and unusable production experience for applications with intermittent traffic.
+
+## Using This in Practice
+
+The improvements to Infire flow through to the Workers AI developer experience directly:
+
+```javascript
+// Cloudflare Worker with streaming LLM response
+export default {
+  async fetch(request, env) {
+    const { question } = await request.json();
+
+    const stream = await env.AI.run(
+      "@cf/meta/llama-4-scout-17b-16e-instruct",
+      {
+        messages: [
+          { role: "system", content: "You are a helpful assistant." },
+          { role: "user", content: question }
+        ],
+        stream: true,
+      }
+    );
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+      }
+    });
+  }
+};
+```
+
+**Latency**: Cold start reduction matters most for applications with intermittent traffic. A chatbot that sees bursts of activity followed by quiet periods was previously penalized heavily on the first request after idle periods.
+
+**Cost**: Shared KV cache means the same GPU memory can serve more concurrent users on shared system prompts.
+
+## Design Principles Worth Taking Away
+
+Infire's architecture surfaces patterns that apply beyond Cloudflare's specific implementation:
+
+**Keep system prompts short and consistent.** KV cache sharing only helps when system prompts are identical across requests. Long, request-unique system prompts defeat this optimization. Concise, shared system prompts maximize cache hit rates.
+
+**Stream from the first token.** Edge inference with streaming reduces perceived latency significantly. Do not wait for full generation before sending a response.
+
+**Know your data residency requirements.** Cloudflare routes requests to the nearest PoP automatically. If you are handling data with geographic restrictions, explicitly configure Workers region routing rather than relying on automatic selection.
+
+## Comparison with Other Inference Engines
+
+| Engine | Primary Use | Differentiator |
+|--------|-------------|----------------|
+| vLLM | Self-hosted / cloud | PagedAttention, high throughput |
+| TensorRT-LLM | NVIDIA GPU clusters | CUDA-native optimization |
+| llama.cpp | Edge devices / CPU | Portability, minimal dependencies |
+| Infire | Cloudflare edge | Multi-tenant efficiency, low cold start |
+
+Infire's niche is multi-tenant resource sharing across distributed, GPU-constrained locations. It does not compete with vLLM on raw throughput for dedicated GPU clusters; it is designed for a different deployment model.
+
+## Security Considerations
+
+Multi-tenant KV cache sharing raises an obvious question: can one tenant's cached data leak to another? Cloudflare's design includes tenant identifiers in the KV cache keying scheme, preventing cross-tenant cache access. For highly sensitive workloads, the Cloudflare AI Gateway's zero-data-retention option is available.
+
+## When to Use Workers AI
+
+**Workers AI backed by Infire is a good fit for:**
+- Chatbots and conversational UI features
+- Lightweight document classification
+- Context-aware input suggestions in web applications
+- Global low-latency AI without managing inference infrastructure
+
+**Consider alternatives when:**
+- You need GPT-4o or Claude-level reasoning capability
+- Document length or reasoning complexity exceeds smaller model limits
+- Strict data residency requirements make multi-region distribution problematic
+
+Infire signals that edge AI inference has moved from experimental to production-viable. The infrastructure complexity that previously required a dedicated ML platform team is now available as a straightforward API call.

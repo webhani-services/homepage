@@ -1,0 +1,107 @@
+---
+title: "TypeScript v7 が Go で書き直される理由 — コンパイラ刷新が開発者に与える影響"
+description: "TypeScript チームが v7 でコンパイラを Go で書き直す計画を明らかにしました。なぜ Go なのか、何が変わるのか、移行に向けて今から準備すべきことを整理します。"
+date: "2026-05-07"
+status: "published"
+tags: ["TypeScript", "Go", "Developer Tools", "Frontend", "Compiler"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-7-go-compiler-2026"
+---
+
+Microsoft TypeScript チームは、次のメジャーバージョンである TypeScript v7 で、コンパイラ全体を Go で書き直す計画を進めています。TypeScript 6.0 が「現行 JavaScript 仕様への最後の対応」と位置付けられていたのに対して、v7 はアーキテクチャの根本的な刷新です。
+
+## なぜ Go なのか
+
+TypeScript コンパイラ（`tsc`）は長年 TypeScript 自身で書かれていました。このアーキテクチャは型チェックと言語サービスを同一コードベースで共有できる利点がありましたが、パフォーマンスの上限が課題になってきました。
+
+Go を選んだ主な理由はパフォーマンスです。Go はガベージコレクションを持ちながらも、C/C++ に近い実行速度を発揮できます。また、goroutine による並行処理が型チェックの並列化に適しています。
+
+Rust も検討されましたが、TypeScript コンパイラの型システムが依拠する複雑な共有可変状態の管理が、Rust の所有権モデルと相性が悪かったとされています。Go の GC モデルは既存のコンパイラロジックをより直接的に移植できます。
+
+## 何が速くなるか
+
+公開されているベンチマーク（非公式含む）では、型チェックのスループットが現行の 5〜10 倍になるケースが報告されています。大規模なモノレポ環境での変化が特に顕著です。
+
+```bash
+# 現在（tsc v6.0 での例）
+$ time npx tsc --noEmit
+real    0m12.4s  # 50万行規模のモノレポ
+
+# TypeScript v7（Go ベース、予測値）
+real    0m1.8s   # 同等のコードベース
+```
+
+Language Server Protocol（LSP）の応答速度も改善されます。IDE での補完候補表示や型エラーの表示が遅れているプロジェクトでは、体感できる差が出るでしょう。
+
+## 開発者から見た変更点
+
+### API 互換性
+
+コンパイラの言語が変わっても、`tsconfig.json` や型定義の書き方は変わりません。`tsc` コマンドのインターフェースも維持される予定です。
+
+変わるのは TypeScript Compiler API（`import { createProgram } from "typescript"`）を直接使っている場合です。Go 版のコンパイラは Node.js から呼び出す際のバインディング層が提供されますが、既存の Compiler API との互換性は一部制限が生じる可能性があります。
+
+```typescript
+// 影響を受けるユースケース例: Compiler API を直接使うカスタムトランスフォーマー
+import * as ts from "typescript";
+
+const transformer: ts.TransformerFactory<ts.SourceFile> = (context) => {
+  return (sourceFile) => {
+    // このような低レベル API を使っているコードは
+    // v7 での動作確認が必要になる可能性がある
+    const visitor: ts.Visitor = (node) => {
+      if (ts.isCallExpression(node)) {
+        // ...
+      }
+      return ts.visitEachChild(node, visitor, context);
+    };
+    return ts.visitNode(sourceFile, visitor) as ts.SourceFile;
+  };
+};
+```
+
+### 影響を受けるツール
+
+TypeScript Compiler API に依存するツールは移行対応が必要になります。代表的なものは以下のとおりです。
+
+- ts-morph（AST 操作ライブラリ）
+- ts-node / tsx（TypeScript の直接実行）
+- 一部の ESLint プラグイン（`@typescript-eslint`）
+- カスタム Babel / SWC プラグイン
+
+`@typescript-eslint` は大きな影響を受けるツールの一つで、既にチームが v7 対応を検討しています。
+
+### Type Stripping との関係
+
+Node.js 22 以降でサポートされた Type Stripping（`node --experimental-strip-types`）は、Go 版コンパイラと方向性が一致しています。型情報を実行時に除去するだけなら TypeScript コンパイラ全体を起動する必要がないため、ts-node の代替として Node.js ネイティブの実行パスが主流になっていくと予想されます。
+
+## 移行スケジュールと今できる準備
+
+TypeScript v7 は 2026 年後半のリリースが予定されています。今から準備できることを整理します。
+
+**Compiler API 依存の棚卸し**
+
+プロジェクト内で TypeScript Compiler API を使っているコードやツールを特定しておくことが先決です。
+
+```bash
+# Compiler API の使用箇所を確認
+grep -r "from 'typescript'" --include="*.ts" --include="*.js" .
+grep -r "require('typescript')" --include="*.ts" --include="*.js" .
+```
+
+**型定義を標準仕様に近づける**
+
+非標準の型ハックや TypeScript 固有の回避策を減らし、型定義をシンプルに保つことが、移行コストを下げます。
+
+**TypeScript 6.0 への移行を先行させる**
+
+v7 対応の前に v6.0 が土台になります。`strict` モード移行を含む v6.0 対応を先に完了させておくのが得策です。
+
+## まとめ
+
+TypeScript v7 の Go ベースコンパイラは、開発者体験の改善という観点では期待が大きい変更です。特に、モノレポや大規模 Next.js プロジェクトを扱うチームにとっては、型チェック時間の短縮は生産性に直結します。
+
+一方で、TypeScript Compiler API を利用した独自ツールやトランスフォーマーを持つプロジェクトは、早めに影響調査を始めることをお勧めします。移行ガイドはまだ公開されていませんが、TypeScript の公式ブログと `@typescript-eslint` リポジトリの動向を継続的にウォッチするのが現時点での最善策です。
+
+コンパイラが変わっても型の書き方は変わりません。言語としての TypeScript の学習投資は引き続き有効です。
