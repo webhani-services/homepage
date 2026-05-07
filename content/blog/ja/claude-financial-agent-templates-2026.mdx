@@ -1,0 +1,122 @@
+---
+title: "Anthropic が公開した金融サービス向け Claude Agent Templates の設計を読む"
+description: "Anthropic が発表した10種の金融サービス向け Agent Templates と Claude Mythos Preview の概要を整理し、AI Agent 導入の実践的な視点から解説します。"
+date: "2026-05-08"
+status: "published"
+tags: ["AI", "Claude", "LLM", "Agent", "FinancialServices"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-financial-agent-templates-2026"
+---
+
+Anthropic は2026年5月5日、金融サービス向けの Agent Templates を10種類公開しました。Claude Cowork と Claude Code の Plugin として利用できるほか、Claude Managed Agents SDK の Cookbook としても提供されています。同日、Claude Mythos Preview が32ステップにわたるサイバー攻撃シナリオを自律的に完了したことも発表され、AI Agent の自律性が新たな段階に入りつつあることを示しています。
+
+## Agent Templates が何を解決するか
+
+金融サービス業務の多くは、構造化されていながらも大量の判断を伴います。財務レポートのレビュー、規制文書のコンプライアンス確認、リスク評価の文書化などです。これらを単一の LLM 呼び出しで処理しようとすると、コンテキストが断片化し精度が落ちます。
+
+Agent Templates はこの問題を、Tool use + Memory + Sub-agent の組み合わせで解決します。単純なプロンプトとは異なり、複数ステップにわたる業務フローを Agent が自律的に実行できる設計になっています。
+
+用意されているテンプレートが対象とする業務:
+
+- 財務レポートの自動分析と要約
+- 規制・コンプライアンス文書のレビュー
+- 投資ポートフォリオのリスク評価
+- 取引データの異常検知
+- 顧客向け投資シナリオのモデリング
+
+## 実装の構造
+
+Claude Managed Agents SDK を使った基本的な Agent ループの例です。
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+def run_compliance_agent(document: str) -> str:
+    tools = [
+        {
+            "name": "check_regulation",
+            "description": "Looks up applicable regulations for a given topic in the compliance database",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string"},
+                    "jurisdiction": {
+                        "type": "string",
+                        "enum": ["JP", "US", "EU"]
+                    }
+                },
+                "required": ["topic", "jurisdiction"]
+            }
+        },
+        {
+            "name": "flag_issue",
+            "description": "Records a compliance issue found in the document",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "section": {"type": "string"},
+                    "issue": {"type": "string"},
+                    "severity": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"]
+                    }
+                },
+                "required": ["section", "issue", "severity"]
+            }
+        }
+    ]
+
+    messages = [
+        {"role": "user", "content": f"Review the following document for compliance issues:\n\n{document}"}
+    ]
+
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=4096,
+            tools=tools,
+            messages=messages
+        )
+
+        if response.stop_reason == "end_turn":
+            return extract_report(response.content)
+
+        tool_results = process_tool_calls(response.content)
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+```
+
+Tool の定義の質が Agent の精度を左右します。`description` が曖昧だと Agent の判断がぶれます。何をするツールか、どんな入力を期待するかを具体的に記述することが重要です。
+
+## Claude Mythos Preview との文脈
+
+Mythos Preview が32ステップのサイバー攻撃シナリオを単独で完了したという発表は、Agent の自律性の水準が大きく上がっていることを示しています。金融 Agent Templates もその延長線上にあり、単発の問い合わせではなく、複数 Tool を呼び出しながら判断を積み重ねる設計が前提です。
+
+ただし、Mythos Preview のような高度な自律動作を金融業務にそのまま適用することには慎重であるべきです。金融業務における Agent の判断は、コンプライアンス・法的責任と直結するためです。
+
+## 実務適用で押さえるべきポイント
+
+**データの取り扱い**
+
+金融データには個人情報（PII）や機密情報が含まれる可能性が高いです。Claude API に送信できるデータの範囲を法務チームと確認し、必要に応じてマスキングやトークン化を実施してください。
+
+**Tool の障害対応**
+
+市場データ API などの外部 Tool が障害を起こした場合の Agent の挙動を設計してください。テンプレートにはこの部分が含まれておらず、個別の実装が必要です。
+
+**Human-in-the-loop**
+
+取引実行や重大なリスク判定については、Agent の出力をそのまま実行させない設計が必要です。Tool use の中に確認ステップを組み込み、人間の承認を経てから次のアクションを実行する仕組みを設けてください。
+
+## webhani の見解
+
+今回の Agent Templates は、AI Agent の設計パターンを学ぶ上でも参考になります。金融業務以外のドメインにも応用できる構造です。
+
+プロダクション適用にあたっては、テンプレートをそのまま使うのではなく、自社の業務フロー・データポリシー・エラー処理を組み込んだ形に作り込む必要があります。小さなユースケースから試し、Tool の信頼性と Agent の精度を実測してから拡張するアプローチを推奨します。
+
+---
+
+*参考: Anthropic Blog, Air Street Press "State of AI: May 2026", blog.greeden.me*

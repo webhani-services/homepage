@@ -1,0 +1,156 @@
+---
+title: "AWS EKS Hybrid Nodes Gateway: Pod-to-Pod Communication Across Cloud and On-Prem"
+description: "AWS released the EKS Hybrid Nodes Gateway on May 4, 2026. It enables pod-to-pod communication between cloud and on-premises nodes without network infrastructure changes."
+date: "2026-05-08"
+status: "published"
+tags: ["AWS", "Kubernetes", "EKS", "HybridCloud", "CloudInfrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-eks-hybrid-nodes-gateway-2026"
+---
+
+AWS released the EKS Hybrid Nodes Gateway on May 4, 2026. The core capability: pod-to-pod communication between cloud and on-premises nodes in the same EKS cluster, without requiring changes to network infrastructure.
+
+## The Problem It Solves
+
+EKS Hybrid Nodes — the ability to register on-premises machines as nodes in an EKS cluster — has existed for a while. The limitation was network: getting cloud and on-prem pods to communicate required additional setup, typically involving:
+
+- VPN or Direct Connect configuration
+- Manual routing for pod CIDRs
+- Firewall rule changes
+- Coordination with network teams
+
+Technically achievable, but the configuration complexity and change management overhead were real adoption blockers.
+
+## How the Gateway Works
+
+The EKS Hybrid Nodes Gateway handles pod-to-pod routing transparently at the cluster level. Cloud pods and on-prem pods in the same cluster see each other as cluster-native service endpoints — no application changes required.
+
+```bash
+# Create a cluster with Hybrid Nodes Gateway enabled
+aws eks create-cluster \
+  --name production-hybrid-cluster \
+  --kubernetes-version 1.36 \
+  --resources-vpc-config \
+    subnetIds=["subnet-abc123","subnet-def456"],\
+    securityGroupIds=["sg-abc123"] \
+  --hybrid-node-config \
+    enabledNodeTypes=["onPremises"],\
+    remoteNetworkConfig='{"remotePodNetworks":[{"cidrs":["10.0.0.0/16"]}],"remoteNodeNetworks":[{"cidrs":["192.168.0.0/24"]}]}'
+```
+
+For existing clusters:
+
+```bash
+aws eks update-cluster-config \
+  --name existing-cluster \
+  --hybrid-node-config \
+    enabledNodeTypes=["onPremises"],\
+    remoteNetworkConfig='{"remotePodNetworks":[{"cidrs":["10.0.0.0/16"]}]}'
+```
+
+## A Practical Configuration
+
+A hybrid deployment where cloud handles API traffic and on-premises runs services that need direct database access:
+
+```yaml
+# Cloud-side API gateway deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: production
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/compute-type: ec2  # place on cloud nodes
+      containers:
+        - name: api-gateway
+          image: api-gateway:2.1.0
+          env:
+            - name: DATA_SERVICE_URL
+              # Kubernetes service DNS — works across cloud/on-prem boundary
+              value: "http://data-service.production.svc.cluster.local:8080"
+---
+# On-premises data service deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-service
+  namespace: production
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: data-service
+  template:
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/compute-type: hybrid  # place on on-prem nodes
+      containers:
+        - name: data-service
+          image: data-service:1.5.0
+          # Direct access to on-premises databases — no network change needed
+```
+
+From the `api-gateway` pod, `data-service` is just another Kubernetes Service. The Gateway handles the routing across the physical boundary transparently.
+
+## Kubernetes v1.36 Requirement
+
+The Gateway requires Kubernetes v1.36, which also brings Declarative Validation to GA. API configuration errors surface earlier and more predictably — an ancillary benefit when managing hybrid cluster configurations where misconfigurations can be harder to debug.
+
+## What to Check Before Adopting
+
+**Latency**
+
+The Gateway eliminates the network configuration problem, but not the physics. If your on-premises infrastructure is in a different datacenter, pod-to-pod communication will have higher latency than intra-cloud calls. Measure actual round-trip times before putting synchronous service dependencies across the boundary.
+
+**Network Policy**
+
+With the Gateway, on-prem pods can reach cloud services and vice versa. Define explicit NetworkPolicy rules to limit which pods can communicate:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-onprem-egress
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      location: on-premises
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              accepts-onprem-traffic: "true"
+      ports:
+        - port: 8080
+```
+
+## Who This Is For
+
+This is most valuable for organizations that:
+
+- Have regulatory or compliance requirements that keep certain data on-premises
+- Have invested in on-prem infrastructure that isn't going away soon
+- Want to gradually migrate workloads to cloud without a full cutover
+
+It's less useful if your architecture is already fully cloud-native, or if the latency profile of cross-boundary calls makes the hybrid model impractical for your workloads.
+
+## Takeaway
+
+EKS Hybrid Nodes Gateway removes a meaningful operational barrier to hybrid Kubernetes. The network configuration work that previously blocked hybrid adoption can now be skipped, letting infrastructure teams focus on workload placement rather than connectivity plumbing.
+
+Start with non-critical workloads to validate latency behavior and refine NetworkPolicy before moving production traffic to a hybrid topology.
+
+---
+
+*Sources: Cloud Native Now, thenewstack.io "AWS Kubernetes Invisible Simplicity"*

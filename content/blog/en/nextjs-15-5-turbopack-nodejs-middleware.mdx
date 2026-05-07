@@ -1,0 +1,147 @@
+---
+title: "Next.js 15.5: Node.js Middleware Is Stable, Turbopack Builds Are in Beta"
+description: "Next.js 15.5 stabilized Node.js middleware and shipped Turbopack production builds in beta. Here's what changed, what it enables, and what to watch out for."
+date: "2026-05-08"
+status: "published"
+tags: ["Next.js", "TypeScript", "Frontend", "Turbopack", "Middleware"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-15-5-turbopack-nodejs-middleware"
+---
+
+Next.js 15.5 shipped three changes that directly affect production codebases: Node.js middleware is now stable, Turbopack production builds are in beta, and TypeScript DX has meaningful improvements. Here's what each means in practice.
+
+## Node.js Middleware: What Actually Changed
+
+Before 15.5, Next.js middleware ran exclusively on the Edge Runtime — fast and lightweight, but no access to Node.js APIs. `fs`, `crypto`, native modules, and many auth libraries were off-limits. If you needed those, you had to push logic into API routes and check results from middleware, which added latency and complexity.
+
+With 15.5, middleware runs on the Node.js runtime by default. The full Node.js API surface is available.
+
+```typescript
+// middleware.ts — full Node.js APIs now available
+import { NextRequest, NextResponse } from 'next/server'
+import { createHash } from 'crypto' // previously unavailable in middleware
+
+export async function middleware(request: NextRequest) {
+  const authHeader = request.headers.get('authorization')
+
+  if (!authHeader?.startsWith('Bearer ')) {
+    return NextResponse.json({ error: 'Missing token' }, { status: 401 })
+  }
+
+  const token = authHeader.slice(7)
+
+  // crypto module works directly in middleware now
+  const tokenHash = createHash('sha256').update(token).digest('hex')
+  const isValid = await validateTokenHash(tokenHash)
+
+  if (!isValid) {
+    return NextResponse.redirect(new URL('/login', request.url))
+  }
+
+  return NextResponse.next()
+}
+
+export const config = {
+  matcher: ['/api/:path*', '/dashboard/:path*']
+}
+```
+
+The most impactful scenario is auth. JWT verification, session validation, and cryptographic checks that previously required a round-trip to an API route can now live in middleware where they belong.
+
+## Turbopack Production Builds
+
+`next build --turbopack` is now available in beta. Vercel is already using it for vercel.com, v0.app, and nextjs.org.
+
+```bash
+# Enable Turbopack for production builds
+next build --turbopack
+```
+
+```json
+// package.json
+{
+  "scripts": {
+    "build": "next build --turbopack"
+  }
+}
+```
+
+Build speed improvements vary significantly by project size and configuration. Larger codebases with many modules benefit more. The Vercel team has reported meaningful reductions in preview deployment times.
+
+**Caveats**: It's beta. Some webpack plugins and custom configurations may not be compatible. Before switching production builds, test in a CI environment with your full configuration. The `--turbopack` flag doesn't affect dev server behavior — that's already been Turbopack-powered since Next.js 15.0.
+
+## TypeScript DX Improvements
+
+### Typed Routes
+
+Link `href` values are now validated at compile time. Navigating to a route that doesn't exist in your app is a type error.
+
+```typescript
+// Compile error if /products/[id] doesn't exist as a route
+<Link href="/products/123">View Product</Link>
+
+// Typo — compile error
+<Link href="/productz/123">Bad Link</Link>
+```
+
+Enable it in your config:
+
+```typescript
+// next.config.ts
+const nextConfig = {
+  experimental: {
+    typedRoutes: true // stable in 15.5
+  }
+}
+```
+
+### Helper Types: PageProps, LayoutProps, RouteContext
+
+```typescript
+// app/blog/[slug]/page.tsx
+import type { PageProps } from 'next/types'
+
+export default function BlogPost({ params, searchParams }: PageProps) {
+  // params and searchParams are fully typed — no manual type annotation needed
+  return <article>{params.slug}</article>
+}
+
+export async function generateMetadata({ params }: PageProps) {
+  return {
+    title: `Post: ${params.slug}`
+  }
+}
+```
+
+### next typegen Command
+
+Generate type artifacts without running a full build:
+
+```bash
+# Generates .next/types — much faster than a full build
+npx next typegen
+```
+
+This is useful in CI to typecheck without the full build overhead.
+
+## Migration Considerations
+
+If you have middleware that explicitly sets `runtime = 'edge'`:
+
+```typescript
+// Remove this to use Node.js runtime (default in 15.5)
+export const runtime = 'edge'
+```
+
+For typed routes: enabling it on an existing codebase will surface every broken Link at once. Run `npx next typegen` first to see the scope, then fix iteratively rather than all at once.
+
+## Takeaway
+
+Node.js middleware is the most practical change in 15.5 — it removes a whole class of workarounds. If your middleware currently delegates to an API route for auth logic, this is worth refactoring.
+
+Turbopack production builds are worth testing in a staging environment now, with a clear plan to move to production once it exits beta.
+
+---
+
+*Sources: Next.js Blog, InfoQ "Next.js 15.5 Ships", peerlist.io*

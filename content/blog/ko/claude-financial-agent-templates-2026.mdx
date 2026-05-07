@@ -1,0 +1,122 @@
+---
+title: "Anthropic 금융 서비스용 Claude Agent Templates 실전 분석"
+description: "Anthropic이 발표한 10종의 금융 서비스 Agent Templates와 Claude Mythos Preview를 분석하고, AI Agent 개발에 어떻게 활용할지 살펴봅니다."
+date: "2026-05-08"
+status: "published"
+tags: ["AI", "Claude", "LLM", "Agent", "FinancialServices"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-financial-agent-templates-2026"
+---
+
+Anthropic은 2026년 5월 5일 금융 서비스 분야에 특화된 Agent Templates 10종을 공개했습니다. Claude Cowork와 Claude Code의 Plugin으로 제공되며, Claude Managed Agents SDK의 Cookbook으로도 활용할 수 있습니다. 같은 날, Claude Mythos Preview가 32단계의 사이버 공격 시나리오를 자율적으로 완료했다는 발표도 나왔습니다. AI Agent의 자율성이 새로운 수준에 도달하고 있음을 보여주는 사례입니다.
+
+## 어떤 업무를 다루는가
+
+금융 서비스 업무는 대부분 구조적이지만 판단을 많이 요구합니다. 재무 Report 검토, 규제 문서 Compliance 확인, 포트폴리오 Risk 평가 등이 그 예입니다. 이런 업무는 LLM이 Tool을 통해 실질적인 가치를 제공할 수 있는 영역입니다.
+
+10종의 Template이 다루는 업무:
+
+- 재무 Report 자동 분석 및 요약
+- 규제 Compliance 문서 검토
+- 포트폴리오 Risk 평가
+- 거래 데이터 이상 탐지
+- 고객 투자 시나리오 모델링
+
+각 Template은 단순한 Prompt가 아닌 System Prompt, Tool 정의, Memory 전략, Sub-agent 라우팅까지 포함한 완성된 Agent 구성입니다.
+
+## Agent 구현 구조
+
+Claude Managed Agents SDK를 사용한 Compliance 검토 Agent의 기본 구조입니다.
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+def run_compliance_agent(document: str) -> dict:
+    tools = [
+        {
+            "name": "lookup_regulation",
+            "description": "특정 주제에 대한 해당 관할권의 규정을 조회합니다",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string"},
+                    "jurisdiction": {
+                        "type": "string",
+                        "enum": ["JP", "US", "EU"]
+                    }
+                },
+                "required": ["topic", "jurisdiction"]
+            }
+        },
+        {
+            "name": "log_compliance_issue",
+            "description": "문서에서 발견된 Compliance 문제를 기록합니다",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "section": {"type": "string"},
+                    "issue": {"type": "string"},
+                    "severity": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"]
+                    }
+                },
+                "required": ["section", "issue", "severity"]
+            }
+        }
+    ]
+
+    messages = [
+        {"role": "user", "content": f"다음 문서의 Compliance를 검토해 주세요:\n\n{document}"}
+    ]
+
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=4096,
+            tools=tools,
+            messages=messages
+        )
+
+        if response.stop_reason == "end_turn":
+            return extract_findings(response.content)
+
+        tool_results = process_tool_calls(response.content)
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+```
+
+Tool Description의 품질이 Agent 정확도를 좌우합니다. 각 Tool이 정확히 무엇을 하는지, 어떤 Input을 기대하는지 명확하게 작성해야 합니다.
+
+## Claude Mythos Preview와의 맥락
+
+Mythos Preview가 32단계의 사이버 공격 시나리오를 자율 완료했다는 발표는 Multi-step Agent Action이 Frontier Model의 실질적인 역량 범위 안에 들어왔음을 의미합니다. 금융 Agent Templates는 이런 자율성을 특정 도메인 내에서 제한적으로 활용하는 구조입니다.
+
+기술적 가능성은 이미 존재합니다. 제약은 Model 역량이 아닌 Governance와 규제입니다.
+
+## Production 적용 전 준비사항
+
+**데이터 Governance**
+
+금융 데이터는 PII와 규제 대상 정보를 포함할 가능성이 높습니다. Claude API에 어떤 데이터를 전송할 수 있는지 법무팀과 확인하고, 필요한 경우 Masking이나 Tokenization을 적용하세요.
+
+**Tool 장애 대응**
+
+외부 Tool(시장 데이터 API, Compliance DB 등)의 장애 시 Agent 동작을 설계해야 합니다. Template에는 이 부분이 포함되어 있지 않습니다. 각 Tool에 대한 Fallback 로직을 반드시 구현하세요.
+
+**Human-in-the-loop**
+
+투자 권고, Compliance 판정, Risk 등급 변경 등 중요한 Output에 대해서는 Agent가 단독으로 실행하지 않도록 인간 승인 단계를 설계하세요.
+
+## webhani의 관점
+
+이번 Agent Templates는 금융 서비스에 국한되지 않고 다양한 도메인에 응용할 수 있는 구조를 담고 있습니다. 특히 Tool use 설계와 Agentic Loop 패턴은 업무 자동화 전반에 참고가 됩니다.
+
+Template을 그대로 Production에 사용하기보다는, 자사의 Data Pipeline, Error 처리, 승인 Flow를 통합한 형태로 작성하는 것을 권장합니다. 소규모 Use Case부터 시작해 검증 후 확장하는 접근이 현실적입니다.
+
+---
+
+*참고: Anthropic Blog, Air Street Press "State of AI: May 2026"*
