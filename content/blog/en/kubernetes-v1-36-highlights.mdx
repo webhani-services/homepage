@@ -1,0 +1,178 @@
+---
+title: "Kubernetes v1.36: Declarative Validation Goes GA and Pod-Level Resource Management"
+description: "Kubernetes v1.36 brings Declarative Validation to GA and introduces Pod-Level Resource Managers in alpha. Here's what each feature changes for cluster operators."
+date: "2026-05-09"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "DevOps", "Container", "Platform Engineering"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-v1-36-highlights"
+---
+
+Kubernetes v1.36 is out. Two features stand out: **Declarative Validation for Kubernetes native types reaches General Availability**, and **Pod-Level Resource Managers land as an alpha feature**. Here's what each one means for day-to-day cluster operations and workload management.
+
+## Declarative Validation Goes GA
+
+### The Problem It Fixes
+
+Kubernetes resource validation has historically been implemented as imperative Go code spread across the codebase. The result was that the "specification" of what a valid resource looked like was implicit — encoded in logic rather than schema. Error messages from invalid inputs were sometimes cryptic, and the gap between documentation and actual validation behavior was real.
+
+Getting a precise answer to "what values are valid for this field?" often required either reading source code or trial-and-error with `kubectl apply`.
+
+### What Changes in v1.36
+
+Declarative Validation moves validation rules out of Go code and into the API schema itself, expressed in OpenAPI v3. The API definition becomes the authoritative source for validation rules, rather than a separate layer of imperative checks.
+
+The practical benefits:
+
+**1. Clearer error messages**
+
+```bash
+# Before: sometimes opaque
+Error from server: admission webhook denied the request
+
+# v1.36 with declarative validation: schema-derived
+The Deployment "my-app" is invalid:
+  spec.template.spec.containers[0].resources.limits.cpu:
+    Invalid value: "abc": must be a valid resource quantity
+    (e.g., "500m", "1", "2.5")
+```
+
+When the error points to the field and the expected format, debugging invalid manifests is faster. This matters most in CI pipelines and template-heavy GitOps workflows where the source of an invalid value isn't always obvious.
+
+**2. CEL-based validation for CRDs without webhooks**
+
+Custom Resource Definitions can now use `x-kubernetes-validations` with CEL expressions to enforce complex constraints without running an Admission Webhook:
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: databases.example.com
+spec:
+  versions:
+    - name: v1
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                replicas:
+                  type: integer
+                  minimum: 1
+                  maximum: 10
+                storageSize:
+                  type: string
+                  pattern: '^[0-9]+(Gi|Ti)$'
+              x-kubernetes-validations:
+                - rule: "self.replicas <= 3 || self.storageSize.endsWith('Ti')"
+                  message: "More than 3 replicas requires Ti-class storage"
+```
+
+Admission Webhooks are powerful but introduce an availability dependency: if the webhook service is down, API requests fail. CEL rules evaluate in the API server itself, removing that dependency for validation logic. For platform teams maintaining internal operators and CRDs, this is a meaningful reliability improvement.
+
+## Pod-Level Resource Managers (Alpha)
+
+### Current Limitation
+
+Today, Kubernetes resource management operates at the container level:
+
+```yaml
+containers:
+  - name: app
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "256Mi"
+      limits:
+        cpu: "1000m"
+        memory: "512Mi"
+  - name: sidecar
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "64Mi"
+```
+
+This works well enough for simple workloads but creates friction in a few real-world scenarios:
+
+- Sidecar containers (Envoy, Fluent Bit, etc.) are hard to size correctly — over-allocate and you waste resources, under-allocate and they throttle under load
+- There's no mechanism for containers within a Pod to share unused capacity from each other
+- GPU-based AI/ML workloads want to think about the GPU as a pod-level resource, but the per-container model makes this awkward
+
+### What Pod-Level Resource Managers Introduce
+
+The alpha feature in v1.36 allows defining resource budgets at the Pod level, with the goal of enabling dynamic allocation between containers within that budget:
+
+```yaml
+# Note: Alpha API — subject to change before graduation
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ml-inference
+spec:
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+      nvidia.com/gpu: "1"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+      nvidia.com/gpu: "1"
+  containers:
+    - name: model-server
+      image: inference-server:latest
+    - name: metrics-exporter
+      image: prometheus-exporter:latest
+```
+
+With a pod-level resource budget, the model server can use more CPU during inference peaks without the metrics exporter starving it, as long as total pod usage stays within the declared budget.
+
+### The GPU Utilization Connection
+
+The 2026 CAST AI State of Kubernetes Optimization report found average GPU utilization in Kubernetes clusters at just 5%. Average CPU utilization sits at 8%. These numbers reflect how common it is to over-provision resources defensively.
+
+Pod-Level Resource Managers, once mature, directly addresses part of this: when containers within a Pod can share capacity rather than having isolated allocations, the gap between provisioned and used resources shrinks.
+
+For teams running AI inference workloads — where a model server is the primary consumer but sidecars are always present — pod-level budgeting aligns the resource model with how these workloads actually consume resources.
+
+### Using It Today
+
+This is an alpha feature. Do not use it in production. To experiment in a test cluster, enable the feature gate explicitly:
+
+```bash
+# Enable on API server (test environments only)
+--feature-gates=PodLevelResourceManagers=true
+```
+
+The API surface will likely change before this graduates to beta or stable. Track the Kubernetes enhancement proposals (KEPs) if you're planning adoption.
+
+## Context: Kubernetes Utilization in Practice
+
+The CAST AI report's finding that average CPU utilization is 8% deserves attention regardless of v1.36. The cause is almost always over-specified resource requests and limits. Teams set conservative values, and over time clusters accumulate headroom that no workload ever uses.
+
+A practical starting point for right-sizing:
+
+```bash
+# Use VPA in recommendation mode to get data-driven suggestions
+kubectl describe vpa <deployment-name>
+
+# Check actual usage vs requests
+kubectl top pods -n production --sort-by=cpu
+kubectl top pods -n production --sort-by=memory
+```
+
+Vertical Pod Autoscaler in recommendation mode observes actual usage and surfaces suggested values without changing anything. Running it for a week before adjusting resource specs gives you data rather than guesses.
+
+## Summary
+
+Kubernetes v1.36 addresses two different layers of the same underlying challenge: making the platform more precise and efficient.
+
+**Declarative Validation GA** is a foundational improvement that benefits CRD authors and platform teams most directly. Better error messages and webhook-free CEL validation reduce operational overhead.
+
+**Pod-Level Resource Managers Alpha** is forward-looking infrastructure for workloads — particularly AI/ML — that don't map cleanly onto the per-container resource model. It's too early for production use but worth understanding as the feature matures.
+
+The utilization numbers from the CAST AI report are a useful reminder that Kubernetes efficiency problems often have nothing to do with new features — they're configuration habits that compound over time.
