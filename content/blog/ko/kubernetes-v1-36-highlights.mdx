@@ -1,0 +1,172 @@
+---
+title: "Kubernetes v1.36 주요 기능: Declarative Validation GA 승격과 Pod-Level Resource Managers"
+description: "Kubernetes v1.36에서 Declarative Validation이 GA로 승격되고 Pod-Level Resource Managers가 Alpha로 추가되었습니다. 클러스터 운영에 미치는 영향을 정리합니다."
+date: "2026-05-09"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "DevOps", "Container", "Platform Engineering"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-v1-36-highlights"
+---
+
+Kubernetes v1.36이 릴리스되었습니다. 이번 버전에서 주목할 변경사항은 두 가지입니다. **Declarative Validation for Kubernetes Native Types의 General Availability(GA) 승격**과 **Pod-Level Resource Managers의 Alpha 도입**입니다. 각 기능이 클러스터 운영과 워크로드 관리에 어떤 변화를 가져오는지 살펴봅니다.
+
+## Declarative Validation GA 승격
+
+### 기존 방식의 문제
+
+Kubernetes 리소스 유효성 검사는 오랫동안 Go 코드로 명령형(Imperative) 방식으로 구현되어 있었습니다. 검증 로직이 코드베이스 곳곳에 분산되어 있어, "이 필드에 어떤 값이 유효한가"를 정확히 파악하려면 공식 문서만으로는 부족하고 실제로 `kubectl apply`를 해봐야 하는 경우도 있었습니다. 오류 메시지도 경우에 따라 모호하게 표시되었습니다.
+
+### v1.36에서 무엇이 달라지나
+
+Declarative Validation은 유효성 검사 규칙을 Go 코드에서 분리해 OpenAPI v3 스키마에 선언적으로 정의합니다. API 정의 자체가 유효성 검사의 공식 소스가 됩니다.
+
+**1. 더 명확한 오류 메시지**
+
+```bash
+# 이전: 모호한 오류 메시지
+Error from server: admission webhook denied the request
+
+# v1.36 이후: 스키마 기반의 명확한 메시지
+The Deployment "my-app" is invalid:
+  spec.template.spec.containers[0].resources.limits.cpu:
+    Invalid value: "abc": must be a valid resource quantity
+    (e.g., "500m", "1", "2.5")
+```
+
+어떤 필드의 어떤 값이 왜 잘못되었는지 명확히 알 수 있습니다. GitOps 워크플로우나 CI 파이프라인에서 잘못된 Manifest의 원인을 빠르게 파악하는 데 도움이 됩니다.
+
+**2. Admission Webhook 없이 CRD 유효성 검사**
+
+Custom Resource Definition(CRD)에서 `x-kubernetes-validations`와 CEL 표현식을 사용해 복잡한 유효성 검사를 Admission Webhook 없이 구현할 수 있습니다:
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: databases.example.com
+spec:
+  versions:
+    - name: v1
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                replicas:
+                  type: integer
+                  minimum: 1
+                  maximum: 10
+                storageSize:
+                  type: string
+                  pattern: '^[0-9]+(Gi|Ti)$'
+              x-kubernetes-validations:
+                - rule: "self.replicas <= 3 || self.storageSize.endsWith('Ti')"
+                  message: "3개 이상의 Replica에는 Ti 클래스 Storage가 필요합니다"
+```
+
+Admission Webhook은 강력하지만 Webhook 서비스 자체의 가용성이 클러스터 안정성에 영향을 미친다는 단점이 있었습니다. CEL 규칙은 API Server 내부에서 평가되므로 이 의존성을 줄일 수 있습니다. 내부 Operator나 CRD를 관리하는 Platform 팀에게 특히 유용한 개선입니다.
+
+## Pod-Level Resource Managers (Alpha)
+
+### 현재 Container 단위 리소스 관리의 한계
+
+현재 Kubernetes에서는 리소스 관리가 Container 단위로 이루어집니다:
+
+```yaml
+containers:
+  - name: app
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "256Mi"
+      limits:
+        cpu: "1000m"
+        memory: "512Mi"
+  - name: sidecar
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "64Mi"
+```
+
+이 구조는 단순한 워크로드에서는 잘 동작하지만 몇 가지 실용적인 문제가 있습니다:
+
+- Sidecar Container(Envoy, Fluent Bit 등)의 리소스 적정값을 산정하기 어렵습니다. 여유 있게 설정하면 낭비가 생기고, 부족하게 설정하면 부하 시 병목이 됩니다
+- 같은 Pod 내 Container 간에 유휴 리소스를 공유할 방법이 없습니다
+- AI/ML 워크로드처럼 GPU를 Pod 전체 단위로 관리하고 싶은 경우 복잡한 구성이 필요합니다
+
+### Pod-Level Resource Managers가 제안하는 방향
+
+v1.36에 Alpha로 추가된 Pod-Level Resource Managers는 Pod 전체의 리소스 예산을 정의하고, Container 간 동적 배분을 목표로 합니다:
+
+```yaml
+# 주의: Alpha API — 정식 릴리스 전 변경될 수 있습니다
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ml-inference
+spec:
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+      nvidia.com/gpu: "1"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+      nvidia.com/gpu: "1"
+  containers:
+    - name: model-server
+      image: inference-server:latest
+    - name: metrics-exporter
+      image: prometheus-exporter:latest
+```
+
+Pod 레벨의 리소스 예산을 정의하면, 추론 피크 시 모델 서버가 메트릭 수집 Container의 미사용 CPU를 활용할 수 있게 됩니다. Pod 전체의 합산 사용량이 예산 이내라면 개별 Container의 경계를 넘어서도 됩니다.
+
+### GPU 활용률 문제와의 연관성
+
+CAST AI의 2026년 Kubernetes 최적화 보고서에 따르면, Kubernetes 클러스터의 평균 GPU 활용률은 단 5%, CPU는 8%에 불과합니다. 방어적으로 리소스를 과다 설정하는 관행이 누적된 결과입니다.
+
+Pod-Level Resource Managers는 이 문제에 직접적으로 접근합니다. Container가 고립된 할당량을 갖는 대신 Pod 예산을 공유하면, 프로비저닝된 리소스와 실제 사용 리소스 간 격차를 줄일 수 있습니다.
+
+### 현재 사용 방법
+
+Alpha 기능입니다. 운영 환경에서는 사용하지 마십시오. 테스트 환경에서 실험하려면 Feature Gate를 명시적으로 활성화해야 합니다:
+
+```bash
+# API Server 시작 옵션에 추가 (테스트 환경 전용)
+--feature-gates=PodLevelResourceManagers=true
+```
+
+Beta 또는 Stable로 승격되기 전에 API 스펙이 변경될 수 있습니다. 도입을 고려한다면 Kubernetes Enhancement Proposals(KEPs)를 추적해두는 것을 권장합니다.
+
+## Kubernetes 리소스 활용률의 현실
+
+CAST AI 보고서의 CPU 평균 활용률 8%, GPU 5%라는 수치는 v1.36과 직접 관련은 없지만 많은 팀이 인지해야 할 현실입니다. 원인은 대부분 과도하게 설정된 리소스 Requests와 Limits가 시간이 지나며 쌓인 것입니다.
+
+적정값을 찾기 위한 실용적인 접근:
+
+```bash
+# VPA Recommendation 모드로 데이터 기반 권장값 수집
+kubectl describe vpa <deployment-name>
+
+# 실제 사용량 vs Requests 비교
+kubectl top pods -n production --sort-by=cpu
+kubectl top pods -n production --sort-by=memory
+```
+
+Vertical Pod Autoscaler(VPA)를 Recommendation 모드로 운영하면 실제 사용량을 관찰해서 권장값을 제안해줍니다. 아무것도 변경하지 않고 1~2주 데이터를 수집한 뒤 리소스 설정을 조정하는 방식이 안전합니다.
+
+## 정리
+
+Kubernetes v1.36의 두 주요 변경사항은 서로 다른 레이어의 문제를 다룹니다.
+
+**Declarative Validation GA**는 API 신뢰성과 예측 가능성을 높이는 기반 개선입니다. CRD를 개발하는 Platform 팀에게 특히 유용하며, Webhook 의존성 없이 복잡한 유효성 검사를 구현할 수 있게 됩니다.
+
+**Pod-Level Resource Managers Alpha**는 AI/ML 워크로드 증가를 고려한, 더 유연한 리소스 관리 모델을 향한 포석입니다. 아직 운영 환경 적용은 이르지만 기능의 방향성을 파악해두면 GA 전환 시 빠르게 대응할 수 있습니다.
+
+새로운 기능만큼이나 리소스 활용률 개선에 주목할 필요가 있습니다. Kubernetes 효율성 문제의 상당 부분은 새 기능이 아닌 설정 습관에서 비롯됩니다.

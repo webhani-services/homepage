@@ -1,0 +1,176 @@
+---
+title: "Kubernetes v1.36の注目機能：Declarative Validation GAとPod-Level Resource Managers"
+description: "Kubernetes v1.36ではDeclarative ValidationがGAに昇格し、Pod-Level Resource ManagersがAlphaとして追加されました。実運用への影響を解説します。"
+date: "2026-05-09"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "DevOps", "Container", "Platform Engineering"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-v1-36-highlights"
+---
+
+Kubernetes v1.36がリリースされました。今回のリリースで特に注目すべきは2点です。**Declarative Validation for Kubernetes Native TypesのGeneral Availability（GA）**と、**Pod-Level Resource ManagersのAlpha導入**です。それぞれがクラスター運用にどのような変化をもたらすのかを整理します。
+
+## Declarative Validation のGA昇格
+
+### これまでの状況
+
+Kubernetesのリソース定義（Pod、Deployment、Serviceなど）への入力バリデーションは、長らく命令的（Imperative）なコードベースで実装されていました。バリデーションロジックがGoのコード内に分散しており、APIの挙動と公式ドキュメントの間に乖離が生じやすい構造でした。
+
+「このフィールドに何を設定できるか」を正確に知るには、ドキュメントを読むだけでは不十分で、実際にapplyしてみないと分からないケースもありました。
+
+### Declarative Validationが変えること
+
+v1.36でGAになったDeclarative Validationは、バリデーションルールをコードから切り離し、API定義と同じ場所に宣言的に記述する仕組みです。OpenAPI v3のスキーマ定義にバリデーションルールが埋め込まれるため、APIの仕様そのものがバリデーションの正規ソースになります。
+
+運用者にとっての実際のメリットは次のとおりです：
+
+**1. エラーメッセージの改善**
+
+```bash
+# 以前: 内部エラーメッセージが曖昧なケースがあった
+Error from server: error when applying patch:
+admission webhook "validate.example.com" denied the request
+
+# v1.36以降: スキーマに基づいたより明確なメッセージ
+The Deployment "my-app" is invalid:
+  spec.template.spec.containers[0].resources.limits.cpu:
+    Invalid value: "abc": must be a valid resource quantity (e.g., "500m", "1", "2.5")
+```
+
+**2. CRDへの波及効果**
+
+Custom Resource Definition（CRD）も同様のアプローチでバリデーションを定義できるようになります。`x-kubernetes-validations`（CEL式によるバリデーション）との組み合わせで、Admission Webhookなしに複雑なバリデーションロジックを実装できます。
+
+```yaml
+# CRDでのDeclarative Validation例
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: databases.example.com
+spec:
+  versions:
+    - name: v1
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                replicas:
+                  type: integer
+                  minimum: 1
+                  maximum: 10
+                storageSize:
+                  type: string
+                  pattern: '^[0-9]+(Gi|Ti)$'
+              x-kubernetes-validations:
+                - rule: "self.replicas <= 3 || self.storageSize.endsWith('Ti')"
+                  message: "3台を超えるレプリカにはTiストレージが必要です"
+```
+
+Admission Webhookは便利ですが、Webhookサービス自体の可用性がクラスターの安定性に影響するという問題がありました。CELベースのバリデーションはAPIサーバー内で評価されるため、この依存を減らせます。
+
+## Pod-Level Resource Managers（Alpha）
+
+### 現在のリソース管理の限界
+
+現在のKubernetesでは、CPUとメモリのリソース管理はContainer単位で行います。
+
+```yaml
+containers:
+  - name: app
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "256Mi"
+      limits:
+        cpu: "1000m"
+        memory: "512Mi"
+  - name: sidecar
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "64Mi"
+```
+
+この設計は多くのケースで機能しますが、いくつかの実用的な問題があります：
+
+- サイドカーコンテナ（Envoy、Fluent Bitなど）のリソース見積もりが難しく、余裕を持たせると無駄が生じる
+- コンテナ間でリソースを融通する仕組みがない
+- AI/MLワークロードのようにGPUをPod全体として扱いたいケースへの対応が複雑
+
+### Pod-Level Resource Managersの仕組み
+
+v1.36で追加されたPod-Level Resource ManagersはAlphaフィーチャーです。Pod全体のリソースバジェットを定義し、その配分を動的に管理できる仕組みを目指しています。
+
+```yaml
+# Pod-Level Resource（Alpha機能のため仕様は変更される可能性があります）
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ml-inference
+spec:
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+      nvidia.com/gpu: "1"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+      nvidia.com/gpu: "1"
+  containers:
+    - name: model-server
+      image: my-inference-server:latest
+    - name: metrics-exporter
+      image: prometheus-exporter:latest
+```
+
+Podレベルで予算を定義することで、コンテナ間でCPU/メモリを動的に融通できるようになります。モデル推論のピーク時にメトリクス収集コンテナがリソースを使い切っている、といった状況を避けやすくなります。
+
+### AIワークロードへの影響
+
+Kubernetesがデファクトのアプリケーション実行環境になる中で、GPUを使うAI/MLワークロードの増加は著しいです。現在のCAST AIのレポートによると、KubernetesクラスターのGPU平均利用率はわずか5%という調査結果があります。
+
+Pod-Level Resource ManagersはこのGPU利用効率改善にも寄与する設計です。1つのGPUを複数のコンテナが協調して使えるようになれば、GPU割当の最小単位による無駄を減らせます。
+
+ただし、これはまだAlpha機能です。本番環境での使用は推奨されません。動作検証はFeature Gateを明示的に有効化したテスト環境で行ってください。
+
+```bash
+# Alpha機能の有効化（テスト環境のみ）
+# kube-apiserver起動オプション
+--feature-gates=PodLevelResourceManagers=true
+```
+
+## Kubernetesリソース利用率の現状
+
+v1.36とは直接の関連はありませんが、CAST AIの2026年レポートでは業界全体の状況が示されています：
+
+- **CPU平均利用率: 8%**
+- **GPU平均利用率: 5%**
+
+これは過剰なリソースリクエストとリミット設定が蔓延していることを示しています。多くのチームがリソース不足を恐れて余裕を持たせすぎた結果、実際のリソース利用効率が著しく低い状態になっています。
+
+適正なリソース設定のためのアプローチ：
+
+```bash
+# Vertical Pod Autoscalerで実績ベースの推奨値を取得
+kubectl describe vpa my-deployment
+
+# 名前空間ごとのリソース使用状況を確認
+kubectl top pods -n production --sort-by=cpu
+kubectl top pods -n production --sort-by=memory
+```
+
+Vertical Pod Autoscaler（VPA）のrecommendationモードを使い、実際のリソース使用量を観察してから適切な値を設定するアプローチが効果的です。
+
+## まとめ
+
+Kubernetes v1.36の2つの主要な変更は、異なるレイヤーの問題に対応しています。
+
+- **Declarative Validation GA**: APIの信頼性と予測可能性を向上させる基盤的な改善。CRD開発者にとっては特にメリットが大きい
+- **Pod-Level Resource Managers Alpha**: AIワークロード増加を見据えた、将来の柔軟なリソース管理への布石
+
+Alphaフィーチャーは本番投入前に変更される可能性がありますが、仕様を追っておくことで移行タイミングを逃さずに済みます。公式ブログとCHANGELOGを定期的にチェックする習慣を持っておくことを推奨します。
