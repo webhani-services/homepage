@@ -1,0 +1,261 @@
+---
+title: "Vercel AI SDK 6: Agent Abstractions, Tool Approval, and MCP Support"
+description: "Vercel AI SDK 6 stabilizes agent development with createAgent(), per-tool human approval flows, built-in MCP client support, and OpenTelemetry tracing. Here's what changed and how to use it."
+date: "2026-05-10"
+status: "published"
+tags: ["Vercel", "AI SDK", "Agents", "MCP", "TypeScript"]
+thumbnail: ""
+author: "webhani"
+slug: "vercel-ai-sdk-6-agents-2026"
+---
+
+Vercel AI SDK 6 is primarily a stabilization release. Features that shipped as experimental in v5 are now production-ready, and the API surface has been cleaned up around agent workflows. The three additions worth paying attention to are `createAgent()`, the `needsApproval` tool flag, and the built-in MCP client. This post covers each one with working examples, plus the breaking changes you'll hit when migrating from v5.
+
+## createAgent() — Reusable Agent Objects
+
+Previously, agent logic lived inside individual `generateText()` or `streamText()` calls. Every API route, background job, and script that used the same agent had to duplicate the model configuration, system prompt, and tool list. `createAgent()` eliminates that.
+
+```typescript
+import { createAgent } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { searchWeb, fetchPage, summarize } from "./tools";
+
+const researchAgent = createAgent({
+  model: openai("gpt-4o"),
+  system: "You are a research assistant. Retrieve information and summarize findings concisely.",
+  tools: {
+    searchWeb,
+    fetchPage,
+    summarize,
+  },
+  maxSteps: 10,
+});
+
+// Use the same agent in an API route
+export async function POST(req: Request) {
+  const { topic } = await req.json();
+  const result = await researchAgent.generate(`Research this topic: ${topic}`);
+  return Response.json({ summary: result.text });
+}
+
+// Or in a background job
+export async function runDailyDigest() {
+  const result = await researchAgent.generate("Summarize today's AI news");
+  await sendDigestEmail(result.text);
+}
+```
+
+The agent object is just a configured wrapper around `generateText()`. No magic — the value is in centralizing configuration so that changes to the model, system prompt, or tool list propagate everywhere without hunting through call sites.
+
+## needsApproval — Pausing Execution for Human Review
+
+Letting an agent autonomously write to production systems — databases, email, deployment pipelines — requires trust. SDK 6 adds `needsApproval: true` at the tool level. When the agent decides to call a tool flagged this way, execution pauses and returns a `requires-approval` status instead of running the tool.
+
+```typescript
+import { createAgent, tool } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { z } from "zod";
+
+const deployAgent = createAgent({
+  model: openai("gpt-4o"),
+  system: "You manage infrastructure deployments.",
+  tools: {
+    analyzeChanges: tool({
+      description: "Analyze the PR diff and estimate deployment risk",
+      parameters: z.object({ prUrl: z.string() }),
+      execute: async ({ prUrl }) => analyzeChanges(prUrl),
+    }),
+    triggerDeploy: tool({
+      description: "Trigger a production deployment",
+      parameters: z.object({ prUrl: z.string(), environment: z.string() }),
+      needsApproval: true,
+      execute: async ({ prUrl, environment }) => triggerDeploy(prUrl, environment),
+    }),
+  },
+});
+
+export async function POST(req: Request) {
+  const { pr } = await req.json();
+  const result = await deployAgent.generate(`Deploy ${pr} to production`);
+
+  if (result.status === "requires-approval") {
+    await db.pendingApprovals.create({
+      agentState: result.state,
+      toolCall: result.pendingToolCall,
+      requestedAt: new Date(),
+    });
+    return Response.json({ status: "pending", id: result.state.id });
+  }
+
+  return Response.json({ result: result.text });
+}
+```
+
+Resuming after approval uses the persisted state:
+
+```typescript
+export async function POST(req: Request) {
+  const { approvalId, approved } = await req.json();
+  const pending = await db.pendingApprovals.findById(approvalId);
+
+  const resumed = await deployAgent.resume({
+    state: pending.agentState,
+    approved,
+  });
+
+  return Response.json({ result: resumed.text });
+}
+```
+
+The key design point: `needsApproval` is per-tool, not per-agent. Read-only tools like `analyzeChanges` run freely; write tools like `triggerDeploy` gate on approval. Both can coexist in the same agent without splitting your tool definitions across multiple agents.
+
+## createMcpClient() — Connecting MCP Servers
+
+The Model Context Protocol ecosystem has been growing steadily, but wiring MCP servers into SDK calls previously required third-party glue code. SDK 6 ships a first-party MCP client.
+
+```typescript
+import { createAgent, createMcpClient } from "ai";
+import { openai } from "@ai-sdk/openai";
+
+const githubMcp = createMcpClient({
+  transport: {
+    type: "stdio",
+    command: "npx",
+    args: ["-y", "@modelcontextprotocol/server-github"],
+    env: { GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_TOKEN! },
+  },
+});
+
+const codeReviewAgent = createAgent({
+  model: openai("gpt-4o"),
+  system: "You review pull requests and provide actionable, specific feedback.",
+  tools: await githubMcp.getTools(),
+});
+
+const review = await codeReviewAgent.generate(
+  "Review PR #123 in webhani/homepage"
+);
+
+await githubMcp.close();
+```
+
+HTTP-based MCP servers work the same way:
+
+```typescript
+const remoteMcp = createMcpClient({
+  transport: {
+    type: "http",
+    url: "https://mcp.internal.example.com/api",
+    headers: { Authorization: `Bearer ${process.env.MCP_TOKEN}` },
+  },
+});
+```
+
+`getTools()` fetches the tool manifest from the MCP server and converts it to the SDK's tool format automatically. Any MCP-compatible server — GitHub, Slack, databases, internal APIs — can be plugged into an agent this way without writing adapter code.
+
+## OpenTelemetry Tracing
+
+Debugging multi-step agent runs without observability is painful. SDK 6 integrates with OpenTelemetry to emit spans for each LLM request, tool call, and step transition.
+
+```typescript
+// instrumentation.ts (Next.js) or app entry point
+import { registerOTel } from "@vercel/otel";
+
+registerOTel({ serviceName: "webhani-ai-app" });
+```
+
+```typescript
+const researchAgent = createAgent({
+  model: openai("gpt-4o"),
+  tools: { searchWeb, fetchPage, summarize },
+  experimental_telemetry: {
+    isEnabled: true,
+    functionId: "research-agent",
+    metadata: {
+      version: "1.0",
+    },
+  },
+});
+
+// Each generate() call produces a trace with child spans per step
+const result = await researchAgent.generate("Find recent Vercel announcements", {
+  experimental_telemetry: {
+    metadata: { userId: ctx.userId, sessionId: ctx.sessionId },
+  },
+});
+```
+
+The spans show you which tools were called, in what order, how long each LLM request took, and where the agent spent most of its steps. Send them to any OTLP-compatible backend — Jaeger, Honeycomb, Grafana Tempo — to get a timeline view of agent execution.
+
+## Per-Tool Strict Mode
+
+JSON Schema validation strictness is configurable per tool. `strict: true` rejects responses with unexpected properties; `strict: false` allows them through. The useful case is when you have tools with well-defined output schemas alongside tools that benefit from looser validation.
+
+```typescript
+const agent = createAgent({
+  model: openai("gpt-4o"),
+  tools: {
+    createInvoice: tool({
+      description: "Create a new invoice record",
+      parameters: invoiceSchema,
+      strict: true, // exact schema required — no extra fields
+      execute: async (params) => createInvoice(params),
+    }),
+    searchDocuments: tool({
+      description: "Search internal documents",
+      parameters: searchSchema,
+      strict: false, // allow the model to pass additional context fields
+      execute: async (params) => searchDocuments(params),
+    }),
+  },
+});
+```
+
+Previously you had to choose one validation mode for the entire call. Per-tool control is a minor but useful addition.
+
+## Breaking Changes from v5
+
+**`experimental_tools` renamed to `tools`**
+
+```typescript
+// v5
+const result = await generateText({
+  model,
+  experimental_tools: { searchWeb },
+});
+
+// v6
+const result = await generateText({
+  model,
+  tools: { searchWeb },
+});
+```
+
+This is a find-and-replace change. There are no behavioral differences.
+
+**Chat SDK transcript format changed**
+
+`useChat()` message objects have a new schema in v6. If you're persisting chat transcripts to a database, you'll need a migration script before upgrading. The Vercel docs include a reference migration.
+
+**`LanguageModel` type renamed**
+
+Code that imports and references the `LanguageModel` type directly needs updating:
+
+```typescript
+// v6
+import type { LanguageModelV2 } from "ai";
+
+function runWithModel(model: LanguageModelV2) {
+  return createAgent({ model, tools: {} });
+}
+```
+
+## Takeaways
+
+For teams already using AI SDK v5 in production:
+
+- The `experimental_tools` rename is mechanical and low-risk. Do it first.
+- If you persist chat transcripts, test the migration script on a copy of your data before cutting over.
+- `createAgent()` is worth adopting even if you don't need approval flows — it centralizes configuration that's currently scattered across call sites.
+- `needsApproval` is the right primitive for any agent that touches write operations. Use it before you need it rather than after.
+- The MCP client is worth evaluating if you're currently maintaining custom adapters for MCP-compatible services.

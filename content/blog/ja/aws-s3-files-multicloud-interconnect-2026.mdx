@@ -1,0 +1,170 @@
+---
+title: "Amazon S3 FilesとAWS Interconnect Multicloud：AI/MLワークロードのための新しいCloud Primitive"
+description: "What's Next with AWS 2026で発表されたAmazon S3 FilesとAWS Interconnect Multicloudを解説。AI/MLトレーニングパイプラインが求めるファイルシステムセマンティクスとプライベート接続を、実装観点から掘り下げます。"
+date: "2026-05-10"
+status: "published"
+tags: ["AWS", "S3", "Multicloud", "Cloud Infrastructure", "AI/ML"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-s3-files-multicloud-interconnect-2026"
+---
+
+2026年5月4日に開催された「What's Next with AWS 2026」で、AWSは2つのサービスを発表しました。Amazon S3 FilesとAWS Interconnect Multicloudです。どちらも地味に見えますが、AI/MLワークロードの設計に直接影響するCloud Primitiveです。それぞれ何が変わるのか、実装観点で整理します。
+
+## Amazon S3 Files：S3をファイルシステムとしてマウントする
+
+### 何が変わったか
+
+従来のS3 GETリクエストは、HTTPオーバーヘッドにより数十ミリ秒のレイテンシが発生していました。S3 Filesはこれを1ミリ秒未満まで削減し、AWS Compute上でPOSIX準拠のファイルシステムとしてS3バケットをマウントできるようにします。
+
+レイテンシの改善はシンプルな数字の話ではありません。ML Training Jobがチェックポイントを書き込む頻度、DataLoaderがバッチを読み込む速度、複数のTraining Nodeがデータを共有する際のI/Oパターン——これらすべてに影響します。
+
+### マウントの仕組み
+
+```bash
+# S3バケットをファイルシステムとしてマウント
+aws s3files mount s3://my-training-data /mnt/training-data \
+  --region ap-northeast-1 \
+  --read-ahead-size 4MB
+
+# マウント後はPOSIXファイル操作として扱える
+ls /mnt/training-data/
+cat /mnt/training-data/dataset/train.jsonl | wc -l
+```
+
+マウント後、Training Scriptの変更は不要です。既存のファイルI/OコードがそのままS3に対して動作します。
+
+```python
+# SDKの変更不要 — 標準ファイルI/Oで動作
+import torch
+from torch.utils.data import DataLoader
+
+dataset = MyDataset("/mnt/training-data/dataset/")  # S3上のデータをローカルと同様に参照
+loader = DataLoader(dataset, batch_size=32, num_workers=4)
+
+for batch in loader:
+    # チェックポイントもマウントポイントに書き込むだけ
+    torch.save(model.state_dict(), "/mnt/training-data/checkpoints/step_{step}.pt")
+```
+
+### FSx for LustreおよびEFSとの比較
+
+S3 FilesはFSx for LustreやEFSを完全に代替するものではありません。それぞれ適した用途が異なります。
+
+```
+                   S3 Files    FSx for Lustre    EFS
+レイテンシ           ~1ms        <1ms（高スループット）  低~中
+セットアップ         シンプル     複雑（クラスター）      中程度
+コスト              S3標準料金   高め              中程度
+永続性              S3永続       外部S3と同期が必要    永続
+マルチリージョン共有  ○          ×                 ×（単一VPC/Region）
+Spot Instance耐性   高           低（クラスター依存）   中程度
+```
+
+高スループットの分散トレーニングでFSx for Lustreが依然として有利な場面はあります。ただし、セットアップの複雑さとコストを許容できない場合や、すでにS3にデータが存在する場合は、S3 Filesが合理的な選択肢になります。
+
+### 採用を検討すべきケース
+
+- 既存のS3データセットをML Trainingに使いたいが、SDK変更を避けたい
+- Spot Instanceを多用するためチェックポイントの耐障害性が重要
+- 複数のTraining JobまたはNodeがデータを読み書きする共有ストレージが必要
+- FSx for Lustreのクラスター管理コストを削減したい
+
+逆に、極限のスループットが必要な大規模分散トレーニング（数百GPU）では、FSx for Lustreの方が適しています。
+
+## AWS Interconnect Multicloud：VPC間のプライベート接続をマネージドで
+
+### 何が変わったか
+
+複数のCloud Provider（GCP、Azureなど）を使う企業にとって、プロバイダー間のプライベート接続は長らく手間のかかる作業でした。AWS Direct Connect + GCP Cloud Interconnect（またはAzure ExpressRoute）を個別に設定し、BGPルーティングを管理し、双方のVPCのIP CIDRが重複しないよう設計する——これをCloud Pairごとに繰り返す必要がありました。
+
+AWS Interconnect Multicloudはこれをマネージドサービスとして提供します。自前のAppliance不要、Cloud PairごとのVPN設定不要。AWSコンソールまたはAPIから設定でき、接続はAWSのバックボーンを経由したプライベートリンクとして確立されます。
+
+### 設定フロー
+
+```bash
+# AWS側でInterconnectを作成
+aws interconnect create-connection \
+  --connection-name "aws-to-gcp-prod" \
+  --provider gcp \
+  --remote-vpc-id "projects/my-project/global/networks/prod-vpc" \
+  --bandwidth 10Gbps \
+  --region ap-northeast-1
+
+# 接続ステータスの確認
+aws interconnect describe-connection \
+  --connection-name "aws-to-gcp-prod"
+```
+
+GCP側では、AWS Interconnectからの接続要求を承認する操作が必要ですが、双方のコンソールでのクリックとなり、自前のルーター設定は発生しません。
+
+### 何が解決されるか
+
+エンタープライズ環境で多いのは「OpenAI APIやGCP Vertex AIへのアクセスには直接インターネット接続が必要だが、厳格なネットワークポリシーで外部通信を禁止している」というジレンマです。
+
+Interconnect Multicloudを使うと：
+
+```
+従来のパターン（問題あり）:
+Training Node（AWS VPC）→ NAT Gateway → Public Internet → GCP Vertex AI
+
+Interconnect Multicloud使用後:
+Training Node（AWS VPC）→ AWS Interconnect → Private Link → GCP VPC → Vertex AI
+```
+
+インターネットを経由しないため、ネットワークポリシーの例外申請が不要になります。データはAWSとGCPのバックボーン間をプライベートに流れます。
+
+### データ転送コストへの影響
+
+マルチクラウド環境でのData Egressコストは見落としやすい落とし穴です。InternetへのData Egressに比べ、プロバイダー間の専用接続はレートが異なることが多く、大量データを扱うML PipelineではこのコストがS3 Filesと並んで重要な設計上の考慮点になります。接続設定時に転送量とレートを事前に確認することを推奨します。
+
+## S3 FilesとInterconnect Multicloudを組み合わせる
+
+2つのサービスを組み合わせると、クラウドをまたいだML Pipelineを構成できます。
+
+```
+典型的なマルチクラウドMLパイプライン:
+
+データ収集（GCP BigQuery/GCS）
+      ↓ Interconnect Multicloud（プライベート転送）
+AWS S3（統合データレイク）
+      ↓ S3 Files（ファイルシステムとしてマウント）
+AWS EC2 / SageMaker Training Job
+      ↓ チェックポイント → S3 Files経由でS3に書き戻し
+      ↓ モデルアーティファクト → Interconnect経由でGCPへ
+GCP Vertex AI（推論エンドポイント）
+```
+
+Training NodeはS3上のデータをローカルファイルのように読み、チェックポイントをS3に書き戻す。完成したモデルはInterconnectを経由してGCPの推論基盤に転送される。このパターンが、プライベートネットワーク内で完結するようになります。
+
+実装上の注意点として、S3 FilesはAWS Compute（EC2、SageMaker等）上での動作が前提です。GCP側のComputeから直接マウントすることは現時点ではサポートされていません。データの読み書きはAWS側で行い、結果をInterconnect経由でGCPに送るという設計になります。
+
+## 採用判断のガイドライン
+
+### Amazon S3 Files
+
+今すぐ試す価値がある状況：
+- S3データセットを使うML Trainingで、DataLoaderの改修コストを最小化したい
+- FSx for Lustreを使っているが、クラスター管理の手間を減らしたい
+- Spot InstanceベースのTrainingでチェックポイントの頻度を上げたい
+
+まだ様子見でよい状況：
+- 大規模分散Training（200GPU以上）で最大スループットが必要
+- すでにEFSやFSx for Lustreが安定稼働しており移行コストが見合わない
+
+### AWS Interconnect Multicloud
+
+今すぐ試す価値がある状況：
+- 複数Cloudを使っており、プロバイダー間のネットワーク設定が運用負荷になっている
+- 厳格なネットワークポリシーにより、GCP/AzureのManaged APIへのアクセスが制限されている
+- マルチクラウドのデータ転送でData Egressコストを最適化したい
+
+まだ様子見でよい状況：
+- シングルCloud構成で完結しており、マルチクラウドの必要性がない
+- 転送データ量が少なく、現在のVPN設定で十分
+
+## まとめ
+
+Amazon S3 FilesはS3のレイテンシ問題を実用レベルで解消し、ML TrainingのデータI/Oを簡素化します。AWS Interconnect Multicloudはプロバイダー間の専用接続をマネージドにすることで、エンタープライズのマルチクラウド運用の摩擦を減らします。
+
+どちらも「すぐに全員が必要とするサービス」ではありませんが、AI/MLワークロードがマルチクラウドで動く設計を検討しているなら、インフラの選択肢として把握しておくべきサービスです。
