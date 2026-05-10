@@ -1,0 +1,139 @@
+---
+title: "Docker Kanvas: Compose에서 Kubernetes로의 자동 변환"
+description: "Docker가 Kanvas를 출시했습니다. Docker Compose 파일을 Kubernetes 매니페스트로 자동 변환하여 로컬 개발 환경과 프로덕션 클러스터 간의 간극을 줄입니다. Helm과의 차이점과 실제 활용법을 정리합니다."
+date: "2026-05-11"
+status: "published"
+tags: ["Docker", "Kubernetes", "DevOps", "cloud-infrastructure", "container"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-compose-kubernetes"
+---
+
+## Docker Kanvas란
+
+Docker가 Kanvas를 출시했습니다. 로컬 개발에서 사용하는 Docker Compose 파일을 Kubernetes 매니페스트로 자동 변환하는 플랫폼입니다. 로컬 환경은 `docker-compose up`으로 실행하고, 프로덕션은 별도의 Kubernetes 매니페스트로 관리하는 이중 구조 문제를 해결하는 것이 목표입니다.
+
+## 변환 방식
+
+Kanvas는 `docker-compose.yml`을 읽어 Service는 Deployment로, Port는 Service로, Volume은 PersistentVolumeClaim으로 변환합니다.
+
+```yaml
+# 입력: docker-compose.yml
+version: "3.9"
+services:
+  web:
+    image: my-app:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgres://db:5432/mydb
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=mydb
+      - POSTGRES_PASSWORD=secret
+
+volumes:
+  pg_data:
+```
+
+이로부터 다음과 같은 Kubernetes 리소스가 생성됩니다.
+
+```yaml
+# 생성된 Kubernetes Deployment (web)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: my-app:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: DATABASE_URL
+              value: "postgres://db:5432/mydb"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  ports:
+    - port: 3000
+  selector:
+    app: web
+```
+
+## Helm, Kustomize와의 비교
+
+세 도구의 목적이 다르므로 직접 비교보다는 각각의 역할을 이해하는 것이 중요합니다.
+
+| 도구 | 특징 | 적합한 상황 |
+|------|------|------------|
+| **Helm** | 값 치환 기반 템플릿 엔진 | 복잡한 다중 환경 설정 관리 및 배포 |
+| **Kustomize** | 패치 기반 오버레이 시스템 | 환경별 기본 설정 + 차분 관리 |
+| **Kanvas** | Compose → Kubernetes 자동 변환 | Compose 기반 프로젝트의 Kubernetes 마이그레이션 |
+
+Kanvas는 Helm이나 Kustomize의 대체재가 아니라 마이그레이션의 출발점입니다. Kanvas로 기본 매니페스트를 생성한 후 Kustomize로 환경별 차이를 관리하는 방식이 실용적입니다.
+
+## Kanvas가 효과적인 상황
+
+- **첫 Kubernetes 마이그레이션** — Compose 기반 프로젝트를 처음 Kubernetes로 전환하는 팀
+- **개발자 온보딩** — Compose와 생성된 매니페스트를 나란히 비교하며 Kubernetes 개념 학습
+- **빠른 프로토타이핑** — 매니페스트 직접 작성 없이 Kubernetes 리소스를 빠르게 구성
+
+## Kanvas의 한계
+
+자동 생성된 매니페스트는 시작점일 뿐, 프로덕션 적용을 위해서는 추가 작업이 필요합니다.
+
+- **Resource Requests/Limits** — 기본적으로 생성되지 않으며 Kubernetes 스케줄링에 필수
+- **Ingress 설정** — Compose의 `ports`가 기본 Service로 변환되며 라우팅 가능한 Ingress는 별도 구성 필요
+- **Security Context** — 비루트 사용자, 읽기 전용 파일시스템 등 보안 설정 추가 필요
+- **HPA / 스케일링** — Compose에는 스케일링 개념이 없어 변환 불가
+- **Secret 관리** — Compose 환경 변수가 ConfigMap 평문값으로 변환되므로 Secret 분리 필요
+
+`depends_on`은 Kubernetes에서 직접 지원되지 않으므로 대체 구현이 필요합니다.
+
+```yaml
+# depends_on을 readinessProbe로 대체
+readinessProbe:
+  exec:
+    command:
+      - pg_isready
+      - -h
+      - db
+  initialDelaySeconds: 5
+  periodSeconds: 5
+```
+
+## webhani의 관점
+
+Kubernetes 도입 시 Helm 차트와 Kustomize 설정 학습에 상당한 시간이 소요됩니다. Kanvas는 이미 Compose에 익숙한 팀이 Kubernetes로 진입하는 장벽을 낮추는 데 실질적인 가치가 있습니다.
+
+가장 실용적인 활용법은 "Helm 차트를 대체하는 것"이 아니라 "Compose 개념이 Kubernetes 리소스로 어떻게 변환되는지 이해하는 학습 도구"로 사용하는 것입니다. 이후 프로덕션 전용 설정을 수동으로 추가하는 방식이 안전합니다.
+
+생성된 출력물을 검토 없이 프로덕션에 배포하지 않아야 합니다. 보안 컨텍스트는 기본적으로 허용적으로 설정되며, Resource Limits는 실제 워크로드에 맞게 조정이 필요합니다.
+
+## 요약
+
+- Docker Kanvas: Compose → Kubernetes 자동 변환으로 마이그레이션 부담 경감
+- Helm/Kustomize 대체재가 아닌 마이그레이션 출발점으로 활용
+- 생성된 매니페스트에 프로덕션 강화 작업 필수: Resource Limits, Security Context, Ingress, HPA
+- `depends_on`은 readinessProbe 또는 initContainer로 대체
+- Compose와 매니페스트 대응 관계를 학습하는 데 유용
