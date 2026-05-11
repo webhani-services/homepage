@@ -1,0 +1,158 @@
+---
+title: "Kubernetes 1.35 の Dynamic Resource Allocation が Beta へ：AI/ML ワークロードの GPU 管理が変わる"
+description: "Kubernetes 1.35 で Dynamic Resource Allocation（DRA）が Beta に移行。GPU などの特殊なハードウェアリソースをより精密に管理できる新しいアプローチが、AI/ML ワークロードの運用を大きく変えようとしています。"
+date: "2026-05-12"
+status: "published"
+tags: ["Kubernetes", "GPU", "AI/ML", "Cloud Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-35-dynamic-resource-allocation"
+---
+
+## なぜ今、DRA が重要なのか
+
+2026 年、AI/ML ワークロードは Kubernetes 上で動作する標準的なサービスになりました。しかし、GPU などの特殊なハードウェアリソースを効率的に管理することは、従来の CPU/メモリ中心の Kubernetes の仕組みでは困難でした。
+
+Kubernetes 1.35 で Dynamic Resource Allocation（DRA）が Beta に昇格したことは、この問題への直接的な回答です。
+
+## 従来の Resource 管理の限界
+
+従来の Kubernetes では、GPU などの特殊リソースは Device Plugin API を通じて管理されていました。
+
+```yaml
+# 従来の GPU 要求方法 — 整数しか指定できない
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: ml-training
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+```
+
+この方式には根本的な限界があります。
+
+- **単純な整数割り当てのみ**：特定の GPU モデルや GPU の一部（MIG スライシング）を要求できない
+- **静的な設定**：デプロイ時に決定した設定を動的に変更できない
+- **複雑なリソース関係を表現できない**：「同じ NVLink 接続上の 2 枚の GPU」という要求が困難
+
+## DRA が解決すること
+
+DRA は `ResourceClaim` と `DeviceClass` という新しい API オブジェクトを導入し、より表現力の高いリソース要求を可能にします。
+
+```yaml
+# DeviceClass — GPU カテゴリの定義
+apiVersion: resource.k8s.io/v1beta1
+kind: DeviceClass
+metadata:
+  name: nvidia-h100
+spec:
+  selectors:
+    - cel:
+        expression: >
+          device.driver == "nvidia.com" &&
+          device.attributes["model"].string == "H100"
+```
+
+```yaml
+# ResourceClaim — 具体的なリソース要求
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: gpu-for-training
+spec:
+  devices:
+    requests:
+      - name: main-gpu
+        deviceClassName: nvidia-h100
+        allocationMode: ExactCount
+        count: 2
+        selectors:
+          - cel:
+              expression: >
+                device.attributes["memory"].quantity >= quantity("80Gi") &&
+                device.attributes["nvlink"].bool == true
+```
+
+この例では「80GB 以上のメモリを持ち、NVLink 接続が有効な H100 GPU を 2 枚」という要求を表現できます。従来の Device Plugin API では不可能だった記述です。
+
+### Pod での利用
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ml-training-job
+spec:
+  resourceClaims:
+    - name: gpu-resources
+      resourceClaimName: gpu-for-training
+  containers:
+    - name: trainer
+      image: pytorch/pytorch:2.5-cuda12.4
+      resources:
+        claims:
+          - name: gpu-resources
+      command: ["torchrun", "--nproc_per_node=2", "train.py"]
+```
+
+Pod は ResourceClaim を名前で参照します。スケジューラーは ResourceClaim の条件を満たすノードにのみ Pod を配置します。条件を満たせなければスケジューリングは行われません。
+
+## AI/ML ワークロードへの実際の影響
+
+### マルチテナント GPU クラスターの効率化
+
+従来の整数ベースの割り当てでは、1 枚の GPU を複数のジョブで共有することが困難でした。DRA を使うと、GPU の MIG（Multi-Instance GPU）スライシングを Kubernetes レベルで宣言的に管理できるようになります。
+
+```yaml
+# GPU スライシングの例 — 10GB MIG スライスを要求
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: inference-gpu-slice
+spec:
+  devices:
+    requests:
+      - name: mig-slice
+        deviceClassName: nvidia-gpu-mig
+        allocationMode: ExactCount
+        count: 1
+        selectors:
+          - cel:
+              expression: 'device.attributes["migProfile"].string == "1g.10gb"'
+```
+
+推論チームが 10GB スライスを、ファインチューニングチームが 40GB スライスを、同じ物理 GPU で独立して使用できます。これはマルチテナント運用において大きな効率化をもたらします。
+
+### Batch Processing の最適化
+
+AI の学習ジョブは、利用可能な GPU の種類や接続形態によってパフォーマンスが大きく変わります。DRA によって、スケジューラーがより最適なリソース割り当てを行えるようになります。
+
+## 移行の考慮点
+
+DRA は Beta になりましたが、本番環境への導入には慎重な計画が必要です。
+
+**Driver の対応状況**：DRA を活用するには、GPU ベンダーが DRA 対応の Driver を提供している必要があります。NVIDIA は DRA 対応に積極的ですが、すべてのベンダーが同じ段階にあるわけではありません。GPU のモデルと Driver のバージョンを必ず確認してください。
+
+**API の安定性**：Beta とはいえ、GA（正式リリース）に向けて API が変更される可能性があります。本番での早期採用はマニフェストの書き直しコストを伴います。
+
+**既存の Device Plugin との共存**：DRA は既存の Device Plugin API を置き換えるものではなく、並行して使用できます。段階的な移行が可能です。
+
+**モニタリングツールの成熟度**：DRA リソースのメトリクスを対応した Prometheus Exporter や Grafana Dashboard はまだ追いついている途中です。初期は可観測性が制限される可能性があります。
+
+## webhani の推奨
+
+AI/ML ワークロードを Kubernetes 上で運用している、または計画しているチームへの推奨事項：
+
+1. **開発・検証環境で DRA を試す**：Kubernetes 1.35 以上の環境で DRA Feature Gate を有効化し、NVIDIA DRA Driver を展開して運用モデルを把握しておく
+2. **GPU 利用率のモニタリング強化**：DRA 導入前後で GPU 利用率を計測し、効果を定量化する
+3. **NVIDIA GPU Operator の最新版を確認**：DRA 対応の GPU Driver が使用している GPU モデルで提供されているか確認する
+4. **GA を見据えた移行計画**：Beta 段階での本番導入は学習投資と捉え、GA 後の移行を基本方針にする
+
+## まとめ
+
+- Kubernetes 1.35 で DRA が Beta に昇格。GPU モデル、メモリ量、NVLink、MIG スライシングなどを YAML で宣言可能
+- 従来の Device Plugin API の整数ベース割り当ての限界を根本的に解決するアプローチ
+- マルチテナント GPU クラスターで MIG スライシングをネイティブ Kubernetes リソースとして管理可能
+- 本番環境への導入は GA 後を推奨。今はスタビリティ環境で運用モデルを把握することに集中する
