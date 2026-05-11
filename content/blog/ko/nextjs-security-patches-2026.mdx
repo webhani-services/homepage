@@ -1,0 +1,194 @@
+---
+title: "Next.js 보안 패치 분석: Middleware Bypass부터 Cache Poisoning까지"
+description: "Next.js가 DoS, Middleware 우회, XSS, SSRF, Cache Poisoning 등 다수의 보안 취약점을 수정했습니다. App Router와 Pages Router 모두 영향을 받으므로 운영 중인 팀은 즉시 확인이 필요합니다."
+date: "2026-05-12"
+status: "published"
+tags: ["Next.js", "Security", "Web Development", "Middleware", "Cache"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-security-patches-2026"
+---
+
+## 수정된 취약점 개요
+
+Next.js가 높음·중간·낮음 각 심각도에 해당하는 다수의 보안 취약점을 수정한 릴리스를 공개했습니다. App Router와 Pages Router 모두 영향을 받으며, 수정된 취약점 유형은 다음과 같습니다.
+
+- **DoS (Denial of Service)**: 특정 요청 패턴으로 서버 과부하 유발
+- **Middleware 우회**: 인증/인가 로직 우회 가능
+- **XSS (Cross-Site Scripting)**
+- **SSRF (Server-Side Request Forgery)**
+- **Cache Poisoning**
+
+Next.js를 운영 환경에서 사용 중이라면 현재 버전을 확인하고 즉시 업데이트를 진행해야 합니다.
+
+## Middleware Bypass: 가장 위험한 취약점
+
+Next.js Middleware는 인증 토큰이나 세션을 확인하는 용도로 많이 사용됩니다. Middleware가 우회되면 보호된 Route가 인증 없이 접근 가능해집니다.
+
+위험한 패턴:
+
+```typescript
+// middleware.ts — Middleware에만 인증을 의존하는 취약한 구조
+import { NextRequest, NextResponse } from "next/server";
+
+export function middleware(request: NextRequest) {
+  const token = request.cookies.get("auth-token");
+  if (!token) {
+    return NextResponse.redirect(new URL("/login", request.url));
+  }
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ["/dashboard/:path*", "/api/protected/:path*"],
+};
+```
+
+Middleware가 우회되면 `/api/protected/*` Route는 완전히 무방비 상태가 됩니다.
+
+개선 방법 — Route Handler에서도 독립적으로 인증을 검증합니다:
+
+```typescript
+// app/api/protected/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { verifySession } from "@/lib/auth";
+
+export async function GET(request: NextRequest) {
+  const token = request.cookies.get("auth-token")?.value;
+
+  // Middleware에 의존하지 않고 Route Handler에서 직접 검증
+  if (!token) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const session = await verifySession(token);
+  if (!session) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  return NextResponse.json({ userId: session.userId });
+}
+```
+
+**원칙: Middleware는 첫 번째 방어선이지, 유일한 방어선이 아닙니다.**
+
+## Cache Poisoning 대응
+
+Cache Poisoning은 공격자가 캐시에 악의적인 콘텐츠를 주입해 이후 사용자에게 노출시키는 공격입니다. Next.js App Router의 적극적인 캐싱 전략은 이 공격의 영향 범위를 넓힐 수 있습니다.
+
+명시적인 캐시 제어가 핵심입니다:
+
+```typescript
+// 민감한 데이터가 있는 Route는 동적 렌더링 강제
+export const dynamic = "force-dynamic";
+
+async function loadData(userId: string) {
+  // 사용자별 데이터 — 절대 캐시하지 않음
+  const userData = await fetch(`https://api.example.com/users/${userId}`, {
+    cache: "no-store",
+    headers: { Authorization: `Bearer ${await getToken()}` },
+  });
+
+  // 공개 데이터 — 시간 기반 갱신
+  const publicContent = await fetch("https://api.example.com/news", {
+    next: { revalidate: 300 }, // 5분마다 갱신
+  });
+
+  return {
+    user: await userData.json(),
+    news: await publicContent.json(),
+  };
+}
+```
+
+민감하거나 사용자별 데이터에는 반드시 `cache: 'no-store'`를 명시하세요. Next.js의 자동 캐시 추론에 의존하지 마세요.
+
+## SSRF 방어: URL 검증
+
+Server Action이나 API Route에서 외부 URL로 요청을 보낼 때 URL 검증이 없으면, 내부 서비스나 클라우드 메타데이터 엔드포인트에 접근이 가능해집니다.
+
+```typescript
+// app/actions/fetch-data.ts
+"use server";
+
+const ALLOWED_HOSTS = new Set(["api.example.com", "cdn.example.com"]);
+
+function validateExternalUrl(rawUrl: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error("유효하지 않은 URL입니다");
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("HTTP/HTTPS만 허용됩니다");
+  }
+
+  if (!ALLOWED_HOSTS.has(parsed.hostname)) {
+    throw new Error(`허용되지 않는 호스트: ${parsed.hostname}`);
+  }
+
+  return parsed;
+}
+
+export async function fetchExternalData(url: string) {
+  const validated = validateExternalUrl(url); // 유효하지 않으면 예외 발생
+  const response = await fetch(validated.toString());
+  return response.json();
+}
+```
+
+차단 목록(Blocklist)보다 허용 목록(Allowlist) 방식이 훨씬 안전합니다. 내부 IP 대역(169.254.x.x, 10.x.x.x 등)은 Blocklist에서 빠뜨리기 쉽습니다.
+
+## XSS 방어를 위한 CSP 헤더 설정
+
+```typescript
+// next.config.mjs
+const nextConfig = {
+  async headers() {
+    return [
+      {
+        source: "/(.*)",
+        headers: [
+          {
+            key: "Content-Security-Policy",
+            value: [
+              "default-src 'self'",
+              "script-src 'self'",
+              "style-src 'self' 'unsafe-inline'",
+              "img-src 'self' data: https:",
+              "connect-src 'self' https://api.example.com",
+              "frame-ancestors 'none'",
+            ].join("; "),
+          },
+          {
+            key: "X-Frame-Options",
+            value: "DENY",
+          },
+        ],
+      },
+    ];
+  },
+};
+
+export default nextConfig;
+```
+
+엄격하게 시작하고, 합법적인 요구사항이 생길 때 개별 지시어를 완화하는 방식을 권장합니다.
+
+## 즉시 취해야 할 조치
+
+1. **Next.js 업데이트**: `npm install next@latest` 실행 후 릴리스 노트에서 영향 받는 버전 범위 확인
+2. **Middleware 의존 인증 점검**: Middleware에만 인증을 의존하는 Route를 파악하고 Route Handler에 독립적 검증 추가
+3. **캐시 설정 감사**: 동적 데이터와 인증이 필요한 Route의 캐시 설정을 명시적으로 검토
+4. **외부 요청 URL 검증 추가**: Server Action과 API Route에서 외부로 보내는 요청에 Allowlist 기반 URL 검증 적용
+5. **자동 업데이트 설정**: Dependabot이나 Renovate로 패치 릴리스 자동 적용 체계 구축
+
+## 정리
+
+- Next.js가 DoS, Middleware 우회, XSS, SSRF, Cache Poisoning 취약점을 패치 — 운영 환경 즉시 업데이트 필요
+- Middleware 단독 인증은 이번 패치와 무관하게 구조적 위험 요소 — Route Handler에 독립적 인증 추가 필수
+- 캐시는 명시적으로 제어해야 하며, 민감 데이터에는 `cache: 'no-store'` 사용
+- URL Allowlist와 CSP 헤더로 패치 이상의 추가 방어 계층 구축 권장
+- Dependabot 등으로 Next.js 업데이트를 자동화해 향후 노출 기간을 최소화
