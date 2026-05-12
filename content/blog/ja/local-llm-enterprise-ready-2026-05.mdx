@@ -1,0 +1,111 @@
+---
+title: "Local LLMが本番利用可能になった：2026年のEnterprise向けセルフホスティング"
+description: "クラウドAIコストの上昇を受け、Local LLMを自社Infrastructure上で動かす選択肢が現実的になりました。選定基準から運用Patternまで実践的に解説します。"
+date: "2026-05-13"
+status: "published"
+tags: ["LLM", "AI", "Self-Hosting", "Enterprise", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "local-llm-enterprise-ready-2026-05"
+---
+
+2026年Q1に主要組織から255モデルがリリースされた事実は、Cloud APIへの依存と並行して、もう一つの流れが加速していることを示しています。Local LLMの本番運用です。
+
+「精度が低い」「セットアップが複雑すぎる」と評されていたLocal LLMが、現在はEnterpriseのProductionユースケースに耐えうる状態になっています。この転換を可能にしたのは、モデルの小型化と精度向上が同時進行したことです。
+
+## 何が変わったか
+
+Alibaba QwenチームがリリースしたCodingに特化した27Bパラメータモデルは、フロンティア品質のCoding Assistantとして機能します。27BクラスはA100一枚（またはRTX 4090相当のコンシューマGPU）で推論できます。
+
+主な採用動機は3点に集約されます：
+
+- **コスト**: 月10万トークン以上を継続的に処理する場合、Cloud APIよりも安価になるケースが増えています
+- **プライバシー**: ソースコード・顧客データをCloud事業者のサーバーに送信しない
+- **レイテンシ**: 社内Network内での推論によりAPI呼び出しの往復コストがなくなる
+
+## 実践的なセットアップ
+
+OllamaはLocal LLM推論の事実上の標準です。Docker Composeを使った最小構成：
+
+```yaml
+# docker-compose.yml
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  ollama_data:
+```
+
+起動後、モデルをPullして動作確認します：
+
+```bash
+# モデルのダウンロード（初回のみ）
+docker exec -it ollama ollama pull qwen2.5-coder:32b
+
+# 推論テスト
+curl http://localhost:11434/api/chat -d '{
+  "model": "qwen2.5-coder:32b",
+  "messages": [{"role": "user", "content": "TypeScriptでfetchラッパーを書いてください"}],
+  "stream": false
+}'
+```
+
+## OpenAI互換APIとしての利用
+
+OllamaはOpenAI互換のREST APIを提供しています。既存のApplication Codeをほぼ変更せずに切り替えられます。
+
+```typescript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "http://localhost:11434/v1",
+  apiKey: "ollama", // 値は任意（認証なし）
+});
+
+async function chat(message: string): Promise<string> {
+  const response = await client.chat.completions.create({
+    model: "qwen2.5-coder:32b",
+    messages: [{ role: "user", content: message }],
+  });
+  return response.choices[0].message.content ?? "";
+}
+```
+
+## ユースケース別のモデル選定
+
+すべてのタスクに最大モデルを使う必要はありません。タスクとモデルサイズのマッピングを設計することでコストと精度を最適化できます：
+
+| ユースケース | 推奨モデルクラス | VRAM目安 |
+|---|---|---|
+| コード補完・Snippet生成 | 7B〜14B | 8〜16GB |
+| ドキュメント要約・分類 | 7B〜14B | 8〜16GB |
+| コードレビュー・リファクタリング | 32B | 24〜32GB |
+| 複雑な設計相談 | 70B+ | 多GPU or Cloud |
+
+70B以上のタスクはCloud APIに委譲し、繰り返し処理の多い軽量タスクをLocal LLMで処理するHybrid構成が現実的です。
+
+## セキュリティ上の注意点
+
+セルフホスティングにはセキュリティの責任も伴います：
+
+- OllamaはデフォルトでローカルNetworkのみにBindします。社内Networkに公開する場合は認証Layerを追加してください
+- モデルWeightは信頼できるソース（Hugging Face公式リポジトリ、Ollama Library）からのみ取得する
+- 推論サーバーはDocker Networkで隔離し、Application Serviceからのみアクセス可能にする
+
+## まとめ
+
+Local LLMは「実験的な選択肢」から「エンジニアリング上の設計選択の一つ」になりました。Cloud APIのコストが事業の制約になり始めている場合や、データプライバシーの要件が厳しい場合、Local LLMは合理的な解です。
+
+27Bクラスのモデルが単一GPUで動作する現状では、オンプレミスServerや社内PCクラスタを持つEnterprise組織にとって、導入コストは以前より大幅に低下しています。まずはCI/CDの特定JobやDocument検索といった限定的なユースケースから試すのが堅実なアプローチです。
