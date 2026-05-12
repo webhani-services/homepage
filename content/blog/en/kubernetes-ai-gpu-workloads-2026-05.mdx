@@ -1,0 +1,180 @@
+---
+title: "Running AI/ML Workloads on Kubernetes: DRA and GPU Scheduling in 2026"
+description: "Kubernetes 1.35 brought Dynamic Resource Allocation to beta, making GPU scheduling more practical for AI inference and training. Here's what changed and how to use it."
+date: "2026-05-13"
+status: "published"
+tags: ["Kubernetes", "GPU", "AI/ML", "DevOps", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-ai-gpu-workloads-2026-05"
+---
+
+Kubernetes 1.36 shipped with Volume Group Snapshots reaching GA and continued progress on Dynamic Resource Allocation (DRA). As AI workloads become a first-class infrastructure concern, Kubernetes GPU management has evolved significantly. Here's the current state of the art.
+
+## The limitations of the old approach
+
+Until DRA, the only way to request a GPU in Kubernetes was:
+
+```yaml
+resources:
+  limits:
+    nvidia.com/gpu: "1"
+```
+
+This works, but it's coarse. You get a whole GPU or nothing — no fractional allocation, no hardware property selection, no sharing between pods. For teams running many small inference tasks, GPUs sat idle most of the time.
+
+## What DRA changes
+
+Dynamic Resource Allocation (DRA) introduces a `ResourceClaim` API that separates the declaration of hardware requirements from pod scheduling. Instead of requesting "one GPU unit," you declare what you need from the hardware:
+
+```yaml
+apiVersion: resource.k8s.io/v1alpha3
+kind: ResourceClaimTemplate
+metadata:
+  name: inference-gpu-claim
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpu
+          deviceClassName: nvidia.com/gpu
+          selectors:
+            - cel:
+                expression: >
+                  device.attributes["nvidia.com/gpu"].memory >= 16
+```
+
+Pods reference the claim rather than declaring raw resource limits:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llm-inference-pod
+spec:
+  resourceClaims:
+    - name: gpu
+      resourceClaimTemplateName: inference-gpu-claim
+  containers:
+    - name: server
+      image: your-registry/inference-server:latest
+      resources:
+        claims:
+          - name: gpu
+```
+
+DRA's binding conditions reached beta in Kubernetes 1.35. Full production stability is still maturing, but the API is stable enough to build on for non-critical workloads.
+
+## Practical patterns for today
+
+While DRA matures, these patterns remain the production-tested baseline:
+
+### GPU node isolation with taints and tolerations
+
+```bash
+# Label and taint GPU nodes at cluster setup time
+kubectl label nodes gpu-node-1 nvidia.com/gpu.present=true
+kubectl taint nodes gpu-node-1 nvidia.com/gpu=present:NoSchedule
+```
+
+```yaml
+# Workload that targets GPU nodes
+spec:
+  tolerations:
+    - key: "nvidia.com/gpu"
+      operator: "Equal"
+      value: "present"
+      effect: "NoSchedule"
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  containers:
+    - name: trainer
+      image: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+```
+
+### Per-namespace GPU quotas
+
+Prevent teams from monopolizing GPU resources:
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ml-team-gpu-quota
+  namespace: ml-team
+spec:
+  hard:
+    requests.nvidia.com/gpu: "4"
+    limits.nvidia.com/gpu: "4"
+```
+
+### Training jobs vs inference deployments
+
+Training is finite; inference is long-running. Use `Job` for training to automatically free GPUs on completion:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: finetune-job
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: trainer
+          image: your-registry/trainer:latest
+          resources:
+            limits:
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: weights
+              mountPath: /models
+              readOnly: true
+      volumes:
+        - name: weights
+          persistentVolumeClaim:
+            claimName: pretrained-weights-pvc
+```
+
+## Monitoring GPU workloads
+
+Standard CPU/memory metrics are insufficient for AI workloads. Add NVIDIA's DCGM Exporter to your Prometheus stack:
+
+```yaml
+# values.yaml for dcgm-exporter helm chart
+serviceMonitor:
+  enabled: true
+  interval: 15s
+
+metrics:
+  # Key metrics to track
+  - DCGM_FI_DEV_GPU_UTIL       # GPU utilization %
+  - DCGM_FI_DEV_FB_USED        # GPU memory used (MB)
+  - DCGM_FI_DEV_FB_FREE        # GPU memory free (MB)
+  - DCGM_FI_PROF_GR_ENGINE_ACTIVE  # SM (streaming multiprocessor) activity
+```
+
+This gives you Grafana dashboards that show actual GPU utilization, not just whether a GPU is allocated.
+
+## Recommendations
+
+**Separate GPU node pools from CPU workloads.** Mixing GPU and CPU workloads on the same nodes complicates scheduling, cost attribution, and autoscaling. Use dedicated node groups or node pools with your cloud provider.
+
+**Model weights need careful storage design.** Multi-gigabyte model files are a first-class infrastructure concern. A PersistentVolume with `ReadOnlyMany` access mode lets multiple inference pods share the same weights without per-pod copies.
+
+**Size your GPU requests conservatively at first.** Start with per-pod GPU allocation and measure actual utilization before optimizing. Premature micro-optimization with MIG (Multi-Instance GPU) or time-slicing adds complexity that may not be worth it until you understand your actual usage patterns.
+
+## Conclusion
+
+Kubernetes GPU management has matured enough to be the right platform for most AI/ML infrastructure. DRA's progression toward stability is making GPU scheduling more expressive, but the practical patterns — taint-based isolation, ResourceQuota, Job-based training — remain solid foundations.
+
+The key architectural decision is to treat AI workloads as first-class citizens from the start: separate node pools, dedicated namespaces, GPU-specific monitoring. Retrofitting these onto a mixed-workload cluster is significantly harder than building them in from the beginning.

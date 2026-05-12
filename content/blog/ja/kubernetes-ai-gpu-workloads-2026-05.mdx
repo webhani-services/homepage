@@ -1,0 +1,151 @@
+---
+title: "KubernetesでAI/MLワークロードを扱う：DRAとGPUスケジューリングの実践"
+description: "Kubernetes v1.35でDynamic Resource Allocation（DRA）がBetaに昇格し、AI/MLワークロードのGPUスケジューリングが実用的になりました。設定パターンと注意点を解説します。"
+date: "2026-05-13"
+status: "published"
+tags: ["Kubernetes", "GPU", "AI/ML", "DevOps", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-ai-gpu-workloads-2026-05"
+---
+
+Kubernetes 1.36がVolume Group SnapshotのGAと、DRA（Dynamic Resource Allocation）の重要なアップデートを含む形でリリースされました。AIワークロードがInfrastructureの主役になりつつある今、KubernetesのGPU管理機能がどう変わったか整理します。
+
+## 従来のGPUスケジューリングの問題点
+
+これまでKubernetesでGPUを割り当てる唯一の方法は、Podのリソースリクエストに`nvidia.com/gpu: 1`を指定することでした。この方式にはいくつかの制限があります：
+
+- GPUを**整数単位**でしか割り当てられない（半分のGPUは不可）
+- 複数のPodが同一GPUを共有できない
+- GPUの特性（メモリ容量、アーキテクチャ）を指定した細かい選択ができない
+
+小規模な推論タスクが多いシステムでは、GPUリソースの大半がアイドル状態になるという無駄が生じていました。
+
+## DRA（Dynamic Resource Allocation）とは
+
+DRAはKubernetes 1.26でAlphaとして導入され、1.35でBindingの条件評価がBetaに昇格した機能です。ResourceClaimという新しいAPIオブジェクトを使い、GPUなどの特殊ハードウェアをより柔軟に要求・割り当てできます。
+
+概念的には「GPUをPodに直接割り当てる」ではなく「GPUの利用条件を宣言し、スケジューラが最適な割り当てを判断する」モデルです。
+
+### ResourceClaimTemplateの例
+
+```yaml
+apiVersion: resource.k8s.io/v1alpha3
+kind: ResourceClaimTemplate
+metadata:
+  name: gpu-inference-claim
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpu
+          deviceClassName: nvidia.com/gpu
+          selectors:
+            - cel:
+                expression: >
+                  device.attributes["nvidia.com/gpu"].memory >= 16  # GB単位
+```
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llm-inference
+spec:
+  resourceClaims:
+    - name: gpu
+      resourceClaimTemplateName: gpu-inference-claim
+  containers:
+    - name: inference-server
+      image: your-registry/llm-server:latest
+      resources:
+        claims:
+          - name: gpu
+```
+
+## 実運用で考慮すべきこと
+
+### Node Selectorによるハードウェア分離
+
+DRAが完全に普及するまでの現実的な対応として、Node SelectorとTaintを組み合わせたGPU Node分離が依然として有効です：
+
+```yaml
+# GPU Nodeに付けるTaint
+# kubectl taint nodes gpu-node-1 nvidia.com/gpu=present:NoSchedule
+
+apiVersion: v1
+kind: Pod
+spec:
+  tolerations:
+    - key: "nvidia.com/gpu"
+      operator: "Equal"
+      value: "present"
+      effect: "NoSchedule"
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  containers:
+    - name: trainer
+      image: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+```
+
+### Namespace単位のリソースQuota
+
+GPU NodeへのアクセスをNamespace単位で制限することで、チーム間のリソース競合を防げます：
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: gpu-quota
+  namespace: ml-team
+spec:
+  hard:
+    requests.nvidia.com/gpu: "4"
+    limits.nvidia.com/gpu: "4"
+```
+
+## AI/MLワークロードのKubernetes化で注意する点
+
+**Stateの管理。** モデルWeightファイルは数GBから数百GBになります。PersistentVolumeを適切に設計し、ReadOnlyManyでWorker PodがWeightを共有できるようにすることで、起動時間とStorage I/Oを削減できます。
+
+**Job vs Deployment。** 訓練タスクはKubernetes Jobとして、推論サービスはDeploymentとして管理するのが基本です。JobはPod完了後にリソースを解放するため、訓練クラスタのコスト管理に適しています。
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-finetune-job
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: trainer
+          image: your-registry/trainer:latest
+          resources:
+            limits:
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: model-weights
+              mountPath: /models
+      volumes:
+        - name: model-weights
+          persistentVolumeClaim:
+            claimName: model-weights-pvc
+```
+
+**監視指標の変化。** GPU WorkloadではCPU使用率やMemoryといった従来の指標だけでなく、GPU使用率・GPU Memory使用量・CUDA KernelのThroughputを監視する必要があります。DCGM Exporter（NVIDIA Data Center GPU Manager）をPrometheusと組み合わせることで、GPU特有の指標をGrafanaで可視化できます。
+
+## まとめ
+
+KubernetesのAI/ML対応は急速に成熟しています。DRAのBeta昇格はその一里塚であり、今後のReleaseでGPU共有や細粒度の割り当てが本番利用可能になる見通しです。
+
+現時点では、Node TaintとResourceQuotaを使ったGPU Node分離、Job APIを使った訓練ワークロード管理、DCGMを使ったGPU監視というパターンが実証済みの構成です。AI InfrastructureをKubernetesに統合する際は、既存のCPUワークロードと混在させるのではなく、GPU専用Nodeプールを分けることを強く推奨します。
