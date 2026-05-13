@@ -1,0 +1,137 @@
+---
+title: "Next.js 2026년 5월 Security Release: 지금 바로 패치해야 할 13개 CVE"
+description: "Vercel이 2026년 5월 발표한 Next.js Security Release에서 13개의 취약점이 패치되었습니다. Auth Bypass, SSRF, Cache Poisoning 등 주요 내용과 대응 방법을 정리합니다."
+date: "2026-05-14"
+status: "published"
+tags: ["Next.js", "security", "CVE", "web-development", "React"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-security-release-may-2026"
+---
+
+2026년 5월, Vercel이 Next.js의 대규모 Security Release를 발표했습니다. 한 번에 13개의 Advisory가 처리되었으며 Denial of Service, 인증 우회(Auth Bypass), SSRF(Server-Side Request Forgery), Cache Poisoning, XSS에 이르는 다양한 범주를 포함합니다.
+
+현재 Next.js로 운영 중인 서비스가 있다면 즉각적인 대응이 필요합니다.
+
+## 패치된 버전
+
+두 개의 활성 Release Line에 패치가 제공되었습니다.
+
+- **Next.js 15.5.18**
+- **Next.js 16.2.6**
+
+**중요**: Next.js 13.x 및 14.x에는 패치가 제공되지 않습니다. 이 버전을 사용 중이라면 15.x 또는 16.x로 업그레이드하는 것이 유일한 해결책입니다.
+
+## 주요 취약점 분석
+
+### 1. 인증 우회 - Auth Bypass (심각도: 높음)
+
+두 가지 경로의 Auth Bypass 취약점이 발견되었습니다.
+
+**App Router의 Segment-Prefetch Bypass**
+
+내부 Prefetch Endpoint를 통해 Middleware 기반 인증 검사를 우회할 수 있는 취약점입니다. 페이지 데이터를 사전 로드하기 위해 설계된 Prefetch 메커니즘이 Middleware 규칙을 일관되게 적용하지 않아, 인증되지 않은 상태로 보호된 Route에 접근할 수 있었습니다.
+
+**Pages Router의 i18n Default Locale Bypass**
+
+`/[locale]/path` 패턴의 i18n Route에서 Default Locale로 접근 시 인증을 우회할 수 있습니다. Next.js Middleware로 인증을 구현한 프로젝트에 직접적인 영향을 줍니다.
+
+```typescript
+// 패치 전 악용 가능했던 패턴 (개념도)
+// /dashboard에 인증 Middleware가 적용된 경우
+export function middleware(request: NextRequest) {
+  if (!request.cookies.has('session')) {
+    return NextResponse.redirect(new URL('/login', request.url))
+  }
+}
+// 패치 후: Prefetch 요청도 Middleware를 올바르게 통과하도록 수정됨
+```
+
+### 2. SSRF - Server-Side Request Forgery (심각도: 높음)
+
+WebSocket Upgrade 요청을 처리하는 애플리케이션에서 SSRF가 발생할 수 있습니다. 공격자가 서버로 하여금 내부 네트워크 주소에 요청을 보내도록 유도할 수 있으며, 클라우드 환경에서는 AWS IMDSv1(`http://169.254.169.254`)과 같은 메타데이터 Endpoint에 접근할 위험이 있습니다.
+
+### 3. Denial of Service (심각도: 높음)
+
+두 가지 DoS 취약점이 패치되었습니다.
+
+- **React Server Components DoS** (CVE-2026-23870): 잘못된 형식의 요청이 RSC 렌더링 파이프라인에서 과도한 리소스 소비를 유발
+- **Cache Component 연결 고갈**: Cache Component를 사용하는 애플리케이션에서 반복 요청으로 서버 연결이 소진되는 문제
+
+### 4. Cache Poisoning (심각도: 중간)
+
+React Server Component 응답에 대한 Cache Poisoning이 가능한 취약점입니다. CDN이나 Next.js 내장 Cache를 사용하는 경우, 공격자가 Cache를 오염시켜 사용자에게 잘못된 콘텐츠를 반환할 수 있습니다.
+
+### 5. Cross-Site Scripting (심각도: 중간/낮음)
+
+App Router 애플리케이션에서 두 가지 XSS 취약점이 발견되었습니다.
+
+- CSP Nonce 누출을 이용한 Nonce 기반 XSS 우회
+- `beforeInteractive` 스크립트를 통한 임의 스크립트 실행
+
+## 업그레이드 방법
+
+```bash
+# 현재 버전 확인
+npx next --version
+
+# Next.js 16 계열
+npm install next@16.2.6
+
+# Next.js 15 계열
+npm install next@15.5.18
+
+# pnpm 사용 시
+pnpm update next@16.2.6
+
+# yarn 사용 시
+yarn upgrade next@16.2.6
+
+# 업그레이드 후 확인
+npx next --version
+
+# 프로덕션 빌드로 회귀 문제 확인
+npm run build
+```
+
+업그레이드 후에는 반드시 전체 Test Suite를 실행하세요. 인증 Middleware 동작이 강화되었기 때문에 Prefetch Bypass에 의존하던 Integration Test가 영향을 받을 수 있습니다.
+
+## 13.x / 14.x 사용자 마이그레이션
+
+지원이 종료된 버전을 사용 중이라면 마이그레이션은 피할 수 없습니다.
+
+**14.x → 15.x / 16.x**는 비교적 업그레이드 경로가 단순합니다. 사용 중인 Deprecated API를 공식 Migration Guide에서 확인하세요.
+
+**13.x → 15.x / 16.x**의 주요 변경 사항:
+- App Router가 기본 패턴으로 자리잡음 (Pages Router는 계속 작동하지만 신규 기능 개발의 중심은 아님)
+- Server Actions가 많은 Custom API Route 코드를 대체
+- `next/headers`, `next/cookies`가 비동기 API로 변경
+
+상당한 작업이 필요하지만, 13.x는 이미 오래전에 End-of-Life를 맞았습니다. 이번 Security Release를 마이그레이션 계획을 시작하는 계기로 삼으세요.
+
+## WAF 완화 조치의 한계
+
+Cloudflare는 일부 공격 벡터에 대한 WAF Rule을 제공했으며, Netlify의 Edge Infrastructure도 부분적인 보호를 제공합니다. 하지만 Vercel의 공식 입장은 **"완전한 완화는 패치만 가능하다"**입니다.
+
+WAF를 통한 임시 조치는 심층 방어(Defense in Depth)의 일환으로 유용하지만, 업그레이드를 미루는 이유가 되어서는 안 됩니다.
+
+## 우선순위 정리
+
+| 취약점 | 심각도 | 권장 조치 |
+|---|---|---|
+| Auth Bypass (App Router) | 높음 | 즉시 패치 |
+| Auth Bypass (Pages Router i18n) | 높음 | 즉시 패치 |
+| SSRF (WebSocket) | 높음 | 즉시 패치 |
+| DoS (RSC) | 높음 | 즉시 패치 |
+| DoS (연결 고갈) | 높음 | 즉시 패치 |
+| Cache Poisoning | 중간 | 다음 배포 시 패치 |
+| XSS (CSP Nonce) | 중간 | 다음 배포 시 패치 |
+| XSS (beforeInteractive) | 낮음 | 다음 릴리스 사이클에 패치 |
+
+높음 수준의 취약점은 아직 패치하지 않은 경우 Incident로 처리해야 합니다. 특히 Auth Bypass는 복잡한 익스플로잇 없이도 조작된 Prefetch 요청만으로 탐색 가능한 취약점입니다.
+
+## 마치며
+
+한 번의 Release에서 13개의 Advisory를 처리하는 것은 이례적입니다. Auth Bypass와 SSRF가 높은 심각도로 포함된 것은 Next.js 역사상 가장 심각한 Security Event 중 하나입니다.
+
+Next.js 15.5.18 또는 16.2.6으로 최대한 빠르게 업그레이드하고, 13.x / 14.x 사용 중이라면 이번 기회에 마이그레이션 계획을 시작하세요.
