@@ -1,0 +1,145 @@
+---
+title: "Next.js May 2026 Security Release：今すぐ対応すべき13件の脆弱性"
+description: "Vercelが2026年5月にリリースしたNext.jsのセキュリティアップデートで13件の脆弱性が修正されました。認証バイパス、SSRF、Cache Poisoningの詳細と対応方法を解説します。"
+date: "2026-05-14"
+status: "published"
+tags: ["Next.js", "security", "CVE", "web-development", "React"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-security-release-may-2026"
+---
+
+2026年5月、Vercel は Next.js の重大なセキュリティリリースを公開しました。13件の Advisory が一度に対処され、Denial of Service から認証バイパス、SSRF（Server-Side Request Forgery）、Cache Poisoning、XSS まで多岐にわたります。
+
+現在 Next.js を運用しているプロジェクトは早急な対応が必要です。
+
+## 修正対象のバージョン
+
+対応済みのバージョンは以下の通りです。
+
+- **Next.js 15.5.18**
+- **Next.js 16.2.6**
+
+**重要**: Next.js 13.x および 14.x はパッチの提供予定がありません。これらのバージョンを使用しているプロジェクトは、15.x または 16.x への移行が必要です。
+
+## 主要な脆弱性の概要
+
+### 1. 認証バイパス（高深刻度）
+
+App Router の segment-prefetch メカニズムと、Pages Router の i18n default-locale パスの両方に認証バイパスの脆弱性が存在します。
+
+認証にミドルウェアを使用しているプロジェクトは特に影響を受ける可能性があります。内部の prefetch エンドポイント経由でミドルウェアによる認証チェックを迂回できるため、保護されたルートへの不正アクセスが生じるリスクがあります。
+
+```typescript
+// パッチ前に悪用可能だったパターン（概念図）
+// /dashboard に認証ミドルウェアを適用しているケース
+export function middleware(request: NextRequest) {
+  if (!request.cookies.has('session')) {
+    return NextResponse.redirect(new URL('/login', request.url))
+  }
+}
+
+// パッチ後: prefetch リクエストもミドルウェアを正しく通過するよう修正された
+```
+
+### 2. Server-Side Request Forgery（高深刻度）
+
+WebSocket Upgrade を使用するアプリケーションで SSRF が発生する可能性があります。攻撃者が内部ネットワークへのリクエストを誘導できる場合があり、クラウド環境ではメタデータエンドポイント（AWS IMDSv1 など）へのアクセスリスクがあります。
+
+### 3. Denial of Service（高深刻度）
+
+2 種類の DoS 脆弱性が報告されています。
+
+- **React Server Components 経由の DoS**（CVE-2026-23870 として追跡）：不正な形式のリクエストが過剰なリソース消費を引き起こす
+- **Cache Components の接続枯渇**：Cache Component を使用するアプリケーションで繰り返しリクエストによりサーバー接続が枯渇する
+
+### 4. Cache Poisoning（中程度の深刻度）
+
+React Server Component のレスポンスに対するキャッシュポイズニングが可能な脆弱性です。CDN や Next.js の組み込みキャッシュを使用している場合、攻撃者がキャッシュを汚染してユーザーに誤ったコンテンツを返せる可能性があります。
+
+### 5. Cross-Site Scripting（中〜低深刻度）
+
+CSP nonce および beforeInteractive スクリプトを使用した App Router アプリケーションで XSS の脆弱性が発見されました。
+
+## 対応手順
+
+### ステップ 1：バージョン確認
+
+```bash
+# 現在のバージョンを確認
+npx next --version
+
+# package.json の依存関係を確認
+cat package.json | grep '"next"'
+```
+
+### ステップ 2：アップグレード
+
+```bash
+# Next.js 16 系を使用している場合
+npm install next@16.2.6
+
+# Next.js 15 系を使用している場合
+npm install next@15.5.18
+
+# yarn の場合
+yarn upgrade next@16.2.6
+
+# pnpm の場合
+pnpm update next@16.2.6
+```
+
+### ステップ 3：動作確認
+
+アップグレード後は必ず以下を確認してください。
+
+```bash
+# ビルドが通ることを確認
+npm run build
+
+# 型チェック
+npx tsc --noEmit
+
+# テスト実行
+npm test
+```
+
+認証ミドルウェアの動作が強化されているため、prefetch バイパスに依存していた Integration Test は影響を受ける可能性があります。
+
+## 13.x / 14.x からの移行が必要な場合
+
+パッチが提供されない旧バージョンを使用している場合、移行作業が必要です。
+
+**14.x → 15.x / 16.x**はアップグレードパスが比較的シンプルです。使用中の Deprecated API を公式 Migration Guide で確認してください。
+
+**13.x → 15.x / 16.x** の主な変更点：
+- App Router が基本パターンとして確立（Pages Router は引き続き動作するが新機能の中心ではない）
+- Server Actions が多くのカスタム API Route のコードを置き換える
+- `next/headers`、`next/cookies` が非同期 API に変更
+
+## WAF による暫定対応の限界
+
+Cloudflare は一部の攻撃ベクトルに対する WAF ルールを公開しており、Netlify のエッジインフラも部分的な保護を提供しています。しかし Vercel の公式見解では「完全な緩和策はパッチのみ」とされています。
+
+WAF を通じた暫定対応は多層防御の一環として有用ですが、アップグレードを遅らせる理由にはなりません。
+
+## 対応優先度
+
+| 脆弱性 | 深刻度 | 推奨アクション |
+|---|---|---|
+| 認証バイパス（App Router） | 高 | 即時パッチ |
+| 認証バイパス（Pages Router i18n） | 高 | 即時パッチ |
+| SSRF（WebSocket） | 高 | 即時パッチ |
+| DoS（RSC） | 高 | 即時パッチ |
+| DoS（接続枯渇） | 高 | 即時パッチ |
+| Cache Poisoning | 中 | 次回デプロイ時にパッチ |
+| XSS（CSP nonce） | 中 | 次回デプロイ時にパッチ |
+| XSS（beforeInteractive） | 低 | 次回リリースサイクルでパッチ |
+
+高深刻度の脆弱性は、未パッチの場合はインシデントとして扱う必要があります。特に認証バイパスは攻撃者が容易に探索できる脆弱性です。
+
+## まとめ
+
+今回のリリースは 13 件という多数の脆弱性が一括で対処された点で異例です。認証バイパスや SSRF は本番環境での悪用リスクが高く、早急な対応が必要です。
+
+Next.js 15.5.18 または 16.2.6 へのアップグレードを最優先で実施し、13.x / 14.x 系を使用している場合はこの機会に移行計画を立てることを強く推奨します。

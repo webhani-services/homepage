@@ -1,0 +1,132 @@
+---
+title: "Next.js May 2026 Security Release: 13 CVEs to Patch Immediately"
+description: "Vercel shipped a coordinated Next.js security release covering 13 advisories — auth bypass, SSRF, cache poisoning, DoS, and XSS. Here's what you need to upgrade and why."
+date: "2026-05-14"
+status: "published"
+tags: ["Next.js", "security", "CVE", "web-development", "React"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-security-release-may-2026"
+---
+
+Vercel published a coordinated security release for Next.js in May 2026 covering 13 advisories. The scope is broad: denial of service, authentication bypass, server-side request forgery, cache poisoning, and cross-site scripting. If you run Next.js in production, this requires immediate attention.
+
+## Patched Versions
+
+Both active release lines have received patches:
+
+- **Next.js 15.5.18**
+- **Next.js 16.2.6**
+
+**No patches are planned for Next.js 13.x or 14.x.** If your project is on either of these versions, upgrading to 15.x or 16.x is the only path to remediation.
+
+## Vulnerability Breakdown
+
+### Authentication Bypass (High Severity)
+
+Two distinct auth bypass vectors were discovered:
+
+1. **App Router segment-prefetch bypass** — internal prefetch endpoints can be exploited to bypass middleware-based authentication checks
+2. **Pages Router i18n default-locale bypass** — requests to the default locale via `/[locale]/path` patterns can circumvent authentication
+
+Projects using Next.js middleware for authentication are directly at risk. The prefetch mechanism, which was designed to speculatively load page data, was not consistently applying middleware rules — allowing unauthenticated access to protected routes.
+
+```typescript
+// Pattern that was exploitable pre-patch (conceptual)
+// Middleware applies to /dashboard
+export function middleware(request: NextRequest) {
+  if (!request.cookies.has('session')) {
+    return NextResponse.redirect(new URL('/login', request.url))
+  }
+}
+// After patching: prefetch requests now correctly pass through middleware
+```
+
+### Server-Side Request Forgery — WebSocket Upgrades (High Severity)
+
+Applications handling WebSocket upgrade requests were vulnerable to SSRF. An attacker could craft requests that cause the server to make outbound connections to internal network addresses — including cloud metadata endpoints like `http://169.254.169.254` (AWS IMDSv1).
+
+This is particularly relevant for applications deployed in cloud environments where the metadata service is accessible from the application host.
+
+### Denial of Service (High Severity)
+
+Two DoS vectors were patched:
+
+- **React Server Components DoS** (tracked upstream as CVE-2026-23870): malformed requests could trigger excessive resource consumption in the RSC rendering pipeline
+- **Cache Component connection exhaustion**: repeated requests could exhaust server connections in applications using caching components
+
+### Cache Poisoning (Moderate Severity)
+
+React Server Component responses could be poisoned via crafted requests. Applications using CDN caching or Next.js's built-in cache are at risk of serving attacker-controlled content to legitimate users.
+
+### Cross-Site Scripting (Moderate / Low Severity)
+
+Two XSS vectors in App Router applications:
+
+- CSP nonce leakage enabling nonce-based XSS bypass
+- `beforeInteractive` script injection allowing arbitrary script execution
+
+## How to Upgrade
+
+```bash
+# Check your current version
+npx next --version
+
+# Upgrade to patched version (Next.js 16 line)
+npm install next@16.2.6
+
+# Next.js 15 line
+npm install next@15.5.18
+
+# yarn
+yarn upgrade next@16.2.6
+
+# pnpm
+pnpm update next@16.2.6
+
+# Verify the upgrade
+npx next --version
+
+# Run a production build to catch any regressions
+npm run build
+```
+
+After upgrading, run your full test suite. Auth middleware behavior has been tightened — integration tests that relied on prefetch bypassing middleware may need to be updated to reflect the corrected behavior.
+
+## Migrating from 13.x or 14.x
+
+If you're on an unsupported version, a migration is unavoidable.
+
+**14.x → 15.x / 16.x** is a relatively straightforward upgrade path. Review the official Next.js migration guide for deprecated APIs you're currently using.
+
+**13.x → 15.x / 16.x** involves more significant changes:
+- App Router is now the primary pattern (Pages Router still works but isn't the focus of new features)
+- Server Actions replace much of the custom API route boilerplate
+- `next/headers` and `next/cookies` now use async APIs
+
+The effort is non-trivial, but 13.x is well past end-of-life at this point. Treat this security release as the forcing function to start the migration conversation.
+
+## WAF Mitigations Are Partial
+
+Cloudflare has published WAF rules for some of these vectors, and Netlify's edge infrastructure provides partial coverage. However, Vercel's official position is that **patching is the only complete mitigation**. WAF rules are best treated as a defense-in-depth measure, not as a reason to delay the upgrade.
+
+## Priority Assessment
+
+| Vulnerability | Severity | Recommended Action |
+|---|---|---|
+| Auth bypass (App Router) | High | Patch immediately |
+| Auth bypass (Pages Router i18n) | High | Patch immediately |
+| SSRF via WebSocket | High | Patch immediately |
+| DoS (RSC) | High | Patch immediately |
+| DoS (connection exhaustion) | High | Patch immediately |
+| Cache poisoning | Moderate | Patch in next deploy |
+| XSS (CSP nonce) | Moderate | Patch in next deploy |
+| XSS (beforeInteractive) | Low | Patch in next release cycle |
+
+High severity items should be treated as incidents if you haven't patched. The auth bypass vulnerabilities in particular are straightforward for an attacker to probe — there's no need for complex exploitation, just crafted prefetch requests.
+
+## Summary
+
+Thirteen advisories in a single release is unusual. The combination of auth bypass and SSRF at high severity makes this one of the more serious Next.js security events to date.
+
+Upgrade to 15.5.18 or 16.2.6 as quickly as your review process allows. If you're on 13.x or 14.x, treat this as the forcing function to begin migration planning now rather than later.

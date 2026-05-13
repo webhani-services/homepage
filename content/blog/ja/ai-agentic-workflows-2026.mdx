@@ -1,0 +1,158 @@
+---
+title: "LLMからAgentic Workflowへ：Code with Claude 2026から学ぶ自律型AI開発"
+description: "Code with Claude 2026カンファレンスで明らかになったAI Agentの最新動向と、Agentic Workflowが開発現場にもたらす具体的な変化を解説します。"
+date: "2026-05-14"
+status: "published"
+tags: ["AI", "LLM", "Claude", "agentic-workflow", "developer-tools"]
+thumbnail: ""
+author: "webhani"
+slug: "ai-agentic-workflows-2026"
+---
+
+LLM は長らく「プロンプトを渡すと応答を返す」という一問一答のツールとして使われてきました。しかし 2026 年は、その使われ方が根本から変わりはじめています。
+
+2026年5月に Anthropic が開催したカンファレンス「Code with Claude 2026」では、AI Agent が複数のステップを自律的に組み合わせて目標を達成する「Agentic Workflow」のデモや事例が多数発表されました。今回はその内容を整理しながら、実務への応用を考えます。
+
+## Agentic Workflow とは何か
+
+Agentic Workflow とは、AI Agent が事前に与えられた目標に向かって、計画・実行・修正のサイクルを自律的に繰り返す仕組みです。従来の LLM 利用と何が違うのかを比較すると明確です。
+
+| 従来の LLM 利用 | Agentic Workflow |
+|---|---|
+| プロンプト → 応答（1回） | 目標設定 → 計画 → 実行 → フィードバック（反復） |
+| ユーザーが次のステップを指示 | Agent が次のステップを自律判断 |
+| 外部ツール連携は手動 | ツール呼び出しを Agent が自動選択 |
+| 短期的な文脈のみ保持 | 長期的なメモリと状態管理を持つ |
+
+Code with Claude 2026 では特に「Goal-Oriented Planning」と「Contextual Memory」が強調されており、Agent がタスク達成のためにどのツールをいつ呼び出すかを動的に決定する実装例が複数紹介されました。
+
+## 実装の基本構造
+
+Agentic Workflow の実装には、大きく 3 つのコンポーネントが必要です。
+
+### 1. Planning Layer
+
+Agent が目標をサブタスクに分解し、実行順序を決定する部分です。Claude API では `thinking` モードを活用することで、推論過程を明示的にトレースできます。
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+def plan_task(goal: str) -> list[str]:
+    response = client.messages.create(
+        model="claude-opus-4-7",
+        max_tokens=2048,
+        thinking={"type": "enabled", "budget_tokens": 1024},
+        messages=[{
+            "role": "user",
+            "content": f"Break down this goal into sequential subtasks: {goal}"
+        }]
+    )
+    return parse_subtasks(response.content)
+```
+
+### 2. Tool Integration Layer
+
+Agent が外部サービスやデータソースと連携するためのインターフェースです。Claude の Tool Use 機能を使うと、関数定義を渡すだけで Agent が自律的にツールを選択・呼び出します。
+
+```python
+tools = [
+    {
+        "name": "search_docs",
+        "description": "Search technical documentation",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "run_code",
+        "description": "Execute Python code and return output",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string"}
+            },
+            "required": ["code"]
+        }
+    }
+]
+```
+
+### 3. Memory Layer
+
+長期的な文脈を保持するためのストレージです。会話履歴をそのまま渡すのではなく、重要な情報を構造化して管理します。
+
+```python
+from dataclasses import dataclass
+from typing import Any
+
+@dataclass
+class AgentMemory:
+    completed_tasks: list[str]
+    current_context: dict[str, Any]
+    tool_results: list[dict]
+
+    def to_system_prompt(self) -> str:
+        return f"""
+Completed tasks: {', '.join(self.completed_tasks)}
+Current context: {self.current_context}
+Available tool results: {len(self.tool_results)} results cached
+"""
+```
+
+## Code with Claude 2026 で発表された重要な変更点
+
+カンファレンスでは、実装面でも注目すべき発表がありました。
+
+**Claude Code のレート制限引き上げ**：Pro・Max・Enterprise ユーザー向けの 5 時間制限が 2 倍になりました。長時間の Agentic タスクを安定して実行できる環境が整いつつあります。
+
+**Anthropic と SpaceX の提携**：SpaceX の Colossus データセンターの全容量を Anthropic が使用するパートナーシップが発表されました。大規模な推論ワークロードへの対応強化が期待されます。
+
+**SubQ の登場**：スタートアップ企業 Subquadratic が 1,200万トークンのコンテキストウィンドウを持つ LLM「SubQ」を発表しました。長期的な Agentic タスクでのコンテキスト管理が大幅に楽になる可能性があります。
+
+## 実務への適用：どこから始めるか
+
+Agentic Workflow はすべての用途に適しているわけではありません。webhani がクライアントのプロジェクトで得た経験から、適切な使い所を整理します。
+
+**Agentic Workflow が有効なケース：**
+- コードレビュー → 修正 → テスト実行の一連のサイクル
+- ドキュメント収集 → 要約 → レポート生成
+- エラーログ分析 → 原因特定 → 修正案の提示
+
+**単発の LLM 呼び出しで十分なケース：**
+- テキスト翻訳・要約
+- 単一ファイルのコード補完
+- 定型フォーマットへのデータ変換
+
+重要なのは「自律性の度合い」です。すべてを Agent に任せようとすると、エラーが連鎖してデバッグが困難になります。人間が検証できるチェックポイントを適切に設計することが、信頼性の高い Agentic システムの条件です。
+
+## エラー連鎖を防ぐ設計パターン
+
+Agentic 開発で最もよくある失敗は「エラーの連鎖」です。Agent が間違った前提を持つと、その上に積み重なるツール呼び出しがすべて誤った方向に向かいます。これを防ぐための実践的なパターンを 2 つ紹介します。
+
+**明示的な失敗シグナル**
+
+막힌 상황에서 재시도를 반복하는 대신, 명확히 신호를 보내도록 설계합니다。
+
+```python
+system_prompt = """
+サブタスクを 2 回試みて完了できない場合は、
+'STUCK: <理由>' と応答してください。
+回避策を試みずに、막힌 상황을 명확히 알려주세요。
+"""
+```
+
+**段階的なチェックポイント**
+
+次のサブタスクに進む前に、完了した内容を構造化された形式で要約させます。デバッグのコンテキストとしても機能します。
+
+## まとめ
+
+Code with Claude 2026 が示したのは、AI がツールから「協力者」へとシフトしている現実です。Agentic Workflow の導入は一度に全部やる必要はなく、小さなタスクから段階的に自律化の範囲を広げていくアプローチが現実的です。
+
+まずは単一ツールを持つ簡単な Agent から始め、動作を確認しながら複雑度を上げていく。その積み重ねが、実務に耐えられる Agentic システムの構築につながります。
