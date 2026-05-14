@@ -1,0 +1,165 @@
+---
+title: "Code with Claude 2026: Building Production Agentic CI/CD Systems"
+description: "Key architectural lessons from Anthropic's May 6 developer conference on running Claude Code at scale — long-horizon tasks, parallel agents, multi-repo workflows, and operational controls."
+date: "2026-05-15"
+status: "published"
+tags: ["Claude", "AI", "CICD", "Agentic", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "code-with-claude-2026-agentic-cicd-05"
+---
+
+On May 6, 2026, Anthropic hosted Code with Claude in San Francisco — a developer conference focused not on product announcements but on how to actually run Claude Code in production environments. Three tracks covered Claude Code, Claude Platform, and Managed Agents, with sessions ranging from "Rearchitecting your workflows with the agentic system" to GitHub-scale engineering and proactive agent workshops.
+
+The core message: Claude Code is no longer just an autocomplete tool. The question being answered at this event was how to run it as a proper CI/CD component at scale.
+
+## Long-Horizon Tasks: What Changed
+
+Most teams using AI coding assistants today are using them for inline completions and chat-based Q&A. Code with Claude 2026 centered on a different mode of operation: long-horizon tasks — multi-step work that can't fit in a single prompt.
+
+Examples of long-horizon tasks:
+- Read a feature spec, implement changes across multiple files, add tests, and open a PR
+- Receive a security vulnerability report, identify affected code paths, implement fixes, and verify the patch
+- Apply a breaking API change consistently across a multi-service codebase
+
+These aren't novel ideas, but what's changed is the reliability of agents completing them without human intervention at each step. The improvement comes from better agentic control flow, more stable tool use, and improved state management between turns.
+
+## Parallel Agents: The Architectural Pattern
+
+The most practically applicable pattern from the conference was running multiple Claude Code agents in parallel rather than serially.
+
+A single agent handling a complex codebase faces a fundamental constraint: the context window gets saturated as the task grows, degrading output quality. Parallel agents avoid this by splitting work into independently addressable units.
+
+```bash
+# Example: parallel security review across microservices
+claude --parallel \
+  --task "review src/auth-service for security vulnerabilities" \
+  --task "review src/payment-service for security vulnerabilities" \
+  --task "review src/notification-service for security vulnerabilities" \
+  --output-format json \
+  --max-turns 20
+```
+
+In CI/CD, this pattern maps well to monorepo structures where only affected services need review on a given PR:
+
+```yaml
+# .github/workflows/ai-review.yml
+name: AI Code Review
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.detect.outputs.services }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: detect
+        run: |
+          CHANGED=$(git diff --name-only origin/main...HEAD | \
+            grep '^src/' | cut -d'/' -f2 | sort -u | \
+            jq -R -s -c 'split("\n")[:-1]')
+          echo "services=$CHANGED" >> $GITHUB_OUTPUT
+
+  review:
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.detect-changes.outputs.services) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Claude Code review
+        run: |
+          claude review src/${{ matrix.service }} \
+            --focus "bugs,security,performance" \
+            --output github-comment
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+## Operational Controls: What Production Actually Requires
+
+Capability was only half the conference agenda. The other half was operational: how do you govern an agent running in your CI/CD pipeline?
+
+### Permission scoping
+
+Claude Code can write files, run commands, and call external APIs. In production, these need explicit constraints:
+
+```json
+// .claude/settings.json
+{
+  "permissions": {
+    "allow": [
+      "Bash(git:*)",
+      "Bash(npm run test:*)",
+      "Bash(npm run lint:*)",
+      "Bash(npm run build:*)"
+    ],
+    "deny": [
+      "Bash(rm:*)",
+      "Bash(curl:*)",
+      "WebFetch",
+      "Bash(git push:*)"
+    ]
+  }
+}
+```
+
+The deny list is as important as the allow list. In a CI context, you generally don't want the agent pushing to remote, making outbound HTTP requests, or performing destructive filesystem operations.
+
+### Evidence trails
+
+For regulated industries or any team that needs auditability, knowing *what* the agent changed and *why* it made specific decisions is required. Structured logging of agent runs should be treated as a first-class requirement, not an afterthought.
+
+### Cost governance
+
+Running parallel agents at scale can drive up API costs quickly. The conference introduced the concept of pricing signals — setting per-PR or per-service cost ceilings to prevent runaway spending during a large refactor or incident response.
+
+## Multi-Repo Context Management
+
+The GitHub-Scale Engineering session addressed how to apply Claude Code across codebases that span multiple repositories and thousands of services.
+
+The key pattern is explicit context pre-loading. Before an agent starts work, you give it the relevant API contracts, test conventions, and coding standards for the specific area it's operating in:
+
+```bash
+# Pre-load context before starting a cross-repo task
+claude \
+  --context-file .claude/project-context.md \
+  --context-file docs/api-contracts.md \
+  --context-file docs/coding-standards.md \
+  --context-file docs/test-patterns.md \
+  "Update the user service to support the new authentication token format"
+```
+
+Without this, the agent makes assumptions that diverge from your team's conventions — producing technically correct but stylistically inconsistent output that increases review burden.
+
+## The Shift in Mental Model
+
+The most important takeaway from Code with Claude 2026 isn't a specific feature or API — it's a shift in how to think about AI coding tools.
+
+The previous mental model: AI as an interactive assistant that helps developers work faster.
+
+The emerging mental model: AI as an autonomous participant in the software delivery pipeline that handles defined tasks independently, with humans reviewing outputs rather than guiding every step.
+
+This shift requires new engineering work: task boundary definition, permission architecture, observability infrastructure, and cost governance. Teams that approach Claude Code as a more capable autocomplete tool will underutilize it. Teams that architect for autonomous operation — with appropriate controls — will get dramatically more leverage.
+
+## Where to Start
+
+For teams looking to adopt this model:
+
+1. **Define narrow task boundaries first**: Start with tasks that have clear inputs and verifiable outputs (code review, test generation, dependency updates). Avoid open-ended tasks until you've established baseline reliability.
+2. **Instrument before you scale**: Set up logging, cost tracking, and success rate measurement before running agents on critical paths.
+3. **Permissions by default-deny**: Start with the most restrictive permission set and add permissions only when you can justify the specific need.
+4. **Review agent outputs as you'd review a junior contributor**: Until you've established confidence in the agent's behavior on your codebase, treat its outputs as requiring full review rather than spot-checking.
+
+The infrastructure for agentic CI/CD is now mature enough that the bottleneck is organizational design, not technical capability.
+
+---
+
+*Reference: [Code with Claude 2026 Field Guide](https://www.contextstudios.ai/blog/code-with-claude-the-may-6-readiness-field-guide)*
