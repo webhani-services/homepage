@@ -1,0 +1,103 @@
+---
+title: "Kubernetes v1.36: 보안 기본값 강화와 AI 워크로드 지원 성숙"
+description: "Kubernetes v1.36의 핵심 변경 사항과 Ingress NGINX 폐기에 따른 마이그레이션 전략"
+date: "2026-05-16"
+status: "published"
+tags: ["Kubernetes", "DevOps", "Security", "Cloud Infrastructure", "AI Workloads"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-136-security-ga-may-2026"
+---
+
+2026년 5월, Kubernetes v1.36이 출시되었습니다. 70개의 개선 사항을 포함한 이번 릴리스에서는 User Namespaces, Mutating Admission Policies, Fine-Grained Kubelet API Authorization이 GA로 졸업했으며, Ingress NGINX가 공식 폐기되었습니다. 프로덕션 클러스터를 운영하는 팀이 파악해야 할 변경 사항을 정리합니다.
+
+## User Namespaces: 컨테이너 격리 강화
+
+User Namespaces가 v1.36에서 GA에 도달했습니다. 이 기능은 컨테이너 내부에서 root로 보이는 프로세스가 호스트에서는 비특권 사용자 UID로 매핑되도록 합니다.
+
+User Namespaces 없이는 컨테이너 탈출로 컨테이너 내부 root 권한을 얻을 경우 호스트에서도 동일한 권한이 부여될 수 있습니다. User Namespaces를 사용하면 피해 반경이 크게 줄어듭니다.
+
+```yaml
+# Pod 레벨에서 User Namespaces 활성화
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-workload
+spec:
+  hostUsers: false  # User Namespaces 활성화
+  containers:
+  - name: app
+    image: my-app:latest
+    securityContext:
+      runAsUser: 0  # 컨테이너 내부에서는 root이지만
+                    # 호스트에서는 비특권 UID로 매핑됨
+```
+
+보안 요구사항이 엄격한 프로덕션 워크로드에서는 이 설정을 기본 Pod 스펙에 포함시키는 것을 권장합니다. 활성화 전에 컨테이너 이미지가 호스트 레벨 UID에 의존하지 않는지 확인하세요.
+
+## Mutating Admission Policies: Webhook 없이 리소스 변환
+
+Mutating Admission Policies가 GA로 졸업했습니다. 전용 Webhook 서버 없이 CEL(Common Expression Language) 기반으로 리소스를 변환할 수 있습니다. 기본 레이블 추가, 사이드카 설정 주입 등 일반적인 변환 사용 사례에서 운영 오버헤드와 잠재적 장애 지점을 줄일 수 있습니다.
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1alpha1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: inject-team-label
+spec:
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE"]
+      resources: ["pods"]
+  mutations:
+  - patchType: "ApplyConfiguration"
+    applyConfiguration:
+      expression: |
+        Object{
+          metadata: Object.metadata{
+            labels: {"team": "platform"}
+          }
+        }
+```
+
+외부 상태가 필요하거나 복잡한 로직이 필요한 경우에는 여전히 Webhook이 필요합니다. 그러나 선언적 변환에는 네이티브 방식이 더 간결합니다.
+
+## Fine-Grained Kubelet API Authorization
+
+Kubelet API 접근이 이제 더 세밀하게 제어됩니다. 이전에는 접근 권한이 비교적 거칠었지만, 새로운 인가 모델은 특정 서브리소스에 대한 접근 범위를 제한할 수 있어 클러스터 내 횡적 이동 공격의 공격 면을 줄입니다.
+
+Kubelet API에 대한 광범위한 접근을 허용하는 기존 RBAC 정책을 검토하고 적절히 제한하세요.
+
+## Ingress NGINX 폐기
+
+Ingress NGINX는 2026년 3월 24일에 공식 폐기되었습니다. 많은 클러스터에 직접적인 영향을 주는 중요한 변경 사항입니다.
+
+마이그레이션 옵션:
+
+1. **Gateway API** — Kubernetes 공식 차세대 Ingress 추상화, 신규 배포에 권장
+2. **Envoy Gateway** — CNCF 졸업 프로젝트인 Envoy 기반 Gateway API 구현체
+3. **NGINX Inc.의 NGINX Ingress Controller** — 커뮤니티 버전과 별개의 NGINX Inc. 제공 구현체
+
+```bash
+# 현재 Ingress 컨트롤러 버전 확인
+kubectl get pods -n ingress-nginx \
+  -o jsonpath='{.items[*].spec.containers[*].image}'
+
+# Gateway API CRD 설치 여부 확인
+kubectl get crd gateways.gateway.networking.k8s.io 2>/dev/null \
+  && echo "Gateway API 설치됨" || echo "미설치"
+```
+
+폐기는 신규 기능 추가 중단을 의미하며, 결국 보안 패치도 제공되지 않습니다. 장애가 발생하기 전에 지금 바로 마이그레이션 계획을 수립하세요.
+
+## AI 워크로드와 클러스터 모니터링의 변화
+
+Kubernetes는 GPU 기반 워크로드의 기본 오케스트레이션 기반으로 본격적으로 성숙하고 있습니다. 기존의 CPU·메모리 중심 모니터링은 GPU 활용률, 메모리 대역폭, 추론 처리량 등 AI 특화 지표로 보완해야 합니다.
+
+Platform Engineering 팀은 ML 엔지니어가 깊은 Kubernetes 전문 지식 없이도 훈련 작업을 실행할 수 있도록 Ray나 Kubeflow 같은 추상화 계층이 필요하다는 것을 경험하고 있습니다.
+
+## 정리
+
+v1.36은 보안 측면에서 의미 있는 릴리스입니다. User Namespaces와 Fine-Grained Kubelet Auth의 GA 졸업은 보안 기준선을 강화할 수 있는 구체적인 도구를 제공합니다. Ingress NGINX 폐기는 즉각적인 조치가 필요한 항목입니다. 아직 Gateway API를 평가하지 않았다면 지금 시작하세요.

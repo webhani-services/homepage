@@ -1,0 +1,125 @@
+---
+title: "Next.js 15.5とTurbopack：Rust製バンドラーが本番環境に近づく"
+description: "Turbopackビルドがベータ到達、安定版Node.js Middleware、next lint非推奨化——Next.js 15.5の変更点と現場への影響"
+date: "2026-05-16"
+status: "published"
+tags: ["Next.js", "Turbopack", "React", "TypeScript", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-turbopack-production-may-2026"
+---
+
+Next.js 15.5がリリースされ、Turbopackビルドがベータ段階に到達した。安定版Node.js Middleware、TypeScriptの型定義改善、`next lint`の非推奨化など、複数の重要な変更が含まれている。Next.js 16への移行を見据えた準備としても、今回の変更点は把握しておく価値がある。
+
+## Turbopack Builds ベータ到達
+
+TurbopackはVercelが開発するRust製のバンドラーだ。Next.js 14からdev serverでは利用可能だったが、`next build`でのProductionビルドがようやくベータに到達した。
+
+公開されているパフォーマンス比較によると：
+
+| シナリオ | Webpack比 |
+|----------|-----------|
+| 大規模プロジェクトの初期ビルド | 最大700倍高速 |
+| Dev Server 起動 | ほぼ瞬時 |
+| Hot Module Replacement | 大幅に短縮 |
+
+体感できる差はプロジェクトの規模と設定に依存する。コンポーネント数が数百を超え、複雑な依存関係を持つプロジェクトほど効果が顕著だ。
+
+### 有効化の方法
+
+```bash
+# next.config.mjs で有効化する場合
+# Next.js 15.5 以降
+
+# CLIオプションでの指定
+next build --turbopack
+```
+
+ベータ版であるため、既存のカスタムWebpack設定との互換性は必ず確認すること。特に注意が必要なのは：
+
+- カスタムローダー（SVGのReactコンポーネント化など）の互換性
+- Sentry等のWebpack Pluginの対応状況
+- `next.config.mjs`の`webpack`コールバックに依存したロジック
+
+本番投入前に、既存のビルド出力と差異がないことを段階的に検証することを推奨する。
+
+## 安定版 Node.js Middleware
+
+Next.js Middlewareが完全なNode.js環境で動作するようになった。これまでEdge Runtimeの制約により使用できなかったNode.js組み込みモジュールが利用可能になる。
+
+```typescript
+// middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+import { createHash } from "crypto"; // Node.js組み込みモジュールが使用可能に
+
+export function middleware(request: NextRequest) {
+  const token = request.headers.get("x-api-token") ?? "";
+  const hash = createHash("sha256").update(token).digest("hex");
+
+  if (!isValidToken(hash)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: "/api/:path*",
+};
+
+function isValidToken(hash: string): boolean {
+  const validHashes = process.env.VALID_TOKEN_HASHES?.split(",") ?? [];
+  return validHashes.includes(hash);
+}
+```
+
+VercelのFluid Compute環境（標準Node.jsランタイム）との整合性が取れた形だ。Edge Runtimeの制約に悩まされていたチームにとっては、実用的な改善になる。
+
+## `next lint` の非推奨化
+
+`next lint`コマンドが非推奨となり、Next.js 16で削除される予定だ。ESLintや他のリントツールを直接使用することが推奨される。
+
+```json
+// package.json の修正
+{
+  "scripts": {
+    "lint": "eslint src --ext .ts,.tsx,.js,.jsx"
+  }
+}
+```
+
+`.eslintrc.json`や`eslint.config.mjs`でNext.js用のルールセットを明示的に設定することで、これまでの`next lint`相当の動作を維持できる。
+
+```json
+// .eslintrc.json
+{
+  "extends": ["next/core-web-vitals", "next/typescript"]
+}
+```
+
+## TypeScript の改善
+
+React 19のServer ComponentsやActivity APIに向けた型定義の改善が含まれている。Server Componentの非同期関数に対して適切な型推論が効くようになり、`any`や型キャストへの依存が減少する。
+
+```typescript
+// Server Componentの型定義改善の恩恵例
+interface UserProfileProps {
+  userId: string;
+}
+
+// async Server Component — 型推論が正確になる
+async function UserProfile({ userId }: UserProfileProps) {
+  const user = await fetchUser(userId); // 戻り値の型が正確に推論される
+  return <div>{user.name}</div>;
+}
+```
+
+## webhaniの現場から
+
+webhaniではNext.jsを使用するクライアントプロジェクトが複数あり、Turbopackビルドのベータ到達は待ちわびていた機能だ。現時点での推奨アプローチは段階的な評価だ。
+
+**新規プロジェクト**: Turbopackを最初から有効にして開始し、ビルド品質を初期段階から検証する。
+
+**既存プロジェクト**: まずdev serverでTurbopackを有効にして開発体験の改善を確認し、並行してProductionビルドの移行準備を進める。CIでは既存のWebpackビルドをしばらく並行で動かし、出力の一致を継続的に確認すると安心だ。
+
+Next.js 16の正式リリースに向けて、`next lint`の移行とあわせてアップグレードパスを今から計画しておくと、将来の対応コストを低く抑えられる。
