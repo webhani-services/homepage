@@ -1,0 +1,119 @@
+---
+title: "Next.js 15.5 and Turbopack: Rust-Based Builds Move Closer to Production"
+description: "Turbopack builds hit beta, Node.js middleware stabilizes, and next lint is deprecated — here's what Next.js 15.5 means for your project."
+date: "2026-05-16"
+status: "published"
+tags: ["Next.js", "Turbopack", "React", "TypeScript", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-turbopack-production-may-2026"
+---
+
+Next.js 15.5 ships with Turbopack production builds in beta, stable Node.js middleware, TypeScript improvements, and the deprecation of `next lint`. If you're planning a Next.js 16 upgrade path, these changes are worth understanding now.
+
+## Turbopack Builds: Beta for Production
+
+Turbopack, Vercel's Rust-based bundler, has been available for the dev server since Next.js 14. With 15.5, production builds (`next build`) have finally reached beta.
+
+Reported performance characteristics compared to Webpack:
+
+| Scenario | Improvement |
+|----------|-------------|
+| Initial build on large projects | Up to 700x faster |
+| Dev server cold start | Near-instant |
+| Hot Module Replacement | Significantly faster |
+
+The actual gain depends on your project's size and configuration. Smaller projects see less impact; projects with hundreds of components and complex dependency graphs see the most.
+
+### Enabling It
+
+```bash
+# Via CLI flag
+next build --turbopack
+```
+
+Since this is beta, verify compatibility with your existing Webpack customizations:
+
+- Custom loaders (e.g., SVGR for React SVG components)
+- Webpack plugins like Sentry's
+- Logic in the `webpack` callback in `next.config.mjs`
+
+Before promoting to production, run both Webpack and Turbopack builds in CI and diff the outputs. Catch differences early rather than in a production incident.
+
+## Stable Node.js Middleware
+
+Middleware now runs in a full Node.js environment, removing the Edge Runtime restrictions that prevented using Node.js built-in modules.
+
+```typescript
+// middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+import { createHash } from "crypto"; // Now available in Middleware
+
+export function middleware(request: NextRequest) {
+  const token = request.headers.get("x-api-token") ?? "";
+  const hash = createHash("sha256").update(token).digest("hex");
+
+  if (!isValidToken(hash)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: "/api/:path*",
+};
+
+function isValidToken(hash: string): boolean {
+  const validHashes = process.env.VALID_TOKEN_HASHES?.split(",") ?? [];
+  return validHashes.includes(hash);
+}
+```
+
+This aligns with Vercel's Fluid Compute environment, which runs standard Node.js. If you previously worked around Edge Runtime limitations with workarounds or separate API routes, you can now simplify that logic directly in middleware.
+
+## `next lint` Deprecated
+
+The `next lint` command is deprecated and will be removed in Next.js 16. The recommendation is to call ESLint directly.
+
+```json
+// package.json
+{
+  "scripts": {
+    "lint": "eslint src --ext .ts,.tsx,.js,.jsx"
+  }
+}
+```
+
+To preserve the same rule set that `next lint` provided, explicitly configure the Next.js ESLint packages:
+
+```json
+// .eslintrc.json
+{
+  "extends": ["next/core-web-vitals", "next/typescript"]
+}
+```
+
+## TypeScript Improvements
+
+Improved type definitions for React 19 features — Server Components and the Activity API in particular — reduce the need for `any` casts and manual type annotations in server-side code.
+
+```typescript
+// Async Server Components now get accurate type inference
+interface UserProfileProps {
+  userId: string;
+}
+
+async function UserProfile({ userId }: UserProfileProps) {
+  const user = await fetchUser(userId); // Return type inferred correctly
+  return <div>{user.name}</div>;
+}
+```
+
+## Practical Approach
+
+For new projects: enable Turbopack from the start and validate build quality early.
+
+For existing projects: enable Turbopack for the dev server first to improve the development loop. Run production Turbopack builds in a separate CI job alongside the existing Webpack build, and diff the outputs before switching over completely.
+
+Addressing the `next lint` deprecation now costs almost nothing. Doing it during a rushed Next.js 16 upgrade costs more. Take care of it in the next sprint.

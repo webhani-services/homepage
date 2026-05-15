@@ -1,0 +1,103 @@
+---
+title: "Kubernetes v1.36 リリース：セキュリティ強化とAIワークロード対応の成熟"
+description: "70件の改善点を含むKubernetes v1.36の主要変更点と、Ingress NGINX廃止が現場に与えるインパクト"
+date: "2026-05-16"
+status: "published"
+tags: ["Kubernetes", "DevOps", "Security", "Cloud Infrastructure", "AI Workloads"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-136-security-ga-may-2026"
+---
+
+2026年5月、Kubernetes v1.36がリリースされた。70件の機能強化を含む本リリースでは、User Namespaces・Mutating Admission Policies・Fine-Grained Kubelet API AuthorizationがGeneral Availabilityに到達し、Ingress NGINXの廃止も現実のものとなっている。本番クラスターを運用するチームが把握すべき変更点を整理する。
+
+## User Namespaces の General Availability
+
+User NamespacesがついにGAに到達した。この機能により、コンテナ内のプロセスがホストのroot権限とは別のユーザーIDで動作できるようになる。
+
+User Namespacesがない状態では、コンテナブレイクアウトでコンテナ内のroot権限を取得された場合、ホスト上でも同等の権限が付与されてしまうリスクがある。User Namespacesにより、コンテナ内のrootがホスト上では非特権ユーザーとしてマッピングされ、被害範囲が大幅に縮小される。
+
+```yaml
+# Pod specでUser Namespacesを有効化
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-workload
+spec:
+  hostUsers: false  # User Namespacesを有効化
+  containers:
+  - name: app
+    image: my-app:latest
+    securityContext:
+      runAsUser: 0  # コンテナ内ではrootに見えるが
+                    # ホスト上では非特権UIDにマッピング
+```
+
+セキュリティ要件が厳しい本番ワークロードでは、このフラグをベースラインのPod specに含めることを推奨する。有効化の前に、コンテナイメージがホストレベルのUID前提を持っていないことを確認すること。
+
+## Mutating Admission Policies の General Availability
+
+Mutating Admission PoliciesがGAとなり、WebhookサーバーなしにCEL（Common Expression Language）ベースでリソースを変更できるようになった。デフォルトラベルの追加やサイドカー設定の注入といった一般的なユースケースでは、運用オーバーヘッドと潜在的な障害点を削減できる。
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1alpha1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: inject-team-label
+spec:
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE"]
+      resources: ["pods"]
+  mutations:
+  - patchType: "ApplyConfiguration"
+    applyConfiguration:
+      expression: |
+        Object{
+          metadata: Object.metadata{
+            labels: {"team": "platform"}
+          }
+        }
+```
+
+外部状態を必要とする複雑なロジックや多段階の判断が必要なケースでは依然としてWebhookが必要だ。しかし宣言的な変換には、ネイティブアプローチのほうがシンプルに実装できる。
+
+## Fine-Grained Kubelet API Authorization の General Availability
+
+Kubelet APIへのアクセスがより細粒度で制御できるようになった。これまでのKubelet APIアクセスは比較的粗粒度で、「あるかないか」という形だった。新しい認可モデルでは特定のサブリソースへのアクセスをスコープ限定できるため、クラスター内での横移動攻撃のリスクが低下する。
+
+既存のRBACポリシーでKubelet APIへのアクセスを幅広く許可しているものがないかを確認し、適切に絞り込むことを推奨する。
+
+## Ingress NGINX の廃止
+
+2026年3月24日、SIG NetworkとSecurity Response CommitteeがIngress NGINXプロジェクトを廃止した。多くのクラスターに直接影響する重大な変更だ。
+
+移行の選択肢としては：
+
+1. **Gateway API** — Kubernetes公式の次世代Ingress抽象化。新規デプロイに推奨
+2. **Envoy Gateway** — CNCFグラジュエートプロジェクトのEnvoyベースのGateway API実装
+3. **NGINX Inc.のNGINX Ingress Controller** — コミュニティ版とは別の、NGINX Inc.が提供するNGINXベース実装
+
+```bash
+# 現在のIngress NGINXバージョンを確認
+kubectl get pods -n ingress-nginx \
+  -o jsonpath='{.items[*].spec.containers[*].image}'
+
+# Gateway API CRDのインストール確認
+kubectl get crd gateways.gateway.networking.k8s.io 2>/dev/null \
+  && echo "Gateway API インストール済み" || echo "未インストール"
+```
+
+廃止は新機能追加の終了を意味し、最終的にはセキュリティパッチも提供されなくなる。障害に追い込まれる前に、今すぐ移行計画を立てること。
+
+## AIワークロードと監視の変化
+
+KubernetesはGPUベースワークロードのデフォルトのオーケストレーション基盤として本格的に成熟しつつある。従来のCPU・メモリ中心の「ゴールデンシグナル」は、GPU使用率・HBM帯域幅・推論スループットなどAI特有の指標で補完する必要が出てきた。
+
+Platform Engineeringの観点では、MLエンジニアが深いKubernetes知識なしにトレーニングジョブを実行できるよう、RayやKubeflowといった抽象化レイヤーの整備が重要性を増している。
+
+## まとめ
+
+v1.36はセキュリティ強化として意味のあるリリースだ。User NamespacesとFine-Grained Kubelet AuthのGA到達により、ベースラインを引き締めるための具体的な手段が提供された。Ingress NGINXの廃止は即座に対応が必要な項目だ。まだGateway APIを評価していないなら、今すぐ開始することを強く推奨する。
