@@ -1,0 +1,124 @@
+---
+title: "Claude Opus 4.7 출시와 Agentic Workflow 설계 실전 가이드"
+description: "Anthropic의 Claude Opus 4.7 출시와 함께 부상한 Agentic Workflow 패턴을 실전 코드와 함께 정리합니다."
+date: "2026-05-17"
+status: "published"
+tags: ["Claude", "AI", "Agentic Workflow", "LLM", "Claude Code"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-opus-47-agentic-workflows"
+---
+
+Anthropic이 이번 주 Claude Opus 4.7을 정식 출시했습니다. Opus 4.6 대비 고난도 소프트웨어 엔지니어링 작업에서 명확한 성능 향상이 있으며, 특히 복잡한 코딩 태스크에서 두드러집니다. 같은 시기에 열린 Code with Claude 2026 이벤트에서는 업계의 흐름이 단순 LLM 응답 생성에서 자율적인 Agentic Workflow로 이동하고 있음이 명확하게 제시되었습니다.
+
+## Opus 4.7의 주요 변경 사항
+
+Opus 4.6 대비 개선된 영역은 다음과 같습니다.
+
+- **고난도 코딩 태스크**: 여러 파일에 걸친 리팩토링, 긴 디버깅 세션 유지
+- **계획 수립 정확도**: 모호한 태스크를 구체적인 단계로 분해하는 능력 향상
+- **Tool 사용 일관성**: 다단계 Tool 호출에서의 판단 안정성 개선
+
+경쟁 대응을 위해 **Opus 4.7 Fast mode**도 함께 출시되었으며, Agent 루프에서의 레이턴시를 줄이는 데 초점을 맞추고 있습니다. Claude Code 사용자에게는 2026년 7월 13일까지 주간 사용 한도가 50% 추가 확대됩니다.
+
+## Agentic Workflow 기본 구조
+
+Agentic Workflow는 단일 응답 생성 대신 계획→실행→검증의 루프를 통해 태스크를 자율적으로 완료하는 설계입니다.
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+def run_agent(task: str, tools: list, max_steps: int = 8) -> str:
+    messages = [{"role": "user", "content": task}]
+
+    for step in range(max_steps):
+        response = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=8096,
+            tools=tools,
+            messages=messages
+        )
+
+        if response.stop_reason == "end_turn":
+            return next(
+                block.text for block in response.content
+                if hasattr(block, "text")
+            )
+
+        # Tool 실행 결과를 messages에 추가
+        tool_results = dispatch_tool_calls(response.content)
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+
+    raise RuntimeError(f"Agent가 {max_steps} 스텝 내에 완료하지 못했습니다")
+```
+
+`max_steps` 제한은 반드시 설정하세요. 무제한 Agent 루프는 예상치 못한 비용 폭증의 원인이 됩니다.
+
+## Prompt Caching으로 비용 절감
+
+Agent 루프는 입력 토큰 소비가 많습니다. 코드베이스 전체나 대형 시스템 컨텍스트를 반복해서 참조하는 경우, Prompt Caching을 사용하세요.
+
+```python
+response = client.messages.create(
+    model="claude-opus-4-7",
+    max_tokens=4096,
+    system=[
+        {
+            "type": "text",
+            "text": codebase_context,
+            "cache_control": {"type": "ephemeral"}  # 캐시 활성화
+        },
+        {
+            "type": "text",
+            "text": "다음 태스크를 완료하세요:"
+        }
+    ],
+    messages=messages
+)
+```
+
+`ephemeral` 캐시는 5분 TTL을 가집니다. 빠른 루프로 동작하는 Agent에서 동일한 컨텍스트를 반복 참조한다면 입력 비용을 크게 절감할 수 있습니다.
+
+## Tool 설계 원칙
+
+각 Tool은 단일 책임만 가져야 합니다. 여러 동작을 하나의 Tool에 넣으면 모델이 언제 사용할지 판단하기 어려워집니다.
+
+```python
+tools = [
+    build_tool("read_file", "경로로 파일 읽기", {"path": "string"}),
+    build_tool("write_file", "파일에 내용 쓰기", {"path": "string", "content": "string"}),
+    build_tool("run_tests", "테스트 실행", {"test_path": "string"}),
+    build_tool("search_code", "코드베이스 패턴 검색", {"query": "string"}),
+]
+```
+
+Tool을 작게 나눌수록 모델이 각 단계에서 정확한 판단을 내릴 수 있습니다.
+
+## Verification 루프를 워크플로에 포함하기
+
+Agent가 생성한 코드를 그냥 사용하지 마세요. 테스트 실행과 Lint 체크를 워크플로에 포함해 Agent가 스스로 수정할 수 있게 해야 합니다.
+
+```python
+def verification_step(code: str) -> dict:
+    test_result = run_tests()
+    lint_result = run_lint(code)
+    return {
+        "passed": test_result.success and lint_result.success,
+        "errors": test_result.errors + lint_result.errors
+    }
+```
+
+Opus 4.7의 개선된 성능은 빠른 피드백 루프와 결합할 때 효과가 극대화됩니다. 자신의 출력을 검증하고 반복할 수 있는 Agent는 단일 응답을 생성하는 것보다 훨씬 신뢰도가 높습니다.
+
+## 시작하기 좋은 유스케이스
+
+가장 ROI가 높은 첫 번째 적용 대상은 이미 반복적으로 수행하고 있는 작업입니다.
+
+- **실패한 테스트 자동 수정**: Agent가 실패 원인 분석 → 수정 적용 → 재실행
+- **PR Description 자동 생성**: 변경 diff를 분석해 구조화된 설명 작성
+- **의존성 업데이트 검증**: 패키지 업데이트 후 회귀 테스트 자동 수행
+
+작은 범위에서 시작하세요. 하나의 태스크, 고정된 Tool 세트, 명확한 스텝 제한. 설계상의 문제는 이 단계에서 빠르게 드러납니다. Opus 4.7 출시는 Agent 실험을 시작하기 좋은 시점입니다.
