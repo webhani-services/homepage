@@ -1,0 +1,141 @@
+---
+title: "Claude Opus 4.7 とAgentic Workflow設計の実践"
+description: "Claude Opus 4.7のリリースを機に、LLM応答生成から自律Agentへの移行を実践的な設計パターンで解説します。"
+date: "2026-05-17"
+status: "published"
+tags: ["Claude", "AI", "Agentic Workflow", "LLM", "Claude Code"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-opus-47-agentic-workflows"
+---
+
+Anthropicは今週Claude Opus 4.7を一般公開しました。前バージョンのOpus 4.6と比較して、特に「困難なソフトウェアエンジニアリングタスク」での性能向上が顕著とされています。
+
+同時期に開催されたCode with Claude 2026イベントでは、業界のトレンドとして「単純なLLM応答」から「自律的なAgentic Workflow」への移行が明確に示されました。この記事では、Opus 4.7の実際の変化点と、Agentic Workflowをどう設計すべきかを整理します。
+
+## Opus 4.7 の実際の変化点
+
+Opus 4.7はOpus 4.6に対して以下の領域で改善されています。
+
+- **難易度の高いコーディング**: 複数ファイルにまたがる複雑なリファクタリングや長いデバッグセッション
+- **計画の精度**: タスクの分解と依存関係の認識が向上
+- **ツール使用の一貫性**: 複数ステップのツール呼び出しにおける判断の安定性
+
+また、Claude Codeユーザー向けに週次利用上限が2026年7月13日まで50%引き上げられています（既存の拡張上限に積算）。さらに、レイテンシを重視した「Opus 4.7 Fast mode」も同時にリリースされました。
+
+## Agentic Workflowとは何か
+
+Agentic Workflowは、AIが単一の応答を生成するのではなく、ツールを使いながら複数ステップのタスクを自律的に完了する設計です。典型的な構造は以下の通りです。
+
+```
+Planner → Executor → Verifier → (再試行またはComplete)
+```
+
+この構造で重要なのは各レイヤーの責務の分離です。Plannerには「何を」「どの順序で」行うかだけを持たせ、実装詳細はExecutorに委譲します。
+
+### シンプルなAgentループの実装例
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+def run_coding_agent(task: str, max_steps: int = 8) -> str:
+    messages = [{"role": "user", "content": task}]
+
+    for step in range(max_steps):
+        response = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=8096,
+            tools=get_tools(),
+            messages=messages,
+            system="You are an expert software engineer. Complete the task step by step, verifying each change."
+        )
+
+        if response.stop_reason == "end_turn":
+            return extract_text(response)
+
+        if response.stop_reason == "tool_use":
+            tool_results = execute_tool_calls(response.content)
+            messages.extend([
+                {"role": "assistant", "content": response.content},
+                {"role": "user", "content": tool_results}
+            ])
+
+    raise RuntimeError(f"Agent did not complete task within {max_steps} steps")
+```
+
+ループ終了条件は明示的に設定してください。制限なしのAgentループは予期しないコスト増の原因になります。
+
+## Prompt Cachingでコストを制御する
+
+Agentic WorkflowではトークンのIN方向が多くなります。コードベース全体をシステムプロンプトに含める場合など、繰り返し参照する大きなコンテキストはPrompt Cachingを使ってください。
+
+```python
+response = client.messages.create(
+    model="claude-opus-4-7",
+    max_tokens=4096,
+    system=[
+        {
+            "type": "text",
+            "text": codebase_context,
+            "cache_control": {"type": "ephemeral"}  # キャッシュ有効
+        },
+        {
+            "type": "text",
+            "text": "Complete the following task:"
+        }
+    ],
+    messages=messages
+)
+```
+
+`cache_control: ephemeral`を指定すると、最大5分間コンテキストがキャッシュされます。繰り返しのAgentループで同じコードベースを読む場合、大幅なコスト削減が可能です。
+
+## ツール設計のベストプラクティス
+
+Agentに渡すツールは「単一責任」を意識してください。
+
+```python
+# 良い例: 責務が分離されている
+tools = [
+    {"name": "read_file", ...},
+    {"name": "write_file", ...},
+    {"name": "run_tests", ...},
+    {"name": "git_diff", ...}
+]
+
+# 避けるべき例: 責務が混在している
+tools = [
+    {"name": "read_and_modify_and_commit", ...}
+]
+```
+
+ツールを細かく分けると、モデルが適切なタイミングで正確なツールを選択しやすくなります。
+
+## Verificationステップを組み込む
+
+生成したコードをそのまま使用するのではなく、テスト実行やLintチェックを必ずAgentのワークフローに組み込みます。Agentはその結果に基づいて自律的に修正を繰り返す設計にするのが基本です。
+
+```python
+def verification_step(code: str) -> dict:
+    """テストとLintを実行して結果を返す"""
+    test_result = run_tests()
+    lint_result = run_lint(code)
+    return {
+        "passed": test_result.success and lint_result.success,
+        "errors": test_result.errors + lint_result.errors
+    }
+```
+
+検証ステップを設けることで、Agentが誤った修正を続けるリスクを減らし、出力の品質を安定させることができます。
+
+## 開発チームへの提案
+
+Agentic Workflowの導入で最も効果的な最初のユースケースは、既存の繰り返し作業です。
+
+- テストの自動修正（失敗したテストをAgentが解析→修正→再実行）
+- コードレビューの自動化（差分を解析してコメント生成）
+- 定型的なドキュメント更新
+
+大きなシステムを最初から作るより、小さなAgentを一つ実装して運用することで、設計上の問題点が早期に見えてきます。Opus 4.7のリリースは、こうした実験を始める良いタイミングです。
