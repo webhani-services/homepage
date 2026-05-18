@@ -1,0 +1,134 @@
+---
+title: "TanStack サプライチェーン攻撃が示す CI/CD セキュリティの盲点"
+description: "2026年5月に発生した TanStack/router リポジトリへの不正コミット事案を起点に、GitHub Actions パイプラインのサプライチェーンリスクと防御策を解説します。"
+date: "2026-05-19"
+status: "published"
+tags: ["security", "supply-chain", "CI/CD", "GitHub Actions", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "tanstack-supply-chain-cicd-security-may-2026"
+---
+
+## TanStack/router で何が起きたか
+
+2026年5月、TanStack/router GitHub リポジトリに、親コミットを持たない孤立したコミット（orphaned commit）が不正に push されるという事案が発生しました。「Mini Shai-Hulud 攻撃」として報告されたこのインシデントは、正規のコントリビューターに見せかけた認証情報を用いたアクセスで発生したとみられています。
+
+確認された実害は報告されていませんが、この事案が示すリスクは軽視できません。TanStack Router は React エコシステムで最もダウンロード数の多いルーティングライブラリの一つです。悪意あるコードがリリースに混入した場合、誰かが発見するまでの間に大量のプロダクションアプリケーションへ伝播する可能性があります。
+
+## なぜ CI/CD パイプラインが狙われるのか
+
+攻撃者にとって CI/CD パイプラインが標的として魅力的な理由は明確です。
+
+1. **高い権限で動作する** — デプロイ認証情報、クラウドプロバイダーへのアクセス権、署名鍵を保有
+2. **自動実行される** — push や PR のたびに人間のレビューなしにコードが実行される
+3. **複雑な依存関係チェーン** — サードパーティ Actions、npm パッケージ、Docker イメージなど外部要素が攻撃対象を広げる
+
+TanStack 攻撃のベクターはパイプライン自体というよりリポジトリアクセス権でしたが、リスクパターンは同じです。リポジトリの侵害は、ビルドアーティファクトの侵害へと連鎖します。
+
+## GitHub Actions の 2026 年セキュリティロードマップ
+
+GitHub は 2026 年の Actions セキュリティロードマップを公表しており、以下の機能を段階的に提供しています。
+
+**ワークフロー依存関係のロック:** Actions のバージョンを SHA でピン留めする現在のベストプラクティスを、公式のロックファイル機能として提供予定です。
+
+**Native Egress Firewall（Layer 7）:** ワークフロー実行中のアウトバウンド通信を制御するファイアウォール。攻撃者のインフラへのデータ持ち出しを防ぎます。
+
+**Scoped Secrets:** シークレットのスコープを特定のワークフローやジョブに限定できるようになります。現在は Organization または Repository レベルで全ジョブがすべてのシークレットを参照できる状態です。
+
+**OIDC Custom Property Claims（GA）:** Actions OIDC トークンにリポジトリのカスタムプロパティをクレームとして含められるようになりました。クラウドプロバイダーとの連携時に、より細粒度のトラストポリシーを実現できます。
+
+## 今すぐ実施できる防御策
+
+### 1. Actions の SHA ピン留め
+
+```yaml
+# 危険: タグは別のコミットを指すよう変更される可能性がある
+- uses: actions/checkout@v4
+
+# 安全: 特定のコミット SHA でピン留め
+- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+```
+
+タグは変更可能です。SHA ピン留めにより、参照するコードが明示的な更新なしに変わることがなくなります。
+
+### 2. 最小権限の設定
+
+```yaml
+# ワークフローレベルで制限的なデフォルトを設定
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # OIDC のみ。静的な認証情報は使わない
+```
+
+既存のワークフローを監査してください。`contents: write` が不要なのに設定されているケースが多く見られます。
+
+### 3. OIDC による静的認証情報の排除
+
+長期有効なアクセスキーをシークレットとして保存する代わりに、OIDC を使用して短命トークンを取得します。
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+
+steps:
+  - name: AWS 認証（OIDC）
+    uses: aws-actions/configure-aws-credentials@010d0da01d0b5a38af31e9c3470dbfdabdecca3a  # v4
+    with:
+      role-to-assume: arn:aws:iam::123456789012:role/github-actions-role
+      aws-region: ap-northeast-1
+      # アクセスキーの指定なし — OIDC トークンから自動取得
+```
+
+このトークンはジョブのスコープで数分間のみ有効です。漏洩しても攻撃者が使用できる時間窓が極めて短くなります。
+
+### 4. ブランチ保護とコミット署名の強化
+
+TanStack インシデントは、既知のコントリビューターに見せかけた不法なコミットが関与していました。コミット署名を要求することで、このタイプの攻撃を直接防げます。
+
+```
+Settings → Branches → Branch protection rules:
+✅ Require pull request reviews before merging
+✅ Require review from Code Owners
+✅ Restrict who can push to matching branches
+✅ Require signed commits  ← このタイプの攻撃への直接的な対策
+```
+
+GPG または SSH コミット署名を強制することで、認証された鍵の有効な署名がないコミットは拒否されます。
+
+### 5. Dependabot による Actions の自動更新
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+```
+
+SHA ピン留めと組み合わせることで、Dependabot が最新のタグ付きリリースへの SHA を自動更新します。不変性と最新性を同時に確保できます。
+
+## 対応の優先順位
+
+| 優先度 | 対策 | 理由 |
+|--------|------|------|
+| 1 | クラウド認証を OIDC に切り替える | 長期静的認証情報を排除。効果大・設定コスト小 |
+| 2 | コミット署名を必須化 | 不正コミット挿入を直接防ぐ |
+| 3 | すべての Actions を SHA ピン留め | 依存関係グラフを固定。Dependabot で管理の手間を削減 |
+| 4 | 権限を最小化 | 認証情報が侵害された際の被害範囲を縮小 |
+
+## まとめ
+
+TanStack インシデントは、サプライチェーン攻撃が著名な OSS プロジェクトにも現実に発生することを示しました。今回は確認された実害はありませんでしたが、攻撃を可能にした手法（正規に見える不正コミット）は、ほかの事例で実際に深刻な被害を引き起こした手法と同じです。
+
+GitHub の 2026 年セキュリティロードマップがプラットフォームレベルで構造的な問題を解決しつつあります。その間も、ここで紹介した防御策は今日すぐ適用可能であり、パイプラインの大きな書き直しなしに最も一般的な攻撃ベクターを塞ぐことができます。
