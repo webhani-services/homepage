@@ -1,0 +1,104 @@
+---
+title: "Anthropic의 Stainless 인수 — SDK와 MCP 생태계에 미치는 영향"
+description: "OpenAI, Google, Cloudflare도 사용하던 SDK·MCP 서버 자동 생성 툴 Stainless를 Anthropic이 인수했습니다. 개발자 생태계 변화를 분석합니다."
+date: "2026-05-19"
+status: "published"
+tags: ["AI", "MCP", "SDK", "Anthropic", "developer-tools"]
+thumbnail: ""
+author: "webhani"
+slug: "anthropic-stainless-acquisition-sdk-mcp-2026"
+---
+
+## Stainless란 무엇인가
+
+2022년 Stripe 출신 엔지니어가 창업한 Stainless는 API 스펙(OpenAPI)으로부터 TypeScript, Python, Go, Java, Kotlin 등 다양한 언어의 SDK를 자동 생성하는 툴입니다. 단일 스펙으로 언어별 일관된 SDK를 만들어낸다는 점에서 많은 API 회사들이 채택했습니다.
+
+주목할 점은 고객 목록입니다. Anthropic 자체뿐 아니라 OpenAI, Google, Cloudflare가 모두 Stainless를 사용했습니다. 경쟁 관계인 AI 회사들이 공유하던 인프라가 이번 인수로 Anthropic 내부 리소스가 됩니다. TechCrunch 보도(2026년 5월 18일)에 따르면 인수 가격은 3억 달러 이상으로 알려졌습니다.
+
+## 인수의 전략적 의미
+
+**SDK 품질이 API 채택률을 결정합니다.** 재시도 로직, 페이지네이션, 타입 안전한 에러 처리, 스트리밍 응답 처리가 잘 구현된 SDK는 개발자의 온보딩 마찰을 크게 줄입니다. Stainless는 이를 자동화했고, 이 역량이 이제 Anthropic 내부에 귀속됩니다.
+
+**MCP 생태계 장악:** Stainless는 SDK뿐 아니라 MCP(Model Context Protocol) 서버도 자동 생성했습니다. Anthropic이 창안한 MCP가 AI 에이전트 툴 연동 표준으로 자리잡아가는 시점에, 그 서버 생성 툴의 핵심 제공자를 인수한 것은 전략적으로 중요합니다.
+
+**경쟁사에 대한 영향:** Anthropic은 Stainless의 호스팅 SDK 생성 서비스를 종료할 예정입니다. 기존 고객은 이미 생성된 코드에 대한 소유권과 수정 권한을 유지하지만, 새로운 자동 생성은 받을 수 없게 됩니다.
+
+## SDK 품질의 실제 차이
+
+```typescript
+// SDK 없이 직접 구현: 타입 안전성과 재시도 로직 부재
+const response = await fetch("https://api.anthropic.com/v1/messages", {
+  method: "POST",
+  headers: {
+    "x-api-key": apiKey,
+    "anthropic-version": "2023-06-01",
+    "content-type": "application/json",
+  },
+  body: JSON.stringify({ model: "claude-opus-4-7", max_tokens: 1024, messages }),
+});
+if (!response.ok) throw new Error(`HTTP ${response.status}`);
+const data = await response.json();
+
+// 생성된 SDK: 타입 안전, 재시도, 스트리밍 내장
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+const message = await client.messages.create({
+  model: "claude-opus-4-7",
+  max_tokens: 1024,
+  messages: [{ role: "user", content: "안녕하세요" }],
+});
+console.log(message.content[0].text);
+```
+
+고품질 SDK는 지수적 백오프, 레이트 리밋 헤더 처리, 타입 분류된 에러 처리를 일관되게 제공합니다. 이를 TypeScript, Python, Go 등 여러 언어에서 동시에 유지하는 것이 Stainless가 자동화한 핵심입니다.
+
+## MCP 서버 생성의 변화
+
+MCP 서버를 직접 작성하면 상당한 보일러플레이트가 필요합니다:
+
+```typescript
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+
+const server = new Server(
+  { name: "my-api-server", version: "1.0.0" },
+  { capabilities: { tools: {} } }
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: "get_data",
+      description: "데이터를 가져옵니다",
+      inputSchema: {
+        type: "object",
+        properties: { id: { type: "string" } },
+        required: ["id"],
+      },
+    },
+  ],
+}));
+```
+
+Stainless는 이를 API 스펙에서 자동 생성했습니다. 호스팅 서비스 종료 후 새로 MCP 서버를 생성해야 하는 팀은 대안을 검토해야 합니다. 현재 [Speakeasy](https://www.speakeasyapi.dev/)와 [Fern](https://buildwithfern.com/)이 유력한 대안으로 거론됩니다.
+
+## 지금 당장 해야 할 일
+
+**Stainless 기존 사용자라면:** 이미 생성된 코드는 계속 사용할 수 있습니다. 새 기능이 필요할 때는 직접 수정하거나 대안 도구로 전환을 검토하세요.
+
+**Anthropic API 사용 중이라면:** 공식 SDK는 Anthropic 내부에서 계속 유지됩니다. 품질 저하를 걱정할 필요 없이 오히려 향상이 기대됩니다.
+
+**MCP 서버를 구축 중이라면:** MCP SDK 직접 구현에 익숙해지는 것이 중요합니다. Anthropic이 MCP와 생성 툴링 모두를 보유하게 된 만큼, 향후 공식 MCP 개발 도구 개선이 기대됩니다.
+
+**다른 AI 프로바이더의 SDK 생성을 위해 Stainless를 사용했다면:** 대안 툴로의 전환 계획을 수립할 시점입니다.
+
+## 마무리
+
+Anthropic의 Stainless 인수는 AI 경쟁이 '모델 성능'에서 '개발자 생태계 주도권'으로 이동하고 있음을 보여줍니다. SDK, CLI, MCP 커넥터 같은 인프라를 내부화하여 개발자 경험의 전체 스택을 제어하는 전략입니다.
+
+2026년 AI 경쟁은 벤치마크 점수만의 문제가 아닙니다. 누가 개발자 경험 레이어를 소유하느냐의 문제이기도 합니다. Anthropic은 그 레이어를 확장하는 선택을 했습니다.
