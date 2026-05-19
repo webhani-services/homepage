@@ -1,0 +1,190 @@
+---
+title: "Temporal Replay 2026 — Serverless Workers と Workflow Streams の発表"
+description: "Temporal の年次カンファレンス Replay 2026 で発表された Serverless Workers、Workflow Streams、Nexus GA など主要機能を実践的な観点で解説します。"
+date: "2026-05-20"
+status: "published"
+tags: ["Temporal", "workflow", "serverless", "distributed-systems", "backend"]
+thumbnail: ""
+author: "webhani"
+slug: "temporal-replay-2026-serverless-workers"
+---
+
+## Temporal とは
+
+Temporal はワークフローの「Durable Execution（永続的な実行）」プラットフォームです。通常のコード（Python、TypeScript、Go、Java）でワークフローを記述すると、Temporal のランタイムがサーバーのクラッシュ、ネットワーク障害、下流サービスの一時的な停止が発生しても、そのワークフローを最終的に完了させることを保証します。
+
+2026年の年次カンファレンス Replay 2026 では、AI エージェントワークフローへの対応を強化する主要機能が複数発表されました。
+
+## Serverless Workers
+
+これまで Temporal Worker の運用には、常時稼働するサーバーまたはコンテナが必要でした。Serverless Workers は AWS Lambda 上での Worker 実行を可能にし、インフラ管理のオーバーヘッドを削減します。
+
+Temporal Cloud が Workflow のキューの状態に基づいて Worker の起動・スケール・シャットダウンを自動的に管理します。
+
+```python
+# serverless_worker.py — AWS Lambda ハンドラ
+import asyncio
+from temporalio.client import Client
+from temporalio.worker import Worker
+from your_workflows import OrderWorkflow, process_order
+
+async def run_worker():
+    client = await Client.connect("your-namespace.tmprl.cloud:7233")
+    
+    worker = Worker(
+        client,
+        task_queue="order-processing",
+        workflows=[OrderWorkflow],
+        activities=[process_order],
+    )
+    
+    # Lambda のタイムアウト前に適切にシャットダウン
+    try:
+        await asyncio.wait_for(worker.run(), timeout=840)  # 14分（Lambda上限15分未満）
+    except asyncio.TimeoutError:
+        await worker.shutdown()
+
+def handler(event, context):
+    asyncio.run(run_worker())
+```
+
+Serverless Workers が適しているのは、バースト性のある処理（メール送信バッチ、夜間の集計処理など）や、常時高いスループットを必要としないタスクです。長時間実行が必要な Workflow（数時間〜数日）や、Lambda のコールドスタートが問題になるレイテンシ敏感なユースケースでは、引き続き常駐 Worker が適しています。
+
+## Workflow Streams
+
+Workflow Streams は、Temporal の Signal と Update プリミティブを基盤にした「永続的なストリーミング」機能です。現在 Public Preview です。
+
+従来の Temporal Workflow はリクエスト-レスポンス型か、完了時に結果を返すモデルでした。Workflow Streams を使うと、長時間実行される Workflow から UI やモニタリングシステムにリアルタイムで中間結果を送信できます。
+
+```python
+from temporalio import workflow, activity
+from dataclasses import dataclass
+from typing import AsyncIterator
+
+@dataclass
+class ProgressUpdate:
+    step: str
+    progress: float
+    result: str | None = None
+
+@workflow.defn
+class LongRunningAnalysis:
+    def __init__(self):
+        self._updates: list[ProgressUpdate] = []
+        self._done = False
+    
+    @workflow.run
+    async def run(self, data_path: str) -> str:
+        # Step 1: データ読み込み
+        await workflow.execute_activity(
+            load_data,
+            data_path,
+            start_to_close_timeout=timedelta(minutes=5)
+        )
+        self._updates.append(ProgressUpdate(step="load", progress=0.25))
+        
+        # Step 2: 分析処理
+        result = await workflow.execute_activity(
+            analyze_data,
+            data_path,
+            start_to_close_timeout=timedelta(minutes=30)
+        )
+        self._updates.append(ProgressUpdate(
+            step="analyze",
+            progress=1.0,
+            result=result
+        ))
+        
+        self._done = True
+        return result
+    
+    @workflow.query
+    def get_updates(self) -> list[ProgressUpdate]:
+        return self._updates
+    
+    @workflow.query
+    def is_done(self) -> bool:
+        return self._done
+```
+
+AI エージェントワークフローでの活用が特に期待されています。推論処理の中間出力をリアルタイムでフロントエンドに送信したり、長時間のバッチ処理の進捗をダッシュボードで可視化したりするユースケースに対応できます。
+
+## Worker Versioning の GA
+
+Worker Versioning は、実行中の Workflow を起動した Worker バージョンに固定する機能です。これにより、デプロイが進行中の Workflow を壊すことなく実行できます。
+
+従来は新バージョンの Worker をデプロイする際、`workflow.patched()` API でコード分岐を記述する必要がありました。これは複雑さをコードベースに蓄積させる設計でした。
+
+```python
+# Worker Versioning を使用したデプロイ設定
+from temporalio.worker import Worker
+from temporalio.client import Client
+
+async def start_versioned_worker():
+    client = await Client.connect("localhost:7233")
+    
+    worker = Worker(
+        client,
+        task_queue="my-task-queue",
+        workflows=[MyWorkflow],
+        activities=[my_activity],
+        # バージョンを指定することで、このバージョンの Worker は
+        # 同じバージョンで開始された Workflow のみを処理する
+        build_id="v2.1.0",
+        use_worker_versioning=True,
+    )
+    
+    await worker.run()
+```
+
+新旧バージョンの Worker を並行稼働させ、v1 で開始された Workflow は v1 Worker が、v2 で開始された Workflow は v2 Worker が処理します。デプロイ中の状態破損リスクを大幅に削減します。
+
+## External Storage
+
+大きなペイロード（ML モデルの出力、大規模なデータセットなど）を Workflow の状態として保持するのは、Temporal の履歴サイズ制限に引っかかる場合があります。External Storage は Amazon S3 などの外部ストレージと Workflow を統合する機能です（現在 Python/Go で Public Preview）。
+
+```python
+from temporalio.contrib.external_storage import ExternalStorage, S3Driver
+
+# S3 に大きなペイロードを保存する設定
+storage = ExternalStorage(
+    driver=S3Driver(
+        bucket="my-workflow-artifacts",
+        region="ap-northeast-1"
+    )
+)
+
+@activity.defn
+async def generate_report(input_data: str) -> str:
+    # 大きなレポートを生成（数MB）
+    report_content = await run_heavy_analysis(input_data)
+    
+    # External Storage に保存し、参照キーを返す
+    key = await storage.store(report_content.encode())
+    return key  # Workflow 履歴には参照キーのみ保存される
+```
+
+AI エージェントや大規模データ処理パイプラインでの活用が想定されています。
+
+## Nexus の GA
+
+Nexus は異なる Temporal Namespace 間でサービスを接続する機能です。Python SDK では GA、TypeScript/. NET SDK では Public Preview です。
+
+大規模なシステムでは、チームやサービスごとに独立した Namespace を持つことがベストプラクティスです。Nexus を使うと、Namespace 間の Workflow 呼び出しをコードレベルで安全に扱えます。
+
+```python
+# Nexus を使った Namespace 間の呼び出し
+from temporalio.nexus import nexus_service, nexus_operation
+
+@nexus_service(name="payment-service")
+class PaymentService:
+    @nexus_operation
+    async def charge(self, amount: float, currency: str) -> str:
+        ...  # 別 Namespace の Workflow を呼び出す
+```
+
+## まとめ
+
+Temporal Replay 2026 の発表は、Temporal を「ミッションクリティカルなバックエンド処理の基盤」から「AI エージェントワークフローの実行環境」へと拡張する方向性を示しています。
+
+Serverless Workers はインフラ管理のコストを下げ、Workflow Streams はリアルタイム性の要件に対応し、Worker Versioning は安全なデプロイを実現します。特に長時間実行が必要な AI エージェントや、複数サービスをまたがるビジネスロジックの実装に Temporal が有力な選択肢となっています。

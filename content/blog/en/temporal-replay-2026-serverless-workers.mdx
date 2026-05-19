@@ -1,0 +1,185 @@
+---
+title: "Temporal Replay 2026: Serverless Workers and Durable Streaming for AI Agents"
+description: "Temporal's Replay 2026 conference introduced Serverless Workers on AWS Lambda, Workflow Streams for real-time output, Worker Versioning GA, and Nexus for cross-namespace services."
+date: "2026-05-20"
+status: "published"
+tags: ["Temporal", "workflow", "serverless", "distributed-systems", "backend"]
+thumbnail: ""
+author: "webhani"
+slug: "temporal-replay-2026-serverless-workers"
+---
+
+## What Temporal Does
+
+Temporal is a durable execution platform. You write workflows as normal code — Python, TypeScript, Go, or Java — and the Temporal runtime guarantees completion even when servers crash, networks partition, or downstream services become temporarily unavailable. The framework serializes workflow state after each step, so execution resumes from where it left off after any failure.
+
+The Replay 2026 conference expanded that foundation with several features aimed squarely at AI agent workflows.
+
+## Serverless Workers
+
+Previously, running Temporal Workers required always-on servers or containers. Serverless Workers adds support for running Workers on AWS Lambda — Temporal Cloud automatically invokes, scales, and gracefully shuts down Workers based on queue depth and metrics.
+
+```python
+# serverless_worker.py — AWS Lambda handler
+import asyncio
+from temporalio.client import Client
+from temporalio.worker import Worker
+from workflows import OrderWorkflow
+from activities import process_order
+
+async def run_worker():
+    client = await Client.connect("your-namespace.tmprl.cloud:7233")
+
+    worker = Worker(
+        client,
+        task_queue="order-processing",
+        workflows=[OrderWorkflow],
+        activities=[process_order],
+    )
+
+    # Shut down cleanly before Lambda's 15-minute limit
+    try:
+        await asyncio.wait_for(worker.run(), timeout=840)
+    except asyncio.TimeoutError:
+        await worker.shutdown()
+
+
+def handler(event, context):
+    asyncio.run(run_worker())
+```
+
+**When Serverless Workers fit**: bursty workloads (batch email sends, nightly aggregations, event-driven triggers), lower-throughput pipelines where cold start latency is acceptable.
+
+**When they don't**: workflows that run for hours or days (Lambda's execution limit), or latency-sensitive tasks where cold start adds unacceptable delay. Always-on workers remain the right choice there.
+
+## Workflow Streams
+
+Workflow Streams is a new primitive built on Temporal's existing Signal and Update mechanisms. It enables long-running workflows to push incremental results to external consumers in real time — without compromising Temporal's reliability model. Currently in Public Preview.
+
+The primary use case is AI agent workflows: stream partial outputs to a UI as the agent reasons through a task, rather than waiting for full completion.
+
+```python
+from temporalio import workflow, activity
+from dataclasses import dataclass, field
+from datetime import timedelta
+
+@dataclass
+class StepResult:
+    step_name: str
+    output: str
+    is_final: bool = False
+
+@workflow.defn
+class ResearchAgent:
+    def __init__(self):
+        self._results: list[StepResult] = []
+        self._complete = False
+
+    @workflow.run
+    async def run(self, query: str) -> str:
+        # Step 1: gather sources
+        sources = await workflow.execute_activity(
+            search_web, query,
+            start_to_close_timeout=timedelta(minutes=2)
+        )
+        self._results.append(StepResult(step_name="search", output=sources))
+
+        # Step 2: synthesize
+        summary = await workflow.execute_activity(
+            synthesize_with_llm, sources,
+            start_to_close_timeout=timedelta(minutes=5)
+        )
+        self._results.append(StepResult(
+            step_name="synthesize", output=summary, is_final=True
+        ))
+
+        self._complete = True
+        return summary
+
+    @workflow.query
+    def stream_results(self) -> list[StepResult]:
+        return self._results
+
+    @workflow.query
+    def is_complete(self) -> bool:
+        return self._complete
+```
+
+A client can poll `stream_results` at any point to get intermediate outputs — all durably stored in the workflow history.
+
+## Worker Versioning
+
+Worker Versioning pins running workflows to the Worker version that started them, so deployments never break in-flight executions. This eliminates the need for `workflow.patched()` branching to handle code changes across workflow generations.
+
+```python
+async def start_versioned_worker(version: str):
+    client = await Client.connect("localhost:7233")
+
+    worker = Worker(
+        client,
+        task_queue="processing-queue",
+        workflows=[DataPipelineWorkflow],
+        activities=[fetch_data, transform_data, store_result],
+        build_id=version,           # e.g. "v2.3.0" or a git SHA
+        use_worker_versioning=True,
+    )
+
+    await worker.run()
+```
+
+Running v1 and v2 workers simultaneously: workflows started on v1 continue to run on v1 workers; new workflows pick up v2. The version boundary is enforced by Temporal Cloud — no routing logic in your code.
+
+## External Storage
+
+Temporal workflow history has size limits. Large payloads — ML model outputs, multi-megabyte data artifacts — can exceed those limits or make history unwieldy. External Storage integrates Amazon S3 (or a custom driver) transparently with workflow execution. Currently in Public Preview for Python and Go.
+
+```python
+from temporalio.contrib.external_storage import ExternalStorage, S3Driver
+
+storage = ExternalStorage(
+    driver=S3Driver(
+        bucket="workflow-artifacts",
+        region="ap-northeast-1"
+    )
+)
+
+@activity.defn
+async def run_batch_inference(model_input: str) -> str:
+    # Heavy computation producing a large result
+    inference_output = await invoke_model(model_input)
+
+    # Store in S3; only the reference key goes into workflow history
+    ref_key = await storage.store(inference_output.encode())
+    return ref_key
+```
+
+The workflow history stores the key, not the payload. Downstream activities retrieve the actual content from S3 using the key.
+
+## Nexus: Cross-Namespace Service Calls
+
+Large Temporal deployments typically use separate Namespaces per team or domain. Nexus provides a typed RPC layer for calling workflows across Namespace boundaries — GA for Python, Public Preview for TypeScript and .NET.
+
+```python
+from temporalio.nexus import nexus_service, nexus_operation
+
+@nexus_service(name="payment-service")
+class PaymentService:
+    @nexus_operation
+    async def charge(self, amount: float, currency: str) -> str:
+        ...
+
+# From another Namespace's workflow:
+@workflow.defn
+class OrderWorkflow:
+    @workflow.run
+    async def run(self, order_id: str) -> str:
+        payment = workflow.get_nexus_client(PaymentService)
+        receipt = await payment.charge(amount=99.00, currency="USD")
+        return receipt
+```
+
+## Summary
+
+Temporal Replay 2026 moves the platform in two directions simultaneously: lower operational barrier (Serverless Workers, External Storage) and stronger support for AI agent patterns (Workflow Streams, Nexus).
+
+For teams building long-running AI pipelines or multi-service orchestration, the combination of durable execution and the new streaming primitives addresses a real gap. Temporal's guarantee that a workflow completes eventually — regardless of infrastructure failures — pairs naturally with the unpredictable execution times of LLM-driven agents.
