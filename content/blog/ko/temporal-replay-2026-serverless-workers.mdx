@@ -1,0 +1,185 @@
+---
+title: "Temporal Replay 2026 — Serverless Workers와 AI 에이전트를 위한 Durable Streaming"
+description: "Temporal의 연간 컨퍼런스 Replay 2026에서 발표된 Serverless Workers, Workflow Streams, Worker Versioning, Nexus GA를 실무 관점에서 정리합니다."
+date: "2026-05-20"
+status: "published"
+tags: ["Temporal", "workflow", "serverless", "distributed-systems", "backend"]
+thumbnail: ""
+author: "webhani"
+slug: "temporal-replay-2026-serverless-workers"
+---
+
+## Temporal이란
+
+Temporal은 워크플로우의 "Durable Execution(영속적 실행)" 플랫폼입니다. 일반적인 코드(Python, TypeScript, Go, Java)로 워크플로우를 작성하면, Temporal 런타임이 서버 크래시, 네트워크 장애, 하위 서비스의 일시적인 중단이 발생해도 워크플로우가 최종적으로 완료됨을 보장합니다. 각 단계 후에 실행 상태를 직렬화하여 장애 발생 시 중단된 지점부터 재개합니다.
+
+2026년 연간 컨퍼런스 Replay 2026에서는 AI 에이전트 워크플로우 지원을 강화하는 여러 기능이 발표되었습니다.
+
+## Serverless Workers
+
+기존에는 Temporal Worker를 실행하려면 항상 실행 중인 서버나 컨테이너가 필요했습니다. Serverless Workers는 AWS Lambda에서 Worker를 실행할 수 있게 하며, Temporal Cloud가 큐 깊이와 메트릭에 따라 Worker를 자동으로 기동·스케일·종료합니다.
+
+```python
+# serverless_worker.py — AWS Lambda 핸들러
+import asyncio
+from temporalio.client import Client
+from temporalio.worker import Worker
+from workflows import OrderWorkflow
+from activities import process_order
+
+async def run_worker():
+    client = await Client.connect("your-namespace.tmprl.cloud:7233")
+
+    worker = Worker(
+        client,
+        task_queue="order-processing",
+        workflows=[OrderWorkflow],
+        activities=[process_order],
+    )
+
+    # Lambda 15분 제한 전에 정상적으로 종료
+    try:
+        await asyncio.wait_for(worker.run(), timeout=840)
+    except asyncio.TimeoutError:
+        await worker.shutdown()
+
+
+def handler(event, context):
+    asyncio.run(run_worker())
+```
+
+**Serverless Workers가 적합한 경우**: 버스트성 워크로드(배치 이메일 발송, 야간 집계 처리), 콜드 스타트 레이턴시가 허용 가능한 낮은 처리량 파이프라인.
+
+**적합하지 않은 경우**: 수 시간~수 일간 실행되는 워크플로우(Lambda 실행 제한), 콜드 스타트가 허용되지 않는 레이턴시 민감 작업. 이런 경우에는 기존 상주 Worker가 적합합니다.
+
+## Workflow Streams
+
+Workflow Streams는 Temporal의 기존 Signal과 Update 프리미티브 위에 구축된 "영속적 스트리밍" 기능입니다. 장시간 실행되는 워크플로우가 완료를 기다리지 않고 실시간으로 중간 결과를 외부 소비자에게 전달할 수 있습니다. 현재 Public Preview입니다.
+
+AI 에이전트 워크플로우에서 특히 유용합니다. 에이전트가 작업을 처리하는 동안 부분 출력을 실시간으로 UI에 스트리밍하거나, 장시간 배치 처리의 진행 상황을 대시보드에서 시각화할 수 있습니다.
+
+```python
+from temporalio import workflow, activity
+from dataclasses import dataclass
+from datetime import timedelta
+
+@dataclass
+class StepResult:
+    step_name: str
+    output: str
+    is_final: bool = False
+
+@workflow.defn
+class ResearchAgent:
+    def __init__(self):
+        self._results: list[StepResult] = []
+        self._complete = False
+
+    @workflow.run
+    async def run(self, query: str) -> str:
+        # 1단계: 소스 검색
+        sources = await workflow.execute_activity(
+            search_web, query,
+            start_to_close_timeout=timedelta(minutes=2)
+        )
+        self._results.append(StepResult(step_name="search", output=sources))
+
+        # 2단계: LLM으로 합성
+        summary = await workflow.execute_activity(
+            synthesize_with_llm, sources,
+            start_to_close_timeout=timedelta(minutes=5)
+        )
+        self._results.append(StepResult(
+            step_name="synthesize", output=summary, is_final=True
+        ))
+
+        self._complete = True
+        return summary
+
+    @workflow.query
+    def stream_results(self) -> list[StepResult]:
+        return self._results
+
+    @workflow.query
+    def is_complete(self) -> bool:
+        return self._complete
+```
+
+클라이언트는 언제든지 `stream_results`를 폴링하여 중간 출력을 가져올 수 있으며, 모든 결과는 워크플로우 히스토리에 영속적으로 저장됩니다.
+
+## Worker Versioning
+
+Worker Versioning은 실행 중인 워크플로우를 시작한 Worker 버전에 고정하는 기능입니다. 이를 통해 배포가 진행 중인 워크플로우를 중단시키지 않고 실행할 수 있습니다. 코드 변경을 처리하기 위해 `workflow.patched()` 분기를 작성할 필요가 없어집니다.
+
+```python
+async def start_versioned_worker(version: str):
+    client = await Client.connect("localhost:7233")
+
+    worker = Worker(
+        client,
+        task_queue="processing-queue",
+        workflows=[DataPipelineWorkflow],
+        activities=[fetch_data, transform_data, store_result],
+        build_id=version,           # 예: "v2.3.0" 또는 git SHA
+        use_worker_versioning=True,
+    )
+
+    await worker.run()
+```
+
+v1과 v2 Worker를 동시에 실행하면: v1에서 시작된 워크플로우는 v1 Worker가, 새 워크플로우는 v2 Worker가 처리합니다. 버전 경계는 Temporal Cloud가 강제하므로 코드에 라우팅 로직이 필요 없습니다.
+
+## External Storage
+
+Temporal 워크플로우 히스토리에는 크기 제한이 있습니다. ML 모델 출력, 수 MB의 데이터 아티팩트 같은 대형 페이로드는 이 제한을 초과하거나 히스토리를 다루기 어렵게 만들 수 있습니다. External Storage는 Amazon S3나 커스텀 드라이버를 워크플로우 실행과 투명하게 통합합니다. 현재 Python과 Go에서 Public Preview입니다.
+
+```python
+from temporalio.contrib.external_storage import ExternalStorage, S3Driver
+
+storage = ExternalStorage(
+    driver=S3Driver(
+        bucket="workflow-artifacts",
+        region="ap-northeast-1"
+    )
+)
+
+@activity.defn
+async def run_batch_inference(model_input: str) -> str:
+    # 대용량 결과를 생성하는 무거운 연산
+    inference_output = await invoke_model(model_input)
+
+    # S3에 저장하고 워크플로우 히스토리에는 참조 키만 저장
+    ref_key = await storage.store(inference_output.encode())
+    return ref_key
+```
+
+워크플로우 히스토리에는 키만 저장되고, 실제 내용은 S3에 보관됩니다.
+
+## Nexus: Namespace 간 서비스 호출
+
+대규모 Temporal 배포에서는 팀이나 도메인별로 독립적인 Namespace를 사용하는 것이 권장됩니다. Nexus는 Namespace 경계를 넘어 워크플로우를 호출할 수 있는 타입 안전한 RPC 레이어를 제공합니다. Python SDK에서는 GA, TypeScript와 .NET SDK에서는 Public Preview입니다.
+
+```python
+from temporalio.nexus import nexus_service, nexus_operation
+
+@nexus_service(name="payment-service")
+class PaymentService:
+    @nexus_operation
+    async def charge(self, amount: float, currency: str) -> str:
+        ...
+
+# 다른 Namespace의 워크플로우에서 호출:
+@workflow.defn
+class OrderWorkflow:
+    @workflow.run
+    async def run(self, order_id: str) -> str:
+        payment = workflow.get_nexus_client(PaymentService)
+        receipt = await payment.charge(amount=99.00, currency="USD")
+        return receipt
+```
+
+## 정리
+
+Temporal Replay 2026은 플랫폼을 두 가지 방향으로 동시에 발전시켰습니다. 운영 장벽을 낮추는 방향(Serverless Workers, External Storage)과 AI 에이전트 패턴 지원을 강화하는 방향(Workflow Streams, Nexus)입니다.
+
+장시간 실행되는 AI 파이프라인이나 멀티 서비스 오케스트레이션을 구축하는 팀에게, 영속적 실행 보장과 새로운 스트리밍 프리미티브의 조합은 실질적인 문제를 해결합니다. LLM 기반 에이전트의 예측 불가능한 실행 시간과 Temporal의 "언젠가는 완료된다"는 보장은 자연스럽게 맞아떨어집니다.
