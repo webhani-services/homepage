@@ -1,0 +1,104 @@
+---
+title: "Claude Sonnet 4.6의 100만 토큰 컨텍스트: 전체 레포지토리 분석이 현실로"
+description: "Anthropic이 Claude Sonnet 4.6에 100만 토큰 컨텍스트 윈도우(베타)를 추가했습니다. 대규모 코드베이스 분석과 기존에 컨텍스트 분할이 필요했던 워크플로우가 어떻게 바뀌는지 설명합니다."
+date: "2026-05-21"
+status: "published"
+tags: ["AI", "Claude", "LLM", "Anthropic", "Developer-Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-sonnet-46-1m-context-window-2026"
+---
+
+Anthropic이 Claude Sonnet 4.6 베타에서 100만 토큰 컨텍스트 윈도우를 공개했습니다. 이전 모델이 200K 수준이었던 것과 비교하면 의미 있는 도약입니다. 단순히 숫자가 커진 것이 아니라, 실제로 가능해지는 작업이 달라집니다.
+
+## 100만 토큰의 실제 규모
+
+100만 토큰은 대략 75만 단어, 약 300만 자에 해당합니다. 소스 코드로 환산하면:
+
+- 소규모 프로젝트 (1~2만 줄): 전체를 거의 수용 가능
+- 중규모 프로젝트 (3~10만 줄): 핵심 로직과 타입 정의 전체를 수용 가능
+- 대규모 프로젝트 (30만 줄 이상): 여전히 선택이 필요하지만 분할 단위가 크게 줄어듦
+
+기존 200K 제한에서는 "이 인터페이스를 변경하면 영향받는 컴포넌트를 모두 파악하고 싶다"는 작업에도 파일을 수동으로 선택해서 컨텍스트를 구성해야 했습니다. 100만 토큰이 되면 중규모 TypeScript/React 프로젝트의 `src/` 하위 파일을 그대로 넘길 수 있습니다.
+
+## 실제로 달라지는 3가지 워크플로우
+
+### 1. 코드베이스 전체 리팩토링
+
+API 인터페이스 변경, 인증 로직 교체처럼 영향 범위가 넓은 수정은 기존에 모델과 여러 번 왕복해야 했습니다. 모델이 파일 A를 모르는 채로 파일 B를 수정하고, 실행해야 오류를 발견하는 사이클의 반복이었습니다.
+
+100만 토큰으로는 프로젝트 전체를 한 번에 넘긴 뒤 "이 인터페이스를 변경할 경우 영향받는 곳을 모두 찾아서 수정 방안도 제시해줘"라고 요청할 수 있습니다.
+
+### 2. 문서와 코드의 정합성 분석
+
+OpenAPI 스펙, 타입 정의, 구현 코드, 테스트 파일을 동시에 컨텍스트에 포함시킬 수 있습니다. "API 문서와 구현 사이에 괴리가 있는 부분을 찾아줘"라는 작업이 수동 대조 없이 가능해집니다.
+
+### 3. 코드 리뷰의 깊이 향상
+
+PR diff와 관련 이슈, 아키텍처 결정 기록, 관련 구현 파일을 함께 넘기면 모델이 의도와 배경을 이해한 상태에서 리뷰를 제공합니다. diff만 보는 것과는 피드백의 질이 다릅니다.
+
+## API 활용 예제
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import { readFileSync, readdirSync } from "fs";
+import { join, extname } from "path";
+
+const client = new Anthropic();
+
+function collectSourceFiles(
+  dir: string,
+  extensions = [".ts", ".tsx"]
+): string {
+  let result = "";
+  const skip = new Set(["node_modules", ".next", "dist"]);
+
+  function walk(current: string) {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      if (skip.has(entry.name)) continue;
+      const fullPath = join(current, entry.name);
+      if (entry.isDirectory()) {
+        walk(fullPath);
+      } else if (extensions.includes(extname(entry.name))) {
+        result += `\n\n// === ${fullPath} ===\n${readFileSync(fullPath, "utf-8")}`;
+      }
+    }
+  }
+
+  walk(dir);
+  return result;
+}
+
+async function analyzeRepository(srcDir: string) {
+  const context = collectSourceFiles(srcDir);
+
+  const response = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 8192,
+    messages: [
+      {
+        role: "user",
+        content: `다음 코드베이스 전체를 분석해서 타입 안전성 문제와 개선 제안을 심각도별로 정리해주세요.\n\n${context}`,
+      },
+    ],
+  });
+
+  return response.content[0].type === "text" ? response.content[0].text : "";
+}
+```
+
+모든 요청에 전체 레포지토리를 넘기는 것은 비효율적입니다. 일상적인 수정에는 관련 파일만, 아키텍처 판단이나 전체 영향 분석이 필요할 때만 대용량 컨텍스트를 활용하는 것이 실용적입니다.
+
+## 비용 현실
+
+100만 토큰 입력은 Sonnet 4.6 가격 기준으로 요청당 몇 달러 수준입니다. 매일 수십 번 실행하는 용도로는 적합하지 않지만, 주간 코드 감사나 대규모 리팩토링 전 영향 범위 조사 등 정기적인 작업에는 충분히 비용 대비 효과가 있습니다.
+
+| 용도 | 컨텍스트 범위 | 적합한 빈도 |
+|------|-------------|-----------|
+| 단일 파일 수정/질문 | 8K~32K | 하루 여러 번 |
+| 다중 파일 리팩토링 | 32K~200K | 하루 수차례 |
+| 레포지토리 전체 분석 | 200K~1M | 주 1회 또는 배포 전 |
+
+## 정리
+
+Sonnet 4.6의 100만 토큰 컨텍스트는 일상적인 코딩 보조를 바꾸는 것이 아니라, 한 번에 모델이 추론할 수 있는 상한선을 높입니다. 레포지토리 전체 영향 분석, 문서 정합성 감사, 복잡한 리팩토링 계획 수립 — 이런 작업을 베타 기간에 시험해보면서 자신의 코드베이스에서의 실제 효과를 파악해두는 것을 권장합니다.

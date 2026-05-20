@@ -1,0 +1,142 @@
+---
+title: "TanStack and Mistral npm Supply Chain Attack: What to Check and Fix Now"
+description: "The 'mini Shai-Hulud' campaign compromised TanStack Router and Mistral AI npm packages with tens of millions of weekly downloads. Here's what credentials may be at risk and the concrete steps to respond."
+date: "2026-05-21"
+status: "published"
+tags: ["Security", "npm", "Supply-Chain", "CI/CD", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "tanstack-npm-supply-chain-attack-2026"
+---
+
+A supply chain campaign dubbed "mini Shai-Hulud" compromised packages in the TanStack ecosystem — including `@tanstack/react-router`, `@tanstack/history`, and `@tanstack/router-core` — along with several Mistral AI npm packages. Combined weekly downloads across the affected packages run into the tens of millions, making this a wide-blast incident.
+
+Separately, Trend Micro disclosed the TeamPCP campaign targeting Docker Hub images, VS Code/OpenVSX extensions, and GitHub Actions workflows with similar credential-harvesting objectives.
+
+## What the Malicious Code Did
+
+The injected code collected environment variables and transmitted them to attacker-controlled infrastructure. Targets included:
+
+- GitHub tokens and personal access tokens
+- AWS, GCP, and Azure access keys present in environment variables
+- CI/CD platform secrets (GitHub Actions, CircleCI, etc.)
+- Container registry credentials
+
+The attack surface is broad because CI pipelines routinely load cloud credentials and repository tokens as environment variables during `npm install` — right when the malicious package code executes.
+
+## Immediate Response Checklist
+
+### Check Your Lock Files
+
+Review `package-lock.json` or `yarn.lock` git history for unexpected version changes to affected packages:
+
+```bash
+# See when lock file changed
+git log --oneline --follow -- package-lock.json | head -20
+
+# Check specific package version history in lock file
+git log -p -- package-lock.json | grep -A 3 '"@tanstack/react-router"'
+```
+
+If the lock file changed at an unexpected time, treat the environment's secrets as potentially compromised.
+
+### Rotate CI/CD Secrets
+
+For any environment that ran `npm install` (not `npm ci`) with the affected packages during the exposure window, rotate:
+
+- GitHub Personal Access Tokens and fine-grained tokens
+- Cloud provider access keys (AWS IAM, GCP service accounts, Azure service principals)
+- CI/CD platform API keys
+- Container registry push credentials
+
+```bash
+# List GitHub Actions secrets for a repo
+gh secret list --repo org/repo
+
+# Update a secret
+gh secret set AWS_ACCESS_KEY_ID --repo org/repo
+```
+
+### Audit Current Dependencies
+
+```bash
+npm audit
+
+# Check installed versions of affected packages
+npm list @tanstack/react-router @tanstack/history @tanstack/router-core
+```
+
+Update to the latest patched versions after the vendors confirm clean releases.
+
+## Structural Defenses
+
+This incident is a good forcing function to harden CI/CD pipelines beyond the immediate response.
+
+### Use `npm ci` Everywhere in CI
+
+`npm ci` verifies SHA512 hashes against `package-lock.json` before installing. `npm install` does not. This is the single highest-leverage change for supply chain defense in most pipelines:
+
+```yaml
+# GitHub Actions
+- name: Install dependencies
+  run: npm ci  # Not npm install
+```
+
+### Restrict CI Permissions Explicitly
+
+GitHub Actions defaults to broad permissions unless restricted. Declare only what each workflow needs:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write  # Only if using OIDC for cloud auth
+```
+
+### Scope Secrets to Steps, Not Jobs
+
+Don't expose all credentials to the entire CI job. Pass secrets only to the steps that need them:
+
+```yaml
+- name: Deploy
+  env:
+    AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  run: ./deploy.sh
+  # Other steps in this job cannot read these env vars
+```
+
+### Prefer OIDC Over Long-Lived Keys
+
+For AWS, GCP, and Azure, replace static access keys with OIDC federation. Short-lived tokens generated per-run eliminate the static secret that supply chain attacks harvest:
+
+```yaml
+- name: Configure AWS credentials
+  uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: arn:aws:iam::123456789:role/github-actions-role
+    aws-region: ap-northeast-1
+    # No static key — token is generated for this run only
+```
+
+### Automated Dependency Monitoring
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 10
+```
+
+## Why Supply Chain Attacks Scale So Effectively
+
+The npm registry is open by design. Publishing a package requires minimal verification, and maintainer accounts are protected only by whatever security practices each individual applies. Once an attacker controls a maintainer account or a dependency of a popular package, a single commit can reach millions of environments within hours.
+
+The TanStack/Mistral attack illustrates the threat model clearly: you don't need to write vulnerable code — you need to trust a package whose maintainer account was compromised.
+
+## Summary
+
+If you use TanStack Router or Mistral AI npm packages: check lock file history, rotate potentially exposed secrets, and update to clean package versions. Use this incident as a prompt to enforce `npm ci` in CI, switch to OIDC authentication where possible, and scope secrets to the minimum required steps. These changes are low-cost and eliminate the most common credential-harvesting vectors.
