@@ -1,0 +1,107 @@
+---
+title: "Claude Sonnet 4.6の100万トークンコンテキスト：リポジトリ全体解析が現実に"
+description: "AnthropicがClaude Sonnet 4.6に100万トークンコンテキストウィンドウ（ベータ）を追加。大規模コードベースの横断的分析や、コンテキスト分割が必要だったワークフローがどう変わるかを解説します。"
+date: "2026-05-21"
+status: "published"
+tags: ["AI", "Claude", "LLM", "Anthropic", "Developer-Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-sonnet-46-1m-context-window-2026"
+---
+
+AnthropicはClaude Sonnet 4.6のベータ版として100万トークンのコンテキストウィンドウを公開しました。以前のモデルが32K〜200K程度だったことを考えると、桁が異なる変化です。ただし「100万トークン使えます」という事実よりも、それが開発ワークフローの何を変えるかのほうが実際には重要です。
+
+## コンテキストサイズと実際のコードベースの関係
+
+まず規模感を整理します。100万トークンは概算で約75万ワード、あるいは約300万文字です。一般的なソースコードで換算すると：
+
+- 小規模プロジェクト（1〜2万行）：全体をほぼ収容できる
+- 中規模プロジェクト（3〜10万行）：コアロジックとほぼすべての型定義を収容できる
+- 大規模プロジェクト（30万行以上）：依然として選択が必要だが、分割の粒度は大幅に下がる
+
+従来の200Kトークンでは、たとえば「このAPIの型定義を修正したいが、それに影響を受けるすべてのコンポーネントを把握したい」というタスクでも、ファイルを手動でピックアップしてコンテキストを組み立てる必要がありました。100万トークンになると、中規模のTypeScript/Reactプロジェクトであれば `src/` 以下のファイルをそのまま渡せるようになります。
+
+```bash
+# srcディレクトリの全TypeScriptファイルのトークン数を確認する（大まかな目安）
+find src/ -name "*.ts" -o -name "*.tsx" | xargs wc -c | tail -1
+# 出力例: 2,400,000 bytes ≒ 600,000トークン → 100万枠内に収まる
+```
+
+## 何が変わるか：3つの具体的なユースケース
+
+### 1. コードベース横断のリファクタリング
+
+APIのインターフェース変更や、認証ロジックの差し替えのような「影響範囲が広い修正」は、これまでモデルに何度も往復して確認作業が発生していました。モデルがファイルAを知らないままファイルBを修正し、実行して初めてエラーに気づく、というサイクルです。
+
+100万トークンがあれば、プロジェクト全体を一度渡してから「このインターフェースを変えた場合の影響箇所をすべてリストアップして、修正案も出して」という問い方ができます。
+
+### 2. ドキュメントとコードの対応分析
+
+OpenAPIスペック、型定義、実装コード、テストファイルを同時にコンテキストに含めることができます。「このAPIドキュメントと実装の間に乖離がある箇所を探して」というタスクが、手動でファイルを選択せずにできるようになります。
+
+### 3. 長期にわたるコードレビュー履歴の参照
+
+PRのdiff、関連するissueのコメント、過去のコードスニペットを同時に渡した上で「このアーキテクチャ判断の背景を踏まえて、今回の変更をレビューして」という依頼が現実的になります。
+
+## APIでの実装例
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import { readFileSync, readdirSync, statSync } from "fs";
+import { join } from "path";
+
+const client = new Anthropic();
+
+function collectSourceFiles(dir: string, extensions = [".ts", ".tsx"]): string {
+  let result = "";
+  const entries = readdirSync(dir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (entry.name === "node_modules" || entry.name === ".next") continue;
+    const fullPath = join(dir, entry.name);
+
+    if (entry.isDirectory()) {
+      result += collectSourceFiles(fullPath, extensions);
+    } else if (extensions.some((ext) => entry.name.endsWith(ext))) {
+      const content = readFileSync(fullPath, "utf-8");
+      result += `\n\n// === ${fullPath} ===\n${content}`;
+    }
+  }
+  return result;
+}
+
+async function analyzeRepository(srcDir: string) {
+  const codeContext = collectSourceFiles(srcDir);
+
+  const response = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 8192,
+    messages: [
+      {
+        role: "user",
+        content: `以下のコードベース全体を分析して、型安全性の問題点と改善提案を出してください。\n\n${codeContext}`,
+      },
+    ],
+  });
+
+  return response.content[0].type === "text" ? response.content[0].text : "";
+}
+```
+
+ただし、コンテキストサイズが大きいほどレイテンシとコストが増加します。全ファイルを毎回渡すのではなく、「通常は差分だけ、設計判断が必要なときだけ全体を渡す」という使い分けが実践的です。
+
+## コスト面の現実
+
+100万トークンのインプットは相応のコストになります。Sonnet 4.6の価格帯（執筆時点）では、100万トークンの入力は数ドルのオーダーです。1日に何十回も回すような用途には向きませんが、週次のコードベース監査や、大規模リファクタリング前の影響調査といった用途なら費用対効果は十分あります。
+
+| 用途 | コンテキスト目安 | コスト感 |
+|------|----------------|---------|
+| 単ファイル修正・質問 | 8K〜32K | 低 |
+| 複数ファイルのリファクタリング | 32K〜200K | 中 |
+| リポジトリ全体の構造分析 | 200K〜1M | 高（定期実行向き） |
+
+## まとめ
+
+Sonnet 4.6の100万トークンコンテキストは、「あったら便利」という機能ではなく、特定のワークフローを根本から変える可能性があります。大規模リポジトリの横断分析、ドキュメント・コード間の整合性チェック、影響範囲が広いリファクタリングのサポート——これらのタスクでコンテキスト分割の手間がなくなることの効果は、実際に試してみると想定以上です。
+
+ベータ期間中に自チームのユースケースで試して、どのタスクに本当に効くかを把握しておくことをお勧めします。

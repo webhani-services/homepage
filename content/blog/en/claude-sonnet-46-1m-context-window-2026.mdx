@@ -1,0 +1,106 @@
+---
+title: "Claude Sonnet 4.6's 1M Context Window: What Actually Changes for Developers"
+description: "Anthropic's Claude Sonnet 4.6 enters beta with a 1M-token context window. Beyond the headline number, here's what it practically enables for codebases, documentation analysis, and agentic workflows."
+date: "2026-05-21"
+status: "published"
+tags: ["AI", "Claude", "LLM", "Anthropic", "Developer-Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-sonnet-46-1m-context-window-2026"
+---
+
+Anthropic released Claude Sonnet 4.6 in beta with a 1M-token context window. Previous models topped out around 200K tokens, so this is a meaningful jump — not just in scale but in what becomes practically feasible.
+
+The interesting question isn't "how large is 1M tokens?" It's: which tasks were previously bottlenecked by context limits, and how does removing that bottleneck change your workflow?
+
+## Putting 1M Tokens in Perspective
+
+One million tokens is roughly 750,000 words or about 3 million characters. For source code, that translates to:
+
+- Small projects (10–20K lines): entire repo fits comfortably
+- Medium projects (30–100K lines): all core logic and type definitions fit
+- Large projects (300K+ lines): still requires selection, but coarser granularity
+
+With the previous 200K limit, tasks like "find every place in the codebase affected by changing this interface" required manual context curation — picking which files to include, copy-pasting relevant sections, running multiple rounds. With 1M tokens, a mid-sized TypeScript/React project fits in a single pass.
+
+## Three Workflows That Change Concretely
+
+### Cross-File Refactoring
+
+Changing an API interface, replacing an auth layer, or moving shared utilities — these modifications have blast radii that span many files. The old pattern was iterative: ask the model to modify file A, get the change, apply it, discover a broken import in file B, repeat.
+
+With full-repo context, you can ask once: "Here's the entire codebase. If I change this interface signature, list every affected file and show me the required modifications." The model has the full picture before it answers.
+
+### Documentation-Code Consistency
+
+Loading an OpenAPI spec, TypeScript type definitions, implementation files, and test suites simultaneously into one context enables a different kind of audit. Instead of manually cross-referencing docs with code, you can ask: "Where does the documented behavior diverge from the implementation?" and get a complete answer.
+
+### Long-Running Code Review Sessions
+
+Passing a PR diff alongside its related issue thread, architectural decision records, and the relevant implementation files in one shot changes the quality of review feedback. The model can reason about intent and history, not just the diff in isolation.
+
+## Implementation Example
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import { readFileSync, readdirSync } from "fs";
+import { join, extname } from "path";
+
+const client = new Anthropic();
+
+function collectSourceFiles(
+  dir: string,
+  extensions = [".ts", ".tsx", ".js", ".jsx"]
+): string {
+  let output = "";
+  const skip = new Set(["node_modules", ".next", "dist", ".git"]);
+
+  function walk(current: string) {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      if (skip.has(entry.name)) continue;
+      const full = join(current, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (extensions.includes(extname(entry.name))) {
+        output += `\n\n// === ${full} ===\n${readFileSync(full, "utf-8")}`;
+      }
+    }
+  }
+
+  walk(dir);
+  return output;
+}
+
+async function auditRepository(srcDir: string): Promise<string> {
+  const context = collectSourceFiles(srcDir);
+
+  const response = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 8192,
+    messages: [
+      {
+        role: "user",
+        content: `Analyze this codebase for type safety issues and inconsistent patterns. List findings grouped by severity.\n\n${context}`,
+      },
+    ],
+  });
+
+  return response.content[0].type === "text" ? response.content[0].text : "";
+}
+```
+
+A practical note: don't send the full repo on every call. Reserve large-context requests for tasks that genuinely need full visibility — architecture audits, cross-cutting refactors, documentation consistency checks. For day-to-day edits, targeted smaller contexts are faster and cheaper.
+
+## Cost Considerations
+
+A 1M-token input at Sonnet 4.6 pricing runs in the low-single-digit dollar range per call. That rules out high-frequency use cases but makes periodic workflows entirely viable:
+
+| Use case | Context range | Frequency fit |
+|----------|--------------|---------------|
+| Single-file questions | 8K–32K | Many times per day |
+| Multi-file refactoring | 32K–200K | Several times per day |
+| Full-repo analysis | 200K–1M | Weekly or pre-release |
+
+## Takeaway
+
+The 1M context window on Sonnet 4.6 doesn't change everyday coding assistance. It changes the ceiling on what you can ask a model to reason about in one shot. Cross-repo impact analysis, documentation audits, and complex refactoring planning are the workflows worth piloting during the beta period to see what the real-world difference looks like on your codebase.

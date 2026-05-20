@@ -1,0 +1,150 @@
+---
+title: "Astral `ty` 안정 릴리스: Rust 기반 Python 타입 검사기 도입 가이드"
+description: "uv 개발사 Astral이 Rust 기반 Python 타입 검사기 `ty`를 안정 버전으로 출시했습니다. mypy, pyright와 비교한 성능 차이와 실제 도입 방법을 설명합니다."
+date: "2026-05-21"
+status: "published"
+tags: ["Python", "Type-Checking", "Developer-Tools", "Astral", "uv"]
+thumbnail: ""
+author: "webhani"
+slug: "astral-ty-python-type-checker-2026"
+---
+
+`uv`와 `ruff`를 만든 Astral이 Rust 기반 Python 타입 검사기 `ty`를 안정 버전으로 릴리스했습니다. 패턴은 익숙합니다: 느린 Python 툴체인 구성 요소를 Rust로 재작성해 획기적인 속도 향상을 제공합니다. `uv`가 패키지 관리에서 그렇게 했듯이, `ty`는 타입 검사 영역에서 같은 일을 시도합니다.
+
+CI에서 mypy 실행 시간이 병목인 팀이나 새 프로젝트에서 빠르고 현대적인 타입 검사기를 원하는 팀에게 평가해볼 만한 릴리스입니다.
+
+## 기존 Python 타입 검사 도구 현황
+
+`ty`를 살펴보기 전에 기존 도구들의 상황을 정리합니다:
+
+**mypy**는 공식 참조 구현으로 플러그인 에코시스템(django-stubs, sqlalchemy-stubs 등)이 가장 성숙합니다. 단점은 속도입니다. 대규모 코드베이스에서는 데몬 모드(`dmypy`)를 사용해도 CI 최초 실행이 느립니다.
+
+**pyright**(Microsoft)는 mypy보다 빠르고 VS Code 통합이 뛰어납니다. Node.js 런타임이 필요하다는 점이 Python 전용 환경에서는 약간의 불편함이 됩니다.
+
+**ty**는 두 도구보다 더 빠른 것을 목표로 하며 Node.js 없이 Python 툴체인 안에서 동작합니다.
+
+## 설치 및 기본 사용법
+
+```bash
+# uv로 설치 (권장)
+uv tool install ty
+
+# 또는 pip으로
+pip install ty
+
+# 버전 확인
+ty --version
+```
+
+타입 검사 실행:
+
+```bash
+# 현재 디렉토리 검사
+ty check
+
+# 특정 경로 검사
+ty check src/ tests/
+
+# CI 통합을 위한 JSON 출력
+ty check --output-format json src/
+```
+
+## 설정
+
+`ty`는 프로젝트 루트의 `ty.toml` 또는 `pyproject.toml`의 `[tool.ty]` 섹션에서 설정합니다:
+
+```toml
+# pyproject.toml
+[tool.ty]
+src = ["src", "tests"]
+exclude = ["**/migrations/**", "**/__pycache__/**"]
+python-version = "3.12"
+strict = false
+```
+
+## mypy에서 마이그레이션
+
+설정 구조는 다음과 같이 대응됩니다:
+
+```toml
+# mypy.ini (기존)
+[mypy]
+python_version = 3.12
+strict = True
+ignore_missing_imports = False
+files = src/
+
+# ty.toml (신규)
+[tool.ty]
+python-version = "3.12"
+strict = true
+src = ["src"]
+```
+
+모든 mypy 옵션이 1:1로 매핑되지는 않습니다. 두 도구를 병행 실행해서 출력을 비교한 뒤 전환하는 단계적 접근이 안전합니다:
+
+```bash
+# 동일 코드베이스에서 출력 비교
+mypy src/ 2>&1 | tee mypy-output.txt
+ty check src/ 2>&1 | tee ty-output.txt
+diff mypy-output.txt ty-output.txt
+```
+
+## CI 통합
+
+```yaml
+# .github/workflows/type-check.yml
+name: Type Check
+
+on: [push, pull_request]
+
+jobs:
+  type-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run type check
+        run: uv run ty check src/
+```
+
+## 주의해야 할 점
+
+### 플러그인 에코시스템 성숙도
+
+mypy의 플러그인 에코시스템(django-stubs, SQLAlchemy stubs 등)은 수년에 걸쳐 개발되었습니다. `ty`의 서드파티 스텁 호환성은 아직 완전히 동등하지 않습니다. 프로젝트가 서드파티 타입 스텁에 크게 의존한다면 마이그레이션 전에 호환성을 먼저 확인하세요.
+
+### 단계적 도입 권장
+
+전체 코드베이스를 즉시 전환하기보다 위험을 줄이는 단계적 접근이 현실적입니다:
+
+1. 새 프로젝트는 처음부터 `ty` 사용
+2. 기존 프로젝트에서 mypy와 `ty`를 병행 실행해 출력 비교
+3. 신뢰성이 확인되면 CI의 주 타입 검사기로 전환
+
+### 실제 성능 차이 측정
+
+성능 차이는 규모가 클수록 명확합니다. 1만 줄 코드베이스에서는 차이가 크지 않을 수 있지만, 10만 줄 이상에서는 CI 실행 시간 단축 효과가 체감됩니다:
+
+```bash
+# 실제 코드베이스에서 벤치마크
+time mypy src/
+time ty check src/
+```
+
+## 정리
+
+`ty` 안정 릴리스는 Astral의 접근 방식이 실험적 단계를 넘어 프로덕션 사용 가능 수준에 이르렀다는 의미입니다. `uv` + `ruff` + `ty` 조합은 일관되고 빠른 Python 툴체인으로 자리잡고 있습니다.
+
+새 프로젝트라면 처음부터 `ty`를 채택하는 것이 합리적인 선택입니다. 기존 프로젝트라면 병행 실행 → 결과 검증 → 전환이라는 명확한 평가 경로를 따르는 것을 권장합니다.

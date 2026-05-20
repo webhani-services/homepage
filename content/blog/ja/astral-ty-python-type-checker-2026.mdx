@@ -1,0 +1,148 @@
+---
+title: "Astral `ty`：Rust製Python型チェッカーが安定版リリース — mypyからの移行を検討する時"
+description: "uvの開発元Astralが、Rust製の高速Python型チェッカー`ty`を安定版としてリリース。mypyやpyrightと比較して何が変わるのか、実際の導入方法と合わせて解説します。"
+date: "2026-05-21"
+status: "published"
+tags: ["Python", "Type-Checking", "Developer-Tools", "Astral", "uv"]
+thumbnail: ""
+author: "webhani"
+slug: "astral-ty-python-type-checker-2026"
+---
+
+Pythonパッケージマネージャー`uv`の開発元として知られるAstralが、Python型チェッカー`ty`を安定版としてリリースしました。Rust製ツールチェーンによる桁違いのパフォーマンスを型チェックの分野に持ち込む試みです。
+
+`uv`が`pip`や`poetry`に対して10〜100倍の速度差を見せたように、`ty`もmypyやpyrightと比較して同様のアプローチを取ります。大規模PythonコードベースでCI実行時間の短縮を求めているチームにとって、試す価値が出てきました。
+
+## mypyとpyrightの現状
+
+型チェックの現行ツールはそれぞれ以下の特徴があります：
+
+- **mypy**：Pythonの公式型チェッカーとして広く使われてきたが、大規模コードベースでは実行が遅い。デーモンモード（`dmypy`）でキャッシュを活用しても、CIでの初回実行は重い。
+- **pyright**：MicrosoftがTypeScriptのツール設計を活かして開発。mypyより速く、VSCodeとの統合が優れているが、Node.jsランタイムが必要。
+
+`ty`はRustで実装することで、どちらよりも実行速度を大幅に向上させることを目指しています。
+
+## インストールと基本的な使い方
+
+```bash
+# uvを使ってインストール（推奨）
+uv tool install ty
+
+# または pip で
+pip install ty
+
+# バージョン確認
+ty --version
+```
+
+プロジェクトのルートで実行：
+
+```bash
+# カレントディレクトリ以下をチェック
+ty check
+
+# 特定のファイルをチェック
+ty check src/main.py src/api/
+
+# 出力フォーマットを指定
+ty check --output-format json
+```
+
+## 設定ファイル
+
+`ty`はプロジェクトルートの`ty.toml`または`pyproject.toml`の`[tool.ty]`セクションで設定します：
+
+```toml
+# pyproject.toml
+[tool.ty]
+# チェック対象のソースディレクトリ
+src = ["src", "tests"]
+
+# 除外パターン
+exclude = ["**/migrations/**", "**/__pycache__/**"]
+
+# Python バージョン
+python-version = "3.12"
+
+# 厳格モード（より多くの型エラーを検出）
+strict = false
+```
+
+## mypyからの移行
+
+既存のmypyユーザーが`ty`に移行する場合、設定のマッピングは以下のようになります：
+
+```toml
+# mypy.ini (旧設定)
+[mypy]
+python_version = 3.12
+strict = True
+ignore_missing_imports = False
+files = src/
+
+# ↓ ty.toml (新設定)
+[tool.ty]
+python-version = "3.12"
+strict = true
+src = ["src"]
+```
+
+すべてのmypyオプションが1:1でマッピングされるわけではないため、段階的な移行が現実的です。まず`ty`を並行して実行して結果を比較し、チームで差分を確認してから切り替えるのが安全です。
+
+## CI/CDへの組み込み
+
+```yaml
+# GitHub Actions例
+name: Type Check
+on: [push, pull_request]
+
+jobs:
+  type-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run ty
+        run: uv run ty check src/
+```
+
+## 実用的な注意点
+
+### エコシステムの成熟度
+
+`ty`は安定版リリースとなりましたが、mypyが長年かけて積み上げてきたプラグインエコシステムやEdgeケースの対応という点では、まだ差があります。Djangoの`django-stubs`、FastAPIのような大型フレームワークとの統合は確認が必要です。
+
+### 段階的導入を推奨
+
+大規模プロジェクトへの即時フル移行より、以下のアプローチが現実的です：
+
+1. 新規プロジェクトで`ty`を採用
+2. 既存プロジェクトでmypyと並行実行して差分確認
+3. 問題がなければCIのメインの型チェッカーを切り替え
+
+### パフォーマンス計測
+
+実際に速度差が出るかは、コードベースの規模と構造によります。大規模プロジェクトほど差が顕著で、10万行以上のコードベースではCI実行時間の削減効果が大きくなります。
+
+```bash
+# 実行時間の計測（比較用）
+time mypy src/
+time ty check src/
+```
+
+## まとめ
+
+`ty`は「uvがpipにやったこと」を型チェックの領域で再現しようとするツールです。安定版リリースにより、本番環境での採用を検討できる段階になりました。大規模コードベースでCI実行時間を短縮したいチームや、新規Pythonプロジェクトを始めるチームにとって、試してみる価値は十分あります。
+
+まずは小規模プロジェクトや新規プロジェクトで試して、mypyとの差分を確認してから段階的に移行を進めることをお勧めします。
