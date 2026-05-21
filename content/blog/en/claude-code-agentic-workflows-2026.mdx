@@ -1,0 +1,178 @@
+---
+title: "Practical Agentic AI Coding — Lessons from Claude Code in 2026"
+description: "Key lessons from working with Claude Code and agentic AI workflows: what actually works, what to watch out for, and how to integrate LLMs into your development process."
+date: "2026-05-22"
+status: "published"
+tags: ["Claude", "AI", "LLM", "agentic-ai", "developer-tools"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-agentic-workflows-2026"
+---
+
+## The Shift from LLM to Agent
+
+The most significant change in developer tooling in 2026 isn't a new model release — it's how those models are being used. What started as glorified autocomplete has evolved into agents that plan, read files, execute commands, verify output, and loop back on failure.
+
+Claude Code, Cursor, and GitHub Copilot Workspace have all shifted toward this model. Claude Opus 4.7, released in April 2026, scored 64.3% on SWE-bench Pro — a benchmark measuring the ability to resolve real GitHub Issues on open-source repositories — up 10.9 points from Opus 4.6. That improvement reflects meaningfully better reasoning over real codebases, not just benchmark optimization.
+
+Here's what actually matters for day-to-day development.
+
+## What Agentic AI Is Good At
+
+Not all tasks benefit from an agent. The distinction is important: using an agent for the wrong task produces code that looks correct but introduces subtle problems you might not catch in review.
+
+**Good fits:**
+- Cross-file refactoring where consistency matters across many files
+- Generating boilerplate that follows existing patterns (tests, type definitions, CRUD handlers)
+- Implementing features similar to ones already in the codebase
+- Updating documentation or generating changelogs from code changes
+
+**Poor fits:**
+- Design decisions requiring deep business domain knowledge
+- Complex debugging where state depends on external systems
+- Security-critical code where the correctness criteria are non-obvious
+- Long multi-session tasks with many interdependencies
+
+The guiding question before delegating to an agent: "How will I verify this?" If you can't answer clearly, the agent will produce something plausible-looking that may be wrong in ways that survive code review.
+
+## Structuring Prompts for Agentic Work
+
+Prompt structure has a larger impact in agentic mode than in conversational LLM use. Vague requests result in the agent making assumptions that may conflict with your intent.
+
+```markdown
+# Task
+[Describe the specific change in 1-2 sentences]
+
+# Context
+- Target file: `src/lib/auth.ts`
+- Related types: `src/types/user.ts`
+- Test file: `src/lib/auth.test.ts`
+
+# Constraints
+- All existing tests must pass after the change
+- Do not use `any` types
+- Follow the error handling pattern in `src/lib/errors.ts`
+
+# Expected output
+- List of modified files
+- Brief summary of what changed and why
+```
+
+The key insight: specify what to achieve and what not to break, not how to implement it. Agents develop their own implementation strategies — your job is to constrain the solution space, not prescribe the solution.
+
+## Context Window Management
+
+One of the most common failure modes in long agentic sessions is context drift — the agent loses track of earlier constraints or decisions as the conversation grows. It's not a model bug; it's a window management problem.
+
+Practical mitigations:
+
+```markdown
+# Session anchor (paste at the start of each new session)
+
+Current work: [brief description]
+Completed:
+- ✅ Refactored authentication module
+- ✅ Updated type definitions
+
+Remaining:
+- [ ] Update test suite
+- [ ] Update documentation
+
+Non-negotiable constraints:
+- No `any` types
+- Error handling must use the custom Result type
+- All endpoints must include request validation
+```
+
+For multi-session tasks, have the agent produce a structured progress summary at the end of each session, then paste it as context at the start of the next. This costs a few tokens but prevents expensive backtracking.
+
+## Integrating Human Review
+
+Taking agent-generated code straight to production is a risk pattern. The practical workflow should include human review checkpoints:
+
+```bash
+# Review changes before committing
+git diff --stat HEAD
+
+# For large changesets, stage interactively
+git add -p
+
+# Run tests against the generated code
+npm test
+
+# Type check separately — tests don't catch type errors
+npx tsc --noEmit
+```
+
+The failure mode to watch for: code that passes tests but has semantic problems — a refactored function that technically works but violates an invariant the tests don't cover, or an error path that swallows exceptions instead of propagating them.
+
+Small, incremental commits from agent work are safer than one large commit. It's easier to identify which agent-suggested change introduced a problem when you're reviewing 100-line diffs rather than 1000-line ones.
+
+## Team Adoption Patterns
+
+Individual agent usage and systematic team adoption are different problems.
+
+For team adoption, the approaches that work:
+
+**1. Document your codebase conventions in agent-readable format**
+
+```markdown
+# Engineering Guidelines for AI Assistants
+
+## TypeScript
+- Always use strict mode; never use `any`
+- Prefer `Result<T, E>` over throwing for domain errors
+- All public functions must have explicit return type annotations
+
+## API Routes (Next.js)
+- Validate request bodies with Zod before processing
+- Return errors using the standard error response shape in `src/lib/api.ts`
+- Log at the service layer, not the route handler layer
+
+## Testing
+- Unit tests: pure functions only
+- Integration tests: use the test database configured in `.env.test`
+```
+
+**2. Share effective prompt templates**
+
+When a prompt pattern produces consistently good results, extract it as a template the whole team can use. Prompts are engineering artifacts.
+
+**3. Apply the same code review bar to agent output**
+
+This is the one most teams get wrong. Agent-generated code often gets lighter review because it's syntactically correct and compiles. Apply the same review criteria you'd apply to a junior engineer's work — maybe stricter, since the agent has no context about why certain decisions were made historically.
+
+## Claude Code Background Tasks in CI
+
+Claude Code's ability to run agent tasks through GitHub Actions — without an active session — changes the workflow for repetitive tasks like updating dependency types after a library upgrade, generating migration scripts, or keeping documentation in sync with code changes.
+
+```yaml
+# .github/workflows/ai-type-update.yml
+name: Update types after dependency bump
+on:
+  pull_request:
+    paths:
+      - 'package.json'
+
+jobs:
+  update-types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Claude Code to update affected types
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: |
+            The package.json has changed. Check if any TypeScript type imports
+            from the modified packages need updates. Run `tsc --noEmit` to find
+            type errors, fix them, and commit with message "chore: update types
+            for dependency changes".
+```
+
+This is still early-stage for most teams, but the pattern is sound: define a bounded, verifiable task, run it in CI, let a human review the PR.
+
+## Summary
+
+Agentic AI has moved past the "should we try this?" stage. The questions now are practical: which tasks to delegate, how to structure prompts, how to manage context in long sessions, and how to integrate agent output into existing review processes.
+
+Model capabilities will continue to improve. The skills that stay valuable: defining tasks precisely, verifying outputs systematically, and knowing where human judgment is irreplaceable.

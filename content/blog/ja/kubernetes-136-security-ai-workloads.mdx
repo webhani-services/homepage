@@ -1,0 +1,148 @@
+---
+title: "Kubernetes v1.36 リリース — セキュリティ強化と AI Workload サポートの成熟"
+description: "Kubernetes v1.36 で General Availability に達した機能と、AI ワークロードサポートの進化を実用的な観点から解説します。"
+date: "2026-05-18"
+status: "published"
+tags: ["Kubernetes", "DevOps", "cloud-infrastructure", "security", "AI"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-136-security-ai-workloads"
+---
+
+## Kubernetes v1.36 の概要
+
+Kubernetes v1.36 が2026年5月にリリースされました。今回のリリースでは70件の機能強化が含まれており、セキュリティのデフォルト値の強化と AI ワークロードサポートの成熟が主要なテーマです。
+
+General Availability（GA）に達した主要機能は3つです：
+
+1. **User Namespaces** — コンテナのセキュリティ分離を強化
+2. **Mutating Admission Policies** — CEL（Common Expression Language）ベースのリソース変更ポリシー
+3. **Fine-Grained Kubelet API Authorization** — kubelet へのアクセス制御の細分化
+
+また、2026年3月24日に Ingress NGINX プロジェクトが退役（archived）されており、使用中のクラスターでは移行計画が必要です。
+
+## User Namespaces の GA
+
+User Namespaces は、コンテナ内のユーザー ID をホストのユーザー ID から分離する機能です。コンテナ内の root ユーザーがホストシステムでは非特権ユーザーとして動作するため、アプリケーションを変更せずに権限昇格攻撃のリスクを低減できます。
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: isolated-workload
+spec:
+  hostUsers: false  # User Namespace を有効化
+  containers:
+  - name: app
+    image: your-app:latest
+    securityContext:
+      runAsUser: 0  # コンテナ内では root
+      # ホストでは非特権ユーザーにマップされる
+```
+
+`hostUsers: false` の設定のみで User Namespaces が有効になります。コンテナ内で root 権限が必要なアプリケーション（一部のレガシーアプリ、ビルドツールなど）を、ホストのセキュリティを損なわずに実行できるようになります。
+
+**注意点:** すべてのコンテナランタイムが User Namespaces を同等にサポートしているわけではありません。展開前に containerd のバージョン（≥1.7）と runtime の互換性を必ず確認してください。
+
+## Mutating Admission Policies
+
+Admission Webhook は機能しますが、運用上の負担があります。外部 Webhook サービスのデプロイと維持が必要で、TLS の管理も発生します。また、Webhook の障害時には対象リソースの作成要求がすべてブロックされるリスクがあります。
+
+Mutating Admission Policies は CEL を使用し、API サーバー内でインラインで実行されます。外部サービスへの依存がなく、レイテンシの低減とメンテナンスコストの削減が期待できます。
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: set-default-labels
+spec:
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      resources: ["pods"]
+      operations: ["CREATE"]
+  mutations:
+  - patchType: ApplyConfiguration
+    applyConfiguration:
+      expression: |
+        Object{
+          metadata: Object.metadata{
+            labels: {"managed-by": "platform-team"}
+          }
+        }
+```
+
+この例では、新しく作成される Pod に自動的にラベルを付与します。Webhook ではこのためにサービスを別途デプロイする必要がありましたが、YAML の宣言だけで実現できます。
+
+外部参照が必要な複雑な変換ロジックは引き続き Webhook が必要です。ラベル注入、デフォルト値の設定、フィールドの正規化といった一般的なパターンに CEL ポリシーを活用してください。
+
+## Fine-Grained Kubelet API Authorization
+
+従来、kubelet API へのアクセス制御は比較的粗い単位でした。v1.36 では個別の kubelet エンドポイントに対する細粒度の認可が GA に達しました。
+
+マルチテナントクラスターや規制環境において、ノードエージェントが侵害された場合の影響範囲を制限する際に特に有効です。
+
+## AI ワークロードサポートの進化
+
+**Dynamic Resource Allocation（DRA）の安定化:**
+
+DRA は GPU、FPGA、カスタムアクセラレータなどのハードウェアリソースを動的に割り当てる機能です。従来の静的な `nvidia.com/gpu` リソースモデルの制約を超えた柔軟な管理が可能になります。
+
+```yaml
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: gpu-claim
+spec:
+  resourceClassName: gpu.example.com
+---
+apiVersion: v1
+kind: Pod
+spec:
+  resourceClaims:
+  - name: gpu
+    resourceClaimName: gpu-claim
+  containers:
+  - name: training
+    image: pytorch/pytorch:latest
+    resources:
+      claims:
+      - name: gpu
+```
+
+**TopologyAwareRouting の改善:**
+
+推論ワークロードにおけるクロスゾーントラフィックを削減できます。大規模モデルを実行する際、コンピューティングノード間のネットワークレイテンシが重要になる場面で効果を発揮します。
+
+## Ingress NGINX 退役：移行計画
+
+CNCF の Ingress NGINX プロジェクト（`kubernetes/ingress-nginx`）が2026年3月24日に退役となりました。nginx.org の NGINX Ingress Controller は別プロジェクトとして継続されています。
+
+`kubernetes` GitHub Organization の `ingress-nginx` を使用している場合は、移行計画を立てる必要があります。
+
+**主な移行先候補:**
+
+| 選択肢 | 成熟度 | 備考 |
+|--------|--------|------|
+| Gateway API（Envoy Gateway、Cilium） | 安定 | 新規デプロイに推奨 |
+| NGINX Inc. Ingress Controller | 安定 | 既存設定との互換性が高い |
+| Traefik | 安定 | シンプルな構成に適している |
+| Contour | 安定 | Envoy ベース、CNCF プロジェクト |
+
+新規プロジェクトには Gateway API を推奨します。クラスター運用者とアプリケーションチームの役割分担が明確になり、エコシステム全体がこの方向に向かっています。
+
+## アップグレードのチェックリスト
+
+v1.36 へのアップグレード前に確認すべき事項：
+
+1. `kubectl deprecations` で削除された API バージョンを確認する
+2. Admission Webhook の互換性を検証する
+3. コンテナランタイムのバージョンを確認する（User Namespaces は最新バージョンが必要）
+4. 本番に近いワークロードでステージング環境での事前検証を実施する
+
+## まとめ
+
+Kubernetes v1.36 は、セキュリティ面（User Namespaces、Fine-Grained Kubelet Auth）とクラスターポリシー管理（Mutating Admission Policies）の両方を改善するリリースです。AI ワークロードの改善も点的ですが実質的です。
+
+運用上最も急ぎ対応が必要なのは Ingress NGINX の退役です。現在使用中であれば、今すぐ移行計画を立てることを推奨します。問題が深刻化してから対応するより、計画的に進める方がはるかにコストが低く済みます。
