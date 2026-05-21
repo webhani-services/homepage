@@ -1,0 +1,139 @@
+---
+title: "Kubernetes v1.36: Security Defaults Tighten and AI Workload Support Matures"
+description: "A practical look at the features graduating to GA in Kubernetes v1.36, plus what the Ingress NGINX retirement means for your clusters."
+date: "2026-05-22"
+status: "published"
+tags: ["Kubernetes", "DevOps", "cloud-infrastructure", "security", "AI"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-136-security-ai-workloads"
+---
+
+## What's in v1.36
+
+Kubernetes v1.36, codenamed Haru, shipped in May 2026 with 70 enhancements. Security and AI workload support dominate the headline features graduating to General Availability (GA):
+
+1. **User Namespaces** — isolates container UIDs from the host
+2. **Mutating Admission Policies** — CEL-based resource mutation without external webhooks
+3. **Fine-Grained Kubelet API Authorization** — per-endpoint access control on the kubelet
+
+There's also a hard operational task: Ingress NGINX was retired on March 24, 2026, and clusters still running it need a migration plan.
+
+## User Namespaces: Better Container Isolation
+
+User Namespaces map container UIDs to unprivileged host UIDs. A process running as `root` inside the container runs as a non-root user on the host. This breaks a class of container escape vulnerabilities without requiring application changes.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: build-runner
+spec:
+  hostUsers: false  # enable User Namespaces
+  containers:
+  - name: builder
+    image: your-builder:latest
+    securityContext:
+      runAsUser: 0  # root inside the container
+      # mapped to an unprivileged UID on the host
+```
+
+Setting `hostUsers: false` is the only required change. This is particularly useful for workloads that legitimately need container-level root (build tools, legacy apps) but where host-level root would be unacceptable.
+
+**Before enabling in production:** verify your container runtime supports User Namespaces. containerd 1.7+ is required. Check your node runtime version and run a compatibility test in a non-production cluster first.
+
+## Mutating Admission Policies: Fewer Moving Parts
+
+Admission Webhooks are flexible but introduce operational overhead. They require a separate service, TLS certificates, and careful availability management — a webhook outage can block resource creation cluster-wide.
+
+Mutating Admission Policies use CEL (Common Expression Language) and execute inside the API server. No external service dependency, lower latency, and significantly less infrastructure to maintain.
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: inject-team-label
+spec:
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      resources: ["pods"]
+      operations: ["CREATE"]
+  mutations:
+  - patchType: ApplyConfiguration
+    applyConfiguration:
+      expression: |
+        Object{
+          metadata: Object.metadata{
+            labels: {"team": "platform"}
+          }
+        }
+```
+
+This adds a `team` label to every new Pod without running a separate webhook service. The same pattern applies for setting default resource limits, normalizing environment variable names, or injecting sidecar annotations.
+
+CEL policies are not a complete webhook replacement. For mutations that require external lookups — checking a remote registry, querying a database — you still need a webhook. But for the majority of common patterns, CEL is simpler and more reliable.
+
+## Fine-Grained Kubelet API Authorization
+
+This is less visible in daily operations but matters in regulated environments and multi-tenant clusters. In previous versions, kubelet API access was coarse-grained. v1.36 GA brings per-endpoint authorization, so you can grant a monitoring agent access to `/metrics` without granting it access to `/exec` or `/logs`.
+
+The practical impact: if a node agent is compromised, the blast radius is limited to the specific kubelet APIs it was authorized to use.
+
+## AI Workload Support: DRA Stabilization
+
+Dynamic Resource Allocation (DRA) — the mechanism for assigning GPUs, FPGAs, and custom accelerators to pods — continues to stabilize in v1.36. The static `nvidia.com/gpu` resource model works for homogeneous GPU pools but becomes limiting when you need to share a single GPU across multiple pods, select GPUs with specific memory characteristics, or support fractional GPU allocation.
+
+```yaml
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: inference-gpu
+spec:
+  resourceClassName: gpu.company.com
+---
+apiVersion: v1
+kind: Pod
+spec:
+  resourceClaims:
+  - name: gpu
+    resourceClaimName: inference-gpu
+  containers:
+  - name: inference-server
+    image: your-inference:latest
+    resources:
+      claims:
+      - name: gpu
+```
+
+DRA enables the GPU driver to negotiate the specific device and configuration at scheduling time, rather than declaring everything statically in the pod spec. This matters as inference workloads become more heterogeneous.
+
+## Ingress NGINX Retirement: Migration Paths
+
+If you're using the `kubernetes/ingress-nginx` controller from the CNCF project (not the NGINX Inc. controller from `nginx.org`), you need to migrate. No further releases, bugfixes, or CVE patches will be published.
+
+| Option | Maturity | Notes |
+|--------|----------|-------|
+| Gateway API + Envoy Gateway | Stable | Recommended for new deployments |
+| Gateway API + Cilium | Stable | Good if you already use Cilium CNI |
+| NGINX Inc. Controller | Stable | High config compatibility with ingress-nginx |
+| Traefik | Stable | Simple configuration, strong middleware support |
+
+Gateway API is the long-term direction the ecosystem is moving toward. If you're starting a new cluster or have the bandwidth for migration, this is the right time. For existing clusters with complex ingress configurations, the NGINX Inc. controller is the lowest-friction migration path.
+
+## Upgrade Checklist
+
+Before upgrading a production cluster to v1.36:
+
+1. Run `kubectl deprecations` to catch removed API versions
+2. Audit Admission Webhooks — verify compatibility with the new webhook mutation policies
+3. Check container runtime version (containerd ≥ 1.7 for User Namespaces)
+4. Validate in a staging environment with production-representative workloads
+5. Plan your Ingress NGINX migration timeline if still running it
+
+## Summary
+
+v1.36 is a security-focused release that reduces operational complexity at the same time — Mutating Admission Policies being the clearest example. The AI workload improvements are incremental but meaningful as GPU workloads become a larger part of cluster operations.
+
+The Ingress NGINX retirement is the most time-sensitive item. If it applies to you, prioritize that migration before other upgrades.

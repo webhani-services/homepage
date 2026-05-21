@@ -1,0 +1,174 @@
+---
+title: "TypeScript が「勝った」— Next.js 15.5 と Turbopack が示す 2026 年の Web 開発"
+description: "JavaScript Survey で「TypeScript has won」が宣言され、Next.js 15.5 が Turbopack ビルドをベータ提供。2026 年の Web 開発スタックの現状を整理します。"
+date: "2026-05-18"
+status: "published"
+tags: ["TypeScript", "Next.js", "Turbopack", "web-development", "frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-wins-nextjs-155-turbopack"
+---
+
+## TypeScript はすでに「標準」になった
+
+JavaScript のエコシステム調査で、ある発言が注目を集めました。Nuxt のコアチームリーダーによる「TypeScript has won. Not as a bundler, but as a language.（TypeScript が勝った。バンドラーとしてではなく、言語として）」という言葉です。
+
+調査によると、回答者の40%がすでに TypeScript のみでコーディングしており、この割合はさらに増加傾向にあります。
+
+この変化は個人の好みを超えた構造的な変化を反映しています。主要なライブラリ・フレームワークの多くが TypeScript を前提として設計されるようになり、AI コーディングツールも TypeScript をデフォルトで出力します。2026年に新規プロジェクトを JavaScript のみで始めるということは、標準的なツールチェーンから意図的に外れることを意味します。
+
+## Next.js 15.5 の主要アップデート
+
+### Turbopack ビルドがベータ提供
+
+これまで開発サーバーのみに対応していた Turbopack が、本番ビルドでもベータ利用可能になりました。
+
+```bash
+next build --turbopack
+```
+
+Turbopack は Rust 製のバンドラーで、大規模なコードベースで Webpack と比較して700倍高速と報告されています。開発サーバーの起動時間とホットモジュールリプレースメントの速度改善はすでに多くのチームが実感していますが、本番ビルドへの対応は待ち望まれていた機能です。
+
+本番ビルドへの切り替えはベータ段階のため、以下を確認してから判断することを推奨します。
+
+- Turbopack ビルド後に全テストスイートを実行する
+- バンドル出力サイズを比較する（Turbopack と Webpack でチャンク分割が異なる場合がある）
+- カスタム Webpack プラグインの Turbopack 対応状況を確認する
+
+```javascript
+// next.config.ts — --turbopack フラグ使用時は特別な設定不要
+// カスタム設定が必要な場合:
+const nextConfig = {
+  experimental: {
+    turbo: {
+      resolveAlias: {
+        underscore: "lodash",
+      },
+    },
+  },
+};
+```
+
+### Node.js Middleware の安定化
+
+Edge Runtime のみだった Middleware が、Node.js Runtime でも安定して動作するようになりました。
+
+```typescript
+// middleware.ts — Node.js Runtime が使用可能に
+import { NextRequest, NextResponse } from "next/server";
+import { verifyToken } from "@/lib/auth"; // Node.js crypto が使用可能
+
+export async function middleware(request: NextRequest) {
+  const token = request.cookies.get("session")?.value;
+
+  if (!token) {
+    return NextResponse.redirect(new URL("/login", request.url));
+  }
+
+  const payload = await verifyToken(token); // 完全な Node.js crypto が利用可能
+
+  const response = NextResponse.next();
+  response.headers.set("x-user-id", payload.userId);
+  return response;
+}
+
+export const config = {
+  matcher: ["/((?!_next|api/public).*)"],
+};
+```
+
+Edge Runtime の制約（Node.js API の一部が使用不可）を気にせずに Middleware を書けるようになりました。認証フローで軽量な crypto ライブラリを別途導入したり、構造を変更したりする必要がなくなります。
+
+### next lint の非推奨化
+
+`next lint` コマンドが非推奨となり、ESLint または Biome を直接使用することが推奨されるようになりました。
+
+```json
+// package.json
+{
+  "scripts": {
+    "lint": "eslint . --ext .ts,.tsx"
+    // または
+    // "lint": "biome check ."
+  }
+}
+```
+
+ESLint を直接設定して使用しているチームには実質的な影響は少ないですが、`next lint` に依存していた場合は対応が必要です。
+
+## Biome の台頭
+
+Biome（旧 Rome）は、ESLint と Prettier を置き換える統合ツールチェーンとして注目されています。Rust 製のため高速で、フォーマッターとリンターが1つのツールにまとまっています。
+
+```bash
+npm install --save-dev @biomejs/biome
+npx @biomejs/biome init
+```
+
+```json
+// biome.json
+{
+  "$schema": "https://biomejs.dev/schemas/1.x.x/schema.json",
+  "formatter": {
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": {
+    "rules": {
+      "recommended": true,
+      "correctness": {
+        "noUnusedVariables": "error"
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "semicolons": "always"
+    }
+  }
+}
+```
+
+**主な制約:** Biome のルールセットはまだ ESLint のプラグインエコシステムほど充実していません。`eslint-plugin-react-hooks` や `@typescript-eslint/strict` など特定のプラグインに依存している場合、移行コストが高い可能性があります。
+
+## TypeScript の設定を見直す
+
+TypeScript が標準になったいま、設定も適切に行うことが重要です。
+
+```json
+// tsconfig.json
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true
+  }
+}
+```
+
+`noUncheckedIndexedAccess` は多くのチームが見落としがちなオプションです。配列インデックスアクセスとオブジェクトプロパティアクセスの型に `undefined` が追加されるため（`arr[0]` が `string` ではなく `string | undefined` になる）、実際のバグを型レベルで捕捉できます。より明示的な処理が必要になりますが、その価値があります。
+
+`strict` モードは後から有効にすると大量のエラーが発生するため、プロジェクト開始時から設定することが重要です。
+
+## 2026年時点での推奨スタック
+
+| カテゴリ | 推奨 | 備考 |
+|--------|------|------|
+| Framework | Next.js 15.x | App Router + RSC の成熟 |
+| 言語 | TypeScript（strict） | 型安全性と IDE サポート |
+| Bundler | Turbopack（新規）/ Webpack（既存） | Turbopack はまだ移行期 |
+| Linter/Formatter | Biome または ESLint + Prettier | チームの既存設定による |
+| CSS | Tailwind CSS 4 | パフォーマンスと開発速度 |
+
+## まとめ
+
+TypeScript の標準化は、もはやトレンドではなく事実です。新規プロジェクトを JavaScript で始める理由を見つけるほうが難しくなっています。Next.js 15.5 の Turbopack 本番ビルドベータと Node.js Middleware の安定化は、具体的な開発体験の改善をもたらします。
+
+Turbopack の本番ビルドはベータ段階であるため、本番への採用は慎重に評価してください。一方、Node.js Middleware は本番利用の準備が整っています。
+
+実践的なアクション：TypeScript の設定に `strict: true` と `noUncheckedIndexedAccess` がなければ、今すぐ追加してエラーを解消してください。コードベースが成長してからより大変になります。
