@@ -1,0 +1,238 @@
+---
+title: "Next.js + TypeScript + TanStack Query로 실천하는 Clean Architecture"
+description: "Next.js App Router, TypeScript, TanStack Query를 조합한 Clean Architecture 실천 패턴을 소개합니다. 관심사를 분리하면서 확장 가능한 프론트엔드 설계의 구체적인 예시를 담았습니다."
+date: "2026-05-23"
+status: "published"
+tags: ["Next.js", "TypeScript", "TanStack Query", "Architecture", "React"]
+thumbnail: ""
+author: "webhani"
+slug: "clean-architecture-nextjs-typescript-2026"
+---
+
+Next.js App Router가 새 프로젝트의 기본 출발점이 된 지금, 장기적으로 유지보수하기 쉬운 코드베이스를 어떻게 구성할 것인지에 대한 질문이 더욱 중요해지고 있습니다. Server Components, Client Components, API Route, TanStack Query의 캐시 레이어—이것들을 어떻게 정리하느냐에 따라 프로젝트의 장기 보수성이 크게 달라집니다.
+
+이 글에서는 webhani에서 Next.js + TypeScript + TanStack Query 구성으로 실무에 적용하는 Clean Architecture 패턴을 소개합니다.
+
+## 왜 Architecture를 의식해야 하는가
+
+컴포넌트에 데이터 취득, 비즈니스 로직, 렌더링을 모두 넣으면 처음엔 잘 돌아갑니다. 하지만 프로젝트가 성장하면 다음 문제가 발생합니다.
+
+- API 호출과 UI 로직이 뒤섞여 테스트를 작성할 수 없다
+- 동일한 fetch 로직이 여러 컴포넌트에 중복되어 API 변경 시 수정 범위가 넓어진다
+- 타입 정의가 컴포넌트마다 따로 놀아 런타임 버그의 온상이 된다
+
+Clean Architecture의 핵심은 **의존 방향을 단방향으로 제어하는 것**입니다. 각 레이어는 아래 레이어만 알고, 위 레이어는 알지 못합니다.
+
+## 권장 디렉터리 구조
+
+```
+src/
+├── app/                    # Next.js App Router — 라우팅만 담당
+│   ├── (routes)/
+│   │   └── users/
+│   │       ├── page.tsx    # Server Component
+│   │       └── [id]/
+│   │           └── page.tsx
+│   └── api/
+│       └── users/
+│           └── route.ts
+├── features/               # 기능 단위 모듈
+│   └── users/
+│       ├── api.ts          # API 호출 함수
+│       ├── queries.ts      # TanStack Query 정의
+│       ├── types.ts        # 타입 정의
+│       └── components/     # 기능 전용 UI
+├── lib/
+│   └── api-client.ts       # HTTP Client 설정
+└── components/             # 공통 UI 컴포넌트
+```
+
+핵심은 `features/` 디렉터리로 기능 단위로 분리하는 것입니다. `users/` 기능에 필요한 것은 모두 `features/users/`에 두고, 기능 간 의존을 최소화합니다.
+
+## 레이어별 구현 패턴
+
+### 1. 타입 정의 레이어 (`types.ts`)
+
+```typescript
+// features/users/types.ts
+export interface User {
+  id: string;
+  name: string;
+  email: string;
+  role: 'admin' | 'member';
+  createdAt: string;
+}
+
+export interface CreateUserInput {
+  name: string;
+  email: string;
+  role: 'admin' | 'member';
+}
+
+export interface UpdateUserInput extends Partial<CreateUserInput> {
+  id: string;
+}
+```
+
+타입 정의를 한 곳에서 관리하면 API 형태가 바뀔 때 컴파일 오류로 변경 영향 범위를 즉시 파악할 수 있습니다.
+
+### 2. API 호출 레이어 (`api.ts`)
+
+```typescript
+// features/users/api.ts
+import { apiClient } from '@/lib/api-client';
+import type { User, CreateUserInput, UpdateUserInput } from './types';
+
+export async function fetchUsers(): Promise<User[]> {
+  return apiClient.get('/api/users');
+}
+
+export async function fetchUserById(id: string): Promise<User> {
+  return apiClient.get(`/api/users/${id}`);
+}
+
+export async function createUser(input: CreateUserInput): Promise<User> {
+  return apiClient.post('/api/users', input);
+}
+
+export async function updateUser({ id, ...input }: UpdateUserInput): Promise<User> {
+  return apiClient.patch(`/api/users/${id}`, input);
+}
+```
+
+이 레이어는 순수한 비동기 함수만으로 구성합니다. React 의존성이 없어 Node.js 환경에서도 브라우저 환경에서도 동작합니다. `apiClient`를 Mock하면 간단히 테스트를 작성할 수 있습니다.
+
+### 3. TanStack Query 레이어 (`queries.ts`)
+
+```typescript
+// features/users/queries.ts
+import {
+  useQuery,
+  useMutation,
+  useQueryClient,
+  queryOptions,
+} from '@tanstack/react-query';
+import { fetchUsers, fetchUserById, createUser, updateUser } from './api';
+import type { CreateUserInput, UpdateUserInput } from './types';
+
+// Query 키를 중앙에서 관리
+export const userKeys = {
+  all: ['users'] as const,
+  detail: (id: string) => ['users', id] as const,
+};
+
+// queryOptions로 Server/Client 양쪽에서 재사용 가능한 정의
+export const usersQueryOptions = queryOptions({
+  queryKey: userKeys.all,
+  queryFn: fetchUsers,
+  staleTime: 1000 * 60 * 5, // 5분
+});
+
+export function useUser(id: string) {
+  return useQuery({
+    queryKey: userKeys.detail(id),
+    queryFn: () => fetchUserById(id),
+  });
+}
+
+export function useCreateUser() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: createUser,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: userKeys.all });
+    },
+  });
+}
+
+export function useUpdateUser() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: updateUser,
+    onSuccess: (updated) => {
+      queryClient.setQueryData(userKeys.detail(updated.id), updated);
+      queryClient.invalidateQueries({ queryKey: userKeys.all });
+    },
+  });
+}
+```
+
+`userKeys`로 Query 키를 집약하는 것이 이 패턴에서 가장 효과적인 관행입니다. 키가 인라인 문자열 리터럴로 흩어지면 캐시 무효화 누락이 반드시 발생합니다.
+
+### 4. Server Component에서 Prefetch
+
+```typescript
+// app/(routes)/users/page.tsx
+import { HydrationBoundary, dehydrate } from '@tanstack/react-query';
+import { getQueryClient } from '@/lib/query-client';
+import { usersQueryOptions } from '@/features/users/queries';
+import { UserList } from '@/features/users/components/UserList';
+
+export default async function UsersPage() {
+  const queryClient = getQueryClient();
+
+  // 서버에서 미리 데이터를 가져옵니다
+  await queryClient.prefetchQuery(usersQueryOptions);
+
+  return (
+    <HydrationBoundary state={dehydrate(queryClient)}>
+      <UserList />
+    </HydrationBoundary>
+  );
+}
+```
+
+`queries.ts`에서 정의한 `queryOptions`를 Server Component에서도 그대로 재사용합니다. 서버에서 Prefetch한 캐시가 클라이언트로 전달되어 첫 렌더링 시 불필요한 로딩 Waterfall이 발생하지 않습니다.
+
+### 5. Client Component에서 사용
+
+```typescript
+// features/users/components/UserList.tsx
+'use client';
+
+import { useSuspenseQuery } from '@tanstack/react-query';
+import { usersQueryOptions } from '../queries';
+
+export function UserList() {
+  // useSuspenseQuery는 data가 반드시 존재함을 타입 레벨에서 보장합니다
+  const { data: users } = useSuspenseQuery(usersQueryOptions);
+
+  return (
+    <ul>
+      {users.map((user) => (
+        <li key={user.id}>
+          <span>{user.name}</span>
+          <span>{user.email}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+`useSuspenseQuery`를 사용하면 `data?.`와 같은 Optional Chaining이 필요 없어집니다. 로딩·에러 상태는 더 상위의 Suspense와 Error Boundary에서 처리합니다.
+
+## 레이어별 테스트 전략
+
+| 레이어 | 테스트 방법 |
+|-------|-----------|
+| `api.ts` | `apiClient`를 Mock한 Unit Test |
+| `queries.ts` | `@testing-library/react` + `QueryClientProvider`로 Hook 테스트 |
+| Components | MSW로 네트워크를 Intercept한 통합 테스트 |
+| `app/` pages | Playwright로 E2E 테스트 |
+
+각 레이어가 독립적으로 테스트 가능한 것은 의존 방향이 단방향으로 제어되기 때문입니다.
+
+## webhani의 관점
+
+Next.js 프로젝트에서 흔히 발생하는 문제는 컨벤션이 없는 것이 아니라, 컨벤션이 강제되지 않는 것입니다. `features/` 디렉터리 구조와 Query 키 집약은 프로젝트 초기에 비용 없이 도입할 수 있고, 6개월 후 데이터 모델을 리팩터링할 때 그 가치를 실감하게 됩니다.
+
+여기서 소개한 패턴은 새로운 개념이 아닙니다. Next.js App Router + TanStack Query라는 특정 제약 조건에 표준적인 계층형 아키텍처 원칙을 적용한 것입니다. 중요한 것은 규칙을 엄격히 지키는 것이 아니라, "변경이 한 곳에 닫힌다"는 설계 의도를 이해하고 팀의 판단으로 적용 범위를 결정하는 것입니다.
+
+## 정리
+
+- `features/<name>/` 단위 분리로 모듈 간 의존을 최소화
+- `types.ts`, `api.ts`, `queries.ts`를 명확히 분리해 각 레이어의 책임을 단일화
+- `queryOptions`로 Server/Client 간 캐시 정의를 중복 없이 공유
+- `userKeys`와 같은 Query 키 집약으로 캐시 무효화 버그를 방지
+- 각 레이어에 맞는 테스트 전략을 별도로 수립

@@ -1,0 +1,163 @@
+---
+title: "AWS Copilot CLI が 2026 年 6 月に End of Support — 移行先の選択と対応方針"
+description: "AWS が AWS Copilot CLI の End of Support を 2026 年 6 月 12 日に予告しました。ECS や App Runner を Copilot で管理しているチームが取るべき移行戦略を解説します。"
+date: "2026-05-23"
+status: "published"
+tags: ["AWS", "ECS", "DevOps", "IaC", "Cloud"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-copilot-cli-eos-2026"
+---
+
+AWS が **AWS Copilot CLI** の End of Support を **2026 年 6 月 12 日**に予告しました。Copilot は Amazon ECS および AWS App Runner 上でコンテナアプリケーションを手軽にデプロイ・運用するために設計された CLI ツールです。EOS 後はセキュリティパッチを含む更新が提供されなくなるため、現在 Copilot を使用しているチームは移行計画を早急に立てる必要があります。
+
+## Copilot CLI とは
+
+AWS Copilot CLI は 2020 年に GA となったツールで、Dockerfile と最低限の設定ファイルから ECS Fargate や App Runner の環境をプロビジョニングできます。特に「ECS の設定が複雑すぎる」と感じるチームに対して、抽象化されたインターフェースを提供することを目的としていました。
+
+```bash
+# Copilot CLI の典型的なワークフロー（参考）
+copilot init
+copilot env init --name production
+copilot deploy --name api
+```
+
+一方で、プロジェクトが成熟するにつれて「Copilot の抽象化では対応しきれない」ケースが増え、Terraform や AWS CDK への移行を検討するチームも多くありました。
+
+## 移行先の選択肢
+
+### 1. AWS CDK（推奨）
+
+AWS CDK は TypeScript/Python などのプログラミング言語で AWS インフラを定義できる IaC ツールです。ECS Fargate のサービス定義も CDK で完結でき、Copilot が生成していた CloudFormation スタックへの移行パスとして最も自然な選択肢です。
+
+```typescript
+import * as ecs from 'aws-cdk-lib/aws-ecs';
+import * as ecsPatterns from 'aws-cdk-lib/aws-ecs-patterns';
+
+const fargateService = new ecsPatterns.ApplicationLoadBalancedFargateService(
+  this,
+  'ApiService',
+  {
+    cluster,
+    cpu: 512,
+    memoryLimitMiB: 1024,
+    taskImageOptions: {
+      image: ecs.ContainerImage.fromEcrRepository(repository, 'latest'),
+      containerPort: 8080,
+      environment: {
+        NODE_ENV: 'production',
+      },
+    },
+    desiredCount: 2,
+    publicLoadBalancer: true,
+  }
+);
+```
+
+CDK の利点は、アプリケーションコードと同じ言語でインフラを記述できるため、チームの学習コストが低い点です。
+
+### 2. Terraform
+
+既存のインフラ管理に Terraform を使用しているチームは、ECS リソースを Terraform に統合するのが自然な流れです。`aws_ecs_service` や `aws_ecs_task_definition` のリソース定義は成熟しており、豊富なコミュニティモジュールも活用できます。
+
+```hcl
+resource "aws_ecs_service" "api" {
+  name            = "api-service"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.api.arn
+  desired_count   = 2
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets         = var.private_subnet_ids
+    security_groups = [aws_security_group.api.id]
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.api.arn
+    container_name   = "api"
+    container_port   = 8080
+  }
+}
+```
+
+### 3. App Runner（Copilot なし）
+
+App Runner 自体は継続して提供されます。Copilot の EOS は App Runner の EOS ではありません。App Runner を引き続き使用するチームは、AWS Console、AWS CLI、または CDK/Terraform を通じて直接管理できます。
+
+```bash
+# AWS CLI で App Runner サービスを直接作成する例
+aws apprunner create-service \
+  --service-name my-api \
+  --source-configuration '{
+    "ImageRepository": {
+      "ImageIdentifier": "123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/my-api:latest",
+      "ImageRepositoryType": "ECR"
+    }
+  }'
+```
+
+### 4. GitHub Actions + AWS CLI の組み合わせ
+
+Copilot の主な役割がデプロイの自動化だったチームは、GitHub Actions と AWS CLI を組み合わせたシンプルなパイプラインに移行する選択肢もあります。
+
+```yaml
+# .github/workflows/deploy.yml
+- name: Deploy to ECS
+  uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+  with:
+    task-definition: task-definition.json
+    service: api-service
+    cluster: production
+    wait-for-service-stability: true
+```
+
+## 移行ステップの進め方
+
+### Step 1: 現在の Copilot 構成を把握する
+
+```bash
+copilot app ls
+copilot env ls
+copilot svc ls
+```
+
+上記コマンドで現在管理されているリソースを一覧化し、対象の CloudFormation スタックを確認します。
+
+### Step 2: CloudFormation スタックをエクスポートする
+
+Copilot が生成した CloudFormation スタックの構成を出力し、移行先 IaC ツールのベースラインにします。
+
+```bash
+aws cloudformation describe-stack-resources \
+  --stack-name <copilot-stack-name> \
+  --query 'StackResources[*].{Type:ResourceType,Id:PhysicalResourceId}' \
+  --output table
+```
+
+### Step 3: 新しい IaC コードを段階的に適用する
+
+既存の CloudFormation スタックをいきなり削除せず、新しい IaC コードで **同等のリソースを並行作成** → トラフィックを切り替え → 旧スタックを削除、という順序で進めます。
+
+## 移行タイムラインの目安
+
+| 期間 | 作業内容 |
+|------|---------|
+| 〜5 月末 | 現状把握・移行先 IaC ツールの選定 |
+| 6 月上旬 | 非本番環境での移行作業・動作確認 |
+| 6 月 12 日 EOS 前 | 本番環境の移行完了 |
+
+EOS 当日に Copilot が即座に使えなくなるわけではありませんが、セキュリティパッチが当たらなくなるため、速やかな移行を推奨します。
+
+## webhani としての見解
+
+AWS Copilot CLI の役割は「ECS の設定ハードルを下げること」でした。チームの規模や要件が増すにつれて、より柔軟な IaC ツールへ移行するのは自然な成長プロセスです。EOS は強制的な移行ですが、この機会にインフラ管理の方針を見直し、長期的に保守しやすい構成に整備することを推奨します。
+
+移行先として最初に検討すべきは **AWS CDK** です。既存の開発チームが TypeScript や Python を使っている場合、学習コストが最も低く、ECS や App Runner のパターンも豊富に揃っています。
+
+## まとめ
+
+- AWS Copilot CLI は 2026 年 6 月 12 日に End of Support
+- EOS 後はセキュリティパッチを含む更新が停止するため、早急な移行が必要
+- 移行先は AWS CDK（推奨）、Terraform、または App Runner の直接管理
+- CloudFormation スタックを段階的に置き換え、トラフィック切り替えで安全に移行する

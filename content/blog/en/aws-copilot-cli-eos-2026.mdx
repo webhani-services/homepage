@@ -1,0 +1,168 @@
+---
+title: "AWS Copilot CLI Reaches End of Support in June 2026: Migration Paths and What to Do Next"
+description: "AWS has announced that Copilot CLI will reach end of support on June 12, 2026. If your team uses Copilot to manage ECS or App Runner workloads, here's how to plan your migration."
+date: "2026-05-23"
+status: "published"
+tags: ["AWS", "ECS", "DevOps", "IaC", "Cloud"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-copilot-cli-eos-2026"
+---
+
+AWS has announced that **AWS Copilot CLI** will reach end of support on **June 12, 2026**. After that date, Copilot will no longer receive updates — including security patches. If your team uses Copilot to deploy and manage workloads on Amazon ECS or AWS App Runner, you need a migration plan in place before the deadline.
+
+## What Copilot CLI Was Built For
+
+AWS Copilot CLI, which reached GA in 2020, was designed to abstract away the complexity of ECS Fargate and App Runner configuration. A minimal setup looked like this:
+
+```bash
+# Typical Copilot workflow
+copilot init
+copilot env init --name production
+copilot deploy --name api
+```
+
+For smaller teams that didn't want to write raw CloudFormation or learn Terraform from scratch, Copilot significantly lowered the barrier to getting containers running on ECS. However, as projects grew in complexity, many teams found the abstraction layer limiting — at which point migrating to CDK or Terraform became the natural next step anyway.
+
+## Your Migration Options
+
+### Option 1: AWS CDK (recommended)
+
+AWS CDK lets you define AWS infrastructure using TypeScript, Python, Go, or Java. The `aws-ecs-patterns` construct library provides high-level abstractions that closely mirror what Copilot was doing under the hood, making it the most natural migration target.
+
+```typescript
+import * as ecs from 'aws-cdk-lib/aws-ecs';
+import * as ecsPatterns from 'aws-cdk-lib/aws-ecs-patterns';
+
+const service = new ecsPatterns.ApplicationLoadBalancedFargateService(
+  this,
+  'ApiService',
+  {
+    cluster,
+    cpu: 512,
+    memoryLimitMiB: 1024,
+    taskImageOptions: {
+      image: ecs.ContainerImage.fromEcrRepository(repository, 'latest'),
+      containerPort: 8080,
+      environment: { NODE_ENV: 'production' },
+    },
+    desiredCount: 2,
+    publicLoadBalancer: true,
+  }
+);
+```
+
+If your team already writes TypeScript or Python, CDK keeps infrastructure and application code in the same language — which lowers cognitive overhead considerably.
+
+### Option 2: Terraform
+
+Teams that already manage other infrastructure with Terraform should bring their ECS resources into the same state. The ECS provider resources are mature and well-documented:
+
+```hcl
+resource "aws_ecs_service" "api" {
+  name            = "api-service"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.api.arn
+  desired_count   = 2
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets         = var.private_subnet_ids
+    security_groups = [aws_security_group.api.id]
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.api.arn
+    container_name   = "api"
+    container_port   = 8080
+  }
+}
+```
+
+The main advantage of consolidating into Terraform is that your entire infrastructure state lives in one place, which simplifies drift detection and cross-resource dependency management.
+
+### Option 3: App Runner without Copilot
+
+If you're running App Runner workloads, it's worth noting that **App Runner itself is not going away** — only the Copilot CLI wrapper around it. You can manage App Runner services directly via the AWS Console, AWS CLI, or CDK/Terraform:
+
+```bash
+aws apprunner create-service \
+  --service-name my-api \
+  --source-configuration '{
+    "ImageRepository": {
+      "ImageIdentifier": "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-api:latest",
+      "ImageRepositoryType": "ECR"
+    }
+  }'
+```
+
+### Option 4: GitHub Actions + AWS CLI for simpler deployments
+
+If Copilot was primarily serving as a deployment tool rather than an infrastructure provisioner, a GitHub Actions pipeline with the official ECS deploy action may be all you need:
+
+```yaml
+# .github/workflows/deploy.yml
+- name: Deploy to ECS
+  uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+  with:
+    task-definition: task-definition.json
+    service: api-service
+    cluster: production
+    wait-for-service-stability: true
+```
+
+## Migration Steps
+
+### Step 1: Inventory what Copilot manages
+
+```bash
+copilot app ls
+copilot env ls
+copilot svc ls
+```
+
+List all applications, environments, and services currently managed by Copilot. This maps directly to CloudFormation stacks you'll need to account for.
+
+### Step 2: Export the CloudFormation stack configuration
+
+Copilot-managed resources are CloudFormation stacks. Inspect them to understand what you're working with:
+
+```bash
+aws cloudformation describe-stack-resources \
+  --stack-name <copilot-stack-name> \
+  --query 'StackResources[*].{Type:ResourceType,Id:PhysicalResourceId}' \
+  --output table
+```
+
+### Step 3: Migrate in parallel, then cut over
+
+Don't delete Copilot-managed stacks directly. Instead:
+1. Create equivalent resources with your new IaC tool
+2. Validate the new environment thoroughly in staging
+3. Shift traffic to the new stack (weighted routing or DNS cut-over)
+4. Delete the old Copilot-managed stacks after a safe observation period
+
+## Suggested Timeline
+
+| Timeframe | Action |
+|-----------|--------|
+| Now – end of May | Inventory resources, choose migration target |
+| Early June | Migrate and validate non-production environments |
+| Before June 12 | Complete production migration |
+
+Copilot won't stop working immediately on June 12, but without security updates, leaving it in use beyond that date is a risk you shouldn't accept for production infrastructure.
+
+## Our Perspective
+
+Copilot CLI served its purpose well for teams that needed a quick path to ECS. Its end of support isn't a failure — it reflects the maturity of the ecosystem. CDK and Terraform now offer similar convenience with far more flexibility for complex requirements.
+
+The forced migration is an opportunity. Many Copilot-managed setups accumulated configuration that was hard to inspect or reason about because it was hidden behind Copilot's abstraction. Moving to CDK or Terraform brings that configuration into explicit, version-controlled code that's much easier to audit and modify.
+
+For teams starting from scratch today, **AWS CDK** is our first recommendation for ECS workloads — it integrates tightly with the AWS ecosystem, supports TypeScript and Python natively, and has excellent construct libraries for common patterns.
+
+## Summary
+
+- AWS Copilot CLI reaches end of support on June 12, 2026 — no more security patches after that date
+- App Runner itself continues; only the Copilot CLI wrapper is being retired
+- Best migration targets: AWS CDK (recommended), Terraform, or direct AWS CLI/GitHub Actions
+- Migrate by creating parallel resources, validating, then cutting over — don't delete Copilot stacks first
