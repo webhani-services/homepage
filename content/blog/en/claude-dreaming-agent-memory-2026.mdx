@@ -1,0 +1,209 @@
+---
+title: "Claude Dreaming: How Anthropic Solved Long-Running Agent Memory"
+description: "Anthropic's Dreaming feature for Managed Agents API consolidates persistent memory between sessions by removing duplicates and stale entries. Here's what it does, how it works, and when your team should use it."
+date: "2026-05-24"
+status: "published"
+tags: ["claude", "ai-agents", "llm", "managed-agents", "memory"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-dreaming-agent-memory-2026"
+---
+
+## The Problem No One Talks About
+
+Most discussions about AI agents focus on what they can do in a single session. Can the model reason well? Does it follow instructions? Does tool use work reliably?
+
+These matter. But for teams using agents on real projects over weeks and months, a different question becomes pressing: **what happens to the agent's memory over time?**
+
+Anthropic's answer — at least for the Managed Agents API — is a research preview feature called Dreaming. It's a practical solution to a problem that compounds quietly until it becomes a bottleneck.
+
+---
+
+## What Agent Memory Actually Looks Like
+
+When you use a persistent agent (like Claude Code across a long project), the agent accumulates memory entries between sessions. These entries capture things like:
+
+- How the codebase is structured
+- Decisions your team has made ("we use Vitest, not Jest")
+- Past bugs and how they were fixed
+- User preferences and working style
+
+Over time, this is valuable. The agent knows your project. It doesn't need to rediscover that you're on a monorepo, or that the API layer uses tRPC, or that migrations run through a specific script.
+
+The problem is that memory isn't curated automatically. Left unchecked, it grows in ways that hurt rather than help:
+
+**Duplicate entries** accumulate across sessions. The agent might record "this project uses TypeScript strict mode" three separate times across three sessions. All three entries consume context on every subsequent call.
+
+**Stale entries** linger. Six months ago you used Redux; you've since migrated to Zustand. The old Redux architecture notes are still there, and they're actively misleading.
+
+**Context bloat** slows everything down. As memory grows, the tokens consumed by context increase. This raises costs and, past a certain size, starts to degrade response quality as the model has more irrelevant information to work through.
+
+---
+
+## What Dreaming Does
+
+Dreaming runs a consolidation pass over an agent's memory store. It does three things:
+
+1. **Deduplication**: Semantically similar entries are merged into a single, cleaner entry
+2. **Stale entry removal**: Entries that haven't been referenced and are past a threshold age are pruned
+3. **Compaction**: Remaining entries are rephrased for density — same information, fewer tokens
+
+The name is deliberate. The analogy to human sleep-based memory consolidation is accurate: during sleep, the brain merges related memories, discards irrelevant detail, and strengthens what matters. Dreaming does the same thing for agent memory, but on a schedule you control.
+
+---
+
+## Implementation: Managed Agents API with Dreaming
+
+Here's how to set this up in TypeScript using the Anthropic SDK:
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+// Create a persistent agent with Dreaming enabled
+async function createPersistentAgent() {
+  const agent = await client.beta.agents.create({
+    model: "claude-opus-4-5",
+    name: "project-assistant",
+    description: "Long-running development assistant for this codebase",
+    instructions: `
+      You are a persistent development assistant with deep knowledge of this codebase.
+      Use your memory to provide consistent, context-aware assistance across sessions.
+      When you learn something new about the project, remember it for future sessions.
+    `,
+    memory: {
+      enabled: true,
+      dreaming: {
+        enabled: true,
+        trigger: "session_end", // auto-consolidate after each session
+      },
+    },
+  });
+
+  console.log(`Agent created: ${agent.id}`);
+  return agent;
+}
+
+// Run a session against the persistent agent
+async function runSession(agentId: string, userMessage: string) {
+  const session = await client.beta.agents.sessions.create(agentId, {
+    metadata: {
+      project_id: "my-project",
+      initiated_by: "developer",
+    },
+  });
+
+  const stream = await client.beta.agents.sessions.messages.stream(
+    agentId,
+    session.id,
+    {
+      role: "user",
+      content: userMessage,
+    }
+  );
+
+  let fullResponse = "";
+  for await (const chunk of stream) {
+    if (chunk.type === "content_block_delta") {
+      fullResponse += chunk.delta.text ?? "";
+      process.stdout.write(chunk.delta.text ?? "");
+    }
+  }
+
+  return fullResponse;
+}
+
+// Manually trigger Dreaming (useful for scheduled jobs)
+async function consolidateMemory(agentId: string) {
+  const result = await client.beta.agents.dream(agentId, {
+    consolidation_level: "balanced", // "conservative" | "balanced" | "aggressive"
+    stale_threshold_days: 14,
+  });
+
+  console.log(`Memory consolidated:`);
+  console.log(`  Before: ${result.entries_before} entries`);
+  console.log(`  After:  ${result.entries_after} entries`);
+  console.log(`  Merged: ${result.merged_count}`);
+  console.log(`  Pruned: ${result.deleted_count}`);
+
+  return result;
+}
+
+// Example: weekly maintenance job
+async function weeklyMaintenance(agentId: string) {
+  console.log("Running weekly agent memory consolidation...");
+  await consolidateMemory(agentId);
+  console.log("Done. Agent memory is clean.");
+}
+
+// Retrieve current memory state for inspection
+async function inspectMemory(agentId: string) {
+  const memory = await client.beta.agents.memory.list(agentId, {
+    limit: 20,
+    order: "desc", // most recently updated first
+  });
+
+  for (const entry of memory.data) {
+    console.log(`[${entry.created_at}] ${entry.content.substring(0, 100)}...`);
+  }
+}
+```
+
+A few things worth noting in this code:
+
+- `trigger: "session_end"` means Dreaming runs automatically in the background after each session closes. There's no blocking wait — it's async.
+- The manual `client.beta.agents.dream()` call is useful when you want control over timing, for example running a deeper consolidation weekly via a CI job.
+- `consolidation_level` trades thoroughness for safety. Start with `"conservative"` in production.
+
+---
+
+## Practical Implications for Development Teams
+
+If your team uses Claude Code or any persistent agent setup on a codebase that evolves over months, Dreaming changes the calculus on a few things:
+
+**You can stop re-explaining context.** Without persistent memory, developers tend to include long context headers at the start of every session ("we use X, Y, Z, here's how the auth works..."). With a well-maintained agent memory, that preamble shrinks or disappears.
+
+**Agent quality improves over time rather than degrading.** Without memory consolidation, a long-running agent accumulates noise. With Dreaming, the signal-to-noise ratio stays high. The agent that works on week 20 of a project should be better than the one on week 2, not worse.
+
+**You can use agent memory as a lightweight project knowledge base.** Over time the agent's consolidated memory becomes a living document of how the project actually works — not what the README says, but what the agent has observed in practice.
+
+---
+
+## webhani's Take: Persistent vs. Stateless Agents
+
+Not every use case benefits from a persistent agent with Dreaming. Here's how we think about the decision:
+
+**Use persistent agents with Dreaming when:**
+- The project runs for more than a month
+- You have a stable team working with the same codebase repeatedly
+- Context-switching costs are high (complex domain, lots of conventions)
+- You're investing in Claude Code or similar for deep integration work
+
+**Use stateless agents when:**
+- The task is well-defined and one-shot (summarize this document, translate this text)
+- You're dealing with sensitive data that shouldn't persist between sessions
+- The codebase changes so fast that remembered context goes stale quickly anyway
+- You need reproducibility and want to eliminate memory as a variable
+
+The key insight is that persistent memory is most valuable when the investment in building that memory is amortized over many future sessions. For short-lived or high-variability work, stateless is simpler and often better.
+
+---
+
+## Current Status and Caveats
+
+Dreaming is currently a **research preview**. That means:
+
+- The API surface may change before general availability
+- We'd recommend testing it on non-critical agents before production rollout
+- Access to Managed Agents API requires a separate application to Anthropic
+
+We're tracking this feature closely at webhani and have started experimenting with it on internal projects. The memory consolidation quality has been solid in early testing — the merged entries are coherent, and the stale pruning is conservative enough that nothing important has been lost.
+
+---
+
+## Summary
+
+Dreaming is one of those features that sounds simple on the surface but addresses a genuinely hard problem: how do you keep an AI agent's knowledge accurate and efficient over months of use? The sleep consolidation metaphor is apt — periodic, automatic memory hygiene that keeps the agent sharp without manual curation overhead.
+
+If you're using Managed Agents API today, enabling Dreaming with `trigger: "session_end"` is a low-effort change with meaningful long-term benefits. If you're evaluating persistent agent architectures, it's a strong signal that Anthropic is thinking seriously about the operational realities of long-running agent deployments.
