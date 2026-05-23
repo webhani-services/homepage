@@ -1,0 +1,186 @@
+---
+title: "Claude Dreaming機能：AIエージェントの記憶をどう管理するか"
+description: "AnthropicのManaged Agents APIに導入されたDreaming機能を解説。セッション間でエージェントのメモリを統合・最適化し、長期プロジェクトでのパフォーマンス向上を実現する仕組みを実装例とともに紹介します。"
+date: "2026-05-24"
+status: "published"
+tags: ["claude", "ai-agents", "llm", "managed-agents", "memory"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-dreaming-agent-memory-2026"
+---
+
+## はじめに
+
+AIエージェントが長期プロジェクトで実用的に使われるようになってきた今、「エージェントの記憶」をどう管理するかという問題が現場の開発者にとって無視できない課題になっています。
+
+AnthropicはManaged Agents APIのリサーチプレビューとして「Dreaming」という機能を公開しました。この機能は、セッションをまたいでエージェントが積み上げた記憶を整理・統合するもので、ちょうど人間が睡眠中に記憶を定着・整理するプロセスに着想を得ています。
+
+この記事では、Dreaming機能が何を解決するのか、どのように使うのか、そしてwebhaniとして実際のプロジェクトへの活用をどう考えているかを整理します。
+
+---
+
+## なぜエージェントのメモリ管理が難しいか
+
+Claude Codeのような長時間動作するエージェントは、コードベースの構造、過去に行った変更、ユーザーの指示スタイルなどを「記憶」として蓄積します。この記憶がある程度積み上がることで、エージェントはより効率的に動作できます。
+
+しかし問題があります。
+
+**コンテキストの肥大化**：メモリエントリが増えると、毎回のプロンプトに含めるコンテキストが大きくなります。トークンコストが増加し、レスポンス品質が落ちることもあります。
+
+**重複エントリの蓄積**：「このプロジェクトはTypeScriptを使っている」という情報が、異なるセッションで何度も記録されることがあります。実質的に同じ情報が複数のエントリとして存在するため、ノイズが増えます。
+
+**古い情報の残存**：ライブラリのバージョンや設計方針など、過去に記録した情報がアップデートされずに残り続けることがあります。エージェントが古い情報を参照してしまうと、的外れな提案をするリスクが生じます。
+
+これらはすべて、「記憶が増えるにつれてエージェントのパフォーマンスが劣化する」という問題として現れます。
+
+---
+
+## Dreamingが解決すること
+
+Dreaming機能は、エージェントのセッション終了後（または指定したタイミングで）、蓄積されたメモリエントリに対して以下の処理を行います。
+
+1. **重複の統合**：意味的に重複するエントリを一つにまとめます
+2. **古いエントリの削除**：信頼度の低い情報や陳腐化したエントリを削除します
+3. **コンテキストの圧縮**：情報量を保ちながらトークン数を削減します
+
+これにより、エージェントは長期間稼働しても記憶がコンパクトかつ正確な状態に保たれます。まさに「睡眠による記憶の整理・定着」のメタファーが適切です。
+
+---
+
+## Managed Agents APIの実装例
+
+実際のコードで見てみましょう。TypeScriptでManaged Agents APIを使い、Dreaming機能を有効化する基本的なパターンです。
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+// エージェントの作成（Dreaming有効）
+async function createAgentWithDreaming() {
+  const agent = await client.beta.agents.create({
+    model: "claude-opus-4-5",
+    name: "code-review-agent",
+    description: "長期コードレビュー担当エージェント",
+    instructions: `
+      あなたはこのコードベースを深く理解するコードレビューエージェントです。
+      過去のレビュー履歴と設計判断を記憶し、一貫したフィードバックを提供してください。
+    `,
+    memory: {
+      enabled: true,
+      dreaming: {
+        enabled: true,
+        // セッション終了後に自動でDreamingを実行
+        trigger: "session_end",
+      },
+    },
+  });
+
+  return agent;
+}
+
+// セッションの作成と実行
+async function runAgentSession(agentId: string, userMessage: string) {
+  const session = await client.beta.agents.sessions.create(agentId, {
+    metadata: {
+      project: "my-typescript-project",
+      session_type: "code_review",
+    },
+  });
+
+  const response = await client.beta.agents.sessions.messages.create(
+    agentId,
+    session.id,
+    {
+      role: "user",
+      content: userMessage,
+    }
+  );
+
+  return response;
+}
+
+// Dreamingを手動でトリガーする場合
+async function triggerDreaming(agentId: string) {
+  const dreamResult = await client.beta.agents.dream(agentId, {
+    // 統合の積極度を設定（conservative / balanced / aggressive）
+    consolidation_level: "balanced",
+    // 何日以上更新されていないエントリを削除するか
+    stale_threshold_days: 30,
+  });
+
+  console.log(`Dreaming完了: ${dreamResult.entries_before}件 → ${dreamResult.entries_after}件`);
+  console.log(`削除: ${dreamResult.deleted_count}件, 統合: ${dreamResult.merged_count}件`);
+
+  return dreamResult;
+}
+
+// 使用例
+async function main() {
+  const agent = await createAgentWithDreaming();
+
+  // 複数セッションにわたる使用
+  await runAgentSession(
+    agent.id,
+    "src/utils/auth.ts のコードレビューをお願いします"
+  );
+
+  await runAgentSession(
+    agent.id,
+    "先週レビューした認証ロジックに関連して、src/middleware/jwt.ts も確認してください"
+  );
+
+  // 手動でDreamingを実行（例：週次バッチ処理など）
+  await triggerDreaming(agent.id);
+}
+
+main().catch(console.error);
+```
+
+このコードのポイントは`memory.dreaming.enabled: true`と`trigger: "session_end"`の設定です。これにより、各セッション終了時にバックグラウンドでメモリの整理が行われます。
+
+---
+
+## 実際のユースケース：長期プロジェクトでのClaude Code
+
+Claude Codeを使って長期のプロダクト開発をしているチームを想定してみましょう。
+
+**典型的な課題**：
+
+- スプリントをまたいで使っていると、プロジェクト固有の設計判断（「このサービスではDDDを採用している」「テストはvitestを使う」など）を毎回指示し直す必要がある
+- 先月リファクタリングしたモジュールについて、エージェントが古い構造を前提に提案してくる
+- 同じコンテキスト情報が重複して記録されており、プロンプトが長くなって遅い
+
+**Dreamingがある場合**：
+
+エージェントは複数スプリントにわたって使い続けても、記憶がコンパクトかつ最新の状態を保ちます。「DDDを採用している」という情報は統合されて1エントリになり、リファクタリング後の構造が反映された状態でエージェントが動作します。
+
+週1回、CIのジョブとしてDreamingを手動トリガーするのも現実的な運用パターンです。
+
+---
+
+## webhaniの考察と推奨
+
+Dreaming機能は、「エージェントを使い捨てではなく育てる」という考え方の実装です。
+
+これまでのLLMの使い方は、基本的にステートレスでした。毎回ゼロから始め、必要な情報は人間が都度コンテキストとして渡す。しかしManaged Agentsは、エージェントが成長・学習し、プロジェクトに特化した知識を持つという方向性を示しています。
+
+**推奨する使い方**：
+
+- **長期プロジェクト（3ヶ月以上）**：Dreamingを有効にした専用エージェントを立てる。コードベースの知識が蓄積されていく
+- **週次または月次でDreaming実行**：自動トリガーと組み合わせて定期的なメモリ最適化を組み込む
+- **`consolidation_level: "conservative"`で始める**：最初は積極的な削除を避け、安定して動作することを確認してから設定を調整する
+
+**注意点**：
+
+- Dreamingは現時点でリサーチプレビューです。本番環境への適用はAPIの安定版リリースを待つことを推奨します
+- エージェントのメモリには機密情報が入り得るため、セキュリティポリシーとの整合性を事前に確認してください
+- 現在はManaged Agents APIを利用するには別途アクセス申請が必要です
+
+---
+
+## まとめ
+
+AIエージェントが実用的なツールとして定着するためには、「記憶の管理」は避けられない課題です。Dreamingはそのひとつの解答であり、Anthropicがエージェントの長期運用を真剣に考えていることを示す機能です。
+
+今後、Claude Codeのようなツールにこの機能が本格統合されていけば、開発者がAIエージェントと「長い付き合い」をする上での体験が大きく変わるでしょう。webhanとしては引き続きこの領域を追いかけ、実プロジェクトへの適用を検討していく予定です。

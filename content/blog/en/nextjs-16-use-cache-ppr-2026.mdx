@@ -1,0 +1,300 @@
+---
+title: "Next.js 16 use cache Directive and Partial Pre-Rendering: A Practical Guide"
+description: "Next.js 16's `use cache` directive and Partial Pre-Rendering fundamentally change how caching works in React apps. This post covers the mechanics, practical code patterns, and migration path from the old fetch-based model."
+date: "2026-05-24"
+status: "published"
+tags: ["nextjs", "react", "performance", "caching", "ppr"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-use-cache-ppr-2026"
+---
+
+Next.js has had a caching problem for years. The fetch-based caching model introduced in Next.js 13 was powerful in theory but notoriously difficult to reason about in practice. Next.js 16 replaces it with something far more explicit: the `use cache` directive. Combined with Partial Pre-Rendering (PPR), it enables a new performance pattern that gets you near-static delivery without giving up the dynamic content your app needs.
+
+## What Was Wrong With the Old Caching Model
+
+The fetch-based caching approach layered several distinct cache mechanisms on top of each other: the Router Cache (client-side, per-navigation), the Full Route Cache (server-side, per-route), Request Memoization (per-render deduplication), and the Data Cache (per-fetch, persisted). Understanding which cache was responsible for what behavior required deep familiarity with Next.js internals.
+
+```typescript
+// Next.js 14/15 — fetch options controlled caching behavior
+async function getProduct(id: string) {
+  const res = await fetch(`https://api.example.com/products/${id}`, {
+    next: { revalidate: 3600, tags: [`product-${id}`] },
+  });
+  return res.json();
+}
+
+// For non-fetch data sources, you had to reach for unstable_cache
+import { unstable_cache } from "next/cache";
+
+const getCachedProduct = unstable_cache(
+  async (id: string) => db.product.findUnique({ where: { id } }),
+  ["product"],
+  { revalidate: 3600, tags: ["products"] }
+);
+```
+
+The `unstable_cache` name was honest—it was a workaround, not a designed API. It had awkward ergonomics around closure serialization, and its interaction with the other cache layers was not always predictable. Many teams working with ORMs or custom data layers found themselves writing defensive cache invalidation logic just to avoid stale data bugs.
+
+Next.js 16 throws out this model in favor of something much cleaner.
+
+## The `use cache` Directive
+
+`use cache` follows the same declarative pattern as `"use client"` and `"use server"`. You place it at the top of a file or at the top of a function body, and Next.js treats that scope as cacheable. No fetch required. Any async operation—database queries, file reads, third-party API calls—can be cached this way.
+
+### File-Level Caching
+
+```typescript
+// app/components/CategoryNav.tsx
+"use cache";
+
+import { getCategories } from "@/lib/db";
+
+export async function CategoryNav() {
+  const categories = await getCategories();
+
+  return (
+    <nav>
+      {categories.map((cat) => (
+        <a key={cat.id} href={`/category/${cat.slug}`}>
+          {cat.name}
+        </a>
+      ))}
+    </nav>
+  );
+}
+```
+
+Placing `"use cache"` at the file level applies caching to every exported function in that file. This is the right choice for components whose data changes rarely and where you want a simple, uniform cache policy for the whole module.
+
+### Function-Level Caching
+
+```typescript
+// app/lib/products.ts
+import {
+  unstable_cacheTag as cacheTag,
+  unstable_cacheLife as cacheLife,
+} from "next/cache";
+
+export async function getProductById(id: string) {
+  "use cache";
+  cacheLife("hours");
+  cacheTag(`product-${id}`, "products");
+
+  const res = await fetch(`https://api.example.com/products/${id}`);
+  return res.json();
+}
+
+export async function getInventory(productId: string) {
+  "use cache";
+  cacheLife("seconds"); // inventory changes fast
+  cacheTag(`inventory-${productId}`);
+
+  return db.inventory.findUnique({ where: { productId } });
+}
+```
+
+Function-level `"use cache"` gives you per-function granularity. Different functions in the same file can have completely different cache lifetimes—`cacheLife("hours")` for product details that rarely change, `cacheLife("seconds")` for inventory that updates frequently.
+
+### `cacheLife()` Profiles
+
+```typescript
+import { unstable_cacheLife as cacheLife } from "next/cache";
+
+export async function getLandingPageContent() {
+  "use cache";
+  // Built-in profiles: "seconds", "minutes", "hours", "days", "weeks", "max"
+  cacheLife("days");
+
+  return cms.getPage("landing");
+}
+
+export async function getUserDashboardData(userId: string) {
+  "use cache";
+  // Custom profile with explicit values
+  cacheLife({
+    stale: 60,       // treat as fresh for 60s (client-side)
+    revalidate: 300, // background revalidation after 5 minutes
+    expire: 3600,    // hard expiry after 1 hour
+  });
+
+  return db.dashboardData.findMany({ where: { userId } });
+}
+```
+
+The three-value profile maps to distinct cache behaviors: `stale` controls the browser-side cache header, `revalidate` triggers background revalidation (stale-while-revalidate semantics), and `expire` sets the hard ceiling after which the cache is unconditionally invalidated.
+
+### `cacheTag()` and On-Demand Revalidation
+
+```typescript
+// app/lib/articles.ts
+import { unstable_cacheTag as cacheTag } from "next/cache";
+
+export async function getArticle(slug: string) {
+  "use cache";
+  cacheTag(`article-${slug}`, "articles");
+
+  return db.article.findUnique({ where: { slug } });
+}
+
+// app/api/webhooks/cms/route.ts
+import { revalidateTag } from "next/cache";
+
+export async function POST(request: Request) {
+  const event = await request.json();
+
+  if (event.type === "article.updated") {
+    revalidateTag(`article-${event.slug}`);
+  } else if (event.type === "bulk.publish") {
+    revalidateTag("articles"); // invalidate all articles at once
+  }
+
+  return Response.json({ ok: true });
+}
+```
+
+The `cacheTag` + `revalidateTag` combination replaces the old `next/cache` `revalidateTag` call pattern, but now the tags are declared alongside the data fetching logic instead of being scattered across the codebase.
+
+## How PPR and `use cache` Work Together
+
+Partial Pre-Rendering solves a different problem: how do you get static performance on pages that contain dynamic content? The answer is to separate the static shell from the dynamic parts and render them independently.
+
+### Enabling PPR
+
+```typescript
+// next.config.ts
+const nextConfig = {
+  experimental: {
+    ppr: "incremental", // opt-in per page; use true for app-wide
+  },
+};
+```
+
+### Structuring a PPR Page
+
+```typescript
+// app/products/[id]/page.tsx
+export const experimental_ppr = true;
+
+import { Suspense } from "react";
+import { ProductDetails } from "@/components/ProductDetails";
+import { StockBadge } from "@/components/StockBadge";
+import { RecommendedProducts } from "@/components/RecommendedProducts";
+
+export default async function ProductPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = await params;
+
+  return (
+    <main>
+      {/* Cached — part of the static shell, served from CDN */}
+      <ProductDetails productId={id} />
+
+      {/* Dynamic — streams in after static shell is delivered */}
+      <Suspense fallback={<StockPlaceholder />}>
+        <StockBadge productId={id} />
+      </Suspense>
+
+      <Suspense fallback={<RecommendationsPlaceholder />}>
+        <RecommendedProducts userId={/* from session */} productId={id} />
+      </Suspense>
+    </main>
+  );
+}
+```
+
+```typescript
+// app/components/ProductDetails.tsx
+"use cache";
+
+import {
+  unstable_cacheTag as cacheTag,
+  unstable_cacheLife as cacheLife,
+} from "next/cache";
+
+export async function ProductDetails({ productId }: { productId: string }) {
+  cacheTag(`product-${productId}`);
+  cacheLife("hours");
+
+  const product = await db.product.findUnique({ where: { id: productId } });
+
+  return (
+    <section>
+      <h1>{product.name}</h1>
+      <p className="description">{product.description}</p>
+      <p className="price">${product.price}</p>
+    </section>
+  );
+}
+```
+
+In this setup, the `ProductDetails` component is cached and becomes part of the prerendered static shell. When a request comes in, Next.js serves the static HTML immediately—the product name, description, and price are already rendered. The `StockBadge` and `RecommendedProducts` components are wrapped in `Suspense`, so they stream in dynamically after the shell is delivered.
+
+The practical effect: the user sees meaningful content almost instantly (static shell from CDN), and the personalized/dynamic parts load without blocking the initial render.
+
+### The Performance Model
+
+For a product page with this structure, the request flow looks like this:
+
+1. Edge cache hit → static shell delivered in milliseconds
+2. Browser renders the static HTML immediately
+3. Dynamic `Suspense` boundaries stream in as their data resolves
+4. Hydration completes for the full page
+
+Compared to full SSR, you eliminate the server latency from the critical path entirely for the static portions. Compared to full SSG, you retain real-time dynamic content for the parts that need it.
+
+## Turbopack as the Default Bundler
+
+Next.js 16 ships with Turbopack as the default bundler for `next dev`. You no longer need to pass `--turbopack` or any configuration flag. This affects `use cache` development in a meaningful way: Turbopack understands the module boundaries created by `"use cache"` and can perform more precise HMR updates. When you edit a cached Server Component, only that component's cache boundary is invalidated rather than the entire module graph.
+
+For projects with webpack plugins that haven't been ported to Turbopack, you can still opt back:
+
+```typescript
+// next.config.ts
+const nextConfig = {
+  bundler: "webpack",
+};
+```
+
+But for new projects or those with standard configurations, the Turbopack default is a net positive—faster startup, faster HMR, and better integration with the `use cache` compilation model.
+
+## Migration From Next.js 14/15
+
+The migration path is mechanical for most patterns.
+
+**Replace `unstable_cache`:**
+
+```typescript
+// Before
+import { unstable_cache } from "next/cache";
+const getUser = unstable_cache(
+  async (id: string) => db.user.findUnique({ where: { id } }),
+  ["user"],
+  { revalidate: 3600, tags: [`user-${id}`] } // note: id not available here
+);
+
+// After
+async function getUser(id: string) {
+  "use cache";
+  cacheLife("hours");
+  cacheTag(`user-${id}`); // id is in scope — no closure serialization issues
+  return db.user.findUnique({ where: { id } });
+}
+```
+
+**Remove redundant fetch cache options:**
+
+When a function uses `"use cache"`, the entire function result is cached. You do not need to pass `next: { revalidate }` or `cache: "force-cache"` to fetch calls inside it—those options are ignored when the enclosing function is already under `"use cache"`.
+
+**Adopt PPR incrementally:**
+
+Start with `ppr: "incremental"` and add `export const experimental_ppr = true` to your highest-traffic pages first. Measure TTFB before and after. The gains are most pronounced on pages with deep component trees where server rendering time was the bottleneck.
+
+## Summary
+
+`use cache` makes caching explicit and colocated with data fetching logic. You no longer need to reason about which of the four cache layers is responsible for a particular cache hit or miss—you declare the cache policy where the data lives, and the framework respects it. Combined with PPR, you get a composable performance model: static where possible, dynamic where necessary, all expressed in component structure rather than route-level configuration.
+
+For any active Next.js project on 14 or 15, the `unstable_cache` to `use cache` migration is worth doing now. The API is stable in Next.js 16, and the ergonomics are substantially better.
