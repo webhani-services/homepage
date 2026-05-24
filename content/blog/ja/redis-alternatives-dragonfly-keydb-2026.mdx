@@ -1,0 +1,175 @@
+---
+title: "Redis代替の現実解：DragonflyとKeyDBを本番環境で使う判断基準"
+description: "RedisのSSPL/RSALv2ライセンス変更を受け、DragonflyやKeyDBへの移行を検討するチームが増えています。8〜12%のコスト効率改善が報告される代替ソリューションの実態と、移行判断の基準を解説します。"
+date: "2026-05-25"
+status: "published"
+tags: ["Redis", "caching", "Dragonfly", "KeyDB", "infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "redis-alternatives-dragonfly-keydb-2026"
+---
+
+## なぜ今、Redisの代替が話題なのか
+
+Redisは長年、キャッシュ・セッションストア・メッセージブローカーの事実上の標準でした。しかし2024年のライセンス変更（BSD → SSPL/RSALv2）以降、エンタープライズ環境での採用を再検討するチームが増えています。
+
+SSPLはMongoDB由来のライセンス条項で、SaaSとしてRedisを提供する場合はソースを公開する義務が生じます。直接自社アプリにRedisを組み込んで使うだけのケースでは影響は少ないですが、法務リスクを嫌うエンタープライズでは検討の対象になっています。
+
+この文脈で注目を集めているのが、DragonflyとKeyDBの2つです。クラウドプロバイダー対比で8〜12%のコスト効率改善が報告されています。
+
+## 各ソリューションの技術的特徴
+
+### Dragonfly
+
+```bash
+# Dockerで試す — Redis互換のドロップイン代替
+docker run --rm -p 6379:6379 docker.dragonflydb.io/dragonflydb/dragonfly
+
+# Redis CLIでそのまま接続可能
+redis-cli -h localhost -p 6379 ping
+# PONG
+
+# 既存のRedisクライアントライブラリがそのまま使える
+```
+
+```python
+# クライアントコードの変更なし
+import redis
+
+client = redis.Redis(host="dragonfly-host", port=6379)
+client.set("key", "value")
+value = client.get("key")  # 既存コードがそのまま動く
+```
+
+Dragonflyはマルチスレッドアーキテクチャを採用しており、シングルスレッドのRedisと比べてCPUコアを有効活用します。
+
+主な特徴：
+- Redis Protocol（RESP2/RESP3）完全互換
+- マルチスレッド：使用可能なすべてのCPUコアを活用
+- Business Source License（BSL）— 4年後にApache 2.0へ移行
+- Sorted Sets、Streams等のデータ構造を完全サポート
+
+**BSLライセンスの注意点**：Dragonflyは4年間のBSL期間中は完全なオープンソースではありません。厳格なオープンソースポリシーを持つチームはこの点を確認してください。
+
+### KeyDB
+
+KeyDBはRedisの完全フォークで、アクティブ-アクティブレプリケーションが核心機能です：
+
+```conf
+# keydb.conf — マルチスレッドとアクティブレプリケーション
+server-threads 4
+active-replica yes
+repl-diskless-sync yes
+```
+
+```bash
+keydb-server /etc/keydb/keydb.conf
+```
+
+アクティブ-アクティブレプリケーションにより、レプリカペアの両ノードが書き込みを受け付けられます。Redis SentinelやClusterなしで高可用性を実現できます。
+
+## パフォーマンスを正直に測る
+
+公表されているベンチマークには注意が必要です。各社が自社に有利な条件で測定することが多いためです。自社のワークロードで測定することが最も重要です：
+
+```python
+# 自社環境でのベンチマーク例
+import redis
+import time
+import statistics
+
+def measure_latency(client, n=10000):
+    """実際のワークロードに近い計測"""
+    writes, reads = [], []
+
+    for i in range(n):
+        start = time.perf_counter()
+        client.set(f"bench:{i}", f"val:{i}")
+        writes.append(time.perf_counter() - start)
+
+    for i in range(n):
+        start = time.perf_counter()
+        client.get(f"bench:{i}")
+        reads.append(time.perf_counter() - start)
+
+    return {
+        "write_p50_ms": statistics.median(writes) * 1000,
+        "write_p99_ms": sorted(writes)[int(n * 0.99)] * 1000,
+        "read_p50_ms": statistics.median(reads) * 1000,
+        "read_p99_ms": sorted(reads)[int(n * 0.99)] * 1000,
+    }
+
+# 同じクライアントライブラリで3つすべて計測可能
+redis_client = redis.Redis(host="redis-host")
+dragonfly_client = redis.Redis(host="dragonfly-host")
+keydb_client = redis.Redis(host="keydb-host")
+
+print("Redis:", measure_latency(redis_client))
+print("Dragonfly:", measure_latency(dragonfly_client))
+print("KeyDB:", measure_latency(keydb_client))
+```
+
+8〜12%のコスト効率改善は、高負荷・マルチスレッド環境での測定値です。RedisインスタンスがすでにCPUアイドル状態なら、パフォーマンス差はわずかです。
+
+## 移行判断の基準
+
+### 移行を検討すべき状況
+
+**ライセンスリスクが高いケース：**
+- Redisをコアとした商用SaaSを運用している（SSPLの対象になる可能性）
+- 法務部門がSSPLの解釈について懸念を持っている
+- 完全なオープンソース純粋主義のポリシーがある
+
+**パフォーマンスメリットが期待できるケース：**
+- 高コアCPUインスタンスを使っているが、Redisがシングルスレッドでボトルネックになっている
+- Redis Enterprise価格なしにアクティブ-アクティブレプリケーションが必要
+
+### 急いで移行する必要がないケース
+
+- Redisをシンプルな内部キャッシュとして使うだけで、SaaSとして提供していない
+- AWSのElastiCache for Redis、Google Cloud MemorystoreなどマネージドRedisを使っている（プロバイダーがライセンス問題を処理）
+- 既存のRedis Clusterが安定稼働しており、CPUボトルネックがない
+
+## Blue/Green方式での移行手順
+
+```yaml
+# Kubernetes：DragonflyをRedisと並行稼働
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dragonfly
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: dragonfly
+          image: docker.dragonflydb.io/dragonflydb/dragonfly
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2"
+            limits:
+              memory: "8Gi"
+              cpu: "4"
+```
+
+推奨移行ステップ：
+1. 新環境（Dragonfly/KeyDB）を既存Redisと並行起動
+2. 読み取りのみ新環境に向ける（検証フェーズ）
+3. データ整合性とレイテンシを確認後、書き込みも移行
+4. Redisをスタンバイとして保持
+5. 問題なければ切り離し
+
+## webhaniの見解
+
+RedisからDragonflyやKeyDBへの移行は、技術的には比較的スムーズです。Redis Protocolの互換性が高く、ほとんどの既存クライアントコードをそのまま使えます。
+
+移行を決断すべき主な理由は2つに絞られます：
+
+1. **ライセンスリスクの排除**：商用SaaSとしてRedisを提供している場合
+2. **パフォーマンスのボトルネック解消**：シングルスレッドのRedisがCPU律速になっている場合
+
+この2つに該当しないなら、安定稼働しているRedis環境を今すぐ変える必要はありません。マネージドサービス（ElastiCache等）を使っている場合は特に、プロバイダーがライセンス問題を処理しているため影響は限定的です。
+
+新しいシステムの学習コストと本番実績の不確実性も考慮した上で、自社ワークロードで測定してから判断することをお勧めします。
