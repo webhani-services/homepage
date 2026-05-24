@@ -1,0 +1,219 @@
+---
+title: "Gemini 3.5 Flash & Spark：Google I/Oで発表された新モデルを実務観点で読む"
+description: "Google I/O 2026でGemini 3.5 FlashとGemini Sparkが発表されました。Claude Opus 4.7やGPT-5との競争が激化する中、各モデルの実務的な使い分けと選定基準を整理します。"
+date: "2026-05-25"
+status: "published"
+tags: ["AI", "LLM", "Gemini", "Google", "model-selection"]
+thumbnail: ""
+author: "webhani"
+slug: "gemini-35-flash-spark-google-io-2026"
+---
+
+## Google I/O 2026のLLM発表
+
+2026年5月19日のGoogle I/Oで、Gemini 3.5 FlashとGemini Sparkの2つのモデルが発表されました。同週にはAlibabaのQwen 3.7 Max（5月20日）やOpenAIのChatGPT Personal Finance（5月15日）も登場し、AI競争がさらに激化しています。
+
+この記事では、実際に開発現場でモデルを選定・統合する観点から、今回の発表を読み解きます。
+
+## Gemini 3.5 Flash：速度と精度のバランス
+
+Gemini 3.5 Flashは、前世代（Gemini 1.5 Flash）からの大幅な性能向上が報告されています。Flashシリーズのポジションは一貫していて、「速度を優先しながらもコスト効率に優れた汎用モデル」です。
+
+実際の用途でいうと：
+
+```python
+import google.generativeai as genai
+
+# Gemini 3.5 Flash — コスト効率重視の処理
+genai.configure(api_key="your-api-key")
+model = genai.GenerativeModel("gemini-3.5-flash")
+
+# ユースケース1：大量のテキスト分類
+def classify_support_tickets(tickets: list[str]) -> list[dict]:
+    results = []
+    for ticket in tickets:
+        response = model.generate_content(
+            f"""
+            サポートチケットを以下のカテゴリに分類してください：
+            billing, technical, account, other
+            
+            チケット: {ticket}
+            
+            カテゴリのみ返してください。
+            """
+        )
+        results.append({
+            "ticket": ticket,
+            "category": response.text.strip()
+        })
+    return results
+
+# ユースケース2：コード補完支援
+def suggest_code_completion(partial_code: str, context: str) -> str:
+    response = model.generate_content(
+        f"Context: {context}\n\nPartial code:\n{partial_code}\n\nComplete this code:"
+    )
+    return response.text
+```
+
+処理速度と価格が重要で、精度が多少下がっても許容できるタスクに向いています。
+
+## Gemini Spark：エッジデバイス向けの小型モデル
+
+Gemini Sparkは、デバイス上での推論を想定した小型モデルです。クラウドAPIに依存せずにモデルを実行できるため、以下のシナリオで価値があります：
+
+**プライバシー重視のアプリケーション**
+- ユーザーのテキストをサーバーに送信せずに処理
+- GDPR・個人情報保護法への対応がシンプルになる
+
+**オフライン動作**
+- インターネット接続なしでLLM機能を提供
+- 帯域の制限された環境での利用
+
+**レイテンシ**
+- API呼び出しのレイテンシがゼロ（デバイス内処理）
+- リアルタイムアシスタント機能に有効
+
+```python
+# Gemini Spark — ローカル推論の想定API（Sparkはデバイス向け）
+from gemini_spark import LocalModel  # 仮のライブラリ名
+
+model = LocalModel.load("gemini-spark-2026")
+
+# デバイス上で動作（ネットワーク不要）
+response = model.generate(
+    "このメールの返信を日本語で書いてください：Hello, ...",
+    max_tokens=200
+)
+```
+
+ただし、小型モデルには精度のトレードオフがあります。複雑な推論や専門知識が必要なタスクは、依然としてクラウドモデルが優ります。
+
+## 2026年のLLM競争環境
+
+今回の発表で、主要モデルの位置づけが整理されてきました：
+
+| モデル | 特徴 | 主なユースケース |
+|-------|-----|----------------|
+| Claude Opus 4.7 | 高精度・複雑な推論 | コード生成、技術分析 |
+| GPT-5 | 汎用高性能 | 広範な業務タスク |
+| Gemini 3.5 Flash | 速度・コスト効率 | 大量処理、分類タスク |
+| Gemini Spark | エッジ・プライバシー | デバイス上AI、オフライン |
+| Qwen 3.7 Max | 多言語対応 | アジア市場向けアプリ |
+
+## マルチモデル戦略の設計
+
+複数のLLMを組み合わせる「マルチモデル」アプローチが実務で広がっています。Googleのモデル群はこの文脈でどう使うべきか：
+
+```python
+import anthropic
+import google.generativeai as genai
+from typing import Literal
+
+LLMProvider = Literal["claude", "gemini-flash", "gemini-pro"]
+
+def route_request(task_type: str, content: str) -> str:
+    """タスクの複雑さに応じてモデルを選択"""
+    
+    if task_type == "complex_reasoning":
+        # 高精度が必要 — Claude Opus
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": content}]
+        )
+        return response.content[0].text
+    
+    elif task_type == "bulk_classification":
+        # 速度・コスト優先 — Gemini 3.5 Flash
+        genai.configure(api_key="gemini-key")
+        model = genai.GenerativeModel("gemini-3.5-flash")
+        return model.generate_content(content).text
+    
+    elif task_type == "simple_extraction":
+        # シンプルタスク — Gemini Flash（コスト最小化）
+        genai.configure(api_key="gemini-key")
+        model = genai.GenerativeModel("gemini-3.5-flash")
+        return model.generate_content(content).text
+    
+    else:
+        raise ValueError(f"Unknown task type: {task_type}")
+```
+
+コスト最適化の観点では、すべてのリクエストを最上位モデルに送るのではなく、タスクの複雑さに応じてモデルを使い分けることが重要です。
+
+## Vertex AI経由での統合
+
+GoogleのモデルはVertex AIを通じて企業向けに提供されます。SLA、データプライバシー、エンタープライズサポートが必要なケースでは直接APIよりもVertex AIが適切です：
+
+```python
+from google.cloud import aiplatform
+from vertexai.generative_models import GenerativeModel
+
+aiplatform.init(project="your-project", location="us-central1")
+
+model = GenerativeModel("gemini-3.5-flash")
+
+response = model.generate_content(
+    "Analyze this customer feedback and extract key issues: ...",
+    generation_config={
+        "temperature": 0.1,  # 分類タスクは低温度で安定性を確保
+        "max_output_tokens": 500,
+    }
+)
+```
+
+Vertex AIの利点：
+- データがGoogleのトレーニングに使用されない（エンタープライズ契約時）
+- VPC内での利用が可能
+- CloudLogging、Cloud Monitoringとの統合
+
+## webhaniの見解
+
+今回のGoogle I/O発表で注目しているのは、モデルのラインナップの幅広さです。SparksのようなエッジモデルからFlashの高速モデルまで、用途別に選べる選択肢が整いつつあります。
+
+実務での推奨アプローチ：
+
+1. **まずタスクを分類する**：精度重視 vs コスト重視 vs プライバシー重視
+2. **ベンチマークは自社データで**：公開ベンチマークより実際のユースケースでの評価が重要
+3. **マルチモデル設計を前提に**：特定プロバイダーへの依存を避け、抽象化レイヤーを設ける
+4. **コスト追跡を導入する**：モデルごとのコストを可視化し、最適化のデータを積む
+
+```python
+# コスト追跡の簡単な実装例
+import time
+from dataclasses import dataclass
+
+@dataclass
+class LLMCallMetrics:
+    model: str
+    input_tokens: int
+    output_tokens: int
+    duration_ms: float
+    cost_usd: float
+
+def track_llm_call(model: str, func, *args, **kwargs) -> tuple:
+    start = time.perf_counter()
+    response = func(*args, **kwargs)
+    duration = (time.perf_counter() - start) * 1000
+    
+    # モデルごとの単価設定
+    cost_per_1k_tokens = {
+        "gemini-3.5-flash": 0.001,
+        "gemini-3.5-pro": 0.005,
+        "claude-opus-4-7": 0.015,
+    }
+    
+    # 実際の実装ではトークン数をレスポンスから取得
+    return response, duration
+
+```
+
+LLMの競争は2026年も続きます。特定プロバイダーに縛られないアーキテクチャを作っておくことが、中長期的な柔軟性につながります。
+
+## まとめ
+
+Gemini 3.5 FlashはAPI経由でのコスト効率重視な大量処理に、Gemini Sparkはデバイス上・オフライン・プライバシー重視のシナリオに向いています。
+
+どちらも既存ワークフローの全体を置き換えるものではなく、タスクに応じた最適なモデル選択という観点で評価することをお勧めします。
