@@ -1,0 +1,119 @@
+---
+title: "Claude Managed Agents Dreaming: Persistent Memory That Cleans Itself Up"
+description: "Anthropic's Dreaming feature automatically consolidates an agent's persistent memory between sessions, removing duplicates and stale entries. Here's what it means for production agent systems."
+date: "2026-05-26"
+status: "published"
+tags: ["Claude", "Anthropic", "AI Agent", "Persistent Memory", "LLM"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-managed-agents-dreaming-memory-2026"
+---
+
+Anthropic has added a feature called Dreaming to Claude Managed Agents. It runs asynchronously when an agent is idle and consolidates persistent memory across sessions — merging duplicates, removing stale entries, and keeping the memory store useful over time. It's currently in research preview, but if you're building agents that run over weeks or months, it's worth understanding now.
+
+## The Persistent Memory Problem
+
+There are two common approaches to giving agents memory across sessions.
+
+**External store**: the agent reads and writes notes through tool calls, backed by a vector DB or key-value store.  
+**Context injection**: summaries of past sessions are injected into the system prompt at the start of each new session.
+
+Both approaches share a fundamental problem: the longer the agent runs, the noisier its memory becomes.
+
+- The same fact gets stored multiple times in slightly different forms
+- Information that was accurate six months ago accumulates alongside current information
+- As the memory store grows, retrieval quality degrades
+
+Without periodic human cleanup, these problems compound. Dreaming is Anthropic's attempt to automate that cleanup.
+
+## How Dreaming Works
+
+Dreaming runs as a background process while the agent isn't handling active requests. The steps are:
+
+1. **Duplicate detection**: identify entries that are semantically redundant
+2. **Consolidation**: merge duplicates into a single entry, preferring the most recent information
+3. **Staleness detection**: flag entries based on age, access frequency, and internal contradictions
+4. **Removal**: delete entries flagged as stale
+
+The key property is that this is asynchronous — it doesn't run during user interactions, so there's no latency impact on live sessions.
+
+## What It Doesn't Solve
+
+Dreaming handles cleanup. It doesn't replace thoughtful memory architecture. If you're building production agent systems, you still need to design:
+
+- **What to store**: not every intermediate result deserves persistence
+- **Retrieval logic**: which memories surface, when, and how they're ranked
+- **Scope isolation**: separating memory by user, project, or domain
+
+Think of Dreaming as garbage collection for agent memory. It's necessary infrastructure, but it doesn't tell your agent what's worth remembering in the first place.
+
+## Outcomes API and Other Updates
+
+Dreaming shipped alongside several other Managed Agents additions that matter for production integration:
+
+- **Higher API rate limits** for workloads that run many parallel agents
+- **Multi-agent orchestration API** for coordinating agents programmatically
+- **Outcomes API** for retrieving agent results via webhook or polling
+- **Microsoft 365 integration** — Excel and PowerPoint add-ins now share full conversation context
+
+The Outcomes API is the most immediately useful for production systems. Instead of polling for results, you register a webhook endpoint and receive a callback when the agent completes its task. This simplifies orchestration significantly for long-running jobs.
+
+```python
+from fastapi import FastAPI, Request
+
+app = FastAPI()
+
+@app.post("/agent-webhook")
+async def receive_outcome(request: Request):
+    payload = await request.json()
+
+    agent_id = payload["agent_id"]
+    status = payload["status"]  # "completed" | "failed" | "cancelled"
+
+    if status == "completed":
+        result = payload.get("result")
+        await store_result(agent_id, result)
+    elif status == "failed":
+        error = payload.get("error")
+        await handle_failure(agent_id, error)
+
+    return {"ok": True}
+```
+
+## Designing for Automatic Cleanup
+
+If you're using or planning to use Dreaming, a few patterns help it work well:
+
+**Tag entries by importance**. If you can mark certain entries as critical (regulatory requirements, user preferences that took effort to capture), you reduce the risk of cleanup removing something that matters.
+
+**Don't store ephemeral data**. Intermediate results from a single session don't need to persist. Only write to long-term memory what would genuinely be useful in future sessions.
+
+```python
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+
+class MemoryTier(Enum):
+    PERSISTENT = "persistent"   # User preferences, critical context
+    STANDARD = "standard"       # Learned facts, typical notes
+    EPHEMERAL = "ephemeral"     # Session-specific, safe to drop
+
+@dataclass
+class MemoryEntry:
+    content: str
+    tier: MemoryTier
+    created_at: datetime
+    tags: list[str]
+
+# Only PERSISTENT and STANDARD entries are worth writing to long-term storage
+def should_persist(entry: MemoryEntry) -> bool:
+    return entry.tier != MemoryTier.EPHEMERAL
+```
+
+**Keep memory granular**. One fact per entry is easier to merge and evaluate for staleness than a large blob of mixed information.
+
+## Our Take
+
+The cost of maintaining agent memory is easy to underestimate. As agents run longer, memory management tends to become the hidden operational work that nobody accounted for at design time. Dreaming addresses a real problem.
+
+That said, the details of how it judges staleness aren't fully documented yet. For business-critical agents — anything making decisions about client data, financial logic, or compliance workflows — we'd recommend auditing memory stores regularly even with Dreaming active. Automated cleanup is useful, but the judgment of what's still relevant often requires human context that the agent doesn't have.
