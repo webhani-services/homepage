@@ -1,0 +1,139 @@
+---
+title: "Redis 8.x のネイティブ Vector Search — AI アプリの Cache 層を再設計する"
+description: "Redis 8.x がネイティブ Vector 類似検索を搭載しました。Semantic Cache の実装が外部サービス不要になった今、AI アプリケーションの Cache 設計をどう変えるべきかを解説します。"
+date: "2026-05-26"
+status: "published"
+tags: ["Redis", "Vector Search", "AI", "Caching", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "redis-8-vector-search-ai-cache-2026"
+---
+
+Redis 8.x がネイティブの Vector 類似検索機能を搭載しました。これまで Semantic Search を実装するには Pinecone や Weaviate などの専用 Vector DB、あるいは pgvector を持つ PostgreSQL が必要でした。Redis がこれを標準機能として提供するようになったことで、AI アプリケーションの Cache 設計に再考の余地が生まれています。
+
+Redis は現時点でインメモリ Data Store の市場シェア82%を占めており、多くの既存システムが既に Redis を Cache 層として使っています。追加インフラなしに Vector Search が使えることの実用的な意味は小さくありません。
+
+## Semantic Cache とは何か
+
+従来の Cache は完全一致のキーで制御します。同じクエリは同じ結果を返しますが、「意味的に同じ」クエリを同一とみなす仕組みはありません。
+
+```python
+# 従来の Cache — 文字列の完全一致
+cache.get("東京の天気は？")       # hit
+cache.get("東京の気温を教えて")   # miss（同じ意味だが別のキー）
+```
+
+Semantic Cache は Vector Embedding を使って意味の距離を計算し、類似クエリへのキャッシュヒットを実現します。LLM を使ったシステムでは、同じ質問が異なる表現で来ることが多く、毎回 LLM API を呼び出すのはコストの無駄です。
+
+```python
+# Semantic Cache — 意味的類似度でヒット判定
+cache.semantic_get("東京の天気は？")       # hit (コサイン類似度 > 閾値)
+cache.semantic_get("東京の気温を教えて")   # hit（同じ Intent として判定）
+cache.semantic_get("大阪の天気は？")       # miss（別の Intent）
+```
+
+## Redis 8.x での実装
+
+Redis 8.x の Vector Search は `HNSW`（Hierarchical Navigable Small World）アルゴリズムをベースにしています。インデックスの作成と検索の基本操作は以下の通りです。
+
+```python
+import redis
+import numpy as np
+
+client = redis.Redis(host="localhost", port=6379, decode_responses=False)
+
+# Vector Index の作成
+client.execute_command(
+    "FT.CREATE", "semantic_cache_idx",
+    "ON", "HASH",
+    "PREFIX", "1", "cache:",
+    "SCHEMA",
+    "query_embedding", "VECTOR", "HNSW", "6",
+    "TYPE", "FLOAT32",
+    "DIM", "1536",          # OpenAI text-embedding-3-small の次元数
+    "DISTANCE_METRIC", "COSINE",
+    "response", "TEXT",
+    "created_at", "NUMERIC"
+)
+
+def embed(text: str) -> np.ndarray:
+    # 実際は Embedding API を呼び出す
+    return np.random.rand(1536).astype(np.float32)
+
+def cache_store(query: str, response: str) -> None:
+    embedding = embed(query)
+    key = f"cache:{hash(query)}"
+    client.hset(key, mapping={
+        "query_embedding": embedding.tobytes(),
+        "response": response,
+        "created_at": int(__import__("time").time())
+    })
+
+def cache_lookup(query: str, threshold: float = 0.92) -> str | None:
+    embedding = embed(query)
+    query_vec = embedding.tobytes()
+
+    results = client.execute_command(
+        "FT.SEARCH", "semantic_cache_idx",
+        f"*=>[KNN 1 @query_embedding $vec AS score]",
+        "PARAMS", "2", "vec", query_vec,
+        "RETURN", "2", "response", "score",
+        "DIALECT", "2"
+    )
+
+    if results[0] == 0:
+        return None
+
+    score = float(results[2][results[2].index(b"score") + 1])
+    if score >= threshold:
+        return results[2][results[2].index(b"response") + 1].decode()
+    return None
+```
+
+コサイン類似度が `threshold` を超えた場合のみキャッシュヒットとみなすことで、意味的に近いが異なる質問への誤ヒットを防ぎます。
+
+## 性能特性と導入時の注意点
+
+Redis は基本的にインメモリ動作です。Vector Index も RAM 上に展開されます。1536次元の Float32 ベクトルは約6KBです。100万エントリのインデックスで約6GBのメモリを消費する計算になります。
+
+| エントリ数 | 1536次元での概算メモリ使用量 |
+|-----------|--------------------------|
+| 10万件    | 約600MB                   |
+| 100万件   | 約6GB                     |
+| 1000万件  | 約60GB                    |
+
+LLM アプリケーションの Semantic Cache として使う場合、エントリ数はそれほど多くならないケースが大半です。ユーザーの質問パターンには反復性があり、数万から数十万件のキャッシュで十分なカバレッジが得られることが多い。
+
+TTL の設定も重要です。情報の陳腐化が速いドメイン（ニュース・株価）ではキャッシュ期間を短くし、比較的安定したドメイン（製品説明・FAQ）では長めに設定します。
+
+```python
+# TTL 付きキャッシュエントリ
+def cache_store_with_ttl(query: str, response: str, ttl_seconds: int = 3600) -> None:
+    embedding = embed(query)
+    key = f"cache:{hash(query)}"
+    pipe = client.pipeline()
+    pipe.hset(key, mapping={
+        "query_embedding": embedding.tobytes(),
+        "response": response,
+        "created_at": int(__import__("time").time())
+    })
+    pipe.expire(key, ttl_seconds)
+    pipe.execute()
+```
+
+## Pinecone や Weaviate と使い分けるか
+
+Redis の Vector Search は Cache 用途に適していますが、大規模な Knowledge Base 検索や複雑なメタデータフィルタリングが必要な場合は専用 Vector DB の方が依然として優位です。
+
+| 用途 | 推奨 |
+|------|------|
+| Semantic Cache (数万〜数十万件) | Redis 8.x |
+| RAG Knowledge Base (数百万件〜) | Pinecone / Weaviate |
+| 複雑なメタデータフィルタリング | 専用 Vector DB |
+| 既存 Redis インフラの活用 | Redis 8.x |
+
+## webhani の見方
+
+「AI アプリを作ったらコストが予想より高くなった」という相談を受けるとき、原因の多くは LLM API の無駄な呼び出しです。Semantic Cache の導入は LLM コスト削減の中で最もシンプルで効果的な施策のひとつです。
+
+Redis 8.x のネイティブ Vector Search は、既に Redis を使っているシステムに Semantic Cache を追加する際の障壁をほぼゼロにします。新たな Vector DB の契約・管理・認証設定が不要になる点は、小規模チームにとって特に大きなメリットです。現在 Redis を使っているシステムであれば、まず Semantic Cache の試験導入から始めることをお勧めします。

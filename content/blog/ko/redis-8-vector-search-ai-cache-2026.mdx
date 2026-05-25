@@ -1,0 +1,157 @@
+---
+title: "Redis 8.x 네이티브 Vector Search — AI 앱의 Cache Layer 재설계"
+description: "Redis 8.x가 네이티브 Vector 유사도 검색을 탑재했습니다. 외부 서비스 없이 Semantic Cache 구현이 가능해진 지금, AI 애플리케이션의 Cache 설계를 어떻게 바꿔야 할지 알아봅니다."
+date: "2026-05-26"
+status: "published"
+tags: ["Redis", "Vector Search", "AI", "Caching", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "redis-8-vector-search-ai-cache-2026"
+---
+
+Redis 8.x에 네이티브 Vector 유사도 검색이 추가됐습니다. 이전까지 Semantic Search를 구현하려면 Pinecone, Weaviate 같은 전용 Vector DB나 pgvector를 사용하는 PostgreSQL이 필요했습니다. 이미 Redis를 운용하는 시스템이라면 추가 인프라 없이 Semantic Cache를 구현할 수 있게 된 셈입니다.
+
+Redis는 현재 In-Memory Data Store 시장에서 82%의 점유율을 보유하고 있습니다. 대부분의 Production 웹 서비스는 이미 Redis를 Cache Layer로 활용하고 있습니다. Native Vector Search는 기존 컴포넌트를 더 강력하게 만들어줍니다.
+
+## Semantic Cache가 해결하는 문제
+
+전통적인 Cache는 정확한 Key 일치로 동작합니다. 같은 의미의 질문이라도 다르게 표현되면 Cache Miss가 발생합니다.
+
+```python
+cache.get("도쿄 날씨는?")              # hit
+cache.get("도쿄 현재 기온 알려줘")     # miss — 다른 Key, 같은 의도
+cache.get("도쿄의 날씨 상태는 어때?")  # miss — 마찬가지
+```
+
+LLM 기반 애플리케이션에서는 이 문제가 크게 부각됩니다. 사용자들은 같은 질문을 다양한 방식으로 표현합니다. 표현이 다를 때마다 LLM API를 새로 호출하면 추론 비용이 사용자 수보다 빠르게 증가합니다.
+
+Semantic Cache는 입력 Query의 Vector Embedding을 계산하고, 유사도 임계값을 초과하는 캐시 항목을 반환합니다. 같은 의도를 가진 다양한 표현에 대해 캐시 응답을 제공합니다.
+
+```python
+cache.semantic_get("도쿄 날씨는?")              # 임베딩 계산, 인덱스 검색
+cache.semantic_get("도쿄 현재 기온 알려줘")     # 코사인 유사도 > 임계값 → hit
+cache.semantic_get("오사카 날씨는 어때?")       # 다른 의도 → miss
+```
+
+## Redis 8.x 구현
+
+Redis 8.x의 Vector 인덱싱은 HNSW(Hierarchical Navigable Small World) 알고리즘을 사용합니다. 다음은 실제 동작하는 구현 예제입니다.
+
+```python
+import redis
+import numpy as np
+from openai import OpenAI
+
+r = redis.Redis(host="localhost", port=6379, decode_responses=False)
+openai_client = OpenAI()
+
+# Vector Index 생성
+r.execute_command(
+    "FT.CREATE", "llm_cache_idx",
+    "ON", "HASH",
+    "PREFIX", "1", "cache:",
+    "SCHEMA",
+    "embedding", "VECTOR", "HNSW", "6",
+    "TYPE", "FLOAT32",
+    "DIM", "1536",
+    "DISTANCE_METRIC", "COSINE",
+    "response", "TEXT",
+    "model", "TEXT",
+    "created_at", "NUMERIC"
+)
+
+def get_embedding(text: str) -> np.ndarray:
+    response = openai_client.embeddings.create(
+        input=text,
+        model="text-embedding-3-small"
+    )
+    return np.array(response.data[0].embedding, dtype=np.float32)
+
+def cache_store(query: str, response: str, ttl: int = 3600) -> None:
+    embedding = get_embedding(query)
+    key = f"cache:{hash(query)}"
+    pipe = r.pipeline()
+    pipe.hset(key, mapping={
+        "embedding": embedding.tobytes(),
+        "response": response,
+        "model": "claude-sonnet-4-6",
+        "created_at": int(__import__("time").time())
+    })
+    pipe.expire(key, ttl)
+    pipe.execute()
+
+def cache_lookup(query: str, threshold: float = 0.92) -> str | None:
+    embedding = get_embedding(query)
+
+    results = r.execute_command(
+        "FT.SEARCH", "llm_cache_idx",
+        "*=>[KNN 1 @embedding $vec AS dist]",
+        "PARAMS", "2", "vec", embedding.tobytes(),
+        "RETURN", "2", "response", "dist",
+        "DIALECT", "2"
+    )
+
+    if results[0] == 0:
+        return None
+
+    items = results[2]
+    dist = float(items[items.index(b"dist") + 1])
+    similarity = 1 - dist  # 코사인 거리 → 유사도 변환
+
+    if similarity >= threshold:
+        return items[items.index(b"response") + 1].decode()
+
+    return None
+```
+
+`threshold` 파라미터로 매칭 엄격도를 조정합니다. 0.92가 좋은 시작점이지만, 전문 용어가 많은 도메인(의료, 법률)은 오탐을 줄이기 위해 조금 더 높게 설정하는 것을 권장합니다.
+
+## 메모리 사용량 계획
+
+Redis는 Vector Index를 RAM에 유지합니다. 1536차원 Float32 벡터 하나당 약 6KB입니다.
+
+| 항목 수 | 메모리 사용량 (1536차원 Float32) |
+|---------|-------------------------------|
+| 10만 건  | 약 600MB                      |
+| 100만 건 | 약 6GB                        |
+| 1000만 건| 약 60GB                       |
+
+LLM 애플리케이션의 Semantic Cache 용도라면 대부분 항목 수가 관리 가능한 수준에 머뭅니다. 사용자 질문은 공통된 의도를 중심으로 클러스터를 형성하는 경향이 있어, 5만~20만 건의 캐시가 상당히 넓은 트래픽 패턴을 커버하는 경우가 많습니다.
+
+## TTL 전략
+
+도메인에 따라 Ground Truth가 얼마나 빠르게 변하는지 고려해 TTL을 설정합니다.
+
+```python
+TTL_CONFIGS = {
+    "news_summary": 900,        # 15분 — 정보가 빠르게 만료됨
+    "product_faq": 86400,       # 24시간 — 비교적 안정적
+    "documentation": 604800,    # 7일 — 드물게 변경
+    "user_preference": 2592000, # 30일 — 장기 유지
+}
+
+def cache_with_domain_ttl(query: str, response: str, domain: str) -> None:
+    ttl = TTL_CONFIGS.get(domain, 3600)
+    cache_store(query, response, ttl=ttl)
+```
+
+도메인별로 다른 TTL을 적용하면 큰 복잡성 추가 없이 캐시 정확도를 높일 수 있습니다.
+
+## Redis vs 전용 Vector DB 선택 기준
+
+Redis 8.x Vector Search는 캐시 용도에 적합합니다. 모든 상황에서 전용 Vector DB를 대체하지는 않습니다.
+
+| 용도 | 권장 |
+|------|------|
+| Semantic Cache (100만 건 미만) | Redis 8.x |
+| RAG Knowledge Base (수백만 문서) | Pinecone / Weaviate / pgvector |
+| 복잡한 메타데이터 필터링 | 전용 Vector DB |
+| 이미 Redis 운용 중 | Redis 8.x |
+
+Redis의 운영 이점은 실질적입니다. 서비스 하나를 추가로 배포, 모니터링, 관리하지 않아도 됩니다. 린한 인프라를 운용하는 팀에게 이 트레이드오프는 종종 충분한 이유가 됩니다.
+
+## webhani의 시각
+
+LLM 추론 비용은 예상보다 빠르게 예산을 초과하는 항목입니다. Semantic Cache는 이를 줄이는 가장 단순하고 효과적인 방법 중 하나입니다. 동등한 답변이 이미 캐시에 있는데 중복 API 호출을 피하는 것이 핵심입니다.
+
+Redis 8.x가 별도 Vector DB 필요성을 없애면서 도입 장벽이 크게 낮아졌습니다. 이미 Redis를 사용 중인 스택이라면 Semantic Cache 추가는 며칠이 아닌 몇 시간 수준의 작업입니다. 높은 임계값(0.92~0.95)에서 시작해 오탐을 최소화하고, 첫 주에 캐시 히트율을 측정한 후 조정하는 방식을 권장합니다.

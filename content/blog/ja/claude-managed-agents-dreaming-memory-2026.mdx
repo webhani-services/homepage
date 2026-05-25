@@ -1,0 +1,130 @@
+---
+title: "Claude Managed Agents の「Dreaming」機能 — Agent Memory の自動整理"
+description: "Anthropic がリリースした Dreaming 機能は、Agent のセッション間 Persistent Memory を自動的に整理・統合します。長期 Agent 運用の実装に与える影響を解説します。"
+date: "2026-05-26"
+status: "published"
+tags: ["Claude", "Anthropic", "AI Agent", "Persistent Memory", "LLM"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-managed-agents-dreaming-memory-2026"
+---
+
+Anthropic が Claude Managed Agents に追加した「Dreaming」は、Agent のセッション間 Persistent Memory を自動的に整理・統合する機能です。Memory の重複排除とステールエントリの削除を、Agent が稼働していない時間帯に自律的に実行します。Research Preview として提供されていますが、長期稼働 Agent を設計する場合は注目する価値があります。
+
+## なぜ Persistent Memory が難しいのか
+
+Agent の Memory を会話をまたいで保持する方法は主に2通りです。
+
+**外部 Store 方式**: Agent が Tool を通じてメモを読み書きする。Vector DB や KV Store に保存する。  
+**Context Window 注入**: 過去セッションの Summary を System Prompt に注入する。
+
+どちらにも共通する問題があります。長期運用するほど Memory が汚染・肥大化することです。
+
+- 同じ情報が複数エントリとして重複保存される
+- 過去は正確だったが現在は古くなった情報が残り続ける
+- Memory の量が増えるにつれ、関連情報の検索精度が低下する
+
+手動クリーンアップなしにはこれらの問題は悪化し続けます。Dreaming はこのクリーンアップを自動化するアプローチです。
+
+## Dreaming の動作原理
+
+Dreaming は Agent がアイドル状態のときに実行される非同期プロセスです。
+
+1. **重複検出**: 意味的に重複しているエントリを特定する
+2. **統合**: 重複を1エントリにマージし、最新情報を優先する
+3. **陳腐化判定**: タイムスタンプ・参照頻度・内容の矛盾から古いエントリを検出する
+4. **削除**: 陳腐化したエントリを Memory Store から除去する
+
+重要なのは、このプロセスが Agent の応答に直接影響しない非同期処理として実行される点です。ユーザーとの会話中にレイテンシは発生しません。
+
+## 実装への影響
+
+現在 Memory 管理を手動で行っている場合、Dreaming が直接解決しない課題もあります。
+
+**解決するもの:**
+- Memory Store の不要な肥大化
+- 重複エントリによる検索ノイズ
+- 明らかに古くなった情報の放置
+
+**解決しないもの:**
+- Memory の初期設計（何を記憶すべきか）
+- Memory Retrieval のロジック（どの Memory をいつ使うか）
+- Memory のスコープ管理（ユーザー別・プロジェクト別の分離）
+
+Dreaming は Memory の「ガベージコレクション」であり、Memory Architecture 全体の設計を置き換えるものではありません。
+
+## Managed Agents に追加された Capability
+
+Dreaming と同時に、Anthropic は Managed Agents に以下を追加しています。
+
+- **API Rate Limit の引き上げ**: 大量の並行 Agent が必要なワークロード向け
+- **Multi-Agent Orchestration API**: Agent 間の協調制御を API から行える
+- **Outcomes API**: Agent の実行結果を Webhook または Polling で取得できる
+- **Microsoft 365 連携の強化**: Excel / PowerPoint Add-in が会話コンテキスト全体を共有
+
+Outcomes API は Production 統合において特に実用的です。Agent の実行完了を Polling ではなく Webhook で受け取れるため、長時間タスクのオーケストレーションがシンプルになります。
+
+```python
+from fastapi import FastAPI, Request
+
+app = FastAPI()
+
+@app.post("/agent-outcome")
+async def handle_outcome(request: Request):
+    payload = await request.json()
+
+    agent_id = payload["agent_id"]
+    status = payload["status"]  # "completed" | "failed" | "cancelled"
+    result = payload.get("result")
+
+    if status == "completed":
+        await process_agent_result(agent_id, result)
+    elif status == "failed":
+        await notify_failure(agent_id, payload.get("error"))
+
+    return {"received": True}
+```
+
+## Memory 管理の設計指針
+
+Dreaming のようなセルフメンテナンス機能を採用する場合でも、以下の設計原則は引き続き有効です。
+
+**Memory に保存するもの**: 状態が変化しにくい事実、ユーザー設定、長期的なコンテキスト。  
+**Memory に保存しないもの**: セッション内の一時的な中間結果、リトライしやすいデータ。
+
+```python
+# Memory エントリの構造例
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+
+class MemoryImportance(Enum):
+    CRITICAL = "critical"   # Dreaming での削除対象外
+    NORMAL = "normal"       # 通常のクリーンアップ対象
+    EPHEMERAL = "ephemeral" # 積極的に削除対象
+
+@dataclass
+class MemoryEntry:
+    content: str
+    created_at: datetime
+    last_accessed: datetime
+    importance: MemoryImportance
+    tags: list[str]
+
+# 重要度を明示することで、自動クリーンアップの精度を上げられる
+critical_entry = MemoryEntry(
+    content="プロジェクト XYZ のデプロイ承認者は田中さんのみ",
+    created_at=datetime.now(),
+    last_accessed=datetime.now(),
+    importance=MemoryImportance.CRITICAL,
+    tags=["deployment", "approval", "project-xyz"]
+)
+```
+
+重要度フラグを明示的に管理することで、自動クリーンアップと Human による制御を組み合わせた設計が可能になります。
+
+## webhani の見方
+
+Dreaming のようなセルフメンテナンス機能は、Agent の長期運用コストを下げる方向のアプローチとして評価しています。Memory の手動クリーンアップは、Agent 運用の中でも特に見落とされやすいコストです。
+
+ただし、Business Context に依存する重要情報が自動削除されるリスクには注意が必要です。Dreaming が「陳腐化」を判断する基準の詳細はまだ公開されていないため、本番システムへの適用では Memory Store の定期監査を継続することをお勧めします。自動化できる部分は自動化しながらも、最終的な判断は Human が担う設計がしばらくは安全です。
