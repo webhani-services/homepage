@@ -1,0 +1,149 @@
+---
+title: "Kubernetes v1.36 Haru: Security Defaults and AI Workload Support"
+description: "Kubernetes v1.36, codenamed Haru, delivers 70 enhancements with User Namespaces reaching GA, CEL-based admission policies, and improved GPU scheduling for AI workloads. Here's what matters in practice."
+date: "2026-05-27"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "DevOps", "Security", "AI"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-136-haru-security-ai-workloads"
+---
+
+## Kubernetes v1.36 at a Glance
+
+Kubernetes v1.36, named Haru (春 — Japanese for spring), is the first major release of 2026. It includes 70 enhancements across security, AI workload support, and API scalability. The theme running through most changes is tightening security defaults while reducing the operational overhead of enforcing them.
+
+## What Graduated to GA
+
+### User Namespaces
+
+User Namespaces decouple container UIDs/GIDs from host OS UIDs/GIDs. A process running as root inside a container maps to an unprivileged UID on the host — significantly containing the blast radius of a container escape.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: isolated-runner
+spec:
+  hostUsers: false  # enable user namespaces
+  containers:
+  - name: runner
+    image: ci-runner:latest
+    securityContext:
+      runAsUser: 0  # root inside the container...
+      # ...but maps to UID 65536+ on the host
+```
+
+This is particularly relevant for CI runners, script execution environments, and any workload that runs user-submitted code. The isolation guarantee is substantially stronger than `securityContext.runAsNonRoot` alone.
+
+### Mutating Admission Policies
+
+CEL-based Mutating Admission Policies (alongside existing Validating Admission Policies) graduate to GA. You can now mutate resources at admission time using CEL expressions — without deploying and maintaining a webhook server.
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: default-resource-limits
+spec:
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE"]
+      resources: ["pods"]
+  mutations:
+  - patchType: "ApplyConfiguration"
+    applyConfiguration:
+      expression: |
+        Object{
+          spec: Object.spec{
+            containers: request.object.spec.containers.map(c,
+              c.with({
+                resources: c.resources.with({
+                  limits: c.?resources.?limits.orValue({}).with({
+                    "memory": c.?resources.?limits.?memory.orValue("256Mi"),
+                    "cpu": c.?resources.?limits.?cpu.orValue("500m")
+                  })
+                })
+              })
+            )
+          }
+        }
+```
+
+Teams replacing webhook-based admission controllers with CEL policies eliminate webhook deployment, TLS management, and a class of admission latency issues. The operational savings compound over time.
+
+### Fine-Grained Kubelet API Authorization
+
+The Kubelet API now supports endpoint-level authorization. Previously, access required the cluster-admin-equivalent `system:kubelet-api-admin` role. In v1.36, monitoring agents, log collectors, and CI systems can request only the specific Kubelet endpoints they need.
+
+This is a meaningful improvement for the principle of least privilege in multi-tenant or multi-team clusters.
+
+## AI Workload Improvements
+
+### Dynamic Resource Allocation (DRA)
+
+DRA handles scheduling of special hardware like GPUs and FPGAs. v1.36 refines its API and improves reliability for production ML workloads.
+
+```yaml
+apiVersion: resource.k8s.io/v1alpha3
+kind: ResourceClaim
+metadata:
+  name: training-gpu
+spec:
+  resourceClassName: nvidia-gpu
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: distributed-training
+spec:
+  resourceClaims:
+  - name: gpu
+    resourceClaimName: training-gpu
+  containers:
+  - name: trainer
+    image: pytorch:2.4
+    resources:
+      claims:
+      - name: gpu
+```
+
+### Topology-Aware Scheduling
+
+For distributed training jobs where GPU-to-GPU bandwidth matters (NVLink, NVSwitch), topology-aware scheduling ensures pods in the same training group are co-located on nodes with matching interconnect topology. This directly affects training throughput for data-parallel and model-parallel workloads.
+
+## Before You Upgrade
+
+**Check for deprecated API usage.** Kubernetes deprecations follow a predictable schedule, but catching them before an upgrade avoids surprises:
+
+```bash
+# surface deprecated API calls in metrics
+kubectl get --raw /metrics | grep apiserver_requested_deprecated_apis
+
+# identify pods with hostUsers: true
+kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}: hostUsers={.spec.hostUsers}{"\n"}{end}'
+```
+
+**Test security default changes in staging first.** Several security-related defaults are tightened in v1.36. Workloads that relied on implicitly relaxed settings may behave differently. Validate in a staging environment before touching production nodes.
+
+**Upgrade path.** Kubernetes supports upgrades from n-1 minor version. From v1.34 or v1.35, the path is straightforward with `kubeadm`:
+
+```bash
+# check current version
+kubectl version --short
+
+# drain a node before upgrading it
+kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data
+```
+
+## Takeaway
+
+v1.36 continues the pattern of making secure-by-default behavior require less manual configuration. Three most actionable changes:
+
+1. **User Namespaces GA** — adopt now for CI runners and untrusted execution environments
+2. **CEL Admission Policies** — migrate webhook-based admission controllers incrementally; operational savings compound
+3. **DRA improvements** — if you're running ML training jobs on Kubernetes, benchmark DRA against your current GPU scheduling setup
+
+For new clusters, v1.36 is the right target. For existing clusters, run the deprecation check, validate in staging, then proceed.
