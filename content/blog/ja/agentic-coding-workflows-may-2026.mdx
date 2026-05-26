@@ -1,0 +1,119 @@
+---
+title: "2026年5月版: Agentic Coding Workflowを実務に取り入れる"
+description: "Claude Opus 4.7がLMArena首位、GPT-5.5もリリースされたAIコーディングツール激戦の今。複数のAIモデルを使い分けるAgentic Workflowの設計パターンと実務導入のポイントを解説します。"
+date: "2026-05-27"
+status: "published"
+tags: ["AI", "LLM", "Claude", "Agentic Coding", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "agentic-coding-workflows-may-2026"
+---
+
+## 2026年5月のAIコーディング環境
+
+AIコーディングツールの競争が激化しています。Claude Opus 4.7はLMArenaのトップを維持し、SWE-bench Verifiedでも最高性能を記録しています。一方でOpenAIはGPT-5.5（ハルシネーション60%削減）とCodex Mobileをリリースし、GoogleはGemini I/O 2026でGemini 3.5 Flashを発表しました。
+
+これだけ多くの強力なモデルが存在する状況では、「どのモデルが最強か」より「どのモデルをいつ使うか」という設計判断の方が重要になってきています。
+
+## Agentic Workflowとは何か
+
+Agentic Workflowとは、LLMが単発の質問に答えるだけでなく、複数のステップにわたるTaskを自律的に実行するパターンです。核となる能力は4つです:
+
+- **Planning**: GoalをExecutableな小さなStepに分解する
+- **Tool Use**: ファイル操作、Command実行、検索などのToolを活用する
+- **Reflection**: 自身の出力を評価し、必要に応じてやり直す
+- **Memory**: 複数のStepにわたってContextを保持する
+
+Claude Opus 4.7のReflection能力の改善が最も顕著に現れるのは、コードのデバッグや複数ファイルにわたるRefactoringといった、途中で方針を修正する必要があるTaskです。
+
+## 実務でのワークフロー設計パターン
+
+### パターン1: モデルを役割で使い分ける
+
+全てのTaskに最上位モデルを使う必要はありません。コスト効率を考えると、役割に応じてモデルを使い分けるアーキテクチャが実用的です。
+
+```typescript
+// モデル選択のガイドライン（概念的な例）
+const modelStrategy = {
+  // 複雑な設計判断・アーキテクチャレビュー
+  strategicTasks: 'claude-opus-4-7',
+  
+  // 日常的なコード生成・修正
+  routineCoding: 'claude-sonnet-4-6',
+  
+  // ドキュメント生成・コメント追加
+  documentation: 'claude-haiku-4-5',
+  
+  // 大量のコード解析・検索
+  codeSearch: 'gemini-3-5-flash', // 長いContextウィンドウを活用
+};
+```
+
+### パターン2: 明確な完了条件を先に定義する
+
+AgentがTaskを自律的に完了するためには、何をもって「完了」とするかが明確である必要があります。
+
+```
+# 良いTask定義の例
+タスク: ユーザー一覧ページのN+1クエリを修正する
+
+完了条件:
+1. docker exec dev_app npm test が全てPASS
+2. ユーザー一覧APIのレスポンスタイムが100ms以下（計測値を記録すること）
+3. 変更箇所にTypeScriptのエラーがないこと
+
+制約:
+- 既存のAPIのResponse Formatを変更しないこと
+- テストを削除・スキップしないこと
+```
+
+このような定義があることで、AgentはTaskの途中で「これで良いのか」と迷うことなく、自分で検証しながら進められます。
+
+### パターン3: 段階的な権限委譲
+
+全てのファイル操作とCommand実行をAutoApproveにするのは避け、段階的に権限を拡大します。
+
+```
+Stage 1（最初の1週間）:
+- 全ての変更をConfirmationあり
+- Agentの判断パターンを観察する
+
+Stage 2（検証済みTaskのみ）:
+- テストの自動生成: AutoApprove
+- ドキュメントの更新: AutoApprove
+- 本番Codeの変更: 引き続きConfirmation
+
+Stage 3（信頼が積み重なったら）:
+- 明確に定義されたRefactoringTask: AutoApprove
+- 新機能の実装: 引き続きPR Reviewで確認
+```
+
+## 注意すべき落とし穴
+
+### Context汚染
+
+長時間のAgentセッションでは、過去のエラーや試行錯誤がContextに蓄積され、判断精度が下がることがあります。定期的にセッションをリセットし、Taskごとに新鮮なContextから始めることで防げます。
+
+### 過度な自信
+
+Agentは「できた」と報告しても、実際にはテストが通っていないケースがあります。完了条件に「テストのコマンドを実行して結果を報告すること」を明示的に含めると、この問題を緩和できます。
+
+```bash
+# Agentに渡す完了確認コマンドの例
+docker exec dev_webhani_hp_app npm run typecheck && \
+docker exec dev_webhani_hp_app npm test 2>&1 | tail -20
+```
+
+### Token消費の急増
+
+Agentic Workflowは通常のChat比較で5〜20倍のToken消費になることがあります。チーム全体で展開する前に、代表的なTaskでの消費量を計測してから月間コストを試算してください。
+
+## まとめ
+
+2026年5月時点では、Claude Opus 4.7、GPT-5.5、Gemini 3.5 Flashなど複数の強力なモデルが並立しています。この環境を最大限活用するためには:
+
+1. **Taskの性質に応じてモデルを使い分ける**: 全てに最上位モデルを使う必要はない
+2. **完了条件を定量的に定義する**: 「修正してください」より「テストが通ること」
+3. **段階的に自動化範囲を広げる**: 最初から全てAutoApproveにしない
+
+AIコーディングツールは急速に進化しています。ツールに振り回されるのではなく、チームのWorkflowに合った形で継続的に最適化していくことが重要です。

@@ -1,0 +1,122 @@
+---
+title: "What to Know Before Migrating to Next.js 16 Beta"
+description: "Next.js 16 beta is out, bringing Turbopack production builds, stable Node.js middleware, and several deprecations. Here's a practical look at what changes and what to watch out for."
+date: "2026-05-27"
+status: "published"
+tags: ["Next.js", "React", "TypeScript", "Turbopack", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-beta-turbopack-stable"
+---
+
+## What's New in Next.js 15.5 and the 16 Beta
+
+Next.js 15.5 shipped Turbopack builds in beta, stable Node.js middleware support, TypeScript config improvements, and deprecation warnings for `next lint`. Next.js 16 beta is now available, previewing larger changes to routing and the developer experience.
+
+The most meaningful shift for most teams is Turbopack reaching production build support.
+
+## Turbopack Production Builds
+
+Turbopack has been the default dev server bundler since Next.js 15. The addition of production build support in 15.5 (beta) closes the last significant gap between Turbopack and Webpack.
+
+Performance numbers on large codebases are substantial:
+
+| Metric | Webpack | Turbopack |
+|--------|---------|-----------|
+| Dev server cold start | ~5s | ~0.5s |
+| HMR round-trip | ~500ms | ~50ms |
+| Production build (large repo) | baseline | up to 700x faster |
+
+The dev server improvements have been available since Next.js 15. The production build improvement is the new piece — and it matters most for CI/CD pipeline duration.
+
+## Stable Node.js Middleware
+
+The edge runtime constraint on middleware has been a long-standing frustration. As of Next.js 15.5, middleware runs stably on the Node.js runtime, which means full access to Node.js APIs — including crypto, streams, and third-party packages with native dependencies.
+
+```typescript
+// middleware.ts — Node.js runtime (Next.js 15.5+)
+import { NextRequest, NextResponse } from 'next/server';
+import { verifyJwt } from './lib/auth'; // Node.js crypto dependency — works now
+
+export async function middleware(req: NextRequest) {
+  const token = req.cookies.get('session')?.value;
+
+  if (!token) {
+    return NextResponse.redirect(new URL('/login', req.url));
+  }
+
+  const payload = await verifyJwt(token);
+  if (!payload) {
+    return NextResponse.redirect(new URL('/login', req.url));
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ['/dashboard/:path*', '/api/:path*'],
+};
+```
+
+This removes the workarounds many teams had in place — route handlers or custom servers just to run Node.js crypto in auth middleware.
+
+## The `next lint` Deprecation
+
+`next lint` is being deprecated in favor of managing ESLint directly. The migration is straightforward but requires updating your project's lint setup before you upgrade.
+
+```js
+// eslint.config.js (flat config format)
+import { FlatCompat } from '@eslint/eslintrc';
+
+const compat = new FlatCompat();
+
+export default [
+  ...compat.extends('next/core-web-vitals'),
+  {
+    rules: {
+      // your custom rules
+    },
+  },
+];
+```
+
+Check your `package.json` scripts and CI configs — anything calling `next lint` directly will need updating.
+
+## Migration Considerations
+
+**Turbopack production builds are still beta.** Before switching from Webpack to Turbopack for production:
+
+- Test builds locally with `next build --turbopack`
+- Watch for issues with custom Webpack loaders or plugins
+- Measure actual build times in CI, not just locally
+
+**React 19 Server/Client component boundaries become more important.** Next.js 16 assumes React 19. If you haven't been deliberate about `'use client'` boundaries, now is the time:
+
+```typescript
+// Default: Server Component
+// runs on the server, can be async, access databases directly
+async function ProductPage({ id }: { id: string }) {
+  const product = await db.products.findById(id);
+  return <ProductView product={product} />;
+}
+
+// Explicit: Client Component
+'use client';
+import { useState } from 'react';
+
+function ProductView({ product }: { product: Product }) {
+  const [quantity, setQuantity] = useState(1);
+  // browser state and events are fine here
+}
+```
+
+## Takeaway
+
+Next.js 16 is a meaningful update, but the path to adoption should be incremental:
+
+1. Migrate `next lint` to direct ESLint config now
+2. Confirm your middleware works on Node.js runtime
+3. Test Turbopack production builds in a staging environment
+4. Hold off on Next.js 16 beta for production until stable release
+
+The dev server already benefits from Turbopack in Next.js 15 — so the main gain waiting in 16 for most teams is production build speed.
