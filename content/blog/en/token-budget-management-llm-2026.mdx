@@ -1,0 +1,209 @@
+---
+title: "Token Budget Management for Production LLMs: Controlling Cost at Scale"
+description: "Practical strategies for managing token consumption in production LLM systems, covering prompt caching, selective context trimming, structured outputs, and multi-agent budget allocation."
+date: "2026-05-28"
+status: "published"
+tags: ["LLM", "Cost Optimization", "AI Architecture", "Anthropic", "Production"]
+thumbnail: ""
+author: "webhani"
+slug: "token-budget-management-llm-2026"
+---
+
+Running LLMs in production introduces a cost dimension that is easy to underestimate during development. A recent report from The New Stack (May 27, 2026) highlighted "tokenmaxxing" — the unintentional accumulation of unnecessary token consumption — as a growing problem across teams deploying AI-powered systems at scale.
+
+With frontier models like Claude Opus 4.7 and GPT-5.5, even a 2x increase in tokens per request translates directly to a 2x increase in API cost. This post covers practical patterns for keeping token usage under control without sacrificing output quality.
+
+## What Tokenmaxxing Looks Like
+
+Token consumption balloons for a few predictable reasons:
+
+- **Bloated context windows**: Including all prior conversation history regardless of relevance to the current query
+- **Verbose system prompts**: Rules written as prose that repeat the same constraints in multiple ways
+- **Retry inflation**: Resubmitting the full request after partial network failures, causing input tokens to be double-counted
+- **Inefficient agent loops**: Multi-step agent workflows that pass the entire accumulated state to each step
+
+None of these issues are immediately visible in development. They only become expensive at scale.
+
+## Start by Measuring
+
+Before optimizing anything, understand where tokens are actually going. A lightweight tracking layer over your API client gives you the data you need.
+
+```typescript
+interface UsageSample {
+  model: string;
+  endpoint: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheHitTokens: number;
+  timestamp: Date;
+}
+
+class TokenTracker {
+  private samples: UsageSample[] = [];
+  private alertThreshold: number;
+
+  constructor(alertThreshold = 50_000) {
+    this.alertThreshold = alertThreshold;
+  }
+
+  record(sample: UsageSample): void {
+    this.samples.push(sample);
+    const total = sample.inputTokens + sample.outputTokens;
+    if (total > this.alertThreshold) {
+      console.warn(
+        `[Token Alert] ${sample.endpoint}: ${total.toLocaleString()} tokens`
+      );
+    }
+  }
+
+  summarizeByEndpoint(): Record<string, number> {
+    return this.samples.reduce((acc, s) => {
+      const key = `${s.model}::${s.endpoint}`;
+      acc[key] = (acc[key] ?? 0) + s.inputTokens + s.outputTokens;
+      return acc;
+    }, {} as Record<string, number>);
+  }
+}
+```
+
+## Strategy 1: Prompt Caching
+
+Anthropic's prompt caching reduces the cost of repeated system prompts or long document contexts to roughly 10% of the normal input rate. For any system prompt longer than ~1,000 tokens, enabling caching is an immediate win that requires almost no code change.
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+const SYSTEM_PROMPT = `You are a technical consultant at webhani Inc.
+Provide practical, concrete advice for client technical questions.
+Follow these principles: ...
+(hundreds of tokens of detailed instructions)`;
+
+async function queryWithCache(userMessage: string) {
+  const response = await client.messages.create({
+    model: "claude-opus-4-7",
+    max_tokens: 1024,
+    system: [
+      {
+        type: "text",
+        text: SYSTEM_PROMPT,
+        cache_control: { type: "ephemeral" },
+      },
+    ],
+    messages: [{ role: "user", content: userMessage }],
+  });
+
+  const cached = response.usage.cache_read_input_tokens ?? 0;
+  const written = response.usage.cache_creation_input_tokens ?? 0;
+  console.log(`Cache: ${cached} tokens read, ${written} tokens written`);
+  return response;
+}
+```
+
+The first request creates the cache. Every subsequent request hits it at ~10% of the original cost.
+
+## Strategy 2: Selective Context Trimming
+
+Conversation history is the most common source of token inflation. Most systems include far more history than the current query actually needs.
+
+```typescript
+interface ScoredMessage {
+  role: "user" | "assistant";
+  content: string;
+  relevanceScore: number; // 0.0–1.0
+  tokenCount: number;
+}
+
+function buildOptimizedContext(
+  history: ScoredMessage[],
+  maxContextTokens: number,
+  keepRecentCount = 4
+): ScoredMessage[] {
+  // Always keep the most recent exchanges
+  const recent = history.slice(-keepRecentCount);
+  const recentTokens = recent.reduce((sum, m) => sum + m.tokenCount, 0);
+
+  // Fill remaining budget by relevance score
+  const older = history.slice(0, -keepRecentCount);
+  const sorted = [...older].sort((a, b) => b.relevanceScore - a.relevanceScore);
+
+  const selected: ScoredMessage[] = [];
+  let remaining = maxContextTokens - recentTokens;
+
+  for (const msg of sorted) {
+    if (remaining < msg.tokenCount) continue;
+    selected.push(msg);
+    remaining -= msg.tokenCount;
+  }
+
+  // Return in chronological order
+  return [
+    ...selected.sort((a, b) => older.indexOf(a) - older.indexOf(b)),
+    ...recent,
+  ];
+}
+```
+
+Relevance scoring can be as simple as recency decay or keyword overlap with the current query. Even a rough heuristic beats including everything indiscriminately.
+
+## Strategy 3: Structured Outputs Reduce Response Size
+
+When the downstream consumer is code rather than a person, request structured output. JSON responses for the same information are typically 30–50% shorter than equivalent natural language explanations.
+
+```typescript
+// Instead of asking for a detailed explanation:
+const verbosePrompt = `
+  Please carefully analyze this code and explain any bugs you find,
+  including the line number, root cause, and suggested fix for each.
+`;
+
+// Request compact structured output:
+const structuredPrompt = `
+Analyze this code for bugs. Respond with JSON only, no explanation:
+
+{"issues":[{"line":number,"severity":"error"|"warning","summary":"<10 words max>","fix":"<corrected code>"}]}
+
+Code:
+\`\`\`
+${codeBlock}
+\`\`\`
+`;
+```
+
+## Budget Allocation in Multi-Agent Systems
+
+When orchestrating multiple specialized agents, assigning explicit token budgets prevents any single agent from consuming disproportionate resources.
+
+```typescript
+const AGENT_BUDGETS = {
+  planner: 8_000,    // Planning: should be concise by design
+  executor: 20_000,  // Execution: handles the complex tasks
+  reviewer: 5_000,   // Review: focused on diffs, not full context
+  summarizer: 3_000, // Summary: short output is the goal
+} as const;
+
+type AgentRole = keyof typeof AGENT_BUDGETS;
+
+async function runAgentWithBudget(role: AgentRole, prompt: string) {
+  return client.messages.create({
+    model: "claude-opus-4-7",
+    max_tokens: AGENT_BUDGETS[role],
+    messages: [{ role: "user", content: prompt }],
+  });
+}
+```
+
+Setting `max_tokens` per role forces each agent to work within its scope. A summarizer that tries to reproduce the full document will simply be cut off — which is the correct behavior.
+
+## Practical Sequence
+
+In production, implement in this order:
+
+1. **Add instrumentation first** — know your baseline before changing anything
+2. **Enable prompt caching** — immediate reduction for long system prompts
+3. **Audit context assembly** — most teams include significantly more history than needed
+4. **Shift to structured output** — especially for agent-to-agent communication
+5. **Set budget alerts** — catch regressions before they appear on the invoice
+
+The compound effect matters. A 20% reduction per request becomes a substantial monthly saving across millions of daily API calls. Token budget management is not a one-time optimization — it is an ongoing operational discipline as your LLM usage scales.
