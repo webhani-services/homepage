@@ -1,0 +1,163 @@
+---
+title: "GitLab 19.0: DevSecOps Orchestration and Secure AI Agent Credential Management"
+description: "Released May 22, 2026, GitLab 19.0 tightens DevSecOps integration across the full pipeline and introduces Agent Vault — a mechanism that lets coding agents operate without ever seeing plaintext secrets."
+date: "2026-05-28"
+status: "published"
+tags: ["GitLab", "DevSecOps", "CI/CD", "AI Agent", "Security"]
+thumbnail: ""
+author: "webhani"
+slug: "gitlab-19-devsecops-ai-agents-2026"
+---
+
+GitLab 19.0 shipped on May 22, 2026. The headline feature is tighter DevSecOps orchestration — security scanning, compliance enforcement, and AI coding workflows unified into a single pipeline model rather than bolted on separately. The update also directly addresses one of the more uncomfortable questions in AI-assisted development: what happens to secrets when a coding agent reads your codebase?
+
+## DevSecOps as First-Class Pipeline Stages
+
+In prior GitLab versions, adding SAST, dependency scanning, or container scanning meant manually including templates and wiring job configurations. GitLab 19.0 introduces a `security:` block that makes security requirements declarative at the project level.
+
+```yaml
+# .gitlab-ci.yml (GitLab 19.0)
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+
+security:
+  policy:
+    require_sast: true
+    block_on_critical: true      # Blocks merge if critical findings exist
+    auto_fix_minor: true         # Proposes patches for minor findings
+  scan_on:
+    - merge_request
+    - default_branch
+
+stages:
+  - build
+  - test
+  - security    # Inserted automatically by GitLab
+  - deploy
+```
+
+With `block_on_critical: true`, any MR with unresolved critical vulnerabilities cannot be merged — no configuration in multiple places, just one declaration. Security policy as code that travels with the repository.
+
+## Agent Vault: Secrets That Agents Cannot Read
+
+The more novel addition is Agent Vault, designed to solve a real problem: AI coding agents need credentials to push code, call APIs, and deploy — but passing secrets directly to an LLM context means they may appear in training data, logs, or intermediate outputs.
+
+Agent Vault extends GitLab's existing CI/CD secret management to act as a credential broker for agents. The agent authenticates through the vault and performs operations with delegated permissions, but never receives the actual secret values.
+
+```yaml
+# .gitlab-ci.yml — Agent Vault configuration
+coding_agent:
+  stage: implement
+  image: registry.gitlab.com/gitlab-org/coding-agent:latest
+  variables:
+    GITLAB_AGENT_VAULT_ENABLED: "true"
+    GITLAB_AGENT_PERMISSIONS: "read_repository,create_mr"
+  secrets:
+    AWS_CREDENTIALS:
+      vault: aws/creds/deploy-role   # Delegated via HashiCorp Vault
+      token: $VAULT_TOKEN
+  script:
+    - gitlab-agent run --task="$TASK_DESCRIPTION"
+```
+
+The agent completes its work — reading code, making changes, opening MRs — without `AWS_CREDENTIALS` ever appearing in its environment as a readable variable. The vault handles authentication on the agent's behalf.
+
+This is a meaningful structural improvement. Previously, the common workaround was granting agents scoped tokens with minimal permissions, which still exposed token values in CI logs and environment dumps.
+
+## Security Policy as Code: A Working Example
+
+Here is a security policy file that demonstrates how 19.0 handles different code sources differently:
+
+```yaml
+# security-policy.yml (place in project root)
+version: "2"
+scan_execution_policy:
+  - name: "Protected Branch Scan"
+    description: "Full scan on any MR targeting main or release branches"
+    enabled: true
+    rules:
+      - type: pipeline
+        branches:
+          - main
+          - release/*
+    actions:
+      - scan: sast
+        variables:
+          SAST_EXCLUDED_PATHS: "spec,test,docs"
+      - scan: container_scanning
+      - scan: dependency_scanning
+
+  - name: "AI Agent Code Review"
+    description: "Additional scanning for commits authored by coding agents"
+    enabled: true
+    rules:
+      - type: merge_request
+        branch_type: protected
+        commits:
+          author_email_regex: ".*agent.*@gitlab\\.com"
+    actions:
+      - scan: sast
+        severity_levels:
+          - critical
+          - high
+```
+
+The second policy targets commits where the author email matches an agent pattern. AI-generated code gets scanned with an additional security pass before it can reach a protected branch — without requiring reviewers to manually identify which commits came from an agent.
+
+## Breaking Changes in 19.0
+
+A few things to check before upgrading:
+
+**Template paths have changed:**
+
+```yaml
+# Broken on 19.0
+include:
+  - template: SAST.gitlab-ci.yml
+
+# Correct
+include:
+  - template: Security/SAST.gitlab-ci.yml
+```
+
+**`only/except` triggers deprecation warnings:**
+
+```yaml
+# Deprecated — will warn on 19.0
+deploy:
+  script: ./deploy.sh
+  only:
+    - main
+
+# Use rules instead
+deploy:
+  script: ./deploy.sh
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+```
+
+**Runner version requirement for Agent Vault:** GitLab Runner 17.5 or later is required. Verify before enabling Agent Vault features:
+
+```bash
+gitlab-runner --version
+
+# Update a Docker-based runner
+docker pull gitlab/gitlab-runner:latest
+docker stop gitlab-runner && docker rm gitlab-runner
+docker run -d --name gitlab-runner \
+  --restart always \
+  -v /srv/gitlab-runner/config:/etc/gitlab-runner \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  gitlab/gitlab-runner:latest
+```
+
+## What Matters in Practice
+
+Of everything in 19.0, two changes have the most immediate impact on teams actively using AI coding tools:
+
+**Security policy as code** standardizes security requirements across repositories without relying on each team to configure scanning jobs correctly. For organizations managing multiple repositories or onboarding AI-generated code, centralizing this in a declarative policy file is a practical improvement.
+
+**Agent Vault** closes a real security gap. If your team is using coding agents in CI/CD pipelines, migrating to Agent Vault should be a near-term priority — not because the old approach was catastrophic, but because removing credential exposure from the LLM context is straightforwardly better.
+
+GitLab 19.0 reads less like a feature release and more like a maturity release. The pieces were mostly there; 19.0 makes them coherent.

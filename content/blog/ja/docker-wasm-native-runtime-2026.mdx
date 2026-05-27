@@ -1,0 +1,180 @@
+---
+title: "DockerのネイティブWebAssembly対応：Containerの次のフェーズ"
+description: "2026年のDockerはLinux Containerに加えてWebAssembly（Wasm）Runtimeをネイティブサポートしました。起動速度・バイナリサイズ・セキュリティの面でのWasm Containerの特性と、適切なユースケースを整理します。"
+date: "2026-05-28"
+status: "published"
+tags: ["Docker", "WebAssembly", "Wasm", "Container", "Cloud Native"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-wasm-native-runtime-2026"
+---
+
+2026年のDockerは、従来のLinux Containerに加えてWebAssembly（Wasm）Runtimeをネイティブにサポートするようになりました。`docker run`コマンドでWasm Moduleを直接実行できるようになったことで、超高速な起動時間と小さなバイナリサイズが求められるユースケースで新しい選択肢が生まれています。
+
+ただし、WasmはLinux Containerの置き換えではありません。この記事では両者の特性を整理し、DockerのWasmサポートをどんな場面で活用できるかを具体的に解説します。
+
+## DockerにおけるWasm Runtimeの仕組み
+
+DockerはContainer RuntimeとしてcontainerdをベースにしていますがWasm対応では`runwasi`というshimが介在します。これにより、Dockerはイメージを`WASI（WebAssembly System Interface）`準拠のWasm Moduleとして実行できます。
+
+```bash
+# WasmイメージをDockerで実行する基本コマンド
+docker run --platform wasi/wasm \
+  --runtime=io.containerd.wasmedge.v1 \
+  my-wasm-app:latest
+```
+
+`--runtime`オプションには現在複数の実装が存在します：
+
+| Runtime | 特徴 |
+|---|---|
+| `io.containerd.wasmedge.v1` | 高いパフォーマンス、本番向け |
+| `io.containerd.wasmtime.v1` | 安定性重視、Bytecode Alliance製 |
+| `io.containerd.spin.v2` | Fermyon Spinベース、HTTP/イベント向け |
+
+## Linux ContainerとWasm Containerの比較
+
+| 特性 | Linux Container | Wasm Container |
+|---|---|---|
+| 起動時間 | 100ms〜数秒 | 1〜10ms |
+| イメージサイズ | 数十MB〜GB | 数百KB〜数MB |
+| システムコール | 直接（Linuxカーネル経由） | WASI経由（サンドボックス） |
+| CPU アーキテクチャ依存 | あり（amd64/arm64） | なし（ポータブル） |
+| 既存ツールとの互換性 | 高い | 制限あり |
+| 言語サポート | すべて | Rust/Go/C/C++が主流 |
+
+Wasm Containerの最大のメリットは**起動速度**と**ポータビリティ**です。同じWasmバイナリがx86、ARM、どこでも動作します。
+
+## 実際のDockerfile（Rust + WASI）
+
+RustでWASI対応のWasm Moduleを作り、DockerでBuildする例です。
+
+```dockerfile
+# ビルドステージ
+FROM rust:1.80-slim AS builder
+
+RUN rustup target add wasm32-wasip1
+
+WORKDIR /app
+COPY . .
+RUN cargo build --target wasm32-wasip1 --release
+
+# 実行ステージ（WasmEdgeベース）
+FROM wasmedge/slim-runtime:0.11.0
+COPY --from=builder /app/target/wasm32-wasip1/release/my_app.wasm /app.wasm
+
+ENTRYPOINT ["wasmedge", "/app.wasm"]
+```
+
+```rust
+// src/main.rs - WASIに対応したシンプルなHTTPハンドラ
+use std::io::{self, Read};
+
+fn main() {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).unwrap();
+
+    let response = process_request(&input);
+    println!("{}", response);
+}
+
+fn process_request(input: &str) -> String {
+    // リクエスト処理ロジック
+    format!("{{\"processed\": true, \"input_length\": {}}}", input.len())
+}
+```
+
+## Docker ComposeでWasmとLinux Containerを混在させる
+
+実際のシステムでは、WasmとLinux Containerを用途に応じて組み合わせることが多いです。
+
+```yaml
+# docker-compose.yml
+services:
+  # 従来のLinux ContainerでDB/Middleware
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: secret
+
+  redis:
+    image: redis:8-alpine
+
+  # Wasm ContainerでLightweightなマイクロサービス
+  request-validator:
+    image: my-org/validator:latest
+    platform: wasi/wasm
+    runtime: io.containerd.wasmedge.v1
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+
+  # 従来のNode.jsサービス
+  api-gateway:
+    build: ./api-gateway
+    ports:
+      - "3000:3000"
+    depends_on:
+      - request-validator
+      - postgres
+```
+
+このような構成では、リクエストのバリデーションやルーティングといった軽量な処理をWasm Containerに任せ、DB接続やファイルI/Oが必要な処理は通常のLinux Containerで行います。
+
+## Wasm Containerが適しているユースケース
+
+**Wasmが強みを発揮する場面：**
+
+- **Edge Computing**: CDN EdgeやServerless Functionでの超低レイテンシ処理
+- **Plugin System**: ホストアプリに埋め込む安全なプラグイン実行環境
+- **リクエストバリデーション**: 起動コストが低いため、高頻度の短命プロセスに向いている
+- **言語非依存のライブラリ配布**: Wasm Moduleはどの言語からも呼び出せる
+
+**Wasmが向いていない場面：**
+
+- **フルスタックWebアプリ**: Node.jsやPythonのエコシステムが必要なケース
+- **データベース処理**: 複雑なファイルシステム操作が必要なミドルウェア
+- **GPU処理**: CUDA/ROCmへのアクセスはWASI経由ではまだ未成熟
+
+## KubernetesとWasm
+
+Kubernetes 1.35以降ではWasm Workloadの実行がより洗練されています。RuntimeClassリソースを使ってWasm Nodeを指定できます。
+
+```yaml
+# RuntimeClass でWasm Runtimeを定義
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: wasmedge
+handler: wasmedge
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wasm-validator
+spec:
+  template:
+    spec:
+      runtimeClassName: wasmedge  # Wasm Runtimeを指定
+      containers:
+        - name: validator
+          image: my-org/validator:latest
+          ports:
+            - containerPort: 8080
+```
+
+## 現時点での採用に関するwebhaniの見解
+
+DockerのネイティブWasm対応は技術的に興味深い進展ですが、Production採用に際してはいくつかの点を慎重に評価する必要があります。
+
+**採用を検討すべき場面：**
+- Rust/GoベースのシンプルなHTTP処理サービスを、起動速度が重要なEdge環境にDeployする場合
+- ポータビリティが最優先で、x86/ARMの両方で同一バイナリを使いたい場合
+
+**もう少し待った方が良い場面：**
+- JavaScriptやPythonのランタイムに依存するアプリケーション
+- npm/pypiのエコシステムを活用したいサービス
+
+Wasmはすべてのコンテナを置き換えるものではなく、特定のユースケースで補完的に使う技術として成熟しつつあります。新規のEdge FunctionやPlugin Systemの設計では、選択肢の一つとして真剣に検討する価値があります。
