@@ -1,0 +1,162 @@
+---
+title: "CloudflareのLLM基盤設計：Prefill/Decode分離とカスタムInference Engine"
+description: "CloudflareがどのようにLLMをグローバルに効率的に動かしているか、InfireエンジンとUnweightによるモデル圧縮技術のアーキテクチャを解説します。"
+date: "2026-05-29"
+status: "published"
+tags: ["Cloudflare", "LLM", "Infrastructure", "AI", "推論最適化"]
+thumbnail: ""
+author: "webhani"
+slug: "cloudflare-llm-infra-prefill-decode"
+---
+
+# CloudflareのLLM基盤設計：Prefill/Decode分離とカスタムInference Engine
+
+大規模なLLMをクラウドで効率的に動かすには、一般的なWebサービスとは全く異なる設計が必要です。2026年5月、Cloudflareがその内部インフラの設計を詳細に公開しました。カスタムInference Engineの「Infire」、Prefill/Decode分離、そしてモデル重みを15〜22%圧縮する「Unweight」——これらの技術は、LLMの本番運用を設計する上で参考になる視点を提供しています。
+
+## LLM Inferenceが難しい理由
+
+まず前提として、なぜLLM Inferenceが一般的なWeb APIとは異なるのかを理解する必要があります。
+
+LLMのInferenceは2つの異なるフェーズに分かれています。
+
+**Prefill Phase（入力処理）**：ユーザーの入力テキスト全体を一度に処理し、KV Cache（Key-Value Cache）を構築します。GPU並列処理に適しており、処理時間は入力長に依存します。高いFLOPS（浮動小数点演算性能）が必要です。
+
+**Decode Phase（出力生成）**：トークンを1つずつ逐次生成します。前のトークンに依存するため並列化が困難で、高いメモリ帯域幅が求められます。
+
+```
+LLM Inference の2フェーズ
+
+─── Prefill ──────────────────────── Decode ──────────────────────────
+プロンプト全体を読んでKV Cacheを構築  |  トークンを1つずつ逐次生成
+高FLOPS、短いバースト処理             |  高メモリ帯域幅、長い尾引き処理
+GPU並列化が効く                       |  並列化困難
+```
+
+この2つのフェーズは計算特性が根本的に異なります。同一のGPUマシンで両方を処理すると、必ずどちらかの特性に妥協が生じます。
+
+## CloudflareのPrefill/Decode分離設計
+
+Cloudflareの基盤設計の中心的なアイデアは、**PrefillとDecodeを別々のマシンで処理する**ことです。
+
+```
+従来の設計（1台のGPUサーバーで全処理）
+Request → [GPU Server: Prefill → Decode] → Response
+
+Cloudflareの設計（分離）
+Request → [Prefill Server] → KV Cache → [Decode Server] → Response
+                                  ↑
+                          KV Cacheをネットワーク越しに転送
+```
+
+この設計により、以下のメリットが生まれます。
+
+**ハードウェアの最適化**：Prefillには高いFLOPSのGPU（A100など）、Decodeには高いメモリ帯域幅のGPU（H100など）と、それぞれに最適なハードウェアを割り当てられます。
+
+**スケーリングの独立性**：トラフィックパターンに応じて、PrefillサーバーとDecodeサーバーを独立してスケールできます。長いプロンプトが増えたらPrefillだけ増やす、といった細かい制御が可能です。
+
+**GPU使用率の向上**：同一マシンで両フェーズを処理すると、Decode中にGPUのPrefill能力が遊んでしまいます。分離することで各マシンのGPU利用効率を高められます。
+
+## カスタムInference Engine「Infire」
+
+CloudflareはvLLMやTGIといった既存のフレームワークを使わず、**独自のInference EngineをRustで実装**しました。これが「Infire」です。
+
+### ページングされたKV Cache管理
+
+vLLMと同様のPagedAttentionの仕組みを採用しています。GPUメモリを固定サイズのページに分割して管理することで、メモリの断片化を防ぎます。
+
+```
+PagedAttention のGPUメモリレイアウト
+┌─────────────────────────────────────────────────────┐
+│ Page 0  │ Page 1  │ Page 2  │ Page 3  │ Page 4  │...│
+│ (req_a) │ (req_b) │ (req_a) │ (req_c) │ (req_b) │...│
+└─────────────────────────────────────────────────────┘
+異なるリクエストが同一の物理メモリページを共有
+事前割り当てによるメモリ無駄がない
+```
+
+### FlashAttentionの統合
+
+FlashAttention-2相当の実装を採用し、長いコンテキストを扱う場合のGPU HBMメモリ使用量をO(n²)からO(n)に削減します。128K以上のコンテキストウィンドウを持つモデルで特に効果的です。
+
+### マルチGPUの効率的な管理
+
+Tensor Parallelismを用いた複数GPUへのモデル分散を、Infireが直接制御します。外部のオーケストレーターに依存せず、ネットワーク転送のオーバーヘッドを最小化しています。
+
+## Unweight：精度を保ったモデル圧縮
+
+Cloudflareが開発した「Unweight」は、LLMの重みを15〜22%圧縮する技術です。重要なのは、**精度の損失なしに**この圧縮を実現している点です。
+
+従来の量子化（8bit、4bitなど）とは異なるアプローチで、重みの冗長性を統計的に分析し、精度を維持しながら必要なデータ量を削減します。
+
+```
+Unweightの実用的な効果
+
+コールドスタートの改善
+  モデルサイズ削減 → GPU HBMへのロード時間短縮 → 起動が速い
+
+メモリ効率の向上
+  同一GPUに収まるモデルが大きくなる → バッチサイズ増加 → スループット向上
+
+KV Cache転送の効率化（分離設計との相乗効果）
+  PrefillサーバーからDecodeサーバーへの転送データ量が削減
+```
+
+16bit精度の70Bパラメータモデル（約140GB）で20%の圧縮が実現すると、約28GBが節約されます。これはバッチサイズを意味のある範囲で増やせる余裕です。
+
+## AI Gatewayとの統合
+
+これらのInfrastructureの上で、CloudflareはUnified APIでの**AI Gateway**を提供しています。70以上のAI ModelへのアクセスをOpenAI互換のAPIで統一します。
+
+```typescript
+// Cloudflare AI Gateway経由でモデルを呼び出す例
+const response = await fetch(
+  `https://gateway.ai.cloudflare.com/v1/${ACCOUNT_ID}/${GATEWAY_ID}/anthropic/v1/messages`,
+  {
+    method: 'POST',
+    headers: {
+      'x-auth-token': CF_API_TOKEN,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'claude-opus-4-7',
+      messages: [{ role: 'user', content: 'Hello' }],
+      max_tokens: 1024,
+    }),
+  }
+)
+```
+
+この設計により、プライマリProviderに障害が発生した場合、アプリケーションコードを変更せずに自動的にフォールバックモデルへルーティングできます。
+
+## self-hosted LLM運用への示唆
+
+Cloudflareの設計から学べる最も重要な教訓は、**LLM InferenceはWebサービスとは別の最適化原則が必要**だということです。
+
+同様の技術はOSSのInference Frameworkで既に利用可能です。
+
+```bash
+# vLLMでPrefill/Decode分離（Disaggregated Prefilling）を有効化
+# Prefill（producer）インスタンス
+python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Llama-3.1-70B-Instruct \
+  --kv-transfer-config \
+  '{"kv_connector":"PyNcclConnector","kv_role":"kv_producer","kv_rank":0}'
+
+# Decode（consumer）インスタンス
+python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Llama-3.1-70B-Instruct \
+  --kv-transfer-config \
+  '{"kv_connector":"PyNcclConnector","kv_role":"kv_consumer","kv_rank":1}'
+```
+
+vLLM、SGLang、LMDeployといったOSSフレームワークは、PagedAttention、FlashAttentionを既に実装しており、2026年にはDisaggregated Prefillingのサポートも追加されています。
+
+webhaniのクライアントでも、プライバシー要件やコスト最適化の観点からself-hosted LLMの検討が増えています。Cloudflareが独自実装したこれらの最適化の多くを、OSSで構築できる時代になっています。
+
+## まとめ
+
+- LLM InferenceにはPrefillとDecodeという計算特性が異なる2フェーズがある
+- CloudflareはPrefillとDecodeを別マシンに分離することでGPU効率を向上させている
+- Rust製Inference Engine「Infire」がPaged KV Cache、FlashAttention、マルチGPU分散を担当
+- 「Unweight」技術でモデル重みを15〜22%圧縮、精度を保ちながらGPUメモリを節約
+- 同様の最適化はvLLM、SGLangなどのOSSで既に実現可能

@@ -1,0 +1,160 @@
+---
+title: "How Cloudflare Runs LLMs at Scale: Prefill/Decode Splitting and the Infire Engine"
+description: "Cloudflare published details on their custom LLM inference infrastructure: prefill and decode phase separation, a Rust-based inference engine called Infire, and 15-22% lossless model weight compression with Unweight."
+date: "2026-05-29"
+status: "published"
+tags: ["Cloudflare", "LLM", "infrastructure", "AI inference", "performance"]
+thumbnail: ""
+author: "webhani"
+slug: "cloudflare-llm-infra-prefill-decode"
+---
+
+# How Cloudflare Runs LLMs at Scale: Prefill/Decode Splitting and the Infire Engine
+
+Running a large language model as a globally distributed service is fundamentally different from running a typical web application. In May 2026, Cloudflare published detailed documentation of their LLM inference infrastructure, including a custom inference engine built in Rust, a novel approach to splitting the two phases of LLM inference across separate machines, and a compression system that reduces model weight size by 15–22% without accuracy loss.
+
+This writeup breaks down the technical decisions and what they imply for teams thinking about self-hosted or high-scale LLM deployments.
+
+## The Two-Phase Problem
+
+LLM inference has two computationally distinct phases, and understanding them is the foundation of Cloudflare's architecture.
+
+**Prefill**: The model reads the entire input prompt at once and builds a KV cache (key-value cache of attention states). This is compute-intensive and parallelizable — it scales with input length and benefits from high FLOPS.
+
+**Decode**: The model generates output tokens one at a time, each depending on all previous tokens. This is sequential by nature, memory-bandwidth-bound, and difficult to parallelize.
+
+```
+Inference request timeline
+
+─── Prefill ──────────────────────────────────── Decode ────────────────────────────────────
+Read full prompt → Build KV cache (parallel)  |  Generate token 1 → 2 → 3 → ... (sequential)
+High FLOPS, short burst                        |  High memory BW, long tail
+GPU parallelism helps                          |  Mostly sequential, hard to parallelize
+```
+
+When both phases run on the same GPU, you get a fundamental mismatch: the hardware is well-utilized during prefill and underutilized during decode. The optimal hardware for each phase is different, yet you're forced to compromise.
+
+## Disaggregated Prefill/Decode
+
+Cloudflare's central architectural decision is to run prefill and decode on **separate machines**.
+
+```
+Traditional (single machine)
+Request → [GPU Server: Prefill → Decode] → Response
+
+Cloudflare (disaggregated)
+Request → [Prefill Server] ──KV cache transfer──→ [Decode Server] → Response
+```
+
+The KV cache is transferred over the network between phases. This sounds expensive, but it enables three things that are otherwise not possible:
+
+**Independent hardware optimization**: Prefill machines can be configured for high FLOPS (dense compute), while decode machines can be configured for high memory bandwidth. No compromise required.
+
+**Independent scaling**: If users are writing long prompts — increasing prefill load — you scale prefill servers without adding decode capacity. Conversely, long-form generation scenarios scale the decode tier independently of prefill resources.
+
+**Better GPU utilization**: A prefill-only machine can batch many prefill operations back-to-back without waiting for decoding to complete. Utilization improves significantly compared to the mixed case.
+
+## The Infire Engine
+
+Rather than adapting an existing framework like vLLM or TGI, Cloudflare built their own inference engine in Rust: **Infire**.
+
+### Paged KV Cache Management
+
+Similar to vLLM's PagedAttention, Infire manages GPU memory as fixed-size pages rather than pre-allocating contiguous blocks per sequence. This eliminates memory fragmentation when handling variable-length sequences concurrently.
+
+```
+PagedAttention: GPU memory layout
+
+┌──────────────────────────────────────────────────────┐
+│ Page 0  │ Page 1  │ Page 2  │ Page 3  │ Page 4  │ ...│
+│ (req_a) │ (req_b) │ (req_a) │ (req_c) │ (req_b) │ ...│
+└──────────────────────────────────────────────────────┘
+
+Different requests share the same physical memory pages.
+No wasted space from pre-allocation per sequence.
+```
+
+### Flash Attention Integration
+
+The attention computation uses a FlashAttention-2-equivalent implementation, reducing memory usage for long context sequences from O(n²) to O(n) in GPU HBM. For models with 128K+ context windows, this is essential for fitting larger batches in memory.
+
+### Efficient Multi-GPU Distribution
+
+Infire manages tensor parallelism across multiple GPUs directly, minimizing the overhead from external orchestration layers. For 70B+ parameter models that must be split across GPUs, this direct control reduces cross-GPU communication latency compared to relying on an external scheduler.
+
+## Unweight: Lossless Model Compression
+
+Cloudflare's **Unweight** system compresses model weights by 15–22% without accuracy degradation. This is distinct from quantization (8-bit, 4-bit), which trades precision for size reduction.
+
+Unweight analyzes statistical redundancy in weight tensors and removes it while preserving the information content. The practical effects:
+
+```
+Impact of 15-22% weight reduction
+
+Cold start
+  Smaller model → Faster load to GPU HBM → Faster cold start
+
+Memory efficiency
+  More VRAM headroom → Larger batch sizes → Higher request throughput
+
+KV cache transfer efficiency (synergy with disaggregated design)
+  Smaller model state → Less data transferred between prefill and decode machines
+```
+
+For a 70B parameter model at 16-bit precision (~140GB), a 20% reduction frees roughly 28GB — enough to meaningfully increase batch size on typical GPU configurations (8× H100).
+
+## AI Gateway: Unified API Layer
+
+On top of this inference infrastructure, Cloudflare operates their **AI Gateway** — a unified API routing requests across 70+ models from multiple providers, with caching, rate limiting, cost visibility, and automatic fallback.
+
+```typescript
+// Cloudflare AI Gateway: single endpoint for multiple providers
+const response = await fetch(
+  `https://gateway.ai.cloudflare.com/v1/${ACCOUNT_ID}/${GATEWAY_ID}/anthropic/v1/messages`,
+  {
+    method: 'POST',
+    headers: {
+      'x-auth-token': CF_API_TOKEN,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'claude-opus-4-7',
+      messages: [{ role: 'user', content: 'Hello' }],
+      max_tokens: 1024,
+    }),
+  }
+)
+```
+
+When a primary provider degrades, the gateway automatically routes to a configured fallback model — without any changes to application code.
+
+## Implications for Self-Hosted LLM Deployments
+
+The patterns Cloudflare implemented are not proprietary — they're where the open-source inference ecosystem has been heading. Several are already available in production-grade frameworks:
+
+```bash
+# vLLM: disaggregated prefill (equivalent to Cloudflare's approach)
+# Prefill (producer) node
+python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Llama-3.1-70B-Instruct \
+  --kv-transfer-config \
+  '{"kv_connector":"PyNcclConnector","kv_role":"kv_producer","kv_rank":0}'
+
+# Decode (consumer) node
+python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Llama-3.1-70B-Instruct \
+  --kv-transfer-config \
+  '{"kv_connector":"PyNcclConnector","kv_role":"kv_consumer","kv_rank":1}'
+```
+
+For teams evaluating self-hosted LLM deployments — typically driven by privacy requirements or cost optimization at high request volume — vLLM, SGLang, and LMDeploy already implement paged attention and FlashAttention, with disaggregated prefill support being added in 2026.
+
+Cloudflare's contribution is demonstrating that these techniques work at a global, multi-tenant scale — not just in research benchmarks or single-tenant internal deployments.
+
+## Key Takeaways
+
+- LLM inference has two phases (prefill and decode) with fundamentally different hardware requirements; running them together on one machine wastes GPU efficiency
+- Cloudflare separates prefill and decode across machines, enabling independent hardware optimization and scaling for each phase
+- Infire (Cloudflare's Rust inference engine) handles paged KV cache, FlashAttention, and multi-GPU tensor parallelism without external orchestration
+- Unweight compresses model weights 15–22% without accuracy loss, reducing cold start times and enabling larger batch sizes
+- The same architectural patterns are available in open-source via vLLM and SGLang for teams evaluating self-hosted deployments

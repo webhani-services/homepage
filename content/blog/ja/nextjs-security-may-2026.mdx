@@ -1,0 +1,168 @@
+---
+title: "Next.js 2026年5月 セキュリティリリース：13件のCVEと対応策"
+description: "Next.js 15.5.18および16.2.6で修正された13件の脆弱性の詳細と、即時アップグレードが必要な理由を解説します。"
+date: "2026-05-29"
+status: "published"
+tags: ["Next.js", "Security", "CVE", "Web開発", "アップグレード"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-security-may-2026"
+---
+
+# Next.js 2026年5月 セキュリティリリース：13件のCVEと対応策
+
+2026年5月、VercelはNext.js向けの大規模なセキュリティアップデートをリリースしました。パッチが当たったバージョンは**15.5.18**と**16.2.6**で、対象となる脆弱性は計13件です。severity別では7件がHigh、4件がModerate、2件がLowと分類されています。
+
+重要なのは、Vercelが「これらの脆弱性はWAFレイヤーで確実に遮断することはできない」と明示していることです。**パッチ適用が唯一の完全な緩和策**です。
+
+## 主要な脆弱性の解説
+
+### 1. WebSocket upgradeを経由したSSRF（Server-Side Request Forgery）
+
+攻撃者が特細工したWebSocket upgradeリクエストを送信することで、Next.jsのupgrade handlerが任意の内部ホストへのプロキシリクエストを実行してしまう脆弱性です。
+
+```http
+GET http://169.254.169.254/latest/meta-data/ HTTP/1.1
+Connection: Upgrade
+Upgrade: websocket
+Host: example.com
+```
+
+absolute-form URIを用いたこのリクエストは、upgrade handlerが検証を行わずに内部ネットワークのホスト（AWSのIMDS、内部APIサーバーなど）へのアクセスを許してしまいます。クラウド環境では特に危険で、IAMクレデンシャルの漏洩につながりうります。
+
+### 2. App RouterのRSCリクエストによるMiddleware Bypass
+
+App RouterがRoute Segmentをprefetchする際、`.rsc`拡張子を持つリクエストを生成します（例：`/dashboard.rsc`）。この`.rsc`形式のリクエストに対してMiddlewareのmatcherが一貫して認可チェックを適用していなかったため、保護されたRouteへの不正アクセスが可能でした。
+
+```typescript
+// middleware.ts
+export const config = {
+  matcher: ['/dashboard/:path*'],
+}
+
+// 攻撃者は /dashboard.rsc にアクセスすることで
+// 上記のmatcherを迂回できていた（パッチ前）
+```
+
+### 3. React Server ComponentsのDoS（CVE-2026-23870）
+
+これはNext.js固有ではなく、React 19のServer Componentsランタイムに起因するupstream脆弱性です。特定のRSCペイロードを処理する際にmemoryリークが発生し、サーバーをクラッシュさせることができます。React 19を使用するすべてのフレームワークが影響を受けます。
+
+### 4. CSP NonceのXSS
+
+`beforeInteractive`スクリプトとCSP nonceの組み合わせにより、特定の条件でnonceが漏洩し、XSS攻撃が可能になる脆弱性です。Content Security Policyによる保護が意図通りに機能しなくなります。
+
+## WAFでは防げない理由
+
+これらの攻撃は通常の正規リクエストと同じHTTPメソッド、同じエンドポイントを使用します。WAFはリクエストの「形」を判断するのが得意ですが、Next.jsの内部処理ロジックの問題はその手前でフィルタリングすることができません。
+
+Vercelの勧告書には重要な記載があります：「これらの脆弱性はWAFレイヤーで確実に遮断することはできない」。
+
+## 影響を受けるバージョン
+
+| バージョン系列 | パッチ適用版 |
+|--------------|------------|
+| Next.js 15.x | 15.5.18 |
+| Next.js 16.x | 16.2.6 |
+| Next.js 14以前 | サポート終了（対策なし） |
+
+Next.js 13.x以前を使用している場合は、修正版が提供されていません。早急に15.x以降へのアップグレードを検討してください。
+
+## アップグレード手順
+
+### 1. 現在のバージョンを確認
+
+```bash
+# package.jsonで確認
+cat package.json | grep '"next"'
+
+# または実行中のバージョンを確認
+npx next --version
+```
+
+### 2. アップグレードを実行
+
+```bash
+# npm
+npm install next@latest
+
+# yarn
+yarn add next@latest
+
+# pnpm
+pnpm add next@latest
+
+# bun
+bun add next@latest
+```
+
+### 3. 動作確認
+
+アップグレード後は必ずローカルでのビルドと、特にMiddlewareが絡む認証Flowの動作を確認してください。
+
+```bash
+# ビルドエラーがないことを確認
+npm run build
+
+# 開発サーバーで動作確認
+npm run dev
+```
+
+### 4. RSCを使用している場合の追加確認
+
+RSCを積極的に使用しているアプリケーションでは、Server Componentのレンダリングが期待通りに動作することを確認します。
+
+```tsx
+// Server Component
+async function UserProfile({ userId }: { userId: string }) {
+  const user = await fetchUser(userId)
+  return <div>{user.name}</div>
+}
+```
+
+## 設計の観点：Defense in Depth
+
+今回のリリースで特に注目すべきは、**Middleware Bypassの脆弱性**です。
+
+Next.jsのApp RouterでMiddlewareによる認証を実装しているサービスは多くあります。「Middlewareで認可を制御しているから安全」という前提が崩れる可能性があったことは、設計の観点から重要な教訓です。
+
+webhaniでは、Middlewareによる認可はあくまで「最初の防衛ライン」として位置づけ、Server ComponentsやRoute Handlers内でも個別に認可チェックを行うことを推奨しています。
+
+```typescript
+// 推奨：Route Handler内でも個別に認可チェック
+export async function GET(req: Request) {
+  const session = await getServerSession(authOptions)
+  if (!session) {
+    return new Response('Unauthorized', { status: 401 })
+  }
+  // ビジネスロジック
+}
+
+// Server Componentでも同様に
+async function AdminPage() {
+  const session = await getServerSession(authOptions)
+  if (!session?.user?.isAdmin) {
+    redirect('/login')
+  }
+  // 管理画面コンテンツ
+}
+```
+
+MiddlewareだけにDependencyするのではなく、各エンドポイントで認可を確認する「Defense in Depth」の設計が、今回のような脆弱性に対して有効です。
+
+## Next.js 14以前を使っている場合
+
+14.x以前はサポートが終了しており、修正版は提供されません。すぐにアップグレードできない場合の暫定対策：
+
+1. インフラレイヤーでWebSocket upgradeのターゲットホスト検証を追加する
+2. 認可チェックをMiddlewareだけでなく各Route Handlerに追加する
+
+ただし、これらはあくまで暫定対策です。できるだけ早く15.5.18以降へのアップグレードを実施してください。
+
+## まとめ
+
+- Next.js 15.5.18と16.2.6で13件の脆弱性が修正された
+- SSRF、Middleware Bypass、DoS、XSSと広範囲に影響する
+- WAFでの緩和は信頼できず、アップグレードが唯一の完全対策
+- Next.js 14以前はサポート終了で修正なし——早急なアップグレードを
+- 設計レベルでDefense in Depthを意識することが長期的に重要

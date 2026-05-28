@@ -1,0 +1,142 @@
+---
+title: "Next.js 2026년 5월 보안 릴리스: 13개 CVE 즉시 패치 필요"
+description: "Next.js 15.5.18과 16.2.6에서 수정된 13개 취약점 — Middleware 우회, WebSocket SSRF, React Server Components DoS의 메커니즘과 즉각적인 대응 방법을 설명합니다."
+date: "2026-05-29"
+status: "published"
+tags: ["Next.js", "보안", "CVE", "웹 개발", "취약점"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-security-may-2026"
+---
+
+# Next.js 2026년 5월 보안 릴리스: 13개 CVE 즉시 패치 필요
+
+Vercel이 2026년 5월에 Next.js 대규모 보안 업데이트를 발표했습니다. 패치가 적용된 버전은 **15.5.18**과 **16.2.6**이며, 총 13개의 취약점이 수정되었습니다. 심각도 기준으로는 High 7개, Moderate 4개, Low 2개입니다.
+
+Vercel은 "이 취약점들은 WAF 레이어에서 신뢰할 수 있게 차단할 수 없다"고 명시하고 있으며, **패치 적용이 유일한 완전한 해결책**입니다.
+
+## 주요 취약점 분석
+
+### WebSocket Upgrade를 통한 SSRF
+
+공격자가 절대 경로(absolute-form URI) 형식의 WebSocket upgrade 요청을 전송하면, Next.js의 upgrade handler가 내부 호스트로 프록시 요청을 실행합니다.
+
+```http
+GET http://169.254.169.254/latest/meta-data/ HTTP/1.1
+Connection: Upgrade
+Upgrade: websocket
+Host: your-app.com
+```
+
+이 공격은 AWS IMDS(인스턴스 메타데이터 서비스)나 내부 API 서버에 대한 접근을 허용할 수 있으며, 클라우드 환경에서는 IAM 자격증명 탈취로 이어질 수 있습니다.
+
+### RSC Prefetch 요청을 통한 Middleware 우회
+
+App Router가 Route Segment를 prefetch할 때 `.rsc` 확장자를 가진 요청을 생성합니다(예: `/dashboard.rsc`). 패치 이전에는 Middleware matcher가 이러한 `.rsc` 형식의 요청에 일관되게 인가 체크를 적용하지 않았습니다.
+
+```typescript
+// middleware.ts
+export const config = {
+  matcher: ['/dashboard/:path*'],
+}
+
+// 패치 이전: 공격자가 /dashboard.rsc로 요청하면
+// 위 Middleware 인가 체크를 완전히 우회할 수 있었음
+```
+
+App Router에서 Middleware로 인증/인가를 구현한 애플리케이션에서는 심각도가 높은 문제입니다.
+
+### React Server Components DoS (CVE-2026-23870)
+
+이 취약점은 Next.js 자체가 아닌 React 19의 Server Components 런타임에서 발생하는 upstream 취약점입니다. 특정 RSC 페이로드를 처리할 때 메모리 누수가 발생해 서버 프로세스를 크래시시킬 수 있습니다. React 19를 사용하는 모든 프레임워크에 영향을 줍니다.
+
+### beforeInteractive 스크립트를 통한 XSS
+
+`beforeInteractive` 스크립트와 CSP nonce의 조합에서 특정 조건이 맞으면 nonce 값이 노출됩니다. nonce가 유출되면 Content Security Policy 보호가 무력화되어 XSS 공격 경로가 열립니다.
+
+## WAF로 막을 수 없는 이유
+
+이 공격들은 정상적인 HTTP 요청과 동일한 메서드와 엔드포인트를 사용합니다. WAF는 요청의 외형과 알려진 공격 패턴을 검사하지만, Next.js 내부 라우팅과 프록시 로직의 문제는 외부에서 필터링할 수 없습니다.
+
+Vercel의 공식 권고문은 명확합니다: "이 취약점들은 WAF 레이어에서 신뢰할 수 있게 차단할 수 없습니다."
+
+## 영향을 받는 버전
+
+| 버전 계열 | 패치 적용 버전 |
+|----------|-------------|
+| Next.js 15.x | 15.5.18 |
+| Next.js 16.x | 16.2.6 |
+| Next.js 14.x 이하 | 지원 종료 — 패치 없음 |
+
+## 업그레이드 방법
+
+```bash
+# 현재 버전 확인
+cat package.json | grep '"next"'
+
+# 최신 버전으로 업그레이드
+npm install next@latest
+# 또는
+yarn upgrade next
+# 또는
+pnpm update next
+```
+
+업그레이드 후 확인사항:
+
+```bash
+# 빌드가 정상적으로 완료되는지 확인
+npm run build
+
+# 특히 인증 Flow를 포함한 테스트 실행
+npm test
+```
+
+인증이 필요한 Route에 대한 E2E 테스트가 있다면 지금 실행하세요. 이번 패치의 Middleware matcher 변경이 올바르게 구현된 인증 Flow를 깨뜨리진 않지만, 검증은 필수입니다.
+
+## 설계적 시사점: Defense in Depth
+
+이번 Middleware 우회 취약점은 흔한 아키텍처 가정 하나를 무너뜨립니다. **"Middleware가 있으면 접근 제어는 충분하다"**는 전제입니다.
+
+충분하지 않습니다. Middleware는 첫 번째 방어선이어야 하며, 유일한 방어선이 되어서는 안 됩니다.
+
+```typescript
+// Route Handler에서 개별 인가 체크
+export async function GET(req: Request) {
+  const session = await getServerSession(authOptions)
+  if (!session?.user) {
+    return new Response('Unauthorized', { status: 401 })
+  }
+  // 보호된 로직 처리
+}
+
+// Server Component에서도 인가 체크
+async function AdminDashboard() {
+  const session = await getServerSession(authOptions)
+  if (!session?.user?.isAdmin) {
+    redirect('/login')
+  }
+  // 관리자 콘텐츠 렌더링
+}
+```
+
+이런 방식의 다중 방어(Defense in Depth)가 이번 취약점처럼 예상치 못한 우회 경로에 대한 현실적인 보호를 제공합니다. 한 레이어가 우회되더라도 실제 리소스가 노출되지 않는 구조입니다.
+
+## Next.js 14 이하 사용자라면
+
+14.x를 사용 중이라면 유일한 해결책은 15.5.18로 업그레이드하는 것입니다. 백포트는 없습니다. 즉시 업그레이드가 어렵다면:
+
+1. 인프라 레이어에서 WebSocket 프록시를 임시로 비활성화
+2. 네트워크 경계에서 명시적인 호스트 검증 추가
+3. Middleware에만 의존하는 인가 Route를 감사하고 Route Handler 레이어에 중복 체크 추가
+
+하지만 이는 임시 방편입니다. 가능한 한 빨리 지원되는 버전으로 업그레이드하세요.
+
+## 핵심 정리
+
+- Next.js 15.5.18과 16.2.6에서 13개 CVE 수정 — 즉시 업그레이드 필요
+- WebSocket 기반 SSRF는 AWS/GCP 클라우드 환경에서 IAM 자격증명 탈취로 이어질 수 있음
+- RSC prefetch를 통한 Middleware 우회는 App Router 기반 앱의 인증 로직에 직접적 영향
+- WAF로는 신뢰할 수 있게 차단 불가 — 패치만이 완전한 해결책
+- Next.js 14 이하는 패치 없음, 지원 중인 버전으로 업그레이드 필요
+- 인가는 Middleware 하나에만 의존하지 말고 Defense in Depth 방식으로 설계
