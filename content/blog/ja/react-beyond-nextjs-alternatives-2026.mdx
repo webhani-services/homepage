@@ -1,0 +1,163 @@
+---
+title: "React 19.2 時代のフレームワーク選択：Next.js の外を探る"
+description: "React Compiler が安定版になり「TypeScript has won」と言われる 2026 年、Next.js 以外の React エコシステムの選択肢を実践的な観点から整理します。"
+date: "2026-05-30"
+status: "published"
+tags: ["React", "Next.js", "TypeScript", "TanStack", "フロントエンド"]
+thumbnail: ""
+author: "webhani"
+slug: "react-beyond-nextjs-alternatives-2026"
+---
+
+「Goodbye Next.js?」というタイトルの記事が Medium で注目を集めています。React 19.2 で React Compiler が安定版になり、JavaScript エコシステムの調査では「TypeScript has won（TypeScript が勝利した）」と断言される 2026 年——それでも一部の開発者は Next.js から離れる選択をしています。
+
+State of JS 2025 調査（2026年2月発表）では、Next.js を使っている 59% のうち 17% が否定的な意見を持っており、「Next.jsの複雑さが absurd になった」という声が目立ちます。その理由と、現実的な代替選択肢を整理します。
+
+## React Compiler の安定版化で何が変わったか
+
+React 19.2 で React Compiler が Stable になりました。最大の変化は**手動での memoization が不要になった**ことです。
+
+従来は、不要な再レンダリングを避けるために `useMemo`、`useCallback`、`React.memo` を手動で適切な箇所に配置する必要がありました。
+
+```tsx
+// React 18 以前：手動 memoization が必要
+const PostList = React.memo(({ posts, onSelect }) => {
+  const sortedPosts = useMemo(
+    () => [...posts].sort((a, b) => b.date - a.date),
+    [posts]
+  );
+  const handleSelect = useCallback(
+    (id: string) => onSelect(id),
+    [onSelect]
+  );
+  return sortedPosts.map(p => (
+    <Post key={p.id} post={p} onSelect={handleSelect} />
+  ));
+});
+```
+
+```tsx
+// React 19.2 以降：コンパイラが自動で最適化
+const PostList = ({ posts, onSelect }: Props) => {
+  const sortedPosts = [...posts].sort((a, b) => b.date - a.date);
+  const handleSelect = (id: string) => onSelect(id);
+  return sortedPosts.map(p => (
+    <Post key={p.id} post={p} onSelect={handleSelect} />
+  ));
+};
+```
+
+コンパイラが依存関係を静的解析し、必要な場所に自動でメモ化を挿入します。コードがシンプルになり、依存配列の誤りに起因するバグも減ります。
+
+## TypeScript の完全勝利
+
+State of JS 2025 調査で注目されたのは「TypeScript has won」という表現です。Nuxt コアチームのリーダーは「バンドラーとしてではなく、言語として TypeScript が完全に勝利した」と述べています。
+
+`next.config.ts` での TypeScript サポートもその証左です：
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next';
+
+const config: NextConfig = {
+  experimental: {
+    reactCompiler: true,
+  },
+  images: {
+    formats: ['image/avif', 'image/webp'],
+  },
+};
+
+export default config;
+```
+
+型補完と型チェックが設定ファイルにまで及ぶようになりました。
+
+## Next.js の不満と代替選択肢
+
+具体的な不満として挙げられるのは、App Router と Pages Router の共存による学習コストの高さ、キャッシュ動作の複雑さとデバッグの難しさ、Vercel との密結合感（他のホスティングでの最適化が難しい）などです。
+
+### TanStack Start
+
+TanStack Start は、フルスタック TypeScript アプリのための軽量な選択肢です。
+
+```typescript
+// TanStack Start のルート定義例
+import { createFileRoute } from '@tanstack/react-router';
+
+export const Route = createFileRoute('/posts/$postId')({
+  loader: async ({ params }) => fetchPost(params.postId),
+  component: PostPage,
+});
+
+function PostPage() {
+  const post = Route.useLoaderData(); // 完全に型付けされている
+  return (
+    <article>
+      <h1>{post.title}</h1>
+      <div>{post.content}</div>
+    </article>
+  );
+}
+```
+
+型安全なルーティングとローダーが特徴で、データがサーバーからコンポーネントへ流れる経路が明示的です。
+
+### React Router v7（Remix 統合）
+
+React Router v7 は Remix と統合され、フルスタックフレームワークとして再定義されました。Vite ベースの開発体験と Remix の loader/action パターンを維持しています。
+
+```typescript
+// React Router v7 のルート定義
+import type { Route } from "./+types/post";
+
+export async function loader({ params }: Route.LoaderArgs) {
+  const post = await getPost(params.id);
+  if (!post) throw new Response("Not found", { status: 404 });
+  return { post };
+}
+
+export default function Post({ loaderData }: Route.ComponentProps) {
+  return <article>{loaderData.post.content}</article>;
+}
+```
+
+`loaderData` の型は `loader` の返り値から自動推論されるため、別途型を宣言する必要がありません。
+
+### 軽量 SPA の選択肢
+
+バックエンド API が別途あり、SSR が不要な場合は、Vite + React + React Router（SPA モード）が最もシンプルです。
+
+```bash
+npm create vite@latest my-app -- --template react-ts
+cd my-app && npm install react-router
+```
+
+複雑なビルド設定がなく、任意の静的ホスティングにデプロイできます。社内ツールやダッシュボードにはこれで十分なケースが多いです。
+
+## どのフレームワークを選ぶか
+
+**Next.js を続けるべきケース：**
+- RSC（React Server Components）によるデータフェッチの恩恵を受けたい
+- Vercel へのデプロイで最大限の最適化を得たい
+- チームが App Router に慣れており、乗り換えコストが高い
+
+**代替を検討すべきケース：**
+- API は別途あり、フロントエンドは SPA で十分
+- Next.js のキャッシュ動作やビルド設定で時間を浪費している
+- Vercel 以外のインフラに最適化してデプロイしたい
+- 新規プロジェクトで要件から判断したい
+
+## webhani の見解
+
+Next.js は依然として強力な選択肢です。しかし「React = Next.js」という等式は 2026 年の時点で正確ではなくなっています。
+
+React Compiler の安定化により、フレームワーク選択の自由度が増しました。最適化の多くをコンパイラが担うようになったため、フレームワーク固有の最適化に依存する必然性が薄れています。
+
+TanStack Start や React Router v7 は「Next.js の代替」ではなく、独立したプロダクション品質のフレームワークです。新規プロジェクトでは 3 つの選択肢を実際の要件で比較・評価するアプローチが、2026 年における現実的な判断です。
+
+## まとめ
+
+React Compiler の安定化は、開発体験の観点から最も実用的なアップデートの一つです。TypeScript の普及は今や前提条件であり、議論の余地がありません。
+
+Next.js の複雑さに悩んでいるなら、TanStack Start や React Router v7 は真剣に検討する価値があります。特に新規プロジェクトや SPA アーキテクチャを採用するケースでは、より軽量な選択肢が合理的な場合が増えています。
