@@ -1,0 +1,147 @@
+---
+title: "React 2026: Next.js 너머의 선택지들"
+description: "React Compiler가 안정 버전이 되고 TypeScript가 JS 생태계를 평정한 2026년, Next.js 외의 React 프레임워크 선택지를 실질적으로 비교합니다."
+date: "2026-05-30"
+status: "published"
+tags: ["React", "Next.js", "TypeScript", "TanStack", "프론트엔드"]
+thumbnail: ""
+author: "webhani"
+slug: "react-beyond-nextjs-alternatives-2026"
+---
+
+Medium에서 "Goodbye Next.js? My New React Stack for 2026"이라는 글이 화제가 됐습니다. State of JS 2025 조사(2026년 2월 발표)에서도 Next.js 사용자의 17%가 부정적인 의견을 가지고 있으며, "Next.js의 복잡성이 absurd해졌다"는 코멘트가 눈에 띕니다.
+
+한편 React 19.2에서 React Compiler가 안정 버전으로 출시됐고, "TypeScript has won"은 이미 기정사실로 받아들여지고 있습니다. 2026년의 React 생태계에서는 Next.js가 더 이상 무조건적인 기본 선택이 아닙니다.
+
+## React Compiler 안정화의 의미
+
+React 19.2의 가장 실용적인 변화는 자동 메모이제이션입니다. 이전에는 불필요한 리렌더링을 방지하기 위해 `useMemo`, `useCallback`, `React.memo`를 수동으로 적절한 위치에 배치해야 했습니다.
+
+```tsx
+// 이전: 수동 메모이제이션 필요
+const PostList = React.memo(({ posts, onSelect }) => {
+  const sortedPosts = useMemo(
+    () => [...posts].sort((a, b) => b.date - a.date),
+    [posts]
+  );
+  const handleSelect = useCallback(
+    (id: string) => onSelect(id),
+    [onSelect]
+  );
+  return sortedPosts.map(p => (
+    <Post key={p.id} post={p} onSelect={handleSelect} />
+  ));
+});
+```
+
+```tsx
+// 이후: 컴파일러가 자동으로 최적화
+const PostList = ({ posts, onSelect }: Props) => {
+  const sortedPosts = [...posts].sort((a, b) => b.date - a.date);
+  const handleSelect = (id: string) => onSelect(id);
+  return sortedPosts.map(p => (
+    <Post key={p.id} post={p} onSelect={handleSelect} />
+  ));
+};
+```
+
+컴파일러가 정적 분석으로 메모이제이션이 필요한 위치를 파악해 자동으로 삽입합니다. 코드가 단순해지고, 잘못된 의존성 배열로 인한 버그도 줄어듭니다.
+
+## TypeScript 완전 정착
+
+Nuxt 코어팀 리더의 "TypeScript has won. Not as a bundler, but as a language"라는 말은 현실을 정확히 표현합니다. `next.config.ts`로 TypeScript 설정 파일이 기본이 되었습니다.
+
+```typescript
+import type { NextConfig } from 'next';
+
+const config: NextConfig = {
+  experimental: {
+    reactCompiler: true,
+  },
+  images: {
+    formats: ['image/avif', 'image/webp'],
+  },
+};
+
+export default config;
+```
+
+설정 파일에도 타입 검사와 자동완성이 적용됩니다.
+
+## 주목할 대안 프레임워크
+
+### TanStack Start
+
+TanStack Start는 타입 안전한 라우팅이 강점인 풀스택 TypeScript 프레임워크입니다.
+
+```typescript
+import { createFileRoute } from '@tanstack/react-router';
+
+export const Route = createFileRoute('/posts/$postId')({
+  loader: async ({ params }) => fetchPost(params.postId),
+  component: PostPage,
+});
+
+function PostPage() {
+  const post = Route.useLoaderData(); // 완전히 타입화됨
+  return (
+    <article>
+      <h1>{post.title}</h1>
+      <div>{post.content}</div>
+    </article>
+  );
+}
+```
+
+데이터가 서버에서 컴포넌트로 전달되는 흐름이 명시적이어서 디버깅이 쉽습니다.
+
+### React Router v7
+
+React Router v7은 Remix와 통합되어 풀스택 프레임워크로 재탄생했습니다. Vite 기반의 개발 경험과 Remix의 loader/action 패턴을 결합합니다.
+
+```typescript
+// app/routes/posts.$id.tsx
+import type { Route } from "./+types/posts.$id";
+
+export async function loader({ params }: Route.LoaderArgs) {
+  const post = await getPost(params.id);
+  if (!post) throw new Response("Not found", { status: 404 });
+  return { post };
+}
+
+export default function Post({ loaderData }: Route.ComponentProps) {
+  return <article>{loaderData.post.content}</article>;
+}
+```
+
+`loaderData`의 타입은 `loader` 반환 타입에서 자동으로 추론되어 별도 선언이 불필요합니다.
+
+### Vite + React (SPA 모드)
+
+별도의 Backend API가 있고 SSR이 필요 없다면, Vite + React + React Router의 SPA 모드가 가장 단순합니다.
+
+```bash
+npm create vite@latest my-app -- --template react-ts
+cd my-app && npm install react-router
+```
+
+복잡한 빌드 설정이 없고, 어느 정적 호스팅에도 배포 가능합니다. 내부 도구나 대시보드에는 이것으로 충분한 경우가 많습니다.
+
+## 프레임워크 선택 기준
+
+**Next.js를 계속 사용해야 할 경우:**
+- React Server Components와 데이터 페칭 모델이 실제로 도움이 되는 경우
+- Vercel 배포를 통해 플랫폼 최적화를 최대한 활용하고 싶은 경우
+- 팀이 App Router에 익숙하고 전환 비용이 큰 경우
+
+**대안을 검토해야 할 경우:**
+- 별도 API가 있고 프론트엔드가 사실상 SPA인 경우
+- Next.js 캐싱 동작 디버깅에 시간을 소모하고 있는 경우
+- Vercel이 아닌 인프라에 최적화된 배포가 필요한 경우
+- 새 프로젝트를 시작하며 실제 요건에 맞는 선택을 새로 평가하고 싶은 경우
+
+## 정리
+
+React Compiler 안정화는 수년 만에 가장 실용적인 React 업데이트입니다. 코드 작성 방식을 바꾸지 않으면서 보일러플레이트를 줄여줍니다. TypeScript는 이제 선택이 아닌 기본 전제입니다.
+
+2026년의 의미 있는 변화는 TanStack Start와 React Router v7이 "Next.js 대안"이 아닌 독립적인 프로덕션 프레임워크로 자리 잡았다는 점입니다. 새 React 프로젝트를 시작할 때 세 가지 옵션을 실제 요건에 맞게 평가하는 것이 합리적인 접근입니다.
