@@ -1,0 +1,90 @@
+---
+title: "Vite 8과 Rolldown: Rust 기반 단일 Bundler로 빌드 패러다임 변화"
+description: "2026년 3월에 정식 출시된 Vite 8은 esbuild와 Rollup을 단일 Rust 기반 Bundler인 Rolldown으로 통합해 10~30배 빌드 속도를 달성했습니다. 변경 사항과 실제 마이그레이션 방법을 분석합니다."
+date: "2026-06-01"
+status: "published"
+tags: ["Vite", "Rolldown", "Rust", "Build Tools", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "vite-8-rolldown-rust-bundler"
+---
+
+2026년 3월 12일, Vite 8.0이 정식 출시되었습니다. Vite 2 이후 가장 큰 아키텍처 변경으로, 개발 환경에서 사용하던 esbuild와 프로덕션 빌드에 사용하던 Rollup이라는 두 개의 Bundler를 Rust 기반 단일 Bundler인 Rolldown으로 대체했습니다.
+
+## 왜 단일 Bundler가 필요했나
+
+Vite의 이중 Bundler 구조는 오랫동안 "개발 환경에서는 잘 되는데 프로덕션에서 문제가 생긴다"는 버그를 발생시키는 근본 원인이었습니다. Tree-shaking 동작 방식, 플러그인 부작용, 코드 분할 로직이 환경에 따라 미묘하게 달랐습니다. 동일한 코드를 서로 다른 시맨틱을 가진 두 Bundler가 처리하는 데서 오는 구조적 문제였습니다.
+
+Rolldown은 이 문제를 근본적으로 해결합니다. Rust로 작성된 네이티브 속도의 Bundler로, esbuild에 준하는 성능을 내면서 Rollup의 Plugin API와 호환됩니다. 기존 Vite 플러그인 대부분이 그대로 동작합니다.
+
+## 실제 성능 개선 수치
+
+Vite 8 출시 당시 공개된 실제 프로덕션 사례:
+
+| 지표 | 개선 폭 |
+|------|---------|
+| 프로덕션 빌드 시간 | 10~30배 빠름 |
+| 개발 서버 콜드 스타트 | 3배 빠름 |
+| 풀 리로드 | 40% 빠름 |
+| 네트워크 요청 수 (개발) | 10분의 1 |
+
+구체적인 사례: Linear는 빌드 시간을 46초에서 6초로 단축(87% 절감), Ramp는 57% 절감, Beehiiv는 64% 개선을 보고했습니다.
+
+## Vite 7에서의 마이그레이션
+
+대부분의 프로젝트에서 마이그레이션은 단순합니다:
+
+```bash
+npm install vite@8 --save-dev
+```
+
+대부분의 경우 이것으로 충분합니다. `vite.config.ts`는 변경 없이 그대로 동작합니다:
+
+```typescript
+// vite.config.ts — 대부분 변경 불필요
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ['react', 'react-dom'],
+        }
+      }
+    }
+  }
+});
+```
+
+Rolldown은 Rollup의 Plugin API를 유지하므로, 공식 프레임워크 플러그인(`@vitejs/plugin-react`, `@vitejs/plugin-vue` 등)은 이미 호환성 업데이트가 완료되어 있습니다.
+
+## 문제가 발생할 수 있는 케이스
+
+추가 테스트가 필요한 상황:
+
+- **커스텀 Rollup 플러그인**: 내부 훅(`renderChunk`, `generateBundle`)을 사용하는 플러그인의 Rolldown 호환성 확인 필요
+- **복잡한 CSS Modules**: 처리 경로가 변경되었으므로 전체 테스트 스위트 실행 권장
+- **Dynamic Import 청크 분할**: Rolldown의 청킹 휴리스틱이 엣지 케이스에서 Rollup과 약간 다를 수 있음
+- **Terser 특화 옵션**: Rolldown은 자체 Minifier를 탑재하므로 일부 `terserOptions`가 적용되지 않을 수 있음
+
+```bash
+# Vite 8 첫 빌드 시 경고 확인
+npx vite build --debug 2>&1 | grep -E "(warn|error)"
+```
+
+## Oxc 기반 Rust 네이티브 파이프라인
+
+Rolldown은 Oxc라는 Rust 기반 JavaScript 툴체인 위에 구축되어 있습니다. 파서, 린터, 트랜스포머, 미니파이어를 포함한 통합 툴체인으로, Vite 8은 이 Rust 네이티브 파이프라인 위에서 esbuild 의존성을 완전히 제거한 첫 버전입니다.
+
+Oxc의 Minifier와 Transformer가 성숙해감에 따라(현재 활발히 개발 중), 향후 Vite 8.x 릴리스에서는 별도의 마이그레이션 없이 추가적인 속도 향상을 기대할 수 있습니다.
+
+## 지금 바로 업그레이드해야 할까?
+
+**새 프로젝트**: 즉시 Vite 8을 사용하는 것이 맞습니다. 이전 아키텍처로 시작할 이유가 없습니다.
+
+**기존 프로젝트**: 커스텀 플러그인의 Rolldown 호환성을 확인하고, Vite 8 빌드에 대해 테스트 스위트를 실행한 후 업그레이드합니다. 마이그레이션 비용은 대부분의 프로젝트에서 낮고, 특히 대규모 코드베이스에서는 첫날부터 측정 가능한 개선 효과가 있습니다.
+
+개발/프로덕션 환경 동등성 개선만으로도, 환경 특화 빌드 버그를 추적해온 팀에게는 충분히 가치 있는 업그레이드입니다. "내 로컬에서는 되는데" 사례가 줄어드는 것만으로도 실질적인 개발 경험 향상입니다.

@@ -1,0 +1,116 @@
+---
+title: "Kubernetes v1.36 \"Haru\"：AIワークロードとセキュリティ強化の70項目"
+description: "2026年4月にリリースされたKubernetes v1.36「Haru」は、User Namespaces GAやWorkload Aware Schedulingなど70件の改善を含みます。AI/MLワークロードを見据えた設計変更を解説します。"
+date: "2026-06-01"
+status: "published"
+tags: ["Kubernetes", "Cloud Native", "Security", "AI Workloads", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-36-haru-ai-workloads"
+---
+
+2026年4月22日、Kubernetes v1.36「Haru」がリリースされました。2026年最初のKubernetesメジャーリリースで、106社・491名のコントリビューターが参加した15週間の開発サイクルを経て、70件の改善が盛り込まれました（Stable昇格18件、Beta昇格25件、新Alpha機能25件）。
+
+今回のリリースのテーマは大きく二つ：セキュリティのデフォルト強化と、AI/MLワークロードへのネイティブ対応です。
+
+## User Namespaces：GAで何が変わるか
+
+User Namespacesは、コンテナ内のrootユーザー（UID 0）をホスト上の非特権ユーザーにマッピングする機能です。プロセスがコンテナを脱出してもホストのroot権限が取得されないため、コンテナブレイクアウト攻撃の影響範囲を根本から制限できます。
+
+```yaml
+# User Namespaces を有効にしたPodの例
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-workload
+spec:
+  hostUsers: false  # User Namespaces を有効化
+  containers:
+  - name: app
+    image: my-app:latest
+    securityContext:
+      runAsUser: 0  # コンテナ内ではroot → ホスト上ではUID 65536+の非特権ユーザー
+```
+
+v1.25から開発してきた機能がついにGAになりました。セキュリティに敏感なワークロードにおいては、v1.36の変更点の中で最も実用的なインパクトを持つ機能です。
+
+レガシーなDockerfileの都合でrootで動作しているコンテナがある場合も、コンテナ全体をリファクタリングせずに実際の分離を実現できる手段が増えました。
+
+## Fine-Grained Kubelet API Authorization（GA）
+
+これまでKubelet APIへのアクセスは粗い単位でしか制御できませんでした。v1.36でGAとなり、各クライアントがkubelet上でアクセスできるAPIエンドポイントを精細に制御できます。
+
+複数チームがノードを共有するマルチテナントクラスターや、誰がPodログを読んだりコンテナにexecできるかについて厳格なコンプライアンス要件がある環境で特に有効です。
+
+## Workload Aware Scheduling（WAS）：AI/MLへのAlpha対応
+
+今回最も注目されているAlpha機能がWorkload Aware Scheduling（WAS）です。新しいPodGroup APIを通じて関連するPodを単一の論理エンティティとして扱い、Gang SchedulingとTopology-Aware配置を実現します。
+
+### Gang Scheduling
+
+Gang Scheduling未使用の場合、8ワーカーが必要な分散学習Jobで4つのPodだけが先にスケジュールされ、残り4つを待ちながらGPUリソースを無駄消費するケースが発生します。
+
+```yaml
+# PodGroup：8つのPodが揃ってからスケジュール、揃わなければ保留
+apiVersion: scheduling.x-k8s.io/v1alpha1
+kind: PodGroup
+metadata:
+  name: llm-training-job
+spec:
+  minMember: 8
+  minResources:
+    nvidia.com/gpu: "8"
+---
+# JobとPodGroupの紐付け
+spec:
+  template:
+    metadata:
+      labels:
+        scheduling.x-k8s.io/pod-group: llm-training-job
+```
+
+Gang Schedulingを使うと、スケジューラーは必要なすべてのPodを配置できるまで待機してから一括バインドします。
+
+### Topology-Aware配置
+
+LLMトレーニングでは、GPU間の通信帯域幅が全体のスループットのボトルネックになることがあります。Topology-Aware配置は関連するPodを同一ネットワークドメイン（ラック、ゾーン）内に配置してクロスラックトラフィックを最小化します。
+
+これにより、AI/MLユースケースにおけるVolcanoやYuniKornといったサードパーティスケジューラーへの依存度を下げられます。
+
+## Mutating Admission Policies（GA）
+
+Webhookなしでポリシーを適用できるMutating Admission PoliciesもGAになりました。CEL（Common Expression Language）でポリシーを記述し、PodやDeploymentへの変更を動的に適用できます。
+
+```yaml
+# 全DeploymentにSidecar注入アノテーションを追加する例
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: inject-sidecar-annotation
+spec:
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["apps"]
+      apiVersions: ["v1"]
+      resources: ["deployments"]
+      operations: ["CREATE", "UPDATE"]
+  mutations:
+  - patchType: "ApplyConfiguration"
+    applyConfiguration:
+      expression: >
+        Object{
+          metadata: Object.metadata{
+            annotations: {"sidecar-injection": "enabled"}
+          }
+        }
+```
+
+Webhookと比べてレイテンシが低く、デバッグも容易で、追加のDeploymentを管理する必要もありません。
+
+## Platformチームへの推奨事項
+
+1. **User Namespacesの有効化**：特定の要件なしにrootで動作しているワークロードに適用。v1.36で最もコスト低く得られるセキュリティ改善
+2. **Fine-Grained Kubelet Authorizationの見直し**：マルチテナント構成であれば必ず確認
+3. **WAS Alphaの把握**：GPUワークロードを運用しているなら、PodGroup APIの設計を理解しておくことを推奨。v1.37またはv1.38でGAへ昇格する可能性が高く、今から理解しておけば後の採用がスムーズになります
+
+Alpha機能を本番で使うことは推奨しませんが、WASの設計方向を理解した上でクラスタートポロジーを設計することで、将来の移行コストを下げられます。

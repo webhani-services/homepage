@@ -1,0 +1,115 @@
+---
+title: "Kubernetes v1.36 Haru: What Platform Teams Should Know"
+description: "Kubernetes v1.36 released in April 2026 with 70 enhancements. User Namespaces GA tightens container security. Workload Aware Scheduling Alpha targets AI/ML cluster needs. Here's what matters for platform engineers."
+date: "2026-06-01"
+status: "published"
+tags: ["Kubernetes", "Cloud Native", "Security", "AI Workloads", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-36-haru-ai-workloads"
+---
+
+Kubernetes v1.36 "Haru" released on April 22, 2026. It's the first Kubernetes release of 2026, with contributions from 106 companies and 491 individuals across a 15-week cycle. The 70 enhancements fall into two clear themes: tightening default security posture, and native support for AI/ML workloads.
+
+## User Namespaces Goes GA
+
+User Namespaces maps a container's root user (UID 0) to an unprivileged user on the host. If a process escapes the container, it doesn't gain root on the node. This eliminates an entire class of container breakout impact.
+
+```yaml
+# Enabling User Namespaces for a Pod
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-workload
+spec:
+  hostUsers: false  # Enable User Namespaces
+  containers:
+  - name: app
+    image: my-app:latest
+    securityContext:
+      runAsUser: 0  # Container root → UID 65536+ on the host
+```
+
+This feature has been in development since v1.25. GA status means production-ready with stable API guarantees and well-defined semantics.
+
+For security-sensitive workloads, this is the most impactful change in v1.36. If your containers run as root for legacy reasons (common in older Dockerfiles), User Namespaces is the path to actual isolation without requiring a full container refactor.
+
+## Fine-Grained Kubelet API Authorization (GA)
+
+Previously, access to the Kubelet API was managed at a coarse level. v1.36 brings Fine-Grained Kubelet API Authorization to GA: you can now control exactly which API endpoints each client can access on a kubelet.
+
+This is particularly relevant for multi-tenant clusters where different teams share nodes, and for environments with compliance requirements around which processes can read pod logs or exec into containers.
+
+## Workload Aware Scheduling: Alpha for AI/ML
+
+Workload Aware Scheduling (WAS) is the most significant new Alpha in v1.36. It treats related pods as a single logical entity via a new PodGroup API, enabling Gang Scheduling and Topology-Aware placement.
+
+### Gang Scheduling
+
+Without Gang Scheduling, a distributed training job with 8 workers might schedule 4 pods first. Those pods sit idle consuming GPU resources while waiting for the other 4.
+
+```yaml
+# PodGroup: schedule all 8 pods together, or none
+apiVersion: scheduling.x-k8s.io/v1alpha1
+kind: PodGroup
+metadata:
+  name: llm-training-job
+spec:
+  minMember: 8
+  minResources:
+    nvidia.com/gpu: "8"
+```
+
+With Gang Scheduling, the scheduler waits until all required pods can be placed before binding any of them. No wasted GPU time.
+
+### Topology-Aware Placement
+
+For LLM training, inter-GPU communication bandwidth is often the bottleneck. Topology-Aware placement co-locates pods within the same network domain (rack, zone) to minimize cross-rack traffic.
+
+```yaml
+# Link Jobs to PodGroups via label
+spec:
+  template:
+    metadata:
+      labels:
+        scheduling.x-k8s.io/pod-group: llm-training-job
+```
+
+This reduces the need for third-party schedulers like Volcano or YuniKorn in AI/ML use cases.
+
+## Mutating Admission Policies (GA)
+
+Mutating Admission Policies reach GA in v1.36. They let you enforce mutations (auto-labeling, default injection, security patching) using CEL expressions — no webhook required.
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: inject-sidecar-annotation
+spec:
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["apps"]
+      apiVersions: ["v1"]
+      resources: ["deployments"]
+      operations: ["CREATE", "UPDATE"]
+  mutations:
+  - patchType: "ApplyConfiguration"
+    applyConfiguration:
+      expression: >
+        Object{
+          metadata: Object.metadata{
+            annotations: {"sidecar-injection": "enabled"}
+          }
+        }
+```
+
+Lower latency than webhooks, simpler to debug, and no additional Deployment to manage.
+
+## What Platform Teams Should Prioritize
+
+1. **Enable User Namespaces** on workloads running as root without a specific requirement — lowest migration cost for the biggest security gain in v1.36
+2. **Review Fine-Grained Kubelet Authorization** if you're in a multi-tenant setup
+3. **Track WAS Alpha** if you're running GPU workloads — the PodGroup API will likely graduate in v1.37 or v1.38; understanding it now lowers adoption friction later
+
+Alpha features in production are generally not recommended. But understanding the design of WAS helps inform cluster topology decisions today, before it becomes the default scheduling path for AI workloads.

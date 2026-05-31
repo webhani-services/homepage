@@ -1,0 +1,91 @@
+---
+title: "Vite 8とRolldown：Rust製Bundlerが変えるフロントエンドビルド"
+description: "2026年3月に正式リリースされたVite 8は、RustベースのBundler「Rolldown」を採用し、10〜30倍のビルド高速化を実現しました。アーキテクチャの変更点と移行ガイドを解説します。"
+date: "2026-06-01"
+status: "published"
+tags: ["Vite", "Rolldown", "Rust", "Build Tools", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "vite-8-rolldown-rust-bundler"
+---
+
+2026年3月12日、Vite 8.0が正式リリースされました。Vite 2以来最大のアーキテクチャ変更で、開発時に使っていたesbuildと本番ビルドに使っていたRollupという二つのBundlerを廃止し、RustベースのRolldown一本に統一しています。
+
+## なぜRolldownなのか
+
+Viteはこれまで開発サーバーにesbuild（Go製）、本番ビルドにRollup（JavaScript製）を使い分けていました。この構成は「開発と本番で動作が異なる」という問題を生む根本的な原因でした。Tree-shakingの挙動、プラグインの副作用、コード分割のロジックが環境によって微妙に違うケースが実際に発生していました。
+
+Rolldownはこの問題を根本から解決します。Rustで書かれたネイティブ速度のBundlerで、esbuildと同等の速度を持ちながら、RollupのPlugin APIと互換性を持っています。既存のViteプラグインの大多数はそのまま動作します。
+
+## 実際のパフォーマンス改善
+
+公開されているベンチマーク結果と実プロダクト事例：
+
+| 指標 | 改善幅 |
+|------|--------|
+| 本番ビルド時間 | 10〜30倍高速 |
+| 開発サーバー起動 | 3倍高速 |
+| フルリロード | 40%高速 |
+| ネットワークリクエスト数 | 10分の1 |
+
+実プロダクトの事例では、Linearが本番ビルドを46秒から6秒に短縮（87%削減）、Rampが57%削減、Beehiivが64%改善を報告しています。
+
+## 移行の実際
+
+既存のVite 7プロジェクトをVite 8に移行する基本的な手順：
+
+```bash
+# viteのバージョンをアップデートするだけ
+npm install vite@8 --save-dev
+```
+
+大多数のプロジェクトでは、これだけで動作します。`vite.config.ts`の変更は不要な場合がほとんどです：
+
+```typescript
+// vite.config.ts - 変更不要なケースが多い
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ['react', 'react-dom'],
+        }
+      }
+    }
+  }
+});
+```
+
+RolldownはRollup Plugin APIを維持しているため、`@vitejs/plugin-react`や`@vitejs/plugin-vue`などの公式プラグインはすでに互換性対応が完了しています。
+
+## 問題が発生しやすいケース
+
+追加の動作確認が必要なケース：
+
+- **カスタムRollupプラグイン**：内部フック（`renderChunk`、`generateBundle`）を使うプラグインはRolldown互換性を確認
+- **複雑なCSS Modules**：処理パスが変わっているため、テストスイートの実行を推奨
+- **動的importのチャンク分割**：RolldownのチャンキングヒューリスティックがRollupと微妙に異なる場合がある
+- **Terser系オプション**：Rolldownは独自のMinimizerを持つため、一部の`terserOptions`が適用されない場合がある
+
+```bash
+# 移行後の最初のビルドで警告を確認
+npx vite build --debug 2>&1 | grep -E "(warn|error)"
+```
+
+## RolldownとOxcの関係
+
+Rolldownの背後にはOxcというRustベースのJavaScriptツールチェーンがあります。パーサー、Linter、Transformer、Minifierを含む統合ツールチェーンで、Vite 8はこのRustネイティブパイプライン上に構築され、esbuild依存から完全に脱却した最初のバージョンです。
+
+OxcのMinimizerとTransformerが成熟するにつれ（現在も活発に開発中）、将来のVite 8.xリリースではさらなる速度向上が期待できます。
+
+## 今すぐアップグレードすべきか
+
+**新規プロジェクト**：即座にVite 8を採用するべきです。古いアーキテクチャで始める理由がありません。
+
+**既存プロジェクト**：カスタムプラグインのRolldown互換性を確認し、テストスイートをVite 8ビルドに対して実行した上でアップグレードします。移行コストは低く、特に大規模コードベースでは測定可能な改善が得られます。
+
+開発と本番の環境差という長年の課題が解消されるだけでも、環境特有のビルドバグを追いかけてきたチームには十分に価値のあるアップグレードです。
