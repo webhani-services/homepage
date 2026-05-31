@@ -1,0 +1,115 @@
+---
+title: "Kubernetes v1.36 Haru: AI 워크로드와 보안 기본값 강화"
+description: "2026년 4월 출시된 Kubernetes v1.36은 User Namespaces GA, Workload Aware Scheduling Alpha 등 70개의 개선 사항을 포함합니다. Platform 팀이 주목해야 할 변경 사항을 분석합니다."
+date: "2026-06-01"
+status: "published"
+tags: ["Kubernetes", "Cloud Native", "Security", "AI Workloads", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-36-haru-ai-workloads"
+---
+
+2026년 4월 22일, Kubernetes v1.36 "Haru"가 출시되었습니다. 2026년 첫 번째 Kubernetes 메이저 릴리스로, 106개 기업과 491명의 기여자가 참여한 15주간의 개발 주기를 거쳤습니다. 70개의 개선 사항(Stable 승격 18개, Beta 승격 25개, 신규 Alpha 25개)은 두 가지 주제로 명확하게 나뉩니다: 보안 기본값 강화와 AI/ML 워크로드 네이티브 지원입니다.
+
+## User Namespaces GA 승격
+
+User Namespaces는 컨테이너 내 root 사용자(UID 0)를 호스트의 비특권 사용자로 매핑하는 기능입니다. 프로세스가 컨테이너를 탈출하더라도 호스트에서 root 권한을 얻지 못합니다. 컨테이너 브레이크아웃 공격의 영향 범위를 근본적으로 제한합니다.
+
+```yaml
+# Pod에서 User Namespaces 활성화
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-workload
+spec:
+  hostUsers: false  # User Namespaces 활성화
+  containers:
+  - name: app
+    image: my-app:latest
+    securityContext:
+      runAsUser: 0  # 컨테이너 내 root → 호스트에서 UID 65536+의 비특권 사용자로 매핑
+```
+
+v1.25부터 개발해온 기능이 드디어 GA가 되었습니다. GA 상태는 안정적인 API 보장과 명확한 시맨틱을 의미합니다.
+
+보안에 민감한 워크로드에서는 v1.36의 변경 사항 중 가장 실질적인 영향을 주는 기능입니다. 레거시 Dockerfile로 인해 root로 실행되는 컨테이너가 있다면, 컨테이너 전체를 리팩토링하지 않고도 실제 격리를 달성할 수 있는 경로가 생겼습니다.
+
+## Fine-Grained Kubelet API Authorization GA
+
+기존에는 Kubelet API에 대한 접근 제어가 거친 단위로만 가능했습니다. v1.36에서 Fine-Grained Kubelet API Authorization이 GA가 되어, 각 클라이언트가 kubelet에서 접근할 수 있는 API 엔드포인트를 정밀하게 제어할 수 있습니다.
+
+여러 팀이 노드를 공유하는 멀티 테넌트 클러스터나, 누가 Pod 로그를 읽거나 컨테이너 내부로 exec할 수 있는지에 대한 엄격한 규정 요건이 있는 환경에서 특히 유용합니다.
+
+## Workload Aware Scheduling (WAS): AI/ML을 위한 Alpha
+
+Workload Aware Scheduling(WAS)은 v1.36에서 가장 주목받는 새 Alpha 기능입니다. 새로운 PodGroup API를 통해 관련 Pod들을 단일 논리 엔티티로 취급하여 Gang Scheduling과 Topology-Aware 배치를 지원합니다.
+
+### Gang Scheduling
+
+Gang Scheduling 없이 8개 워커가 필요한 분산 학습 Job을 실행하면, 4개 Pod만 먼저 스케줄링되어 나머지를 기다리면서 GPU 리소스를 낭비하는 상황이 발생합니다.
+
+```yaml
+# PodGroup: 8개 Pod 모두 준비되면 스케줄링, 아니면 대기
+apiVersion: scheduling.x-k8s.io/v1alpha1
+kind: PodGroup
+metadata:
+  name: llm-training-job
+spec:
+  minMember: 8
+  minResources:
+    nvidia.com/gpu: "8"
+```
+
+Gang Scheduling을 사용하면 스케줄러가 필요한 모든 Pod를 배치할 수 있을 때까지 기다린 후 한꺼번에 바인딩합니다. GPU 리소스 낭비가 없습니다.
+
+### Topology-Aware 배치
+
+LLM 학습에서 GPU 간 통신 대역폭은 종종 전체 처리량의 병목이 됩니다. Topology-Aware 배치는 관련 Pod들을 동일한 네트워크 도메인(랙, 존) 내에 함께 배치하여 크로스 랙 트래픽을 최소화합니다.
+
+```yaml
+# 레이블로 Job과 PodGroup 연결
+spec:
+  template:
+    metadata:
+      labels:
+        scheduling.x-k8s.io/pod-group: llm-training-job
+```
+
+AI/ML 사용 케이스에서 Volcano나 YuniKorn 같은 서드파티 스케줄러에 대한 의존도를 줄일 수 있습니다.
+
+## Mutating Admission Policies GA
+
+Mutating Admission Policies도 v1.36에서 GA가 되었습니다. Webhook 없이 CEL 표현식으로 변형(자동 레이블링, 기본값 주입, 보안 패치)을 적용할 수 있습니다.
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: inject-sidecar-annotation
+spec:
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["apps"]
+      apiVersions: ["v1"]
+      resources: ["deployments"]
+      operations: ["CREATE", "UPDATE"]
+  mutations:
+  - patchType: "ApplyConfiguration"
+    applyConfiguration:
+      expression: >
+        Object{
+          metadata: Object.metadata{
+            annotations: {"sidecar-injection": "enabled"}
+          }
+        }
+```
+
+Webhook 대비 레이턴시가 낮고 디버깅이 쉬우며, 추가적인 Deployment를 관리할 필요가 없습니다.
+
+## Platform 팀을 위한 우선순위
+
+1. **User Namespaces 활성화** — 특정 요구사항 없이 root로 실행 중인 워크로드에 적용. v1.36에서 가장 낮은 마이그레이션 비용으로 얻을 수 있는 보안 효과
+2. **Fine-Grained Kubelet Authorization 검토** — 멀티 테넌트 설정이라면 반드시 확인
+3. **WAS Alpha 추적** — GPU 워크로드를 운영 중이라면 PodGroup API 설계를 파악해두는 것이 좋습니다. v1.37이나 v1.38에서 GA로 승격될 가능성이 높으며, 미리 이해해두면 이후 도입이 수월합니다
+
+Alpha 기능을 프로덕션에서 사용하는 것은 일반적으로 권장하지 않습니다. 그러나 WAS의 설계 방향을 이해하면, AI 워크로드의 기본 스케줄링 경로가 되기 전에 클러스터 토폴로지 결정에 반영할 수 있습니다.
