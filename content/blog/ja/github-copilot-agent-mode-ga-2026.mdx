@@ -1,0 +1,141 @@
+---
+title: "GitHub Copilot Agent Mode が GA — 自律的 PR 自動化を実務に組み込む"
+description: "Microsoft Build 2026 で GitHub Copilot の Agent Mode が GA になりました。Bug 修正から PR 作成まで自律的に実行できるこの機能を、実務ワークフローにどう統合するかを解説します。"
+date: "2026-06-02"
+status: "published"
+tags: ["GitHub", "Copilot", "AI", "developer-tools", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "github-copilot-agent-mode-ga-2026"
+---
+
+Microsoft Build 2026（6月2〜3日、サンフランシスコ）で、GitHub Copilot の **Agent Mode** が General Availability（GA）になりました。これまでベータ版で提供されていた機能が、正式に全 GitHub Copilot 購読者へ解放されます。
+
+Agent Mode は、Bug修正やテスト追加、PR作成といった一連の作業を自律的に実行できる機能です。単なるcode completionツールとは一線を画す、**タスクベースの自律エージェント**として設計されています。
+
+## Agent Mode でできること
+
+### 自律的なタスク実行
+
+従来の GitHub Copilot は、エディタ上での補完提案に特化していました。Agent Mode では、次のような一連のフローを自律的に実行できます：
+
+1. Issue や指示の内容を読んで理解する
+2. 関連するファイルをコードベース全体から特定する
+3. 必要な修正を加える（複数ファイルにまたがっても可）
+4. テストを実行して動作を確認する
+5. PR を作成してレビューを依頼する
+
+ここまでのプロセスが、エンジニアの直接介入なしに実行されます。
+
+### GitHub ワークフローとの統合
+
+Agent Mode は GitHub の既存インフラと深く統合されています：
+
+- **Issues との連携**: Issue に Copilot エージェントを割り当てるだけでタスクを認識する
+- **GitHub Actions との連携**: CI/CD パイプライン上でエージェントを呼び出せる
+- **Branch・PR の自動管理**: 修正用 Branch を作成し、PR を自動でオープン
+
+既存の GitHub ワークフローを大きく変えることなく、エージェントを組み込める点が特徴です。
+
+## 実務での導入戦略
+
+### 向いているタスクと向いていないタスク
+
+Agent Mode を有効活用するには、タスクの性質を見極めることが重要です。
+
+**エージェントに適したタスク:**
+
+```
+- 型エラーの修正（明確なエラーメッセージがある）
+- 単体テストの追加（既存関数のカバレッジ向上）
+- Deprecated API の置き換え（一対一の機械的な置換）
+- 特定パターンの Dead Code 一括削除
+```
+
+**人間が判断すべきタスク:**
+
+```
+- 新機能のアーキテクチャ設計
+- セキュリティ関連の変更（認証・認可ロジック）
+- DBスキーマの変更を伴うマイグレーション
+- 要件が曖昧な Feature 開発
+```
+
+### Issue テンプレートでエージェントを導く
+
+Agent Mode は Issue から情報を読み取ります。Issue の書き方を工夫することで、エージェントの動作精度を高められます。
+
+```markdown
+## Bug Description
+`src/api/auth.ts` の `validateToken` 関数で、トークンが期限切れの場合に
+401ではなく500を返しているため修正が必要。
+
+## Expected Behavior
+期限切れトークンに対して401 Unauthorizedを返す。
+
+## Files to Modify
+- `src/api/auth.ts`: validateToken 関数の修正
+- `src/api/auth.test.ts`: 期限切れトークンのテストケース追加
+
+## Constraints
+- 既存のAPIインターフェース（関数シグネチャ）は変更しない
+- 追加するテストはVitest形式で記述する
+```
+
+ファイル名と制約を明示することで、エージェントが正確に動作しやすくなります。
+
+### Review プロセスの設計
+
+Agent が作成した PR は、必ず人間が Review するプロセスを設計してください。特に確認すべき点：
+
+```
+□ 変更範囲が指示の内容と一致しているか
+□ テストが通っているか（CI が Green か）
+□ 意図していないファイルが変更されていないか
+□ セキュリティ上のリスクがないか（特に入力バリデーション、認証部分）
+□ コードの可読性が保たれているか
+```
+
+Agent が生成したコードは、技術的に動作するが保守性が下がる書き方になっているケースがあります。動作確認だけでなく、コードの質も評価することが重要です。
+
+## CODEOWNERS と権限設計
+
+Agent Mode を本番環境のリポジトリに導入する場合、`CODEOWNERS` ファイルを活用して Agent がアクセスできるファイルの範囲を制限することを推奨します。
+
+```
+# .github/CODEOWNERS
+
+# テストファイルは CI Review のみで変更可
+/src/tests/**  @team-ci-bot
+
+# セキュリティ関連ファイルは人間の Review を必須に
+/src/auth/**   @security-team @senior-engineers
+```
+
+動作特性を把握する前に、全ファイルへの無制限アクセスを許可するのは避けた方が良いでしょう。
+
+## Claude Code との使い分け
+
+GitHub Copilot Agent Mode と Claude Code はどちらもエージェンティックな開発を支援しますが、得意領域が異なります。
+
+| 観点 | GitHub Copilot Agent Mode | Claude Code |
+|------|---------------------------|-------------|
+| GitHub 統合 | ネイティブ（Issue/PR/Actions） | 外部連携が必要 |
+| モデル | GPT-4.5 / 独自モデル | Claude Opus / Sonnet |
+| カスタマイズ | GitHub エコシステム内 | 柔軟なプロンプト設計 |
+| 利用コスト | Copilot サブスクリプション | API 従量課金 |
+
+GitHub を中心にワークフローが構築されているチームには Copilot Agent Mode が自然に統合できます。より高度な推論や柔軟なカスタマイズが必要な場合は Claude Code が選択肢になります。
+
+## webhani としての見解
+
+GitHub Copilot Agent Mode の GA は、エージェンティックな開発が「実験的な取り組み」から「業務標準」へ移行する転換点です。
+
+重要なのは、**ツールを導入することより、Review プロセスと権限設計を先に整えること**です。Agent が作るコードの品質は使い方と組織のプロセスに大きく依存します。小さい範囲でパイロットを始めながら、組織に合ったガードレールを設計することを推奨します。
+
+## まとめ
+
+- GitHub Copilot Agent Mode が Microsoft Build 2026 で GA に
+- Issue から PR 作成まで一連のフローを自律実行できる
+- 導入時は向き・不向きのタスク分類と Review プロセスの設計が先決
+- CODEOWNERS を使ったアクセス制限で安全な運用を設計する

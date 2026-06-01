@@ -1,0 +1,145 @@
+---
+title: "Next.js 16 출시: React Compiler 안정화와 Turbopack 기본 번들러 적용"
+description: "Next.js 16에서 React Compiler가 안정 버전으로 승격되고 Turbopack이 기본 번들러가 됩니다. 업그레이드 영향 분석과 마이그레이션 전략을 살펴봅니다."
+date: "2026-06-02"
+status: "published"
+tags: ["Next.js", "React", "TypeScript", "Turbopack", "frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-react-compiler-turbopack-2026"
+---
+
+Next.js 16이 출시됐습니다. 이번 릴리즈에서 기존 프로젝트에 가장 큰 영향을 미치는 변경 사항은 두 가지입니다: **React Compiler의 안정 버전 승격**과 **Turbopack이 `next dev` 및 `next build` 모두에서 기본 번들러가 된 것**입니다.
+
+두 변경 모두 Next.js 15에서 업그레이드할 때 영향이 있을 수 있으며, 내용을 파악한 후 마이그레이션 계획을 수립하는 것이 중요합니다.
+
+## React Compiler 안정 버전
+
+### 어떤 기능인가
+
+React Compiler는 React 컴포넌트의 불필요한 리렌더링을 자동으로 방지하는 Babel 플러그인입니다. 기존에는 개발자가 수동으로 `useMemo`, `useCallback`을 사용해 최적화하던 부분을 컴파일 타임에 자동화합니다.
+
+```tsx
+// Before: 수동으로 useMemo 추가
+function ProductList({ products, filter }: Props) {
+  const filtered = useMemo(
+    () => products.filter(p => p.category === filter),
+    [products, filter]
+  );
+  return <ul>{filtered.map(p => <li key={p.id}>{p.name}</li>)}</ul>;
+}
+
+// After: React Compiler가 자동으로 메모이제이션 처리
+function ProductList({ products, filter }: Props) {
+  const filtered = products.filter(p => p.category === filter);
+  return <ul>{filtered.map(p => <li key={p.id}>{p.name}</li>)}</ul>;
+}
+```
+
+코드가 단순해지고, 의존 배열 누락 같은 수동 최적화 실수도 방지할 수 있습니다.
+
+### 활성화 전 확인 사항
+
+React Compiler가 올바르게 작동하려면 컴포넌트가 React의 Rules를 준수해야 합니다. 특히 주의할 케이스:
+
+- 조건문 안에서 Hook 호출
+- 렌더 중 사이드 이펙트 실행
+- Props나 State를 직접 Mutate
+
+위반 사항이 있는 파일은 컴파일러가 자동으로 최적화를 건너뛰거나 예기치 않은 동작이 발생할 수 있습니다. 업그레이드 전에 `eslint-plugin-react-hooks` 규칙을 모두 통과하는지 확인하는 것을 권장합니다.
+
+```bash
+npx eslint . --rule 'react-hooks/rules-of-hooks: error' --rule 'react-hooks/exhaustive-deps: warn'
+```
+
+### 점진적 도입 방법
+
+`annotation` 모드를 사용하면 전체 프로젝트에 한 번에 적용하지 않고 단계적으로 도입할 수 있습니다:
+
+```js
+// next.config.mjs
+const nextConfig = {
+  experimental: {
+    reactCompiler: {
+      compilationMode: 'annotation',
+    },
+  },
+};
+```
+
+`annotation` 모드에서는 `'use memo'` 디렉티브를 명시한 파일에만 컴파일러가 적용됩니다. 전체 적용보다 안전하게 마이그레이션할 수 있습니다.
+
+## Turbopack 기본 적용
+
+### 무엇이 달라지나
+
+Next.js 15까지는 기본 번들러가 Webpack이었습니다. Next.js 16에서는 `next dev`와 `next build` 모두에서 Turbopack이 기본값이 됩니다. Turbopack은 Rust로 작성되어 있으며, Vercel 공식 데이터에 따르면 대규모 프로젝트에서 초기 빌드 속도가 최대 5배 빨라진다고 보고되고 있습니다.
+
+### 호환성 확인
+
+Turbopack은 Webpack과 완전히 호환되지는 않습니다. 커스텀 Webpack 플러그인이나 로더를 사용하고 있다면 동작 확인이 필요합니다.
+
+```bash
+# Turbopack 테스트
+next dev --turbo
+
+# Webpack으로 명시적 복귀
+next dev --no-turbo
+```
+
+`next.config.mjs`에 커스텀 `webpack` 설정이 있는 프로젝트는 설정 이식이 필요할 수 있습니다. 업그레이드 전에 Turbopack 호환성 문서에서 지원 여부를 확인하세요.
+
+## React 19.2 새 기능
+
+Next.js 16은 React 19.2 통합을 포함합니다. 주목할 두 가지 추가 기능:
+
+### View Transitions API
+
+페이지 전환 시 애니메이션을 CSS로 제어할 수 있는 Web 표준 API가 App Router에서 지원됩니다:
+
+```tsx
+// app/layout.tsx
+import { unstable_ViewTransition as ViewTransition } from 'react';
+
+export default function Layout({ children }: { children: React.ReactNode }) {
+  return <ViewTransition>{children}</ViewTransition>;
+}
+```
+
+JS 애니메이션 라이브러리 없이도 자연스러운 페이지 전환 효과를 구현할 수 있습니다.
+
+### useEffectEvent
+
+`useEffect` 의존 배열에서 특정 함수를 제외할 수 있는 Hook입니다:
+
+```tsx
+function ChatRoom({ roomId, onReceiveMessage }: Props) {
+  const onMessage = useEffectEvent((message: string) => {
+    onReceiveMessage(roomId, message);
+  });
+
+  useEffect(() => {
+    const socket = connect(roomId);
+    socket.on('message', onMessage);
+    return () => socket.disconnect();
+  }, [roomId]); // onReceiveMessage는 의존 배열에 포함하지 않음
+}
+```
+
+최신 값을 참조해야 하지만 의존 배열에는 포함시키고 싶지 않은 이벤트 핸들러 패턴에 유용합니다.
+
+## 업그레이드 체크리스트
+
+| 항목 | 조치 |
+|------|------|
+| React Compiler | `eslint-plugin-react-hooks` strict 모드 실행, 위반 사항 수정 |
+| Turbopack | `next dev --turbo`로 dev 환경 테스트, 커스텀 Webpack 설정 확인 |
+| React 19.2 | `@types/react`, `@types/react-dom` 업데이트 |
+
+개발 Branch에서 먼저 업그레이드하고 전체 테스트 스위트를 실행한 후, 문제가 없으면 Staging, 본 환경 순서로 진행하는 것을 권장합니다.
+
+## 정리
+
+- React Compiler 안정화 — `annotation` 모드를 통한 점진적 도입이 가장 안전한 방법
+- Turbopack 기본 적용 — 대부분의 프로젝트는 빌드 속도 향상 혜택, 커스텀 Webpack 설정은 검토 필요
+- React 19.2의 View Transitions와 `useEffectEvent`는 도입 가치가 높음

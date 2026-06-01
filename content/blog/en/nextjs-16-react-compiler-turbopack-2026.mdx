@@ -1,0 +1,149 @@
+---
+title: "Next.js 16: React Compiler Stable and Turbopack as the Default Bundler"
+description: "Next.js 16 promotes the React Compiler to stable and makes Turbopack the default bundler for both dev and build. Here's what changes, what to test, and how to plan your upgrade."
+date: "2026-06-02"
+status: "published"
+tags: ["Next.js", "React", "TypeScript", "Turbopack", "frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-react-compiler-turbopack-2026"
+---
+
+Next.js 16 is out. The two changes that matter most for existing projects are: the **React Compiler graduating to stable**, and **Turbopack becoming the default bundler for both `next dev` and `next build`**.
+
+Both affect teams upgrading from Next.js 15. Here's what each change means and how to approach the migration.
+
+## React Compiler: Stable
+
+### What it does
+
+The React Compiler is a Babel plugin that automatically adds memoization to React components — the same optimization you'd previously apply manually with `useMemo` and `useCallback`. It analyzes your component tree at compile time and inserts the appropriate memo boundaries.
+
+```tsx
+// Before: manual memoization
+function ProductList({ products, filter }: Props) {
+  const filtered = useMemo(
+    () => products.filter(p => p.category === filter),
+    [products, filter]
+  );
+  return <ul>{filtered.map(p => <li key={p.id}>{p.name}</li>)}</ul>;
+}
+
+// After: React Compiler handles it
+function ProductList({ products, filter }: Props) {
+  const filtered = products.filter(p => p.category === filter);
+  return <ul>{filtered.map(p => <li key={p.id}>{p.name}</li>)}</ul>;
+}
+```
+
+The code is cleaner and you eliminate a common bug: forgetting to include a dependency in a `useMemo` or `useCallback` dependency array.
+
+### What to check before enabling it
+
+The Compiler only works correctly on components that follow the Rules of React. Key violations to look for:
+
+- Hooks called conditionally
+- Side effects during render
+- Direct mutation of props or state
+
+Run your full test suite with the compiler enabled in a staging environment before rolling it out to production. If the compiler encounters a violation it can't handle, it skips optimization for that component rather than failing — but the behavior change can be subtle.
+
+To check your codebase for violations:
+
+```bash
+npx eslint . --rule 'react-hooks/rules-of-hooks: error' --rule 'react-hooks/exhaustive-deps: warn'
+```
+
+### Incremental adoption with annotation mode
+
+You don't have to enable the compiler project-wide on day one. Start with `annotation` mode:
+
+```js
+// next.config.mjs
+const nextConfig = {
+  experimental: {
+    reactCompiler: {
+      compilationMode: 'annotation',
+    },
+  },
+};
+```
+
+In `annotation` mode, the compiler only applies to files that include the `'use memo'` directive. This lets you adopt it incrementally and isolate any issues before expanding coverage.
+
+## Turbopack: Now the Default
+
+### What changes
+
+Next.js 15 defaulted to Webpack. Next.js 16 makes Turbopack the default for both `next dev` and `next build`. Turbopack is written in Rust and offers significantly faster build times — Vercel reports up to 5x faster initial builds on large projects.
+
+### Compatibility concerns
+
+Turbopack is not a drop-in Webpack replacement. If you use custom Webpack plugins or loaders, you'll need to verify they work.
+
+To test Turbopack without committing to it:
+
+```bash
+# Opt in explicitly
+next dev --turbo
+
+# Opt out if needed
+next dev --no-turbo
+```
+
+Check the Turbopack compatibility documentation before upgrading if your project has a customized `webpack` configuration in `next.config.mjs`. Most standard setups without custom plugins should work without changes.
+
+## React 19.2 Additions
+
+Next.js 16 ships with React 19.2. Two additions worth noting:
+
+### View Transitions API
+
+Browser-native page transition animations, now supported via the App Router:
+
+```tsx
+// app/layout.tsx
+import { unstable_ViewTransition as ViewTransition } from 'react';
+
+export default function Layout({ children }: { children: React.ReactNode }) {
+  return <ViewTransition>{children}</ViewTransition>;
+}
+```
+
+Pair with a CSS `view-transition-name` on the transitioning element to get smooth animated navigations without a JS animation library.
+
+### useEffectEvent
+
+A hook that lets you read the latest value of a prop or state inside a `useEffect` callback without listing it as a dependency:
+
+```tsx
+function ChatRoom({ roomId, onReceiveMessage }: Props) {
+  const onMessage = useEffectEvent((message: string) => {
+    onReceiveMessage(roomId, message);
+  });
+
+  useEffect(() => {
+    const socket = connect(roomId);
+    socket.on('message', onMessage);
+    return () => socket.disconnect();
+  }, [roomId]); // onReceiveMessage is not in the deps array
+}
+```
+
+This solves a common pattern where a callback needs the current value of something but shouldn't cause the effect to re-run when that value changes.
+
+## Upgrade Checklist
+
+| Area | Action |
+|------|--------|
+| React Compiler | Run `eslint-plugin-react-hooks` in strict mode; fix violations |
+| Turbopack | Test `next dev --turbo` in dev; check custom webpack config |
+| React 19.2 | Update `@types/react` and `@types/react-dom` |
+
+Upgrade in a dev branch first. Run your full test suite and verify that no visual regressions appear before moving to staging or production.
+
+## Summary
+
+- React Compiler is now stable — incremental adoption via `annotation` mode is the safest path
+- Turbopack is now the default — most projects benefit from faster builds, but custom webpack configs need review
+- React 19.2 brings View Transitions and `useEffectEvent`, both worth adopting where applicable
