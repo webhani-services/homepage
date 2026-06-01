@@ -1,0 +1,169 @@
+---
+title: "Next.js 16 リリース: React Compiler 安定版と Turbopack がデフォルトになった意味"
+description: "Next.js 16 では React Compiler が安定版に昇格し、Turbopack が next dev と next build の両方でデフォルトになりました。実務アップグレードの影響と移行戦略を解説します。"
+date: "2026-06-02"
+status: "published"
+tags: ["Next.js", "React", "TypeScript", "Turbopack", "frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-react-compiler-turbopack-2026"
+---
+
+Next.js 16 がリリースされました。今回のリリースで特に注目すべき変更は2点です：**React Compiler の安定版への昇格**と、**Turbopack が `next dev` および `next build` 両方でデフォルトになった**ことです。
+
+どちらも Next.js 15 からアップグレードする際に影響が出る可能性がある変更であり、内容を把握した上で移行計画を立てることが重要です。
+
+## React Compiler が安定版に
+
+### React Compiler とは
+
+React Compiler は、React コンポーネントの不要な再レンダリングを自動的に防ぐ Babel プラグインです。従来は開発者が手動で `useMemo` や `useCallback` を使って最適化していた部分を、コンパイル時に自動化します。
+
+```tsx
+// Before: 手動で useMemo を追加していた
+function ProductList({ products, filter }: Props) {
+  const filtered = useMemo(
+    () => products.filter(p => p.category === filter),
+    [products, filter]
+  );
+  return <ul>{filtered.map(p => <li key={p.id}>{p.name}</li>)}</ul>;
+}
+
+// After: React Compiler が自動でメモ化を判断する
+function ProductList({ products, filter }: Props) {
+  const filtered = products.filter(p => p.category === filter);
+  return <ul>{filtered.map(p => <li key={p.id}>{p.name}</li>)}</ul>;
+}
+```
+
+コードはよりシンプルになり、手動の最適化ミス（依存配列の漏れなど）も防げます。
+
+### 注意点: React の Rules への準拠が前提
+
+React Compiler が正しく動くには、コンポーネントが React のルールに準拠している必要があります。特に以下のケースは要注意です：
+
+- Hook を条件分岐の中で呼んでいる
+- 副作用を render 中に実行している
+- Props や State を直接 mutate している
+
+既存コードに違反がある場合、コンパイラが自動で最適化をスキップするか、予期しない挙動が発生する可能性があります。アップグレード前に `eslint-plugin-react-hooks` のルールを全て通過しているか確認することを推奨します。
+
+```bash
+npx eslint . --rule 'react-hooks/rules-of-hooks: error' --rule 'react-hooks/exhaustive-deps: warn'
+```
+
+### 段階的な有効化
+
+`annotation` モードを使うことで、プロジェクト全体に一度に適用せず段階的に導入できます：
+
+```js
+// next.config.mjs
+const nextConfig = {
+  experimental: {
+    reactCompiler: {
+      compilationMode: 'annotation',
+    },
+  },
+};
+```
+
+`annotation` モードでは、`'use memo'` ディレクティブを明示したファイルのみコンパイラが適用されます。全体に一度に適用するより安全に移行できます。
+
+## Turbopack がデフォルトに
+
+### 何が変わるか
+
+Next.js 15 まではデフォルトバンドラが Webpack でした。Next.js 16 では `next dev` と `next build` の両方で Turbopack がデフォルトになります。
+
+Turbopack は Rust で書かれており、Webpack に比べて大幅に高速です。Vercel の公式データでは、大規模プロジェクトでの初回ビルドが最大5倍速くなるケースが報告されています。
+
+### Webpack との互換性
+
+Turbopack は Webpack と完全に互換性があるわけではありません。独自の Webpack プラグインやローダーを使っている場合は動作確認が必要です。
+
+```bash
+# ローカルで Turbopack を試す
+next dev --turbo
+
+# Webpack を明示的に使い続ける場合
+next dev --no-turbo
+```
+
+カスタム `webpack` 設定を持つプロジェクトは、設定の移植が必要になる場合があります。アップグレード前に Turbopack の互換性ドキュメントで対応状況を確認してください。
+
+## React 19.2 の新機能
+
+Next.js 16 は React 19.2 との統合を含みます。主な追加機能：
+
+### View Transitions API
+
+ページ遷移時のアニメーションを CSS で制御できる Web 標準 API が App Router でサポートされました。
+
+```tsx
+// app/layout.tsx
+import { unstable_ViewTransition as ViewTransition } from 'react';
+
+export default function Layout({ children }: { children: React.ReactNode }) {
+  return (
+    <ViewTransition>
+      {children}
+    </ViewTransition>
+  );
+}
+```
+
+JS アニメーションライブラリなしで、自然なページ遷移効果を実装できます。
+
+### useEffectEvent
+
+`useEffect` の依存配列から特定の関数を除外できる Hook です。イベントハンドラのような「最新の値を参照したいが依存には含めたくない」ケースで有用です。
+
+```tsx
+function ChatRoom({ roomId, onReceiveMessage }: Props) {
+  const onMessage = useEffectEvent((message: string) => {
+    onReceiveMessage(roomId, message);
+  });
+
+  useEffect(() => {
+    const socket = connect(roomId);
+    socket.on('message', onMessage);
+    return () => socket.disconnect();
+  }, [roomId]); // onReceiveMessage は依存配列に含めない
+}
+```
+
+## アップグレード戦略
+
+Next.js 16 へのアップグレードは段階的に進めることができます。
+
+### ステップ 1: 現在の状態を確認する
+
+```bash
+# React hooks のルール違反を確認
+npx eslint . --rule 'react-hooks/rules-of-hooks: error'
+
+# Webpack プラグインの使用状況を確認
+grep -r "webpack" next.config.*
+```
+
+### ステップ 2: Turbopack を dev 環境で試す
+
+```bash
+npm run dev -- --turbo
+```
+
+エラーや挙動の違いがあれば、`--no-turbo` で Webpack に戻して原因を特定します。
+
+### ステップ 3: React Compiler を段階的に有効化
+
+`annotation` モードでパイロットファイルから始め、問題がなければ全体に展開します。
+
+## まとめ
+
+| 変更点 | 影響 | 対応 |
+|--------|------|------|
+| React Compiler 安定版 | 手動 useMemo が不要に | React ルール違反コードを修正 |
+| Turbopack デフォルト | ビルド高速化 | カスタム Webpack プラグインの確認 |
+| React 19.2 統合 | View Transitions, useEffectEvent | 段階的に採用 |
+
+Next.js 16 は DX と Performance 両面で大きな改善をもたらします。既存のコードに依存がある場合は、開発環境で十分に試してから本番環境への移行を進めることを推奨します。
