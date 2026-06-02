@@ -1,0 +1,145 @@
+---
+title: "Kubernetes Node Readiness Controller: Pod Scheduling 신뢰성을 근본적으로 개선하기"
+description: "2026년 2월 출시된 Kubernetes Node Readiness Controller는 GPU 드라이버, 네트워크 에이전트, 스토리지 백엔드가 준비되기 전에 Pod가 스케줄링되는 오랜 문제를 해결합니다. 프로덕션 환경 적용을 중심으로 설명합니다."
+date: "2026-06-03"
+status: "published"
+tags: ["kubernetes", "devops", "scheduling", "cloud-native", "production"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-node-readiness-controller-2026"
+---
+
+2026년 2월, Kubernetes 프로젝트가 `kubernetes-sigs` 하위 프로젝트로 Node Readiness Controller (NRC)를 공식 발표했습니다. 이는 오랜 기간 프로덕션 클러스터에서 반복되어 온 문제 — kubelet이 `Ready`를 보고했지만 실제로는 아직 워크로드를 받을 준비가 안 된 노드에 Pod가 스케줄링되는 문제 — 를 해결하기 위한 것입니다.
+
+## 문제의 본질
+
+노드가 클러스터에 참가하면 Kubernetes는 kubelet의 내장 헬스체크가 통과되는 순간 `Ready` 상태로 표시합니다. Scheduler는 이를 신호로 Pod 할당을 시작합니다. 그러나 현대 프로덕션 환경에서 "kubelet이 정상"과 "노드가 워크로드를 처리할 준비 완료"는 종종 다른 의미입니다.
+
+**GPU 노드**: GPU Firmware와 드라이버 로딩에는 수 분이 걸릴 수 있습니다. kubelet이 `Ready`를 보고한 직후 GPU를 요청하는 Pod가 할당되면, 실제로는 GPU를 사용할 수 없어 Pod가 `CrashLoopBackOff`에 빠집니다.
+
+**CNI 초기화**: Cilium이나 Calico 같은 네트워크 에이전트가 완전히 실행되기 전에 네트워킹이 필요한 Pod가 스케줄링되어 연결 오류가 발생합니다.
+
+**스토리지 Backend 대기**: CSI 드라이버나 NFS 마운트가 완료되지 않은 상태에서 Volume을 필요로 하는 Pod가 실행을 시도합니다.
+
+기존 해결책들 — init Container, DaemonSet 시작 스크립트, 수동 Taint/Untaint — 은 작동하지만 팀마다 구현이 달라 일관성이 없고 실수하기 쉽습니다. NRC는 이에 대한 선언적인 클러스터 수준의 해결책입니다.
+
+## NRC의 동작 방식
+
+NRC는 `NodeReadinessRule`이라는 CRD를 도입합니다. 이를 통해 Scheduler가 Pod를 노드에 배치하기 전에 충족해야 할 커스텀 Ready 조건을 선언적으로 정의합니다.
+
+```yaml
+apiVersion: nodeness.kubernetes-sigs.io/v1alpha1
+kind: NodeReadinessRule
+metadata:
+  name: gpu-node-readiness
+  namespace: kube-system
+spec:
+  nodeSelector:
+    matchLabels:
+      node-type: gpu
+  conditions:
+    - type: "GpuDriverReady"
+      status: "True"
+      requiredForScheduling: true
+    - type: "NvidiaDevicePluginReady"
+      status: "True"
+      requiredForScheduling: true
+  timeout: 300s
+  onTimeout: TaintOnly
+```
+
+이 규칙이 적용되면 NRC는 열거된 조건이 모두 충족될 때까지 해당 노드에 자동으로 `node.kubernetes.io/not-ready:NoSchedule` Taint를 부여합니다. 조건이 충족되면 Taint가 자동 해제되어 정상적인 스케줄링이 진행됩니다.
+
+## 커스텀 Condition 설정
+
+`NodeReadinessRule`의 조건들은 노드의 `.status.conditions` 배열에 기록되는 노드 레벨 Kubernetes Condition입니다. 초기화 코드(주로 DaemonSet)가 이 값을 기록하는 역할을 합니다.
+
+```yaml
+# GPU 가용성을 확인하고 Condition을 보고하는 DaemonSet
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-readiness-reporter
+spec:
+  selector:
+    matchLabels:
+      app: gpu-readiness-reporter
+  template:
+    spec:
+      tolerations:
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoSchedule"
+      nodeSelector:
+        node-type: gpu
+      containers:
+        - name: reporter
+          image: bitnami/kubectl:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while true; do
+                if nvidia-smi -L > /dev/null 2>&1; then
+                  kubectl patch node $NODE_NAME --type=json \
+                    -p='[{"op":"add","path":"/status/conditions/-","value":{"type":"GpuDriverReady","status":"True"}}]' \
+                    --subresource=status
+                fi
+                sleep 15
+              done
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+```
+
+**핵심**: 이 DaemonSet에 `not-ready:NoSchedule` Toleration을 반드시 추가해야 합니다. Taint가 걸린 노드에서도 DaemonSet이 실행될 수 있어야 하기 때문입니다. DaemonSet 자체가 Taint를 해제하는 역할을 하므로, Toleration이 없으면 DaemonSet이 시작되지 않고 노드는 영원히 Taint 상태로 남습니다.
+
+## Taint 수명주기 자동화
+
+NRC의 핵심 가치는 Taint/Untaint 주기를 자동화하는 것입니다. 기존에는 수동 작업이나 임시 스크립트로 관리했습니다.
+
+```bash
+# 노드 시작 시 수동 Taint 추가
+kubectl taint nodes gpu-node-1 gpu-init=pending:NoSchedule
+
+# 초기화 완료 후 수동 제거 (잊기 쉬움)
+kubectl taint nodes gpu-node-1 gpu-init-
+```
+
+NRC를 사용하면 `NodeReadinessRule` 사양에 따라 Controller가 노드 Condition 변화에 반응하여 자동으로 Taint를 추가/제거합니다. "Taint 제거를 잊어서 Pod가 영원히 스케줄링되지 않는" 인적 오류가 사라집니다.
+
+## Timeout 동작
+
+초기화를 완료하지 못하는 노드를 위해 `timeout`과 `onTimeout`을 설정합니다.
+
+```yaml
+spec:
+  timeout: 300s
+  onTimeout: TaintOnly   # Taint 유지, 실행 중 Pod 퇴출 없음
+  # onTimeout: Delete    # 클러스터에서 노드 삭제
+```
+
+`TaintOnly`가 대부분의 경우 더 안전한 기본값입니다. 초기화에 실패한 노드는 새 Pod를 받지 않지만 기존 워크로드는 퇴출되지 않습니다. `Delete`는 초기화 실패가 하드웨어 교체가 필요한 문제임을 확신할 때만 사용하세요.
+
+## 프로덕션 도입 체크리스트
+
+NRC는 2026년 초 현재 Alpha 단계입니다. 프로덕션 도입 전 확인할 사항입니다.
+
+**1. Staging 환경에서 먼저 테스트**: Alpha CRD는 Minor 버전 간에 API 변경이 있을 수 있습니다. 특정 NRC 버전을 고정하고 업그레이드 경로를 테스트한 후 프로덕션에 적용하세요.
+
+**2. 노드 초기화 시퀀스 파악**: 클러스터의 각 노드 유형별 실제 초기화 시퀀스를 문서화하고, 이를 반영한 `NodeReadinessRule`을 정의하세요.
+
+**3. DaemonSet Toleration 검증**: Condition을 보고하는 DaemonSet이 `not-ready:NoSchedule` Taint를 Tolerate하는지 확인하세요. 이것이 누락되는 것이 가장 흔한 설정 오류입니다.
+
+## 정리
+
+주요 내용을 정리합니다.
+
+- `NodeReadinessRule` CRD로 노드 그룹별 커스텀 Ready 조건을 선언적으로 정의
+- 조건 충족까지 Taint 자동 관리, 충족 시 자동 해제
+- GPU, CNI, CSI 등 복잡한 초기화 시퀀스를 가진 환경의 Scheduling 신뢰성 향상
+- 현재 Alpha 단계이므로 Staging 검증 후 프로덕션 적용 권장
+
+수동 Taint 관리나 init Container 우회책을 사용 중이라면 NRC를 지금부터 평가해볼 만합니다. GA 전환 시 자연스럽게 표준 도구로 자리잡을 가능성이 높으며, 운영 모델을 미리 이해해두면 도입 결정을 빠르게 내릴 수 있습니다.
