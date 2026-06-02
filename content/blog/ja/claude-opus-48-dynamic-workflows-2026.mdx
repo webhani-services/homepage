@@ -1,0 +1,113 @@
+---
+title: "Claude Opus 4.8 の Dynamic Workflows：Multi-Agent Orchestration が変える開発現場"
+description: "Anthropic が5月28日にリリースした Claude Opus 4.8 は、Dynamic Workflows によって数百の Parallel Subagent を単一セッションで管理できる。Codebase 規模の Migration を自律的に完遂する仕組みを実践的に解説する。"
+date: "2026-06-03"
+status: "published"
+tags: ["claude", "llm", "ai-agents", "dynamic-workflows", "anthropic"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-opus-48-dynamic-workflows-2026"
+---
+
+Anthropic は 5月28日、Claude Opus 4.8 をリリースした。前バージョンの Opus 4.7 からわずか 41 日という速いリリースサイクルは、Agentic AI の進化が急加速していることを示している。今回の最大の変更点は **Dynamic Workflows** と呼ばれる Multi-Agent Orchestration 機能だ。
+
+## Dynamic Workflows の仕組み
+
+従来の AI Coding 支援では、開発者がパイプラインを事前に設計する必要があった。「ファイル A を解析 → 修正案を生成 → テストを実行 → 結果をレポート」という流れを、ツールコールの連鎖として開発者が定義する。
+
+Dynamic Workflows では、Claude 自身がタスクを分析して実行計画を動的に生成し、Subagent のネットワークを構築・管理する。エンジニアは「このコードベースを TypeScript 6 に Migration せよ」という高レベルのゴールを渡せばよく、どの Subagent が何を担当するかの設計は Claude が行う。
+
+Anthropic の公式発表によれば、大規模な Codebase Migration（数十万行規模）を Kickoff から Merge まで、既存のテストスイートを品質基準として完結させることができるとしている。
+
+```python
+# Dynamic Workflows の概念的な使い方（研究プレビュー）
+import anthropic
+
+client = anthropic.Anthropic()
+
+response = client.messages.create(
+    model="claude-opus-4-8-20260528",
+    max_tokens=16000,
+    system="You are a senior engineer with access to this codebase.",
+    messages=[{
+        "role": "user",
+        "content": """
+        この Codebase の全 API Route を Next.js App Router 形式に移行してください。
+
+        完了条件:
+        - 既存のテストがすべてパスすること
+        - TypeScript エラーがないこと
+        - 各ファイルに変更サマリーを出力すること
+        """
+    }],
+    betas=["dynamic-workflows-2026-05-28"]
+)
+```
+
+## Mid-session System Prompt の注入
+
+Opus 4.8 のリリースと同時に、Messages API にも重要な変更が加わった。`system` エントリを `messages` 配列の内部に直接配置できるようになり、実行中の Agent に対してシステム指示を途中で更新できる。
+
+```python
+messages = [
+    {"role": "user", "content": "コードの移行を開始してください"},
+    # ... 複数の往復の後 ...
+    {
+        "role": "system",
+        "content": "以降の変更は src/legacy/ ディレクトリには適用しないこと。このディレクトリは別チームが管理している。"
+    },
+    {"role": "user", "content": "次のモジュールに進んでください"}
+]
+```
+
+この変更の実用的な意義は大きい。長時間動作する Agent において、途中で Permission の範囲を変更したり、Token Budget を調整したりする際に、Prompt Cache を破壊せずに済む。大規模タスクの実行コストが実質的に下がる。
+
+## Effort Controls
+
+ユーザーが Claude の推論深度を制御できる Effort Controls も追加された。API では `thinking` パラメーターで Budget を指定し、タスクの複雑さに応じて推論量を変えられる。
+
+```python
+# 単純な作業には低 effort で十分
+response = client.messages.create(
+    model="claude-opus-4-8-20260528",
+    max_tokens=2048,
+    thinking={"type": "enabled", "budget_tokens": 1024},
+    messages=[{"role": "user", "content": "この関数のドキュメントを追加してください"}]
+)
+
+# 複雑な Architecture 設計には高 effort
+response = client.messages.create(
+    model="claude-opus-4-8-20260528",
+    max_tokens=16384,
+    thinking={"type": "enabled", "budget_tokens": 10000},
+    messages=[{"role": "user", "content": "この Monolith を Microservices に分割する設計を立案してください"}]
+)
+```
+
+タスクの複雑さに応じて Effort を調整することで、コストと品質のバランスを取ることができる。
+
+## 現場での注意点
+
+Dynamic Workflows は現在、研究プレビュー段階にある。実際に試した開発者からは以下の点が報告されている。
+
+**Token 消費の増加**
+並列 Subagent が多数動作するため、同等のタスクを従来の方法で行うより Token 消費が 3〜5 倍になることがある。コスト管理のために、まず小規模なタスクで試すことを推奨する。
+
+**非決定論的な実行**
+Subagent の実行順序と担当範囲が動的に変わるため、同じプロンプトでも毎回異なる実行パスをたどる。重要な Migration 作業では、必ず Git でチェックポイントを作成してから実行すること。
+
+**テストスイートの整備が前提**
+Dynamic Workflows が品質基準として使うのはテストだ。テストカバレッジが低いコードベースでは、Workflows が誤った変更を「成功」と判断するリスクがある。
+
+## webhani の視点
+
+Agentic AI の進化は「ツールを使う AI」から「チームとして動く AI」へのシフトを加速させている。Dynamic Workflows は今後 1〜2 年のうちに、大規模 Refactoring や Legacy Migration の標準アプローチになると見ている。
+
+準備として今できることは、テストカバレッジを高め、コードベースの構造を AI が理解しやすい形（明確な命名、適切なコメント、一貫した Convention）に整えておくことだ。AI の能力が上がるほど、コードベースの「読みやすさ」が生産性に直結する。
+
+## まとめ
+
+- Claude Opus 4.8 の Dynamic Workflows は、AI が自律的に Multi-Agent 計画を生成・実行する
+- Mid-session System Prompt により、長時間 Agent の途中でのコンテキスト更新が容易になった
+- Effort Controls でコストと品質のバランスが取りやすくなった
+- 研究プレビュー段階のため、Token コストと非決定論性には注意が必要

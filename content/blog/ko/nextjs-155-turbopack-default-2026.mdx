@@ -1,0 +1,137 @@
+---
+title: "Next.js 15.5: Turbopack이 기본 Bundler로, Middleware도 Stable"
+description: "Next.js 15.5에서 Turbopack이 개발 서버뿐만 아니라 Production Build의 기본 Bundler가 되었고, Node.js Middleware가 Stable로 승격되었습니다. 업그레이드 전 알아야 할 변경 사항을 정리합니다."
+date: "2026-06-03"
+status: "published"
+tags: ["nextjs", "turbopack", "web-development", "typescript", "bundler"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-155-turbopack-default-2026"
+---
+
+Next.js 15.5에서 Turbopack이 개발 서버와 Production Build 모두에서 기본 Bundler로 채택되었습니다. Webpack은 명시적인 Flag로 계속 사용할 수 있지만, 새 프로젝트는 이제 Turbopack을 기본으로 사용합니다. 함께 Node.js Middleware가 Stable로 승격되어 Middleware 내에서 Edge Runtime의 제약 없이 Node.js 전체 기능을 사용할 수 있게 되었습니다.
+
+## Turbopack이 Production Build의 기본이 된 의미
+
+Turbopack은 이미 `next dev`에서 기본 Bundler였습니다. 이번 변화의 핵심은 `next build`(Production)에서도 Turbopack이 기본이 되었다는 것입니다.
+
+주요 실용적 이점은 다음과 같습니다.
+
+**환경 일관성**: 개발과 Production에서 동일한 Bundler를 사용하면 환경 차이로 인한 미묘한 버그가 줄어듭니다. Webpack의 개발/Production 모드 간 Tree-shaking 차이, Module Resolution 엣지 케이스 등의 문제를 경험해봤다면 이 변화가 반갑게 느껴질 것입니다.
+
+**빌드 속도 개선**: Turbopack의 병렬·증분 빌드는 대규모 애플리케이션에서 효과가 큽니다. Vercel의 벤치마크에 따르면 중간 규모 이상의 앱에서 빌드 시간이 20~40% 단축되었습니다.
+
+기존 Webpack을 계속 사용하려면 Flag를 명시합니다.
+
+```bash
+# 개발 서버를 Webpack으로 실행
+next dev --webpack
+
+# Production 빌드를 Webpack으로 실행
+next build --webpack
+```
+
+## Webpack Plugin 호환성 확인
+
+`next.config.mjs`에서 Webpack Plugin을 직접 사용하고 있다면 Turbopack 호환 여부를 확인해야 합니다. `@svgr/webpack` 같은 일반적인 Plugin은 마이그레이션 경로가 있습니다.
+
+```javascript
+// next.config.mjs
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  turbopack: {
+    rules: {
+      "*.svg": {
+        loaders: ["@svgr/webpack"],
+        as: "*.js",
+      },
+    },
+  },
+};
+
+export default nextConfig;
+```
+
+업그레이드 전에 사용 중인 Webpack Loader와 Plugin 목록을 점검하세요. Turbopack 동등 기능이 없는 Plugin이 있다면 `--webpack` Flag로 마이그레이션 시간을 확보할 수 있습니다.
+
+## Node.js Middleware: Edge 제약에서 해방
+
+이번 업데이트에서 가장 실질적인 변화 중 하나는 Node.js Middleware의 Stable 승격입니다. 기존에는 Middleware가 Edge Runtime(V8 isolate)에서만 실행되어 파일 시스템 접근 불가, npm 패키지 호환성 제한, DB 클라이언트 사용 불가 등의 제약이 있었습니다.
+
+Node.js Middleware를 사용하면 이러한 제약이 모두 해소됩니다.
+
+```typescript
+// middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+import { verifyToken } from "@/lib/auth";  // Node.js 호환 Library 사용 가능
+
+export async function middleware(request: NextRequest) {
+  const token = request.cookies.get("auth_token")?.value;
+
+  if (!token) {
+    return NextResponse.redirect(new URL("/login", request.url));
+  }
+
+  const payload = await verifyToken(token);  // crypto, DB 클라이언트 등 사용 가능
+
+  if (!payload) {
+    return NextResponse.redirect(new URL("/login", request.url));
+  }
+
+  const response = NextResponse.next();
+  response.headers.set("x-user-id", payload.userId);
+  return response;
+}
+
+export const config = {
+  matcher: ["/dashboard/:path*", "/api/private/:path*"],
+};
+```
+
+**주의할 점**: Node.js Middleware는 Edge Middleware보다 Cold Start 지연이 높습니다. 전 세계 엣지 배포가 필요한 레이턴시 민감 경로에는 Edge Middleware가 여전히 유리할 수 있습니다. 대부분의 인증, 로깅 용도에는 Node.js Middleware가 더 적합합니다.
+
+## TypeScript 개선 사항
+
+**Typed Routes**: 앱 Route에 대한 타입 안전한 URL 문자열이 자동 생성됩니다. `href` 오타를 컴파일 시점에 잡을 수 있습니다.
+
+```typescript
+import Link from "next/link";
+
+// 실제 Route 트리에 대해 타입 체크
+<Link href="/about">About</Link>      {/* ✓ 유효 */}
+<Link href="/abuot">About</Link>      {/* ✗ 컴파일 오류 */}
+```
+
+`next.config.mjs`에서 활성화합니다.
+
+```javascript
+const nextConfig = {
+  experimental: {
+    typedRoutes: true,
+  },
+};
+```
+
+**Route Export Validation**: `page.tsx`와 `route.ts` 파일의 잘못된 Export를 Runtime이 아닌 컴파일 시점에 감지합니다. 대규모 Codebase에서 잘못된 Export로 인한 런타임 오류를 미리 방지할 수 있습니다.
+
+## `next lint` 비권장
+
+`next lint` 명령이 15.5에서 비권장되었고 Next.js 16에서 제거될 예정입니다. 표준 ESLint를 직접 사용하도록 `package.json` scripts를 업데이트하세요.
+
+```bash
+# ESLint 직접 실행
+npx eslint .
+```
+
+다음 Major Version 업그레이드 시 Breaking Change를 피하려면 지금 변경해두는 것이 좋습니다.
+
+## 정리
+
+Next.js 15.5의 주요 변경 사항입니다.
+
+- Turbopack이 Production Build의 기본 Bundler가 됨 (`--webpack` Flag로 Webpack 계속 사용 가능)
+- Node.js Middleware Stable 승격 (Edge 제약 해소)
+- Typed Routes와 Route Export Validation 개선
+- `next lint` 비권장 (Next.js 16에서 삭제 예정)
+
+업그레이드 전 Webpack Plugin 호환성 확인과 빌드 시간 측정을 먼저 진행하는 것을 권장합니다. Node.js Middleware의 Stable화는 그동안 Edge 제약으로 Middleware 레이어에서 구현이 어려웠던 인증, 로깅 패턴을 훨씬 자연스럽게 처리할 수 있게 해주는 의미 있는 변화입니다.
