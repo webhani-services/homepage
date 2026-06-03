@@ -1,0 +1,166 @@
+---
+title: "Next.js 16 の Cache Components と Partial Pre-Rendering"
+description: "Next.js 16 で正式導入された Cache Components と Partial Pre-Rendering (PPR) を活用して、ページのレンダリング戦略を根本から見直す方法を解説します。"
+date: "2026-06-04"
+status: "published"
+tags: ["Next.js", "React", "Web Development", "Performance", "Caching"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-cache-components-partial-prerendering"
+---
+
+Next.js 16 の最も重要な変更点のひとつが、Cache Components と Partial Pre-Rendering (PPR) の正式サポートです。これらを組み合わせることで、静的ページの速度と動的コンテンツの新鮮さを両立できるようになります。
+
+## PPR の基本的な考え方
+
+Partial Pre-Rendering は「ページ全体を静的にするか動的にするか」という二択をなくします。代わりに、ひとつのページの中で静的に事前生成できる部分と、リクエスト時に動的に生成する部分を混在させます。
+
+従来のアプローチでは、ページ内に動的なコンポーネントが 1 つでもあると、そのページ全体が動的扱いになりました。PPR では、静的に生成できる部分はビルド時に固定され、動的な部分は `<Suspense>` 境界でラップされてリクエスト時に埋め込まれます。
+
+```
+ビルド時:    [静的シェル] + [Suspense フォールバック] → CDN に配信
+リクエスト時: [静的シェル] + [動的コンテンツ]        → ユーザーに配信
+```
+
+初回バイトまでの時間 (TTFB) は静的シェルがすぐに返るため高速になります。動的コンテンツはストリーミングで後から流し込まれます。
+
+## Cache Components
+
+Next.js 16 では、サーバーコンポーネントの出力を明示的にキャッシュするための `cache` 関数が安定版として提供されます。
+
+```tsx
+// app/components/ProductList.tsx
+import { cache } from "react";
+
+const getProducts = cache(async (categoryId: string) => {
+  const res = await fetch(`/api/products?category=${categoryId}`, {
+    next: { revalidate: 300 }, // 5分ごとに再検証
+  });
+  return res.json();
+});
+
+export async function ProductList({ categoryId }: { categoryId: string }) {
+  const products = await getProducts(categoryId);
+
+  return (
+    <ul>
+      {products.map((p) => (
+        <li key={p.id}>{p.name} — ¥{p.price.toLocaleString()}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+`cache` で包まれた関数は、同一リクエスト内で同じ引数で複数回呼ばれても 1 回しか実行されません。また `next: { revalidate }` を組み合わせることで、ISR (Incremental Static Regeneration) と同様の動作をサーバーコンポーネントレベルで実現できます。
+
+## PPR の設定と実装
+
+`next.config.mjs` で PPR を有効化します。
+
+```js
+// next.config.mjs
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  experimental: {
+    ppr: true,
+  },
+};
+
+export default nextConfig;
+```
+
+ページコンポーネント側では、動的な部分を `<Suspense>` でラップするだけです。
+
+```tsx
+// app/products/[id]/page.tsx
+import { Suspense } from "react";
+import { ProductDetail } from "@/components/ProductDetail";
+import { RelatedProducts } from "@/components/RelatedProducts";
+import { UserRecommendations } from "@/components/UserRecommendations";
+import { ProductSkeleton, RecommendationSkeleton } from "@/components/Skeletons";
+
+export const experimental_ppr = true;
+
+export default function ProductPage({ params }: { params: { id: string } }) {
+  return (
+    <div className="product-page">
+      {/* 静的: ビルド時に生成 */}
+      <nav aria-label="breadcrumb">パンくずリスト</nav>
+
+      {/* 動的: ユーザーセッションに依存 */}
+      <Suspense fallback={<ProductSkeleton />}>
+        <ProductDetail id={params.id} />
+      </Suspense>
+
+      {/* 動的: ユーザーの購買履歴に依存 */}
+      <Suspense fallback={<RecommendationSkeleton />}>
+        <UserRecommendations productId={params.id} />
+      </Suspense>
+
+      {/* キャッシュあり動的: 5分ごとに更新 */}
+      <Suspense fallback={<div>関連商品を読み込み中...</div>}>
+        <RelatedProducts categoryId="electronics" />
+      </Suspense>
+    </div>
+  );
+}
+```
+
+`<Suspense>` 境界の外にあるものはすべて静的シェルの一部になります。
+
+## Cache Components のネスト
+
+Cache Components は入れ子にすることができ、キャッシュの粒度をコンポーネント単位で制御できます。
+
+```tsx
+// サイトヘッダー — 1時間キャッシュ
+async function SiteHeader() {
+  const config = await getSiteConfig(); // cache + revalidate: 3600
+  return (
+    <header style={{ background: config.brandColor }}>
+      {config.siteName}
+    </header>
+  );
+}
+
+// 商品詳細 — 5分キャッシュ
+async function ProductDetail({ id }: { id: string }) {
+  const product = await getProduct(id); // cache + revalidate: 300
+  return (
+    <section>
+      <h1>{product.name}</h1>
+      <p>{product.description}</p>
+    </section>
+  );
+}
+
+// 在庫状況 — キャッシュなし（リアルタイム）
+async function InventoryBadge({ productId }: { productId: string }) {
+  const stock = await getStockLevel(productId);
+  return <span>{stock > 0 ? "在庫あり" : "在庫切れ"}</span>;
+}
+```
+
+ページ全体ではなくコンポーネント単位でキャッシュポリシーを設定できるため、データの更新頻度に合わせた細かいチューニングが可能になります。
+
+## 従来の ISR との違い
+
+| 観点 | ISR (ページ単位) | PPR + Cache Components |
+|------|-----------------|----------------------|
+| キャッシュ粒度 | ページ全体 | コンポーネント単位 |
+| 動的/静的の混在 | 不可 | 可能 |
+| ユーザー依存コンテンツ | 不可 | Suspense で対応 |
+| 再検証の制御 | ページ単位 | コンポーネント単位 |
+
+## 導入時の注意点
+
+**`<Suspense>` 境界の設計**: PPR の効果はどこで `<Suspense>` を置くかで決まります。ユーザーセッションや実時間データに依存するものは `<Suspense>` でラップし、それ以外はシェルかキャッシュで処理するのが実用的な出発点です。
+
+**フォールバック UI の品質**: 動的コンテンツが遅れて流し込まれる間、ユーザーにはフォールバック (スケルトン) が表示されます。レイアウトシフトを防ぐため、フォールバックとコンテンツは同じサイズに揃えることが重要です。
+
+**静的シェルの独立テスト**: ブラウザで JavaScript を無効にした状態でページ構造が意味を持ち、ナビゲーション可能かを確認しておくのが理想的です。
+
+## まとめ
+
+PPR と Cache Components は、Next.js のレンダリングモデルをページ単位からコンポーネント単位へと進化させます。既存プロジェクトへの段階的な導入も可能で、まずトラフィックの多いページで最も遅い動的コンポーネントを特定し、5〜10 分の再検証を持つ Cache Components を先に適用してみることが現実的なスタート地点です。
