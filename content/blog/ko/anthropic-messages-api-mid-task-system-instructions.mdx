@@ -1,0 +1,151 @@
+---
+title: "Anthropic Messages API: 작업 중 시스템 지시사항 업데이트하기"
+description: "Messages API가 messages 배열 내 system 엔트리를 지원하게 되어, Prompt Cache를 유지하면서 작업 도중 Claude의 지시사항을 동적으로 업데이트할 수 있습니다."
+date: "2026-06-04"
+status: "published"
+tags: ["Claude", "Anthropic", "LLM", "API", "Prompt Engineering"]
+thumbnail: ""
+author: "webhani"
+slug: "anthropic-messages-api-mid-task-system-instructions"
+---
+
+Anthropic의 Messages API에 실용적인 업데이트가 추가되었습니다. `messages` 배열 안에 `role: "system"` 엔트리를 삽입할 수 있게 되어, 장기 실행 에이전트 작업 도중 Claude의 지시사항을 동적으로 변경할 수 있게 되었습니다.
+
+## 기존 방식의 문제점
+
+기존 API에서 시스템 프롬프트는 요청의 최상위 `system` 파라미터에만 설정할 수 있었습니다. 에이전트가 여러 턴에 걸쳐 작업을 진행하면서 지시사항을 변경해야 할 경우, 선택지는 두 가지뿐이었습니다.
+
+**방법 A: user 턴으로 위장**
+
+시스템적인 지시를 사용자 메시지로 넣는 방법입니다. Claude가 user 역할의 메시지를 지시가 아닌 대화의 일부로 해석하기 때문에, 정밀한 동작 변경이 필요한 상황에서는 신뢰성이 낮습니다.
+
+**방법 B: system 파라미터 재작성**
+
+새로운 지시사항을 `system`에 써서 요청을 다시 보내는 방법입니다. 지시사항은 확실히 반영되지만, `system`을 변경할 때마다 Prompt Cache가 무효화됩니다. 수천 토큰 규모의 시스템 프롬프트를 캐시하고 있다면 비용이 크게 늘어납니다.
+
+## 새로운 방식
+
+이제 `messages` 배열 중간에 `system` 엔트리를 삽입할 수 있습니다.
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+messages = [
+    {"role": "user", "content": "인증 모듈의 보안 문제를 검토해 주세요."},
+    {
+        "role": "assistant",
+        "content": "인증 모듈에서 세 가지 잠재적인 문제를 발견했습니다: ..."
+    },
+    # 작업 도중 시스템 지시사항 업데이트
+    {
+        "role": "system",
+        "content": "보안 검토는 완료되었습니다. 이제 성능 문제에만 집중해 주세요. N+1 쿼리, 블로킹 I/O, 메모리 누수를 중점적으로 확인하세요."
+    },
+    {"role": "user", "content": "성능 문제가 있는 부분을 알려주세요."},
+]
+
+response = client.messages.create(
+    model="claude-opus-4-8-20260101",
+    max_tokens=2048,
+    system="당신은 시니어 엔지니어로서 기술 코드 리뷰를 수행합니다.",
+    messages=messages,
+)
+```
+
+최상위 `system` 파라미터는 변경하지 않기 때문에 Prompt Cache는 그대로 유효합니다. 새로운 system 엔트리는 대화 맥락 내에 동적 지시사항으로 주입됩니다.
+
+## 실전 패턴
+
+### 단계별 에이전트
+
+코드 리뷰 에이전트를 예로 들면, 각 단계마다 Claude의 초점을 변경하면서 하나의 대화를 이어갈 수 있습니다.
+
+```python
+def phased_code_review(code: str, client: anthropic.Anthropic) -> dict:
+    base_system = "당신은 코드 리뷰어입니다. 단계별 지시사항을 정확히 따르세요."
+    messages = [
+        {"role": "user", "content": f"이 코드를 리뷰해 주세요:\n\n```\n{code}\n```"},
+    ]
+
+    # 단계 1: 버그 및 논리 오류 검토
+    r1 = client.messages.create(
+        model="claude-opus-4-8-20260101",
+        max_tokens=1024,
+        system=base_system,
+        messages=messages + [
+            {"role": "system", "content": "단계 1: 버그, 논리 오류, 엣지 케이스만 보고하세요."}
+        ],
+    )
+    bugs = r1.content[0].text
+    messages.append({"role": "assistant", "content": bugs})
+
+    # 단계 2: 성능 분석 (새로운 지시사항 주입)
+    messages.append({
+        "role": "system",
+        "content": "단계 2: 버그 검토가 완료되었습니다. 이제 알고리즘 복잡도와 메모리 사용량에만 집중하세요."
+    })
+    messages.append({"role": "user", "content": "성능 문제를 알려주세요."})
+
+    r2 = client.messages.create(
+        model="claude-opus-4-8-20260101",
+        max_tokens=1024,
+        system=base_system,
+        messages=messages,
+    )
+
+    return {"bugs": bugs, "performance": r2.content[0].text}
+```
+
+### 권한 기반 동적 제약
+
+사용자 역할에 따라 Claude가 접근할 수 있는 정보 범위를 작업 도중에 조절하는 패턴입니다.
+
+```python
+def apply_access_policy(messages: list[dict], role: str) -> list[dict]:
+    constraints = {
+        "guest": "공개 정보만 참조하여 답변하세요. 가격 정보, 내부 지표, 고객 데이터는 언급하지 마세요.",
+        "analyst": "집계 데이터와 통계 정보에 접근 가능합니다. 개인 식별 정보는 제외하세요.",
+        "admin": "전체 접근 권한이 있습니다. 콘텐츠 제한이 없습니다.",
+    }
+
+    if role in constraints:
+        return [{"role": "system", "content": constraints[role]}] + messages
+
+    return messages
+```
+
+## Prompt Cache 설계 고려사항
+
+`messages` 내의 system 엔트리는 캐시 대상이 아닙니다. 캐시 효율을 최대화하려면 다음 원칙을 지켜야 합니다.
+
+- **고정 콘텐츠** (역할 정의, 대용량 문서, 코드베이스 컨텍스트): 최상위 `system` 파라미터에 배치
+- **동적 콘텐츠** (단계별 지시사항, 요청별 제약): `messages` 내 system 엔트리로 주입
+
+```python
+# 캐시됨 — 크고 안정적인 콘텐츠
+base_system = f"""
+당신은 코드 분석 어시스턴트입니다.
+
+프로젝트 개요:
+{project_readme}
+
+코딩 컨벤션:
+{style_guide}
+"""
+
+# 캐시되지 않음 — 단계마다 변하는 콘텐츠
+dynamic_entry = {{
+    "role": "system",
+    "content": f"현재 단계: {phase_name}. 출력 형식: {output_format}"
+}}
+```
+
+500 토큰 이상이고 요청 간에 변하지 않는 내용은 `system`에, 단계나 사용자에 따라 달라지는 내용은 `messages`에 넣는 것이 실용적인 기준입니다.
+
+## 정리
+
+작업 중 system 엔트리 삽입은 에이전트 개발자에게 세 번째 선택지를 제공합니다. "신뢰성이 낮은 user 턴 위장"과 "비용이 높은 캐시 무효화 재작성" 사이의 균형점입니다.
+
+설계 시 핵심은 아키텍처 단계에서 미리 결정하는 것입니다. 어떤 지시사항이 고정되어 캐시되어야 하고, 어떤 것이 작업과 함께 변화해야 하는지를 명확히 구분하면, 에이전트가 복잡해질수록 비용 예측 가능성과 동작 제어력을 모두 유지할 수 있습니다.

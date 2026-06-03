@@ -1,0 +1,150 @@
+---
+title: "Anthropic Messages API: Updating System Instructions Mid-Task"
+description: "The Messages API now supports system entries inside the messages array, letting you update Claude's instructions during a task without invalidating the prompt cache."
+date: "2026-06-04"
+status: "published"
+tags: ["Claude", "Anthropic", "LLM", "API", "Prompt Engineering"]
+thumbnail: ""
+author: "webhani"
+slug: "anthropic-messages-api-mid-task-system-instructions"
+---
+
+Anthropic has updated the Messages API to accept `role: "system"` entries inside the `messages` array. For anyone building multi-step agents, this solves a real problem: how do you change Claude's instructions mid-task without destroying your prompt cache?
+
+## The Problem It Solves
+
+Until now, the system prompt lived exclusively at the top-level `system` parameter of each API request. If your agent needed to shift focus between phases — say, from bug detection to performance review — you had two awkward options:
+
+**Inject instructions as a user turn.** This works, but Claude treats user-role messages as conversation input rather than directives. Reliability suffers when you need precise behavioral changes.
+
+**Rewrite the `system` parameter.** This is reliable, but any change to `system` invalidates the prompt cache. If your base system prompt is several thousand tokens (a common pattern when injecting documentation or codebases), you pay the full cache miss cost every time you need to update instructions.
+
+## How It Works
+
+You can now drop a system entry anywhere inside the `messages` array:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+messages = [
+    {"role": "user", "content": "Review the authentication module for security issues."},
+    {
+        "role": "assistant",
+        "content": "I found three potential issues in the auth module: ..."
+    },
+    # Mid-task instruction update
+    {
+        "role": "system",
+        "content": "Security review is complete. Now focus exclusively on performance — look for N+1 queries, blocking I/O, and memory leaks."
+    },
+    {"role": "user", "content": "What performance issues do you see?"},
+]
+
+response = client.messages.create(
+    model="claude-opus-4-8-20260101",
+    max_tokens=2048,
+    system="You are a senior engineer conducting a technical code review.",
+    messages=messages,
+)
+```
+
+The top-level `system` parameter stays unchanged, so the prompt cache remains valid. The new system entry is injected into the conversation context as a mid-turn directive.
+
+## Practical Patterns
+
+### Phase-Based Agents
+
+This is the most direct use case. A code review agent, a research agent, or a document processing pipeline can change its focus at each phase without starting a new conversation or invalidating the cache.
+
+```python
+def phased_code_review(code: str, client: anthropic.Anthropic) -> dict:
+    base_system = "You are a code reviewer. Follow the phase instructions precisely."
+    messages = [
+        {"role": "user", "content": f"Review this code:\n\n```\n{code}\n```"},
+    ]
+
+    # Phase 1: correctness
+    messages_p1 = messages + [
+        {"role": "system", "content": "Phase 1: Report only bugs, logic errors, and edge cases. Be specific."}
+    ]
+    r1 = client.messages.create(
+        model="claude-opus-4-8-20260101",
+        max_tokens=1024,
+        system=base_system,
+        messages=messages_p1,
+    )
+    bugs = r1.content[0].text
+    messages.append({"role": "assistant", "content": bugs})
+
+    # Phase 2: performance (inject new directive)
+    messages.append({
+        "role": "system",
+        "content": "Phase 2: Bug review is complete. Now focus on algorithmic complexity and memory usage only."
+    })
+    messages.append({"role": "user", "content": "What performance problems exist?"})
+
+    r2 = client.messages.create(
+        model="claude-opus-4-8-20260101",
+        max_tokens=1024,
+        system=base_system,
+        messages=messages,
+    )
+
+    return {"bugs": bugs, "performance": r2.content[0].text}
+```
+
+### Permission-Scoped Responses
+
+If your application has multiple user tiers, you can inject access constraints mid-conversation without rebuilding the entire prompt:
+
+```python
+def apply_access_policy(messages: list[dict], role: str) -> list[dict]:
+    constraints = {
+        "guest": "Only reference publicly available information. Do not mention pricing, internal metrics, or customer data.",
+        "analyst": "Aggregated data and statistics are accessible. Avoid any personally identifiable information.",
+        "admin": "Full access. No content restrictions apply.",
+    }
+
+    if role in constraints:
+        return [{"role": "system", "content": constraints[role]}] + messages
+
+    return messages
+```
+
+## Cache Design Considerations
+
+System entries inside `messages` are not cached. To maximize cache efficiency:
+
+- **Stable content** (role definitions, large documents, codebase context): keep in the top-level `system` parameter
+- **Dynamic content** (phase instructions, per-request constraints): inject as `messages` system entries
+
+```python
+# This gets cached — large, stable, rarely changes
+base_system = f"""
+You are a code analysis assistant.
+
+Project context:
+{project_readme}
+
+Coding conventions:
+{style_guide}
+"""
+
+# This does not get cached — changes with each phase
+dynamic_entry = {
+    "role": "system",
+    "content": f"Current phase: {phase_name}. Output format: {output_format}"
+}
+```
+
+A practical split: anything over 500 tokens that stays constant across requests belongs in `system`. Anything that changes per phase or per user belongs in `messages`.
+
+## When Not to Use This
+
+This feature is designed for agents and multi-step workflows. For single-turn completions, the top-level `system` parameter is still the right place for all instructions. Adding mid-conversation system entries to a one-shot request adds complexity without benefit.
+
+## Takeaway
+
+Mid-task system entries give agent developers a third option between "imprecise user-turn injection" and "expensive cache-busting system rewrites." The design implication is straightforward: decide at architecture time which instructions are fixed (cache them in `system`) and which evolve with the task (inject them into `messages`). That separation keeps costs predictable and behavior controllable as your agents grow more complex.
