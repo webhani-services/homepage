@@ -1,0 +1,105 @@
+---
+title: "KubeVirt v1.8：Hypervisor Abstraction LayerとConfidential ComputingがKubernetes VM管理を変える"
+description: "KubeCon EU 2026で発表されたKubeVirt v1.8は、KVM依存を抽象化するHALとIntel TDX Attestationを導入します。VMware代替としての成熟度と、AI/HPCワークロードへの実用的な意味を解説します。"
+date: "2026-06-06"
+status: "published"
+tags: ["Kubernetes", "KubeVirt", "Virtualization", "Confidential Computing", "Cloud Native"]
+thumbnail: ""
+author: "webhani"
+slug: "kubevirt-v1-8-multi-hypervisor-2026"
+---
+
+KubeVirt v1.8がKubeCon + CloudNativeCon Europe 2026で発表されました。Kubernetes v1.35に対応するこのリリースで最も重要な変更は、KVMへの依存を抽象化するHypervisor Abstraction Layer（HAL）の導入と、Confidential Computing機能の大幅強化です。
+
+## KubeVirtとは
+
+KubeVirtはKubernetes上でVirtual Machineを管理するCNCFプロジェクトです。ContainerとVMを同一のKubernetes APIとワークロードスケジューラで管理でき、特にVMwareからの移行先として注目されています。
+
+KubeVirtを使うと、`kubectl`でVMを操作し、KubernetesのNetworkPolicy、RBAC、Storageとネイティブに統合できます：
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: workload-vm
+spec:
+  running: true
+  template:
+    spec:
+      domain:
+        cpu:
+          cores: 4
+        memory:
+          guest: 8Gi
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+      volumes:
+        - name: rootdisk
+          containerDisk:
+            image: quay.io/kubevirt/ubuntu-container-disk:latest
+```
+
+ContainerとVMを単一コントロールプレーンで運用できる点が核心的な価値です。
+
+## Hypervisor Abstraction Layer（HAL）
+
+v1.7まで、KubeVirtはKVMをハードコードされたバックエンドとして使用していました。HALの導入により、Hypervisorバックエンドをプラグイン形式で差し替えられる構造になります。
+
+**HALが重要な理由：**
+
+**マルチクラウド対応の柔軟性** — パブリッククラウド環境によっては、Nested KVMが利用できない、または推奨されないケースがあります。HALによって、クラウドプロバイダーネイティブのHypervisorレイヤーへのブリッジが可能になります。
+
+**ARM/非x86環境** — KVMはx86中心です。HALにより、ARM64などアーキテクチャ上の制約があるプラットフォームでも代替バックエンドが使えます。
+
+**ベンダーロックインの排除** — HALがInterfaceとして定義されることで、Hypervisorの実装詳細からKubeVirtのユーザー向けAPIが分離されます。将来のHypervisor選択の自由度が上がります。
+
+KVMは引き続きデフォルトです。既存のデプロイメントへの影響はありません。
+
+## Intel TDX Attestationによる機密ワークロード対応
+
+v1.8のConfidential Computing Working Groupは、Intel TDX（Trust Domain Extensions）Attestationのサポートを追加しました。これにより、VMが「実際にConfidential Hardware上で動作していること」を暗号学的に証明できます。
+
+実際のユースケース：
+
+- **金融・医療データの処理** — データが暗号化された実行環境（TEE: Trusted Execution Environment）内でのみ処理されることを証明
+- **規制対応のマルチテナント環境** — テナント間の物理的分離を暗号学的な領収書として証明
+- **サードパーティとの機密データ共有** — VMがどのようなソフトウェアスタックで動作しているかをリモートで検証可能に
+
+```yaml
+# Confidential VM の設定例（概念）
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+spec:
+  template:
+    spec:
+      domain:
+        launchSecurity:
+          tdx: {}  # Intel TDX を有効化
+```
+
+金融・医療・公共機関など規制産業のチームにとって、これはKubeVirtとVMwareのConfidential Computing対応の差を大幅に縮める変更です。
+
+## AI/HPCワークロード向けPCIe NUMA Topology Awareness
+
+v1.8はPCIe NUMAトポロジー認識も追加しました。GPUや高速NICをVMに割り当てる際に、CPU NUMAドメインと同じソケット上にあるPCIeデバイスを優先して配置する機能です。
+
+AI/ML推論やHPCワークロードでは、GPUとCPUがクロスソケットになるとメモリバス経由の転送コストが増大します。NUMAトポロジーを考慮した割り当てにより、KubeVirtコミュニティが「near-native performance」と表現するレベルのパフォーマンスが実現します。
+
+分散学習でGPUを多数使うチームにとって、この変更はリソース管理の精度を実用レベルに引き上げます。
+
+## VMware移行の文脈での位置づけ
+
+Broadcomによるvmwareの買収以降、ライセンスコストや価格体系の変更を機にKubernetesネイティブなVMware代替を検討する組織が増えています。KubeVirt v1.8はその文脈で以下を提供します：
+
+- KubernetesのAPIとエコシステム（GitOps、RBAC、NetworkPolicy）とVMをネイティブ統合
+- Confidential Computingによるエンタープライズグレードのセキュリティ
+- HALによる特定Hypervisorへの依存排除
+
+ただし、VMwareのvSphere/vSANが提供する高度なStorage機能やライブマイグレーション機能については、まだ成熟度の差があります。すでにKubernetes中心のインフラ運用を選択した組織向けの有力な選択肢であり、VMwareの完全な機能的代替としてはまだ段階があります。
+
+## まとめ
+
+KubeVirt v1.8は、Kubernetes上のVM管理がエンタープライズユースケースに対応するための重要な一歩です。HALによるHypervisor抽象化、Intel TDX AttestationによるConfidential Computing、NUMA対応のリソース割り当てはいずれも実際の運用課題に応える変更です。VMware移行やKubernetes上でのVMワークロード運用を検討しているチームにとって、v1.8は評価のタイミングです。
