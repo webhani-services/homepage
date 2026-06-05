@@ -1,0 +1,134 @@
+---
+title: "OpenTelemetry CNCF卒業とGenAI Observabilityの標準化：LLM AgentへのOTel実装ガイド"
+description: "2026年5月、OpenTelemetryがCNCFの卒業プロジェクトに認定されました。GenAI Semantic ConventionsはLLM ClientスパンとAgent SpanをOTelで計測する標準を確立しつつあります。AI依存のサービスにObservabilityを実装する方法を解説します。"
+date: "2026-06-06"
+status: "published"
+tags: ["OpenTelemetry", "Observability", "LLM", "Distributed Tracing", "Monitoring"]
+thumbnail: ""
+author: "webhani"
+slug: "opentelemetry-graduation-genai-observability-2026"
+---
+
+Cloud Native Computing Foundation（CNCF）は2026年5月21日、OpenTelemetryの卒業（Graduation）を発表しました。これはOpenTelemetryが「実験的プロジェクト」ではなく、エンタープライズ本番環境で使われる成熟した標準として公式に認定されたことを意味します。
+
+過去12ヶ月でOpenTelemetry JavaScript APIパッケージは13.6億ダウンロードを超え、Python APIも13億ダウンロードを記録。もはやObservabilityのデファクトスタンダードです。問題は「採用するかどうか」ではなく、「LLMやAgentワークフローまで計装できているか」です。
+
+## なぜLLMワークロードには異なる計測軸が必要か
+
+標準的なHTTPやデータベース計装は、リクエスト時間・ステータスコード・エラーレートをカバーします。しかしLLMパイプラインで必要な信号はそれとは異なります：
+
+- 入力/出力/推論トークンの消費量
+- モデルとプロバイダーの識別
+- Time to First Token（TTFT）vs エンドツーエンドのレイテンシ
+- Agent間のSubtask委譲
+- ツール呼び出しと結果の記録
+
+**GenAI Semantic Conventions**はこれらの計測軸を統一されたSpan属性として定義します。ベンダーが異なっても同じ属性名を使うことで、バックエンドを変えても計装コードを書き直す必要がありません。
+
+## GenAI Semantic Conventionsの構造
+
+2026年初頭時点で4つの主要領域が標準化されています。
+
+### 1. LLM Client Spans
+
+LLMプロバイダーへのAPI呼び出しを表すSpanです。
+
+```python
+span.set_attribute("gen_ai.system", "anthropic")          # プロバイダー
+span.set_attribute("gen_ai.request.model", "claude-opus-4-8")  # モデル名
+span.set_attribute("gen_ai.usage.input_tokens", 1234)     # 入力トークン
+span.set_attribute("gen_ai.usage.output_tokens", 512)     # 出力トークン
+span.set_attribute("gen_ai.request.max_tokens", 2048)     # 設定上限
+span.set_attribute("gen_ai.response.finish_reasons", ["end_turn"])
+```
+
+### 2. Agent Spans
+
+マルチAgentシステムのオーケストレーションと委譲を表すSpanです。
+
+```python
+span.set_attribute("gen_ai.agent.id", "review-agent-001")
+span.set_attribute("gen_ai.agent.name", "CodeReviewAgent")
+span.set_attribute("gen_ai.operation.name", "invoke_agent")
+```
+
+### 3. Events
+
+会話ターンとツール呼び出しをSpanイベントとして記録します：
+- `gen_ai.user.message`
+- `gen_ai.assistant.message`
+- `gen_ai.tool.message`
+
+### 4. Metrics
+
+Observabilityバックエンドが標準クエリで参照できるMetric定義です：
+- `gen_ai.client.token.usage` — 消費トークン数（Counter）
+- `gen_ai.client.operation.duration` — 呼び出しレイテンシ（Histogram）
+- `gen_ai.server.time_to_first_token` — TTFT（Histogram）
+
+## Python実装例
+
+最小限の実装パターンを示します：
+
+```python
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+# セットアップ
+provider = TracerProvider()
+provider.add_span_processor(
+    BatchSpanProcessor(OTLPSpanExporter(endpoint="http://otel-collector:4317"))
+)
+tracer = provider.get_tracer("ai-service")
+
+def call_llm(prompt: str, model: str = "claude-opus-4-8") -> str:
+    with tracer.start_as_current_span("gen_ai.request") as span:
+        span.set_attribute("gen_ai.system", "anthropic")
+        span.set_attribute("gen_ai.request.model", model)
+
+        response = anthropic_client.messages.create(
+            model=model,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        span.set_attribute("gen_ai.usage.input_tokens", response.usage.input_tokens)
+        span.set_attribute("gen_ai.usage.output_tokens", response.usage.output_tokens)
+        span.set_attribute("gen_ai.response.finish_reasons", [response.stop_reason])
+
+        return response.content[0].text
+```
+
+Trace Contextはサービスグラフを通じて伝播するため、フロントエンドのトレースがLLM呼び出しをトリガーしても、単一の分散トレースとして繋がります。
+
+## ログvsトレース：解決時間の差
+
+CNCFの卒業発表には、分散トレーシング導入チームの障害解決時間が「4時間以上から約15分に短縮された」というデータが含まれています。
+
+メカニズムは明快です。ログでは複数サービスのログを時系列でつなぎ合わせる作業が必要です。トレースは因果関係を自動的に記録するため、「どのSpanが遅延の原因か」「どのLLM呼び出しでエラーが発生したか」を即座に特定できます。
+
+AIワークフローでこの差はさらに大きくなります。AgentがサブAgentを呼び出し、各AgentがLLMを呼び出す構造は、ログだけでデバッグするのが非常に困難です。分散トレースは全体のツリーを一度に表示します。
+
+## ベンダーサポートの状況
+
+主要ObservabilityバックエンドはすでにGenAI Semantic Conventionsに対応しています：
+
+- **Datadog**: LLM Observabilityとしてトークンコスト・レイテンシのダッシュボードを提供
+- **Honeycomb**: AI SpanのQuery UIを実装
+- **New Relic**: AI Monitoringとしてトレースレベルのインスペクションを提供
+
+Conventionsが属性名を標準化しているため、バックエンドを変えてもExporterを差し替えるだけで計装コードは変更不要です。
+
+## 今すぐ取り組むべき優先順位
+
+**優先度1**: LLM Client呼び出しに`gen_ai.system`、`gen_ai.request.model`、トークン消費量を記録する。これだけでコスト帰属ダッシュボードをすぐに構築できます。
+
+**優先度2**: モデルと環境ごとにTTFTを追跡する。負荷がかかった状況でTTFTが悪化しても、出力トークン数からは検出できません。
+
+**優先度3**: AgentのSubtaskにTrace Contextを伝播させる。マルチステップワークフローが切れた複数のSpanではなく、単一のTrace Treeを生成するようにします。
+
+## まとめ
+
+OpenTelemetryのCNCF卒業は、分散トレーシングが本番インフラの必須要件になったことの公式な認定です。GenAI Semantic ConventionsはLLMとAI AgentワークフローをOTelの計装対象として標準化しています。LLM Spanの計装なしにAIサービスをプロダクションで運営することは、パフォーマンス問題の診断とコスト帰属に必要な信号なしに運営することを意味します。
