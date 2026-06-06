@@ -1,0 +1,208 @@
+---
+title: "React 19.2: Activity 컴포넌트와 useEffectEvent로 달라지는 개발 경험"
+description: "React 19.2에서 Stable이 된 Activity 컴포넌트와 useEffectEvent Hook의 실용적인 사용법을 설명합니다. 비표시 UI의 상태 보존과 Effect 내 이벤트 처리가 복잡한 버그를 어떻게 방지하는지 구체적인 코드로 소개합니다."
+date: "2026-06-07"
+status: "published"
+tags: ["React", "React 19", "Frontend", "JavaScript", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "react-19-2-activity-useeffectevent-2026"
+---
+
+## 오래된 문제를 해결하는 두 가지 API
+
+2025년 10월 1일 출시된 React 19.2는 여러 기능을 안정화했습니다. 그중 특히 실용적인 두 가지가 있습니다. `<Activity>` 컴포넌트와 `useEffectEvent` Hook입니다. 둘 다 새로운 기능을 추가한다기보다, 지금까지 불안정한 우회책이 필요했던 패턴을 깔끔하게 해결합니다.
+
+React Compiler는 별도 글에서 다루므로, 여기서는 이 두 API에 집중합니다.
+
+## Activity: 숨겨진 UI의 상태 보존
+
+### 기존의 Trade-off
+
+Tab, 모달, Dashboard 위젯처럼 표시/숨김을 전환하는 UI를 다룰 때 React 19.2 이전에는 두 가지 선택지뿐이었습니다.
+
+**선택지 A: 숨길 때 Unmount.** DOM이 깔끔해지고 메모리 낭비가 없습니다. 하지만 재표시 시 State가 초기화되고 데이터를 다시 Fetch해야 합니다.
+
+**선택지 B: CSS로 숨김 (`display: none`).** State가 유지됩니다. 하지만 컴포넌트가 계속 Mount된 채로 DOM 노드와 Subscription을 유지하며, 숨겨진 상호작용 요소로 인한 접근성 문제도 생깁니다.
+
+```tsx
+// 선택지 A — Tab 전환 시 State 손실
+function TabPanel({ activeTab }) {
+  return (
+    <>
+      {activeTab === "overview" && <OverviewTab />}
+      {activeTab === "settings" && <SettingsTab />}
+    </>
+  );
+}
+
+// 선택지 B — 숨겨진 DOM이 계속 쌓임
+function TabPanel({ activeTab }) {
+  return (
+    <>
+      <OverviewTab style={{ display: activeTab === "overview" ? "block" : "none" }} />
+      <SettingsTab style={{ display: activeTab === "settings" ? "block" : "none" }} />
+    </>
+  );
+}
+```
+
+### Activity의 해결책
+
+`<Activity mode="hidden">`은 세 번째 방법을 제공합니다. React가 **DOM은 분리하되 State와 메모리는 유지**합니다. `mode`가 다시 `"visible"`로 바뀌면 DOM이 재Mount가 아닌 "재연결"됩니다. State 그대로, 스크롤 위치 유지, 재Fetch 없음.
+
+```tsx
+import { Activity } from "react";
+
+function TabPanel({ activeTab }) {
+  return (
+    <>
+      <Activity mode={activeTab === "overview" ? "visible" : "hidden"}>
+        <OverviewTab />
+      </Activity>
+      <Activity mode={activeTab === "settings" ? "visible" : "hidden"}>
+        <SettingsTab />
+      </Activity>
+    </>
+  );
+}
+```
+
+숨김 상태에서는 DOM이 존재하지 않아 숨겨진 요소가 포커스를 받거나 스크린 리더에 노출되는 접근성 문제가 없습니다. 가시 상태에서는 전체 DOM이 복원됩니다.
+
+### 실용적인 Use Case
+
+**즉시 전환을 위한 Pre-rendering**: 사용자가 다음에 이동할 가능성이 높은 화면을 `mode="hidden"`으로 미리 준비해두면 전환이 즉각적입니다.
+
+```tsx
+function Dashboard() {
+  const [view, setView] = useState<"chart" | "table">("chart");
+
+  return (
+    <>
+      <nav>
+        <button onClick={() => setView("chart")}>차트</button>
+        <button onClick={() => setView("table")}>테이블</button>
+      </nav>
+
+      <Activity mode={view === "chart" ? "visible" : "hidden"}>
+        {/* 무거운 D3.js 시각화 — 렌더링 State 보존 */}
+        <DataChart />
+      </Activity>
+      <Activity mode={view === "table" ? "visible" : "hidden"}>
+        {/* 필터/정렬 State를 가진 테이블 — UI State 보존 */}
+        <DataTable />
+      </Activity>
+    </>
+  );
+}
+```
+
+**다단계 Form**: 각 단계를 `<Activity>`로 감싸면 단계를 이동해도 입력값이 초기화되지 않습니다.
+
+## useEffectEvent: Effect 로직과 Effect 생명주기 분리
+
+### 의존성 배열 문제
+
+`useEffect`의 의존성 배열은 React에서 가장 다루기 어려운 부분 중 하나입니다. 핵심 긴장감: Effect를 다시 실행시키지 않으면서 Prop이나 State의 최신 값을 참조하고 싶다는 것입니다.
+
+```tsx
+// 흔히 발생하는 문제 패턴
+function ChatRoom({ roomId, onNewMessage }) {
+  useEffect(() => {
+    const socket = connect(roomId);
+
+    socket.on("message", (msg) => {
+      // 최신 onNewMessage를 원하지만,
+      // 의존성 배열에 추가하면 매번 Socket이 재연결됨
+      onNewMessage(msg);
+    });
+
+    return () => socket.disconnect();
+  }, [roomId, onNewMessage]); // onNewMessage Identity가 바뀔 때마다 재연결
+}
+```
+
+이전 해결책: Lint 규칙 비활성화(문제를 숨김), ref 우회(동작하지만 장황하고 오류 발생 가능), 또는 의도치 않은 재연결 수용.
+
+### useEffectEvent의 해결책
+
+`useEffectEvent`는 함수를 "이벤트 같은 것"으로 표시합니다. 항상 최신 Props와 State를 읽지만 Identity가 안정적이어서 Effect 재실행을 유발하지 않습니다.
+
+```tsx
+import { useEffect, useEffectEvent } from "react";
+
+function ChatRoom({ roomId, onNewMessage }) {
+  // onMessage는 항상 최신 onNewMessage를 가지지만 Effect 재실행을 유발하지 않음
+  const onMessage = useEffectEvent((msg: string) => {
+    onNewMessage(msg); // 항상 최신 Callback
+  });
+
+  useEffect(() => {
+    const socket = connect(roomId);
+    socket.on("message", onMessage); // 안정적인 Identity — Callback 변경 시 재연결 없음
+    return () => socket.disconnect();
+  }, [roomId]); // roomId만 필요
+}
+```
+
+`useEffectEvent`로 래핑된 함수는 이벤트 핸들러처럼 동작합니다. 항상 현재 Closure를 캡처하지만 Effect 스케줄링을 유발하는 의존성 추적에는 참여하지 않습니다.
+
+### 사용 시기
+
+**특정 변경 시에만 실행되어야 하는 Analytics 추적:**
+
+```tsx
+function ProductPage({ productId, userSegment }) {
+  const logView = useEffectEvent(() => {
+    // userSegment 변경이 재추적을 유발하지 않음
+    analytics.track("product_viewed", { productId, userSegment });
+  });
+
+  useEffect(() => {
+    logView();
+  }, [productId]); // 상품 변경 시에만 추적
+}
+```
+
+**Callback Prop이 있는 외부 Subscription:**
+
+```tsx
+function PriceAlert({ symbol, threshold, onAlert }) {
+  const handlePrice = useEffectEvent((price: number) => {
+    if (price > threshold) onAlert(symbol, price);
+    // threshold와 onAlert가 항상 최신 값, Subscription 재구축 없음
+  });
+
+  useEffect(() => {
+    const sub = market.subscribe(symbol, handlePrice);
+    return () => sub.unsubscribe();
+  }, [symbol]); // symbol 변경 시에만 재구독
+}
+```
+
+### 사용하지 말아야 할 경우
+
+`useEffectEvent`는 "의존성 배열을 생각하고 싶지 않다"는 일반적인 탈출구가 아닙니다. Effect 시스템의 의존성 추적은 정확성을 위해 존재합니다. 값이 Effect 로직에는 참여하지만 Effect 재실행은 유발하지 않아야 할 때 구체적으로 사용하세요.
+
+## React 19.2의 다른 추가 사항
+
+**cacheSignal API**: `cache()`로 비용이 큰 비동기 호출을 중복 제거할 때, `cacheSignal`은 해당 캐시 데이터와 연관된 렌더링 생명주기가 종료되거나 중단되었을 때 신호를 제공합니다.
+
+```tsx
+import { cache } from "react";
+
+const fetchUser = cache(async (id: string, { signal }: { signal: AbortSignal }) => {
+  return fetch(`/api/users/${id}`, { signal }).then(r => r.json());
+});
+```
+
+**Node.js에서 Web Streams**: React 19.2는 Node.js, Deno, Edge Runtime 전체에서 일관된 Web Streams API 지원을 추가합니다. Runtime별 우회 없이 Streaming SSR에 유용합니다.
+
+## Webhani의 시각
+
+`<Activity>`와 `useEffectEvent`는 기능을 추가하기보다 버그 발생 면적을 줄이는 종류의 추가 사항입니다. 새로운 것을 가능하게 하는 것이 아니라, 이전에는 위험한 우회책이 필요했던 패턴을 안전하게 작성할 수 있게 합니다.
+
+특히 `useEffectEvent`는 가장 흔한 미묘한 Effect 버그 원인 중 하나를 해결합니다. Codebase에 Lint 규칙이 비활성화된 `useEffect` Hook이나 "재실행 없이 최신 값 읽기"를 위한 ref 우회책이 있다면 `useEffectEvent` Migration 후보입니다.
+
+두 API 모두 React 19.2에서 Stable입니다. React 19.x를 사용 중이라면 업그레이드 경로가 간단합니다.

@@ -1,0 +1,208 @@
+---
+title: "React 19.2: Activity Component and useEffectEvent in Practice"
+description: "React 19.2 stabilized two features that solve long-standing patterns in React development: the Activity component for preserving state in hidden UI, and useEffectEvent for separating effect logic from effect lifecycle. Here's how they work and when to use them."
+date: "2026-06-07"
+status: "published"
+tags: ["React", "React 19", "Frontend", "JavaScript", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "react-19-2-activity-useeffectevent-2026"
+---
+
+## Two Problems That Needed Real Solutions
+
+React 19.2, released on October 1, 2025, stabilized several features. Two are particularly worth understanding in depth: `<Activity>` and `useEffectEvent`. Neither adds new capabilities in the abstract sense — both solve concrete problems that developers have been working around with fragile patterns for years.
+
+The React Compiler is covered separately. This post focuses on these two APIs.
+
+## Activity: Preserving State in Hidden UI
+
+### The Old Trade-off
+
+Any time you have UI that toggles between visible and hidden — tabs, modals, dashboard panels, sidebars — you faced a two-option choice before React 19.2:
+
+**Option A: Unmount on hide.** Clean DOM, no wasted memory. But state is lost on re-mount, which means re-fetching data, losing scroll position, resetting form state.
+
+**Option B: CSS hide (`display: none`).** State preserved. But the component stays mounted, keeping its DOM nodes and subscriptions alive indefinitely, creating accessibility issues with hidden interactive elements.
+
+```tsx
+// Option A — state loss on tab switch
+function TabPanel({ activeTab }) {
+  return (
+    <>
+      {activeTab === "overview" && <OverviewTab />}
+      {activeTab === "settings" && <SettingsTab />}
+    </>
+  );
+}
+
+// Option B — hidden DOM accumulates
+function TabPanel({ activeTab }) {
+  return (
+    <>
+      <OverviewTab style={{ display: activeTab === "overview" ? "block" : "none" }} />
+      <SettingsTab style={{ display: activeTab === "settings" ? "block" : "none" }} />
+    </>
+  );
+}
+```
+
+### What Activity Does
+
+`<Activity mode="hidden">` takes a third path: React detaches the DOM but preserves component state and the React tree in memory. When `mode` switches back to `"visible"`, the DOM re-attaches rather than re-mounts — state intact, scroll position intact, no re-fetch.
+
+```tsx
+import { Activity } from "react";
+
+function TabPanel({ activeTab }) {
+  return (
+    <>
+      <Activity mode={activeTab === "overview" ? "visible" : "hidden"}>
+        <OverviewTab />
+      </Activity>
+      <Activity mode={activeTab === "settings" ? "visible" : "hidden"}>
+        <SettingsTab />
+      </Activity>
+    </>
+  );
+}
+```
+
+The DOM is absent while hidden — hidden elements are not focusable, not announced to screen readers, not part of the tab order. When visible, the full DOM is back. This handles the accessibility problem that `display: none` didn't.
+
+### Practical Use Cases
+
+**Pre-rendering for instant transitions**: Wrap the next likely screen in `mode="hidden"` so it's ready when the user navigates to it.
+
+```tsx
+function Dashboard() {
+  const [view, setView] = useState<"chart" | "table">("chart");
+
+  return (
+    <>
+      <nav>
+        <button onClick={() => setView("chart")}>Chart</button>
+        <button onClick={() => setView("table")}>Table</button>
+      </nav>
+
+      <Activity mode={view === "chart" ? "visible" : "hidden"}>
+        {/* Heavy D3 visualization — preserves render state */}
+        <DataChart />
+      </Activity>
+      <Activity mode={view === "table" ? "visible" : "hidden"}>
+        {/* Table with active filters/sort — preserves UI state */}
+        <DataTable />
+      </Activity>
+    </>
+  );
+}
+```
+
+**Multi-step forms**: Preserve partially filled steps without storing all state in a parent. Each step is an `<Activity>` — switching steps doesn't reset form input.
+
+## useEffectEvent: Separating Effect Logic from Effect Lifecycle
+
+### The Dependency Array Problem
+
+`useEffect`'s dependency array is one of the most consistently misused parts of React. The core tension: you want to reference the latest value of a prop or state variable inside an effect without re-running the effect every time that value changes.
+
+```tsx
+// The common problematic pattern
+function ChatRoom({ roomId, onNewMessage }) {
+  useEffect(() => {
+    const socket = connect(roomId);
+
+    socket.on("message", (msg) => {
+      // We want the latest onNewMessage callback,
+      // but adding it to deps causes socket reconnect on every render
+      onNewMessage(msg);
+    });
+
+    return () => socket.disconnect();
+  }, [roomId, onNewMessage]); // Re-connects whenever onNewMessage changes identity
+}
+```
+
+The options before `useEffectEvent`: suppress the lint rule with `// eslint-disable-next-line` (hides the problem), use a ref workaround (works but verbose and error-prone), or accept the unintended reconnections.
+
+### The useEffectEvent Solution
+
+`useEffectEvent` marks a function as "event-like" — it always reads the latest props and state, but its identity is stable, so it doesn't trigger effect re-runs.
+
+```tsx
+import { useEffect, useEffectEvent } from "react";
+
+function ChatRoom({ roomId, onNewMessage }) {
+  // onMessage always has the latest onNewMessage, but won't cause effect re-runs
+  const onMessage = useEffectEvent((msg: string) => {
+    onNewMessage(msg); // always the latest callback
+  });
+
+  useEffect(() => {
+    const socket = connect(roomId);
+    socket.on("message", onMessage); // stable identity — no reconnect on callback change
+    return () => socket.disconnect();
+  }, [roomId]); // only reconnect when roomId changes
+}
+```
+
+The function wrapped in `useEffectEvent` behaves like an event handler: it always captures the current closure but doesn't participate in the dependency tracking that drives effect scheduling.
+
+### When to Use It
+
+**Analytics tracking where visit should only fire on specific changes:**
+
+```tsx
+function ProductPage({ productId, userSegment }) {
+  const logView = useEffectEvent(() => {
+    // userSegment changes don't retrigger tracking
+    analytics.track("product_viewed", { productId, userSegment });
+  });
+
+  useEffect(() => {
+    logView();
+  }, [productId]); // only track when product changes, not segment
+}
+```
+
+**External subscriptions with callback props:**
+
+```tsx
+function PriceAlert({ symbol, threshold, onAlert }) {
+  const handlePrice = useEffectEvent((price: number) => {
+    if (price > threshold) onAlert(symbol, price);
+    // threshold and onAlert always current, subscription never rebuilt
+  });
+
+  useEffect(() => {
+    const sub = market.subscribe(symbol, handlePrice);
+    return () => sub.unsubscribe();
+  }, [symbol]); // only resubscribe on symbol change
+}
+```
+
+### What It's Not For
+
+`useEffectEvent` is not a general escape hatch for "I don't want to think about my dependencies." The effect system's dependency tracking exists for correctness reasons — bypassing it carelessly causes stale data bugs. Use `useEffectEvent` specifically when a value participates in the logic of an effect but shouldn't drive when the effect re-runs.
+
+## Other React 19.2 Additions
+
+**cacheSignal API**: When using `cache()` to deduplicate expensive async calls, `cacheSignal` provides a cancellation signal that indicates when the render lifecycle associated with that cached data has ended.
+
+```tsx
+import { cache } from "react";
+
+const fetchUser = cache(async (id: string, { signal }: { signal: AbortSignal }) => {
+  return fetch(`/api/users/${id}`, { signal }).then(r => r.json());
+});
+```
+
+**Web Streams in Node.js**: React 19.2 adds consistent Web Streams API support across Node.js, Deno, and edge runtimes — useful for streaming SSR without runtime-specific workarounds.
+
+## Webhani's Take
+
+`<Activity>` and `useEffectEvent` are the kind of additions that reduce bug surface rather than add capability. They don't make new things possible — they make previously risky patterns safe.
+
+`useEffectEvent` in particular addresses one of the most common sources of subtle effect bugs. If your codebase has `useEffect` hooks with suppressed lint rules or ref workarounds for "read latest without re-running," those are strong candidates for `useEffectEvent` migration.
+
+Both APIs are stable in React 19.2. If you're on React 19.x, the upgrade path is straightforward.
