@@ -1,0 +1,159 @@
+---
+title: "Next.js 16 の Partial Prerendering と Cache Components — Server-First 設計の実践"
+description: "Next.js 16 が正式化する Partial Prerendering と Cache Components の仕組みを解説。静的シェルと動的領域を同一 Route に共存させるアーキテクチャとその実装パターンを紹介します。"
+date: "2026-06-09"
+status: "published"
+tags: ["Next.js", "React", "Web Development", "Vercel", "TypeScript"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-partial-prerendering-2026"
+---
+
+Next.js 16 は、Partial Prerendering (PPR) と Cache Components を中核とした「Server-First」アーキテクチャを正式化します。これは、静的生成と動的レンダリングを単一の Route 内で共存させる仕組みであり、これまで「全部 SSG」か「全部 SSR」かという二択を強いられてきた設計上の制約を解消します。
+
+## Partial Prerendering とは何か
+
+PPR の基本的な考え方は、一つの Route を「静的シェル」と「動的領域」に分割することです。
+
+- **静的シェル**: ビルド時に生成され、CDN エッジからほぼ即座に配信される部分（ナビゲーション、レイアウト、静的コンテンツ）
+- **動的領域**: リクエスト時に評価される部分（ユーザー固有データ、リアルタイム在庫情報など）
+
+従来の SSR では、ページ内に一つでも動的なデータが含まれると Route 全体がサーバーサイドで評価されていました。PPR ではこの粒度が Component レベルまで細分化されます。
+
+## 実装パターン
+
+### 基本的な PPR の構造
+
+```tsx
+// app/products/[id]/page.tsx
+
+import { Suspense } from "react";
+import { ProductShell } from "./components/ProductShell";
+import { DynamicInventory } from "./components/DynamicInventory";
+import { DynamicReviews } from "./components/DynamicReviews";
+
+// この Route は静的シェルとして prerender される
+export default function ProductPage({ params }: { params: { id: string } }) {
+  return (
+    <ProductShell id={params.id}>
+      {/* 動的領域は Suspense でラップする */}
+      <Suspense fallback={<InventorySkeleton />}>
+        <DynamicInventory productId={params.id} />
+      </Suspense>
+      <Suspense fallback={<ReviewsSkeleton />}>
+        <DynamicReviews productId={params.id} />
+      </Suspense>
+    </ProductShell>
+  );
+}
+```
+
+`ProductShell` はビルド時に HTML として生成され CDN から配信されます。`DynamicInventory` と `DynamicReviews` はリクエスト時に Server Component としてストリーミングされます。
+
+### Cache Components
+
+Cache Components は、動的な Route の中でも特定のコンポーネントの出力をキャッシュできる仕組みです。
+
+```tsx
+// components/FeaturedBanners.tsx
+import { unstable_cache as cache } from "next/cache";
+
+// 1時間ごとに再評価されるキャッシュ済みコンポーネント
+const getCachedBanners = cache(
+  async () => {
+    const banners = await db.banners.findMany({ where: { active: true } });
+    return banners;
+  },
+  ["featured-banners"],
+  { revalidate: 3600, tags: ["banners"] }
+);
+
+export async function FeaturedBanners() {
+  const banners = await getCachedBanners();
+  return (
+    <ul>
+      {banners.map((banner) => (
+        <li key={banner.id}>{banner.title}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+`revalidate` で再評価間隔を設定し、`tags` で On-Demand Revalidation のトリガーを指定できます。CMS の更新をフックして特定タグのキャッシュを無効化するパターンが典型的な使い方です。
+
+### On-Demand Revalidation との組み合わせ
+
+```typescript
+// app/api/revalidate/route.ts
+import { revalidateTag } from "next/cache";
+import { NextRequest, NextResponse } from "next/server";
+
+export async function POST(request: NextRequest) {
+  const { tag, secret } = await request.json();
+
+  if (secret !== process.env.REVALIDATION_SECRET) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  revalidateTag(tag);
+  return NextResponse.json({ revalidated: true, tag });
+}
+```
+
+CMS の Webhook から `/api/revalidate` を叩くことで、該当タグを持つすべてのキャッシュエントリが次のリクエスト時に再評価されます。
+
+## Next.js 15 からの移行
+
+Next.js 15 で PPR を試験的に有効化していた場合、Next.js 16 での変更点は以下の通りです。
+
+```javascript
+// next.config.mjs — Next.js 16 では ppr フラグが不要になります
+const nextConfig = {
+  // experimental.ppr は Next.js 16 でデフォルト有効
+  // 明示的に無効化したい場合のみ設定
+};
+
+export default nextConfig;
+```
+
+また、Next.js 16 では Turbopack がデフォルトのバンドラーになります。大規模プロジェクトで Webpack に依存したカスタム設定がある場合は、移行前に互換性の確認が必要です。
+
+## パフォーマンスへの影響
+
+PPR が特に効果を発揮するのは、ページの大部分が静的だが一部に動的データが含まれるケースです。
+
+典型的なユースケース:
+
+| ページタイプ | 静的領域 | 動的領域 | PPR の効果 |
+|---|---|---|---|
+| EC サイト商品ページ | 説明・画像・仕様 | 在庫・価格・レビュー | 大（初期表示が大幅改善） |
+| ダッシュボード | ナビ・レイアウト | KPI・リアルタイムデータ | 中（レイアウトシフト軽減） |
+| ブログ記事 | 記事本文・メタ | 関連記事（パーソナライズ） | 中（初期表示は静的と同等） |
+| 認証後のアプリ | 共通 UI シェル | ユーザー固有データ | 中（TTFB 改善） |
+
+ほぼ完全に動的なダッシュボードや、逆に完全に静的なマーケティングページへの効果は限定的です。
+
+## webhani の見解
+
+PPR と Cache Components の組み合わせは、「どのデータをいつ評価するか」を Route 全体ではなく Component 単位で制御できるようにするものです。これにより、設計の判断軸が「SSG か SSR か」から「このデータの鮮度要件は何か」に変わります。
+
+Next.js 16 への移行を検討するチームへのアドバイスを3点挙げます。
+
+**1. データの鮮度要件を整理する**
+
+まず各 Component が必要とするデータの更新頻度をマッピングすることを推奨します。「常に最新」「1時間に1回で十分」「ビルド時でいい」という3段階の分類だけでも、PPR と Cache Components の適用判断が明確になります。
+
+**2. Turbopack 移行のテストを先行させる**
+
+Webpack に依存したカスタムローダーや Plugin がある場合、Turbopack への移行は別タスクとして先に進めることを推奨します。Next.js 16 の機能メリットを Turbopack の移行コストと混在させると、問題の切り分けが難しくなります。
+
+**3. Suspense の粒度を設計する**
+
+PPR では Suspense の配置が UX に直結します。Skeleton の粒度が粗すぎると Layout Shift が増え、細かすぎると実装コストが上がります。デザインシステムに Skeleton Component を組み込むことで、一貫した Fallback UI を維持しやすくなります。
+
+Server-First という方向性は Next.js だけでなく、SvelteKit や Nuxt でも同様の動きが見られます。2026年のフロントエンドアーキテクチャは、クライアントサイドの JavaScript をどれだけ削減できるかを設計の中心に置く傾向が強まっています。
+
+---
+
+*参考: [Next.js Updates by Vercel - June 2026](https://releasebot.io/updates/vercel/next-js), [Next.js 15 and Beyond](https://medium.com/@beenakumawat003/next-js-15-and-beyond-the-future-of-full-stack-react-in-2026-advanced-guide-with-deep-insights-d7253dc46205)*
