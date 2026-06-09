@@ -1,0 +1,90 @@
+---
+title: "Docker Kanvas: Docker Compose에서 Kubernetes로 이어주는 도구"
+description: "Docker와 Layer5가 공동 개발한 Docker Kanvas는 Docker Compose 파일을 Kubernetes 매니페스트로 자동 변환하고 인프라를 시각화합니다. Helm/Kustomize와의 차이점과 실제 활용 시나리오를 정리합니다."
+date: "2026-06-10"
+status: "published"
+tags: ["Docker", "Kubernetes", "DevOps", "Cloud Infrastructure", "Kanvas"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-helm-kustomize-comparison"
+---
+
+Docker와 Layer5가 공동 개발한 Docker Kanvas가 주목받고 있습니다. Docker Compose 파일을 Kubernetes 리소스로 자동 변환하고 인프라 구성을 시각적으로 표현하는 기능을 제공합니다. Helm/Kustomize와의 차이점과 실제 활용 시나리오를 정리합니다.
+
+## Docker Kanvas란?
+
+Kanvas는 Docker Compose 정의를 입력받아 Kubernetes 리소스(Deployment, Service, PersistentVolumeClaim, ConfigMap, Secret)를 자동 생성하는 Infrastructure as Code 도구입니다. Layer5의 Meshery 플랫폼을 기반으로 하며, 서비스 간 의존 관계를 그래프로 시각화하는 기능도 함께 제공합니다.
+
+## Helm/Kustomize와의 위치 비교
+
+Helm과 Kustomize는 각자 실제 문제를 해결하는 성숙한 도구입니다. Kanvas는 이들과 다른 위치를 차지합니다.
+
+**Helm**은 Kubernetes 애플리케이션 배포를 위한 패키지 매니저로, Chart의 재사용성과 의존성 관리가 강점입니다. Go 템플릿의 복잡성과 대규모 Chart 디버깅의 어려움이 단점입니다.
+
+```yaml
+# Helm 템플릿 — 강력하지만 복잡해질 수 있음
+containers:
+  - name: {{ .Values.app.name }}
+    image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+    {{- if .Values.resources }}
+    resources:
+      {{- toYaml .Values.resources | nindent 12 }}
+    {{- end }}
+```
+
+**Kustomize**는 base + overlays 패턴으로 환경별 차이를 관리합니다. kubectl에 내장되어 추가 설치가 필요 없고 순수 YAML을 사용하지만, 복잡한 파라미터 변형에서는 Helm이 더 유연합니다.
+
+**Kanvas**는 개발자에게 친숙한 Docker Compose 형식을 진입점으로 사용합니다. 기존 도구와 경쟁하기보다는 Docker Compose를 사용하는 팀의 Kubernetes 도입 장벽을 낮추는 것이 목표입니다.
+
+## 실제 변환 예시
+
+```yaml
+# docker-compose.yml (기존)
+services:
+  api:
+    image: myapi:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - DB_URL=postgresql://db:5432/appdb
+    depends_on:
+      - db
+  db:
+    image: postgres:16
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
+```
+
+Kanvas는 이로부터 다음 리소스를 생성합니다:
+- `api`용 `Deployment` + `Service`
+- `db`용 `Deployment` + `Service`
+- `pgdata`용 `PersistentVolumeClaim`
+- `DB_URL`용 `Secret` 또는 `ConfigMap`
+
+Visual Editor에서 서비스 간 의존 관계를 확인하고, HPA(Horizontal Pod Autoscaler), NetworkPolicy, Resource Limit 등을 추가한 뒤 최종 매니페스트를 Export할 수 있습니다.
+
+## Kanvas가 적합한 상황
+
+다음 경우에 Kanvas가 잘 맞습니다:
+- Docker Compose 기반 로컬 개발에서 Kubernetes로 이전하는 프로젝트
+- 비교적 단순한 서비스 구성 (마이크로서비스 15개 이하)
+- Kubernetes 경험이 부족한 팀의 온보딩
+- 인프라 구성 문서화 및 시각화가 필요한 경우
+
+다음 경우에는 Helm/Kustomize가 더 적합합니다:
+- 다른 팀이 설치해 사용할 패키지 애플리케이션 배포
+- 다중 클러스터에서 세밀한 환경별 설정 관리
+- 기존 Kubernetes CI/CD Pipeline과의 통합
+
+## 현실적인 평가
+
+Docker Kanvas는 "진입로" 역할에 적합한 도구입니다. Production 급 Kubernetes 환경에서는 Kanvas로 생성한 기본 매니페스트를 Helm Chart로 래핑하거나 Kustomize overlays로 환경별 설정을 관리하는 하이브리드 접근이 현실적입니다.
+
+인프라 의존 관계 시각화 기능은 팀 온보딩과 문서화 측면에서 실질적인 가치를 제공합니다. YAML을 읽지 않고도 의존 그래프를 파악할 수 있다는 점은 신규 팀원의 이해를 크게 돕습니다.
+
+## 정리
+
+Docker Kanvas는 Docker Compose에서 Kubernetes로 전환하는 팀에게 유용한 도구입니다. 해당 전환 시점에 있는 팀이라면 검토해볼 가치가 있습니다. 이미 Helm이나 Kustomize로 Kubernetes를 운영 중인 팀에게는 주요 배포 도구보다는 시각화 레이어로 활용하는 것이 현실적입니다.
