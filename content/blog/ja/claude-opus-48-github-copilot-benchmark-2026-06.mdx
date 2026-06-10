@@ -1,0 +1,144 @@
+---
+title: "Claude Opus 4.8 が GitHub Copilot に統合：Terminal-Bench 2.1 でわかる AI コーディングアシスタントの現在地"
+description: "Claude Opus 4.8 が GitHub Copilot (Pro+/Business/Enterprise) で利用可能になりました。Terminal-Bench 2.1 の最新ベンチマーク結果を踏まえ、各ツールの特性と実務での使い分けを整理します。"
+date: "2026-06-11"
+status: "published"
+tags: ["Claude", "GitHub Copilot", "AI Coding", "LLM", "Benchmark"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-opus-48-github-copilot-benchmark-2026-06"
+---
+
+GitHub Copilot が Claude Opus 4.8 のサポートを追加しました。Pro+・Business・Enterprise プランのユーザーは、IDE を離れることなく Opus 4.8 を利用できます。合わせて Terminal-Bench 2.1 の結果が公開され、主要 AI コーディングアシスタントの現在の位置づけが改めて整理されました。
+
+## Terminal-Bench 2.1 の結果
+
+最新ベンチマークの順位は以下の通りです。
+
+| ツール | モデル | Terminal-Bench 2.1 |
+|---|---|---|
+| Codex CLI | GPT-5.5 | 83.4% |
+| Claude Code | Claude Opus 4.8 | 78.9% |
+| Gemini CLI | Gemini 3.1 Pro | 70.7% |
+
+前回の Terminal-Bench 2.0 では GPT-5.5 が 82.7% でトップでしたが、今回も首位を維持しています。Claude Code with Opus 4.8 は 78.9% で 2 位につけており、前世代モデルから着実に改善しています。
+
+SWE-bench Verified では Claude Opus 4.8 が **88.6%** を記録しており、実際のリポジトリ上でのバグ修正・機能追加タスクでの能力は引き続き高い水準にあります。Terminal-Bench と SWE-bench の両スコアを並べると、Opus 4.8 の強みがコードベース全体の理解と修正にあることがわかります。
+
+## GitHub Copilot での Claude Opus 4.8
+
+これまで Claude のフル機能を活用するには Claude Code または各社の API 連携を別途設定する必要がありました。GitHub Copilot への統合により、VS Code や JetBrains など普段使いの IDE から直接 Opus 4.8 を呼び出せるようになります。
+
+Copilot の Chat インターフェースでモデルを選択するだけで利用可能です。特別な設定は不要です。
+
+```
+# VS Code Copilot Chat でのモデル切り替え
+# チャット入力欄右下のモデルセレクタから選択
+
+> @workspace このリポジトリの認証フローを説明して、
+  セッション管理の問題点を指摘してください
+```
+
+Copilot の `@workspace` コマンドと Opus 4.8 を組み合わせると、ワークスペース全体をコンテキストとした質問が可能になります。大規模コードベースのナビゲーションで特に効果が出やすいユースケースです。
+
+## 大規模コードベースでの活用例
+
+実際に効果が出やすいシナリオとして、依存関係の複雑なリファクタリングを取り上げます。
+
+たとえば、認証ライブラリを `passport.js` から自社実装の JWT ミドルウェアに移行する場面を想定します。
+
+```typescript
+// 移行前: passport.js を使った既存の実装
+import passport from 'passport';
+import { Strategy as JwtStrategy, ExtractJwt } from 'passport-jwt';
+
+passport.use(new JwtStrategy({
+  jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+  secretOrKey: process.env.JWT_SECRET!,
+}, async (payload, done) => {
+  const user = await UserRepository.findById(payload.sub);
+  return user ? done(null, user) : done(null, false);
+}));
+
+export const authenticate = passport.authenticate('jwt', { session: false });
+```
+
+このコードを Copilot Chat に渡し、Opus 4.8 に以下のような指示を出します。
+
+```
+@workspace 現在 passport.js で実装している JWT 認証を
+Express の middleware として直接実装し直してください。
+- UserRepository の使い方は既存コードに合わせる
+- エラーハンドリングは src/middleware/errorHandler.ts の規約に従う
+- テストは tests/auth/ 配下の既存テストが通るようにする
+```
+
+Opus 4.8 はリポジトリ内の `errorHandler.ts` や既存テストファイルを参照した上で、一貫したコードを生成します。単純なスニペット補完と異なり、プロジェクト固有の規約を読み取って適用する点が実務での差です。
+
+```typescript
+// Opus 4.8 が生成した移行後の実装例
+import { Request, Response, NextFunction } from 'express';
+import jwt from 'jsonwebtoken';
+import { UserRepository } from '../repositories/UserRepository';
+import { AppError } from './errorHandler';
+
+export async function authenticate(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader?.startsWith('Bearer ')) {
+    return next(new AppError('認証トークンが見つかりません', 401));
+  }
+
+  const token = authHeader.slice(7);
+
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET!) as { sub: string };
+    const user = await UserRepository.findById(payload.sub);
+
+    if (!user) {
+      return next(new AppError('ユーザーが見つかりません', 401));
+    }
+
+    req.user = user;
+    next();
+  } catch (err) {
+    next(new AppError('無効なトークンです', 401));
+  }
+}
+```
+
+## ツール別の選択指針
+
+今回の統合により、選択肢が増えた分、どこで何を使うかの判断が重要になります。
+
+**GitHub Copilot + Opus 4.8 が適しているケース:**
+- 既に Copilot を導入しているチームが追加コストなしに能力を上げたい場合
+- IDE のエディタ統合を重視する場合（インライン補完 + Chat の組み合わせ）
+- Business/Enterprise プランで組織管理・監査ログが必要な場合
+
+**Claude Code が適しているケース:**
+- Terminal-Bench 2.1 の 78.9% の能力を CLI から最大限引き出したい場合
+- 大規模なマルチステップのコーディングタスクを自律的に実行させたい場合
+- MCP を使ったカスタムツール統合が必要な場合
+
+**Codex CLI が適しているケース:**
+- Terminal-Bench 2.1 トップの 83.4% が重要なターミナル操作タスク
+- OpenAI のエコシステムにすでに統合されている場合
+
+##複数フロンティアモデルが Copilot に集まる意味
+
+今回の Opus 4.8 統合以前から、GitHub Copilot は GPT-5.5 を含む複数モデルを提供しています。これにより、Copilot という一つの Interface から用途に応じたモデルを選べる体制が整いつつあります。
+
+チームにとっての現実的な利点は、モデルの切り替えが運用コストなしに試せることです。特定タスクで Opus 4.8 の方が結果が良ければそちらを使い、コスト最適化が必要な場面では軽量モデルに切り替えるという運用が IDE 内で完結します。
+
+## まとめ
+
+Terminal-Bench 2.1 では Codex CLI + GPT-5.5 が 83.4% でトップ、Claude Code + Opus 4.8 が 78.9% で続いています。Opus 4.8 の SWE-bench Verified 88.6% は依然として高い水準です。
+
+GitHub Copilot への統合は、Opus 4.8 のコードベースナビゲーション能力を IDE から使えるようにする実用的な変化です。すでに Copilot を使っているチームは、追加の設定なしに試せます。
+
+ベンチマーク上位の差は数ポイントですが、実務での影響はタスクの種類によって変わります。自分のプロジェクトの実際のワークロードで試してみることが、どのツールに投資するかの判断に最も役立ちます。
