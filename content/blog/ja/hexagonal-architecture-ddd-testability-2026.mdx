@@ -1,0 +1,233 @@
+---
+title: "2026年のヘキサゴナルアーキテクチャとDDD: ビジネスロジックをテスト可能に保つ"
+description: "Ports and Adapters とDDDのbounded contextを実務目線で整理し、port インターフェースがビジネスロジックを高速にテストでき差し替えやすくする様子を、具体的なTypeScript例で示します。"
+date: "2026-06-12"
+status: "published"
+tags: ["Architecture", "DDD", "Hexagonal Architecture", "Testing", "TypeScript"]
+thumbnail: ""
+author: "webhani"
+slug: "hexagonal-architecture-ddd-testability-2026"
+---
+
+長く運用されるバックエンドで起きる痛みの多くは、ひとつの根本原因に行き着きます。ビジネスロジックがインフラを知りすぎている、ということです。価格計算のルールがSQLクライアントを直接触る。サブスクリプションの状態遷移が、課金プロバイダを呼ぶためにHTTP SDKをimportする。数か月後、データベースは問題なく、課金プロバイダも問題ないのに、どのテストパスもネットワーク接続やコンテナを引きずるせいで、高速なテストが一本も書けなくなっています。
+
+ヘキサゴナルアーキテクチャ、別名 Ports and Adapters は、この結び目を断つために存在します。考え方自体は古いものですが、2026年においては10年前ほど自明ではなかった理由で価値を持ちます。私たちを取り巻くインフラが、異常に変化しやすくなったのです。LLMプロバイダは数週間おきに破壊的変更や新モデルを出してきます。ベンダーAPIは非推奨になります。四半期のうちに3つのモデルプロバイダを評価し、結局どれも恒久採用しない、ということが普通に起こります。システムの外縁がこれほど速く変わるなら、コアはそれらから、自分が制御する明示的で狭い境界によって隔離しておきたい、というわけです。
+
+## 考え方をそのまま述べる
+
+ヘキサゴナルなシステムには、責務の層が3つあります。
+
+**ドメインコア**は、ビジネスルールとユースケースを持ちます。フレームワーク、データベースドライバ、HTTPクライアント、メッセージキューのいずれからもimportしない素のコードです。データがPostgresにあるのかメモリにあるのか、リクエストがRESTで来たのかgRPCで来たのかを知りません。
+
+**port** は、コアが外界に対して必要とする能力を記述したインターフェースで、コアが所有します。「注文を保存する」「通知を送る」「モデルにテキストを要約させる」といったものです。コアはこのインターフェースに依存し、具体的な実装には決して依存しません。
+
+**adapter** は、port の具体的な実装で、実在する技術と話します。`PostgresOrderRepository` は `OrderRepository` port を実装します。別のadapterは、テスト用にメモリ上のmapを使って同じport を実装します。adapterを差し替えてもコアは変わりません。
+
+この形が重要なのは、依存の向きを反転させるからです。インフラがドメインに依存するのであって、その逆ではありません。ドメインは中心に居続け、外を知らないまま安定します。
+
+## 具体例
+
+注文システムの小さな一片をモデル化してみます。ユースケースは「注文する」で、注文をどこかに永続化する必要があります。まずはドメインから始めますが、ドメインは「どこか」が何を意味するかを知りません。
+
+```typescript
+// domain/order.ts — 純粋なビジネス型、インフラなし
+export type OrderId = string;
+
+export interface OrderLine {
+  sku: string;
+  quantity: number;
+  unitPriceCents: number;
+}
+
+export class Order {
+  constructor(
+    readonly id: OrderId,
+    readonly customerId: string,
+    readonly lines: OrderLine[],
+    readonly placedAt: Date,
+  ) {}
+
+  totalCents(): number {
+    return this.lines.reduce(
+      (sum, line) => sum + line.quantity * line.unitPriceCents,
+      0,
+    );
+  }
+}
+```
+
+次に port です。ユースケースが永続化について知ってよいのは、これだけです。ドメインが所有し、ドメインの言葉で表現されたインターフェースです。
+
+```typescript
+// domain/ports.ts — コアが依存する契約
+import { Order, OrderId } from "./order";
+
+export interface OrderRepository {
+  save(order: Order): Promise<void>;
+  findById(id: OrderId): Promise<Order | null>;
+}
+
+export interface IdGenerator {
+  next(): OrderId;
+}
+```
+
+そしてユースケース本体です。上記の port だけに依存します。SQLもクライアントライブラリも環境変数もありません。ここでのビジネスルールは小さいながら本物で、注文には最低1行が必要、というものです。
+
+```typescript
+// domain/place-order.ts — ユースケース
+import { Order, OrderLine } from "./order";
+import { OrderRepository, IdGenerator } from "./ports";
+
+export class EmptyOrderError extends Error {}
+
+export class PlaceOrder {
+  constructor(
+    private readonly repo: OrderRepository,
+    private readonly ids: IdGenerator,
+    private readonly clock: () => Date,
+  ) {}
+
+  async execute(input: {
+    customerId: string;
+    lines: OrderLine[];
+  }): Promise<Order> {
+    if (input.lines.length === 0) {
+      throw new EmptyOrderError("an order needs at least one line");
+    }
+    const order = new Order(
+      this.ids.next(),
+      input.customerId,
+      input.lines,
+      this.clock(),
+    );
+    await this.repo.save(order);
+    return order;
+  }
+}
+```
+
+clock も注入されている点に注目してください。時刻もまたインフラです。注入することで、テストは「現在時刻」に振り回されるのではなく、それを制御できるようになります。
+
+続いてadapterです。本番用のものは、Postgresとどう話すかをスケッチします。これをユニットテストで動かすことはありません。
+
+```typescript
+// adapters/postgres-order-repository.ts
+import { Pool } from "pg";
+import { Order, OrderId } from "../domain/order";
+import { OrderRepository } from "../domain/ports";
+
+export class PostgresOrderRepository implements OrderRepository {
+  constructor(private readonly pool: Pool) {}
+
+  async save(order: Order): Promise<void> {
+    await this.pool.query(
+      "INSERT INTO orders (id, customer_id, lines, placed_at) VALUES ($1, $2, $3, $4)",
+      [order.id, order.customerId, JSON.stringify(order.lines), order.placedAt],
+    );
+  }
+
+  async findById(id: OrderId): Promise<Order | null> {
+    const res = await this.pool.query(
+      "SELECT id, customer_id, lines, placed_at FROM orders WHERE id = $1",
+      [id],
+    );
+    if (res.rows.length === 0) return null;
+    const row = res.rows[0];
+    return new Order(row.id, row.customer_id, row.lines, row.placed_at);
+  }
+}
+```
+
+そしてメモリ上のadapter。これこそが核心です。同じインターフェースを素の `Map` で実装します。
+
+```typescript
+// adapters/in-memory-order-repository.ts
+import { Order, OrderId } from "../domain/order";
+import { OrderRepository } from "../domain/ports";
+
+export class InMemoryOrderRepository implements OrderRepository {
+  private store = new Map<OrderId, Order>();
+
+  async save(order: Order): Promise<void> {
+    this.store.set(order.id, order);
+  }
+
+  async findById(id: OrderId): Promise<Order | null> {
+    return this.store.get(id) ?? null;
+  }
+}
+```
+
+## なぜテストが安くなるのか
+
+ユースケースが Postgres ではなく `OrderRepository` に依存しているので、テストはメモリ版のadapterと、ささいなfakeを2つほど配線するだけで済みます。コンテナもマイグレーションもネットワークもありません。
+
+```typescript
+// place-order.test.ts
+import { describe, it, expect } from "vitest";
+import { PlaceOrder, EmptyOrderError } from "../domain/place-order";
+import { InMemoryOrderRepository } from "../adapters/in-memory-order-repository";
+
+describe("PlaceOrder", () => {
+  const setup = () => {
+    const repo = new InMemoryOrderRepository();
+    let counter = 0;
+    const ids = { next: () => `order-${++counter}` };
+    const clock = () => new Date("2026-06-12T09:00:00Z");
+    return { repo, useCase: new PlaceOrder(repo, ids, clock) };
+  };
+
+  it("有効な注文を保存し合計を計算する", async () => {
+    const { repo, useCase } = setup();
+    const order = await useCase.execute({
+      customerId: "cust-1",
+      lines: [{ sku: "A", quantity: 2, unitPriceCents: 500 }],
+    });
+
+    expect(order.totalCents()).toBe(1000);
+    expect(await repo.findById(order.id)).not.toBeNull();
+  });
+
+  it("行のない注文を拒否する", async () => {
+    const { useCase } = setup();
+    await expect(
+      useCase.execute({ customerId: "cust-1", lines: [] }),
+    ).rejects.toBeInstanceOf(EmptyOrderError);
+  });
+});
+```
+
+これらのテストはミリ秒で走り、決定的です。clock は固定、IDは予測可能、storeはテストごとに新品です。リトライしたくなるような不安定さがありません。後で本番の `PostgresOrderRepository` を加えるときは、実際にデータベースを叩く少数の統合テストでそれをカバーし、それらは分けて少なく保ちます。振る舞いの大半は、インフラに一切触れずに検証されるわけです。
+
+同じ形は、変化の速いAIベンダーに対しても直接効きます。コアに `SummarizationPort` を置き、プロバイダAで一度、プロバイダBでもう一度、そして定型の要約を返す決定的なfakeで三度目を実装します。プロバイダを切り替えても、ドメインロジックとそのテストは一切変わらず、実際のモデルエンドポイントに触れるのは統合スイートだけになります。
+
+## 失敗パターン: 何にでも port
+
+この流儀の正直なリスクは、過剰設計です。パターンを覚えたチームが、あらゆるクラスをインターフェースで包み始め、教義を満たすためだけに存在する「実装が1つしかないport」の森を生み出します。1つずつがファイルを増やし、間接化を増やし、読む人ごとに「これ実際どこで実装されてるの」という一瞬を生みます。それは設計ではなく儀式です。
+
+port が元を取るのは、次のうち少なくとも1つが成り立つときです。
+
+- **実装が複数あるか、現実的に複数になりそうだ。** 決済プロバイダが2つ、ストレージが2系統、オンプレ版とクラウド版、など。
+- **自分が制御しない外部境界をまたぐ。** データベース、サードパーティAPI、ファイルシステム、時刻、乱数、キュー。
+- **テストでfakeにする必要がある。** 高速で決定的に保つために。
+
+どれも当てはまらないなら、port はただの重りです。文字列を整形する純粋関数にインターフェースは要りません。実装が永遠に1つしかない小さな内部ヘルパーにも要りません。境界が本物のところでパターンを使い、そうでないところでは素の関数やクラスを使いましょう。
+
+## bounded context: 巨大な共有モデルを作らない
+
+ここでのDDDの貢献は、ヘキサゴンをどこに引くかを知ることです。罠は、課金・出荷・分析にまたがって共有された単一の `Order` 型が、すべてに奉仕しようとしてフィールドを溜め込み、結果として誰のためにもならなくなることです。「order」という語は文脈ごとに違う意味を持ち、ひとつのモデルにすべての意味を背負わせることが、脆く絡まったコードを生みます。
+
+モジュールの境界を、言葉の境界に合わせましょう。課金チームと出荷チームが同じ語を違う意味で使っているなら、それはモデルを分割すべき強いシグナルです。各bounded contextは自前のドメイン型と自前の port を持ち、継ぎ目で翻訳します。ひとつの文脈の中ではユビキタス言語を一貫させますが、会社全体で一貫させようとはしません。
+
+2026年の節度についてひとこと。ヘキサゴナルアーキテクチャと綺麗なbounded contextは広く適用する価値がありますが、より重いパターンはそうではありません。event sourcing と CQRS は、監査や時系列クエリの要件を持つ、本当に複雑で高トランザクションなドメインで実在の問題を解きます。CRUDなプロダクトの既定値としては不向きです。動く中で最も単純なもの、多くはきれいなモジュラーモノリスから始め、具体的なビジネス上の圧力が要求したときにだけ、マイクロサービスやイベント駆動へ進化させましょう。流行で適用したパターンは、何も買わずにコストだけを足します。
+
+## まとめ
+
+- ドメインコアをインフラのimportから自由に保つ。ドライバやSDKではなく port に依存する。
+- 時刻・乱数・IDも port として注入する。これらは姿を変えたインフラだ。
+- メモリ版adapterでテストの大半を高速かつ決定的にする。統合テストは本番adapter用に取っておき、少なく保つ。
+- port の背後では、変化の速いAIやベンダーAPIが、ドメインロジックとそのテストに触れずに差し替え可能になる。
+- port が元を取るのは、複数実装・外部境界・テストfakeのいずれかがあるときだけ。それ以外は素の関数を選ぶ。
+- bounded context は言葉の境界に沿って引く。ひとつのモデルにすべての意味を背負わせない。
+- event sourcing と CQRS は、ドメインの複雑さが本当に要求するときにだけ手を伸ばす。単純に始め、流行ではなく圧力に進化を駆動させる。
