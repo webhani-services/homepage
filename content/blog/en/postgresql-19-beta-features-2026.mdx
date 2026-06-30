@@ -1,0 +1,78 @@
+---
+title: "PostgreSQL 19 Beta: Reading Parallel autovacuum and REPACK Through an Operations Lens"
+description: "PostgreSQL 19 Beta 1 landed in June 2026. We focus on the changes that hit operational load directly — parallel autovacuum, online REPACK, and ON CONFLICT DO SELECT — and what they mean in practice."
+date: "2026-07-01"
+status: "published"
+tags: ["PostgreSQL", "Database", "Performance", "Backend", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-19-beta-features-2026"
+---
+
+PostgreSQL 19 Beta 1 was released on June 4, 2026 ([PostgreSQL.org](https://www.postgresql.org/about/news/postgresql-19-beta-1-released-3313/)), with the final release expected around September or October as usual. The changelog runs to over 200 changes from PostgreSQL 18, but this article focuses on the ones that directly affect how heavy a running service feels — not the flashy new syntax. Specifically: parallel autovacuum, online REPACK, and `ON CONFLICT DO SELECT`.
+
+## Parallel autovacuum: unblocking the maintenance bottleneck
+
+Run PostgreSQL in production long enough and you will hit the problem where autovacuum can't keep up and a table bloats. On write-heavy tables, a single-process vacuum simply loses the race against the update rate.
+
+PostgreSQL 19 lets autovacuum use parallel workers, configurable via `autovacuum_max_parallel_workers`. It also adds a scoring system that prioritizes which tables to vacuum first.
+
+```sql
+-- Set the number of parallel autovacuum workers
+ALTER SYSTEM SET autovacuum_max_parallel_workers = 4;
+SELECT pg_reload_conf();
+
+-- Tune thresholds for a heavily updated table
+ALTER TABLE events SET (
+  autovacuum_vacuum_scale_factor = 0.02,
+  autovacuum_vacuum_insert_scale_factor = 0.05
+);
+```
+
+The practical meaning is clear. Teams that have been running manual `VACUUM` jobs overnight or scheduling maintenance windows specifically because of bloat may be able to cut that operational cost. Parallel workers consume I/O and CPU, though, so raise the worker count gradually while watching production load.
+
+## Online REPACK: removing bloat with less locking
+
+When you need to physically rebuild a bloated table or index, `VACUUM FULL` takes an exclusive lock, which makes it hard to run without downtime. The standard workaround has been the `pg_repack` extension.
+
+PostgreSQL 19 brings a native `REPACK` command, supporting online table reorganization as a built-in feature.
+
+```sql
+-- Rebuild the table to remove bloat (online)
+REPACK events;
+
+-- Physically order rows by a specific index
+REPACK events USING INDEX events_created_at_idx;
+```
+
+The big win is that it's a standard command with no extension install or privilege setup. That matters most on managed databases where extension support is restricted — you can delete the "set up the extension" step from your runbook entirely.
+
+## ON CONFLICT DO SELECT: friendlier upserts
+
+`ON CONFLICT` is the standard upsert tool, but until now, fetching the existing row on conflict meant either a pseudo-update via `DO UPDATE ... RETURNING` or issuing a separate `SELECT`.
+
+PostgreSQL 19 introduces `ON CONFLICT DO SELECT`, which returns the conflicting existing row directly.
+
+```sql
+-- On conflict, return the existing row (no wasted UPDATE)
+INSERT INTO api_tokens (user_id, token)
+VALUES (42, 'tok_abc')
+ON CONFLICT (user_id) DO SELECT
+RETURNING id, token, created_at;
+```
+
+The get-or-create pattern shows up constantly in application code. Cases that previously fired an empty UPDATE — generating needless row locks and WAL — can now resolve with a SELECT. Reducing write volume also quietly eases replication load and disk I/O.
+
+## Other changes worth noting
+
+Beyond these, foreign-key constraint checks are now up to 2x faster, which helps schemas that model referential integrity strictly. The `pg_plan_advice` extension lets you stabilize and control planner decisions — another tool against the classic incident where a specific query's plan suddenly flips and slows down in production. Native JSON output for `COPY TO` also simplifies data-integration scripts.
+
+## webhani's take
+
+When we evaluate a new major version, we weigh "how much operational load drops" far above "how many new syntax features there are." On that axis, PostgreSQL 19 is significant precisely because it folds parallel autovacuum and REPACK — areas previously covered by extensions or manual procedures — into core.
+
+That said, this is still Beta. Production adoption should wait for the final release, and we recommend verifying three things in a test environment: first, the I/O impact of enabling parallel autovacuum; second, the runtime and locking behavior of `REPACK` against your real table sizes; and third, the change in write volume when you swap existing upsert logic over to `DO SELECT`. Measure those in staging and you can roll out calmly once the final release ships.
+
+---
+
+Reference: [PostgreSQL 19 Beta 1 Released! — PostgreSQL.org](https://www.postgresql.org/about/news/postgresql-19-beta-1-released-3313/)

@@ -1,0 +1,127 @@
+---
+title: "モデルが突然使えなくなったら: Fable 5 の供給停止に学ぶフォールバック設計"
+description: "Anthropic の Claude Fable 5 は 2026 年 6 月のリリース直後に輸出規制で供給停止となりました。特定モデルへの依存を避け、サービスを止めないためのモデル抽象化とフォールバック設計を実装例とともに解説します。"
+date: "2026-07-01"
+status: "published"
+tags: ["Claude", "LLM", "Architecture", "Resilience", "AI"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-fable-5-model-fallback-resilience-2026"
+---
+
+2026 年 6 月、AI 業界で短期間に二つの出来事が続けて起きました。6 月 9 日に Anthropic が最上位モデル Claude Fable 5 を一般提供開始し、その数日後の 6 月 12 日には米国政府の輸出規制指令を受けて Fable 5 と Mythos 5 へのアクセスを一時停止すると発表しました（[Anthropic](https://www.anthropic.com/news/claude-opus-4-8) ほか各種報道）。Opus・Sonnet・Haiku といった他のモデルは影響を受けていませんが、最上位モデルだけを前提に組んでいたプロダクトは対応を迫られたはずです。
+
+この出来事は、特定のモデル ID に直接依存する設計がいかに脆いかを示しています。本記事では、モデルが供給停止・廃止・価格改定されても本番サービスを止めないための抽象化とフォールバックの作り方を、実装例とともに整理します。
+
+## 何が問題なのか
+
+多くのアプリケーションは、コードのあちこちにモデル名をハードコードしています。
+
+```python
+# あちこちに散らばったモデル指定
+response = client.messages.create(
+    model="claude-fable-5",
+    max_tokens=4096,
+    messages=messages,
+)
+```
+
+この書き方だと、モデルが使えなくなった瞬間にすべての呼び出し箇所が壊れます。grep して一つずつ書き換える作業が、障害対応の最中に発生します。モデルの廃止（deprecation）は AI を扱う以上避けられないイベントであり、今回のような規制由来の停止は予告なしに来ることもあります。
+
+## 抽象化レイヤーを一枚挟む
+
+最初の一歩は、モデル選択をビジネスロジックから切り離すことです。「用途」を表す論理名を定義し、実際のモデル ID への対応付けを一箇所に集約します。
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class ModelTier:
+    """用途ごとに優先順位付きの候補リストを持つ"""
+    primary: str
+    fallbacks: list[str] = field(default_factory=list)
+
+# 設定として一箇所で管理する
+MODEL_TIERS = {
+    "reasoning": ModelTier(
+        primary="claude-opus-4-8",
+        fallbacks=["claude-sonnet-4-6"],
+    ),
+    "fast": ModelTier(
+        primary="claude-haiku-4-5",
+        fallbacks=["claude-sonnet-4-6"],
+    ),
+}
+```
+
+呼び出し側は `model="claude-fable-5"` ではなく `tier="reasoning"` のように用途で指定します。これだけで、モデルの差し替えが設定ファイルの一行で済むようになります。今回の Fable 5 停止のようなケースでも、`primary` を Opus 4.8 に書き換えるだけで全社のサービスが復旧します。
+
+## 実行時フォールバックを実装する
+
+設定の集約に加えて、実行時に候補を順番に試すロジックを用意します。最上位モデルが返さないときは次点に降格し、それでもだめなら最後の候補へと落としていきます。
+
+```python
+import anthropic
+from anthropic import APIStatusError
+
+client = anthropic.Anthropic()
+
+# 一時的な失敗とみなすステータスコード
+RETRYABLE = {404, 429, 500, 503, 529}
+
+def create_with_fallback(tier: str, **kwargs):
+    spec = MODEL_TIERS[tier]
+    candidates = [spec.primary, *spec.fallbacks]
+    last_error = None
+
+    for model in candidates:
+        try:
+            return client.messages.create(model=model, **kwargs)
+        except APIStatusError as e:
+            if e.status_code in RETRYABLE:
+                # ログに残して次の候補へ
+                log_fallback(tier, model, e.status_code)
+                last_error = e
+                continue
+            raise  # 構文エラーなど回復不能なものは即座に投げる
+
+    raise RuntimeError(f"tier={tier} の全候補が失敗") from last_error
+```
+
+ここで重要なのは、`404`（モデルが存在しない）も「一時的」として次候補に回している点です。今回の Fable 5 のように、昨日まで存在したモデルが急に `404` を返すケースを想定しておくと、設定変更が間に合わない瞬間でもサービスが自動的に代替モデルへ切り替わります。
+
+## 出力差をどう吸収するか
+
+モデルを切り替えると、当然ながら出力の質や形式が変わります。フォールバックを安全に機能させるには、出力を「契約」として固定しておくことが欠かせません。実務では次の二点が効きます。
+
+第一に、構造化出力を強制することです。Tool use（function calling）で JSON スキーマを定義しておけば、どのモデルが応答しても同じ形でパースできます。自由記述のテキストを正規表現で切り出す実装は、モデルが変わると簡単に壊れます。
+
+```python
+# どのモデルでも同じスキーマを返すよう強制する
+extract_tool = {
+    "name": "extract_summary",
+    "description": "記事から要約とタグを抽出する",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["summary", "tags"],
+    },
+}
+```
+
+第二に、評価セットを用意することです。代表的な入力 20〜50 件に対する期待出力を用意しておき、フォールバック先のモデルでも許容範囲の品質が出るかを定期的に検証します。これがないと、いざ降格したときに「動いてはいるが品質が落ちている」状態に気づけません。
+
+## webhani の視点
+
+私たちが顧客の AI 機能を設計するとき、最初に確認するのが「このプロダクトは特定の一つのモデルに、どれだけ強く縛られているか」です。今回の Fable 5 の件は規制が原因でしたが、モデルの廃止・値上げ・レート制限の強化は日常的に起きます。供給側の都合でサービスが止まるリスクは、AI を組み込む以上つねに存在します。
+
+実務上の優先順位はシンプルです。まずモデル ID をコードから追い出して設定に集約する。次に実行時フォールバックを入れる。そして構造化出力と評価セットで品質を担保する。この三つを最初に整えておけば、次に「最上位モデルが突然使えなくなった」という日が来ても、対応は設定ファイルの一行と数分のデプロイで済みます。
+
+最新・最上位のモデルを使うこと自体は正しい判断です。ただし、その一つに全体重を預けない設計をセットにしておくこと。それが、変化の速い AI を本番で扱うための現実的な保険になります。
+
+---
+
+参考: [Introducing Claude Opus 4.8 — Anthropic](https://www.anthropic.com/news/claude-opus-4-8), [Models overview — Claude Platform Docs](https://platform.claude.com/docs/en/about-claude/models/overview)

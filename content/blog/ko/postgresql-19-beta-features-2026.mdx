@@ -1,0 +1,78 @@
+---
+title: "PostgreSQL 19 Beta 핵심 기능: 병렬 autovacuum과 REPACK을 운영 관점으로 읽기"
+description: "2026년 6월 출시된 PostgreSQL 19 Beta 1에서 운영 부하에 직접 영향을 주는 병렬 autovacuum, 온라인 REPACK, ON CONFLICT DO SELECT를 중심으로 실무에서 어떻게 작동하는지 예제와 함께 정리합니다."
+date: "2026-07-01"
+status: "published"
+tags: ["PostgreSQL", "Database", "Performance", "Backend", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-19-beta-features-2026"
+---
+
+2026년 6월 4일 PostgreSQL 19 Beta 1이 출시되었습니다([PostgreSQL.org](https://www.postgresql.org/about/news/postgresql-19-beta-1-released-3313/)). 정식 버전은 예년대로 9~10월경으로 예상됩니다. PostgreSQL 18 대비 변경 사항은 200건이 넘지만, 이 글에서는 화려한 새 구문보다 운영 중인 Service의 "무게"에 직접 영향을 주는 변경을 중심으로 다룹니다. 구체적으로 병렬 autovacuum, 온라인 REPACK, 그리고 `ON CONFLICT DO SELECT`입니다.
+
+## 병렬 autovacuum: 유지보수 병목을 푼다
+
+PostgreSQL을 운영 환경에서 오래 다루다 보면 autovacuum이 따라잡지 못해 테이블이 비대해지는(bloat) 문제에 반드시 한 번은 부딪힙니다. 쓰기가 많은 테이블에서는 단일 Process vacuum이 갱신 속도를 이기지 못하기 때문입니다.
+
+PostgreSQL 19에서는 autovacuum이 병렬 Worker를 사용할 수 있게 되었고, `autovacuum_max_parallel_workers`로 병렬도를 설정할 수 있습니다. 더불어 어떤 테이블을 우선해서 vacuum할지 결정하는 scoring 구조도 추가되었습니다.
+
+```sql
+-- 병렬 autovacuum Worker 수 설정
+ALTER SYSTEM SET autovacuum_max_parallel_workers = 4;
+SELECT pg_reload_conf();
+
+-- 크게 갱신되는 테이블에는 개별적으로 임계값을 조정
+ALTER TABLE events SET (
+  autovacuum_vacuum_scale_factor = 0.02,
+  autovacuum_vacuum_insert_scale_factor = 0.05
+);
+```
+
+실무적 의미는 명확합니다. 그동안 심야 시간대에 수동 `VACUUM`을 돌리거나 bloat를 이유로 정기 Maintenance Window를 잡아 온 팀이라면, 그 운영 비용을 줄일 가능성이 생깁니다. 다만 병렬 Worker는 I/O와 CPU를 소비하므로, Worker 수는 운영 부하를 보면서 단계적으로 올리는 편이 안전합니다.
+
+## 온라인 REPACK: Lock을 줄이며 비대화를 해소
+
+비대해진 테이블이나 Index를 물리적으로 재구성하고 싶을 때, 지금까지는 `VACUUM FULL`이 배타 Lock을 잡기 때문에 Service를 멈추지 않고 실행하기 어려웠고, `pg_repack` 확장에 의존하는 것이 정석이었습니다.
+
+PostgreSQL 19에서는 `REPACK` 명령이 본체에 들어와, 온라인 테이블 재편성(repacking)이 표준 기능으로 지원됩니다.
+
+```sql
+-- 테이블을 재구성하여 bloat 해소 (온라인)
+REPACK events;
+
+-- 특정 Index 순서로 물리적으로 정렬
+REPACK events USING INDEX events_created_at_idx;
+```
+
+확장 설치나 권한 설정 없이 표준 명령으로 사용할 수 있다는 점이 큰 이점입니다. 특히 Managed Database(확장 도입에 제약이 있는 환경)에서 이 혜택이 크며, 운영 절차서에서 "확장 Setup"이라는 한 항목을 지울 수 있습니다.
+
+## ON CONFLICT DO SELECT: upsert 다루기가 편해진다
+
+`ON CONFLICT`는 upsert의 정석이지만, 지금까지 충돌 시 기존 행의 값을 가져오려면 `DO UPDATE ... RETURNING`으로 의사 갱신을 하거나 별도로 `SELECT`를 던지는 방법이 필요했습니다.
+
+PostgreSQL 19에서는 `ON CONFLICT DO SELECT`가 도입되어, 충돌한 기존 행을 그대로 반환할 수 있습니다.
+
+```sql
+-- 충돌하면 기존 행을 반환 (불필요한 UPDATE를 발생시키지 않음)
+INSERT INTO api_tokens (user_id, token)
+VALUES (42, 'tok_abc')
+ON CONFLICT (user_id) DO SELECT
+RETURNING id, token, created_at;
+```
+
+"있으면 기존을 가져오고, 없으면 생성해서 가져오는(get-or-create)" 패턴은 Application 쪽에서 자주 등장합니다. 지금까지는 빈 UPDATE를 헛돌게 해서 행 Lock과 WAL을 불필요하게 발생시키던 경우가, SELECT로 끝나게 됩니다. 쓰기량 감소는 Replication 부하와 Disk I/O에도 서서히 영향을 줍니다.
+
+## 그 외 짚어 둘 변경
+
+이 밖에도 Foreign Key 제약 Check가 최대 2배 빨라진 점은 참조 무결성을 엄격하게 설계한 Schema에서 효과를 봅니다. 또 `pg_plan_advice` 확장으로 Planner의 판단을 안정화·제어할 수 있게 되었습니다. 운영 환경에서 특정 Query의 Plan이 갑자기 바뀌어 느려지는 사고에 대한 대처 수단이 늘어난 셈입니다. `COPY TO`의 네이티브 JSON 출력도 데이터 연동 Script를 간결하게 해 줍니다.
+
+## webhani의 관점
+
+새 Major 버전을 평가할 때 저희는 "새 구문의 수"보다 "운영 부하가 얼마나 줄어드는가"를 중시합니다. 그 관점에서 PostgreSQL 19는 병렬 autovacuum과 REPACK이라는, 지금까지 확장이나 수작업으로 메워 온 영역을 본체로 끌어들인 점이 실무적으로 크다고 봅니다.
+
+다만 아직 Beta입니다. 운영 투입은 정식 버전을 기다려야 하며, 검증 환경에서 다음 세 가지를 확인하기를 권합니다. 첫째, 병렬 autovacuum을 켰을 때의 I/O 영향. 둘째, `REPACK`을 실제 테이블 크기로 돌렸을 때의 소요 시간과 Lock 동작. 셋째, 기존 upsert 로직을 `DO SELECT`로 바꿨을 때의 쓰기량 변화입니다. 이들을 Staging에서 측정해 두면, 정식 버전 출시 후의 Migration을 차분하게 진행할 수 있습니다.
+
+---
+
+참고: [PostgreSQL 19 Beta 1 Released! — PostgreSQL.org](https://www.postgresql.org/about/news/postgresql-19-beta-1-released-3313/)
