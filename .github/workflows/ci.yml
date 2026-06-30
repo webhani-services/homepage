@@ -11,7 +11,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      cache-hit: ${{ steps.cache-deps.outputs.cache-hit }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Cache node_modules
+        id: cache-deps
+        uses: actions/cache@v6
+        with:
+          path: node_modules
+          key: node-modules-${{ hashFiles('package-lock.json') }}
+
+      - name: Install dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: npm ci
+
   lint:
+    needs: setup
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -21,11 +45,21 @@ jobs:
           node-version: 22
           cache: npm
 
-      - run: npm ci
+      - name: Restore node_modules
+        id: cache-deps
+        uses: actions/cache@v6
+        with:
+          path: node_modules
+          key: node-modules-${{ hashFiles('package-lock.json') }}
+
+      - name: Install dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: npm ci
 
       - run: npm run lint
 
   typecheck:
+    needs: setup
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -35,11 +69,21 @@ jobs:
           node-version: 22
           cache: npm
 
-      - run: npm ci
+      - name: Restore node_modules
+        id: cache-deps
+        uses: actions/cache@v6
+        with:
+          path: node_modules
+          key: node-modules-${{ hashFiles('package-lock.json') }}
+
+      - name: Install dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: npm ci
 
       - run: npm run typecheck
 
   build:
+    needs: setup
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -49,7 +93,16 @@ jobs:
           node-version: 22
           cache: npm
 
-      - run: npm ci
+      - name: Restore node_modules
+        id: cache-deps
+        uses: actions/cache@v6
+        with:
+          path: node_modules
+          key: node-modules-${{ hashFiles('package-lock.json') }}
+
+      - name: Install dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: npm ci
 
       - name: Cache Next.js build
         uses: actions/cache@v6
