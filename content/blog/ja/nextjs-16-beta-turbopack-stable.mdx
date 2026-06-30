@@ -1,0 +1,122 @@
+---
+title: "Next.js 16 BetaとTurbopack: 移行前に知っておくべきこと"
+description: "Next.js 16 Betaが公開され、Turbopack BuildsのBeta、Stable Node.js Middlewareなど開発体験が大きく改善されています。既存プロジェクトへの影響と移行のポイントを整理します。"
+date: "2026-05-27"
+status: "published"
+tags: ["Next.js", "React", "TypeScript", "Turbopack", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-beta-turbopack-stable"
+---
+
+## Next.js 16 Betaの概要
+
+Next.js 15.5ではTurbopack BuildsのBeta、Stable Node.js Middleware、TypeScriptの改善、`next lint`のDeprecation Warningが追加されました。そしてNext.js 16 Betaが公開され、より大きな変更が予告されています。
+
+最も注目すべきはTurbopackのProductionビルド対応です。WebpackからRust製のTurbopackへの移行は、大規模コードベースでの開発体験を根本的に変えます。
+
+## TurbopackのProductionビルド対応
+
+TurbopackはNext.js 15からDev Serverのデフォルトバンドラーになっています。Next.js 15.5ではProductionビルドへの対応（Beta）が追加され、Webpackとの最後の大きな差が埋まりました。
+
+大規模なCodebaseでの性能差は顕著です:
+
+| 項目 | Webpack | Turbopack |
+|------|---------|-----------|
+| Dev Server初期起動 | 〜5秒 | 〜0.5秒 |
+| HMR応答時間 | 〜500ms | 〜50ms |
+| Productionビルド（大規模Repo） | 基準値 | 最大700倍高速 |
+| メモリ使用量 | 高い | 低い |
+
+Dev Server改善はNext.js 15から恩恵を受けていますが、Productionビルドの改善が今回の新しい要素です。CI/CDパイプラインのビルド時間に直接影響します。
+
+## Stable Node.js Middleware
+
+Edge RuntimeベースのMiddlewareの制約は長年の不満でした。Next.js 15.5からMiddlewareがNode.js Runtimeで安定動作し、Node.js API、crypto、Stream、Native Dependencyを持つサードパーティPackageが使えるようになりました。
+
+```typescript
+// middleware.ts — Node.js Runtime（Next.js 15.5以降）
+import { NextRequest, NextResponse } from 'next/server';
+import { verifyJwt } from './lib/auth'; // Node.js crypto依存 — 使用可能に
+
+export async function middleware(req: NextRequest) {
+  const token = req.cookies.get('session')?.value;
+
+  if (!token) {
+    return NextResponse.redirect(new URL('/login', req.url));
+  }
+
+  const payload = await verifyJwt(token);
+  if (!payload) {
+    return NextResponse.redirect(new URL('/login', req.url));
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ['/dashboard/:path*', '/api/:path*'],
+};
+```
+
+MiddlewareでのJWT検証のためにRoute HandlerやCustom Serverを経由していたWorkaroundが不要になります。
+
+## `next lint`のDeprecation
+
+`next lint`がDeprecate予定となり、ESLintを直接管理する形に移行します。Upgrade前にLint設定の整備が必要です。
+
+```js
+// eslint.config.js（Flat Config形式）
+import { FlatCompat } from '@eslint/eslintrc';
+
+const compat = new FlatCompat();
+
+export default [
+  ...compat.extends('next/core-web-vitals'),
+  {
+    rules: {
+      // プロジェクト固有のルール
+    },
+  },
+];
+```
+
+`package.json`のScriptとCI設定で`next lint`を直接呼び出している箇所を確認して修正してください。
+
+## 既存プロジェクトへの移行時の注意点
+
+**Turbopack ProductionビルドはまだBetaです。** WebpackからTurbopackに切り替える前に:
+
+- `next build --turbopack`でローカルビルドを検証する
+- カスタムWebpack Loaderや Pluginとの互換性を確認する
+- CI環境での実際のビルド時間を計測する（ローカルと差異がある場合がある）
+
+**React 19のServer/Client Componentの境界設計がより重要になります。** Next.js 16はReact 19を前提とします。`'use client'`の境界が整理されていない場合は今が見直す機会です:
+
+```typescript
+// デフォルト: Server Component
+async function ProductPage({ id }: { id: string }) {
+  const product = await db.products.findById(id); // Serverサイドで実行
+  return <ProductView product={product} />;
+}
+
+// 明示的なClient Component
+'use client';
+import { useState } from 'react';
+
+function ProductView({ product }: { product: Product }) {
+  const [quantity, setQuantity] = useState(1);
+  // ブラウザのStateとEventが使用可能
+}
+```
+
+## まとめ
+
+Next.js 16の変更は段階的に採用するのが現実的です:
+
+1. `next lint`のDeprecationに備えてESLint設定を直接管理する（今すぐ対応可能）
+2. Node.js RuntimeでのMiddleware動作を確認する
+3. Staging環境でTurbopack Productionビルドをテストする
+4. Next.js 16 BetaのProduction導入はStable Releaseまで待つ
+
+Dev ServerはすでにNext.js 15でTurbopackの恩恵を受けているため、多くのチームにとってバージョン16での主な利点はProductionビルド速度の向上です。

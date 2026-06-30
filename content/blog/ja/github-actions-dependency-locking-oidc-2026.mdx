@@ -1,0 +1,107 @@
+---
+title: "GitHub Actions 2026 セキュリティロードマップ：Dependency Locking と OIDC Custom Claims の実装"
+description: "GitHub は 2026 年のセキュリティロードマップで Workflow Dependency Locking と OIDC Custom Property Claims（4月 GA）を発表しました。サプライチェーン攻撃への具体的な対策を実装例とともに解説します。"
+date: "2026-05-02"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "Security", "DevSecOps", "OIDC"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-dependency-locking-oidc-2026"
+---
+
+CI/CD パイプラインへの攻撃は 2025 年以降も増加傾向にあります。GitHub は 2026 年のセキュリティロードマップとして複数の新機能を発表しており、その中で現在利用可能になっているものが **Workflow Dependency Locking** と **OIDC Custom Property Claims（2026 年 4 月 GA）** です。
+
+既存の Egress Firewall とは異なるレイヤーで機能するこれらの機能が、実際のセキュリティ対策にどう貢献するかを整理します。
+
+## Workflow Dependency Locking
+
+現行の GitHub Actions では `uses: actions/checkout@v4` のようにタグを指定してアクションを参照するケースが多いですが、タグは書き換え可能であるため、侵害されたリポジトリが悪意のあるコミットを同じタグで提供するリスクがあります。
+
+Dependency Locking は、Go の `go.sum` に相当する仕組みをワークフローに導入します。`dependencies:` セクションで直接・間接依存のコミット SHA を固定します。
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on: [push, pull_request]
+
+dependencies:
+  actions/checkout:
+    version: "v4"
+    sha: "11bd71901bbe5b1630ceea73d27597364c9af68"
+  actions/setup-node:
+    version: "v4"
+    sha: "49933ea5288caeca8642d1e84afbd3f7d6820020"
+  actions/cache:
+    version: "v4"
+    sha: "5a3ec84eff668545956fd18022ec81e4c5de7fe6"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci && npm test
+```
+
+SHA が一致しない場合は実行前にジョブが停止します。依存関係の変更は PR に diff として現れるため、意図しない更新をコードレビューで検出できます。
+
+## OIDC Custom Property Claims（GA）
+
+2026 年 4 月に GA となった OIDC Custom Property Claims は、リポジトリのカスタムプロパティを OIDC トークンのクレームとして含める機能です。
+
+従来の OIDC トークンにはリポジトリ名・ブランチ・ジョブ名などの基本情報が含まれていましたが、Custom Property Claims を使うとクラウドプロバイダの ABAC ポリシーをより細かく制御できます。`team=backend`、`env=production` のようなプロパティが設定されたリポジトリは、それらの値をトークンクレームとして出力します。
+
+```yaml
+# .github/workflows/deploy.yml
+permissions:
+  id-token: write  # OIDC トークン生成に必要
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789:role/BackendProdRole
+          aws-region: ap-northeast-1
+```
+
+AWS の信頼ポリシー側では次のように条件を追加します。
+
+```json
+{
+  "Condition": {
+    "StringEquals": {
+      "token.actions.githubusercontent.com:sub": "repo:myorg/myrepo:ref:refs/heads/main",
+      "token.actions.githubusercontent.com:custom_property_team": "backend",
+      "token.actions.githubusercontent.com:custom_property_env": "production"
+    }
+  }
+}
+```
+
+`team=backend` かつ `env=production` が設定されたリポジトリのみが特定の IAM ロールを引き受けられるようになります。リポジトリ名をハードコーディングすることなく、属性ベースのアクセス制御が実現できます。新しいリポジトリを `backend` チームに追加すれば自動的にアクセスが付与され、プロパティを削除すれば即座に取り消されます。
+
+## 実装優先度の考え方
+
+セキュリティ機能の導入は一度に全部行う必要はありません。リスクとコストのバランスで優先度をつけます。
+
+| 機能 | 保護対象 | 導入コスト | 優先度 |
+|------|----------|------------|--------|
+| SHA ピン留め（既存） | アクションの改ざん | 低 | 即時対応推奨 |
+| Dependency Locking | 推移的依存を含む改ざん | 中 | ロードマップ追跡 |
+| OIDC Custom Claims | クラウド権限の粒度向上 | 中 | 複数チーム運用時に有効 |
+| Egress Firewall | Runner からの不正通信 | 高 | リスク評価後 |
+
+今すぐできることは、既存ワークフローでタグ参照を SHA ピン留めに切り替えることです。`step-security/harden-runner` などのツールで自動化できます。
+
+## まとめ
+
+Dependency Locking は CI/CD ワークフローのサプライチェーンリスクに対して宣言的なロックを提供し、OIDC Custom Property Claims はクラウドアクセス制御をリポジトリ属性で細分化します。
+
+OIDC Custom Claims は現在すぐ利用可能です。複数リポジトリのアクセス制御を管理している場合は、2026 年のセキュリティロードマップの残りがリリースされる前に導入を検討する価値があります。

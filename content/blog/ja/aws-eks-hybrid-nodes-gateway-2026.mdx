@@ -1,0 +1,162 @@
+---
+title: "AWS EKS Hybrid Nodes Gateway でオンプレミスと Cloud の境界をなくす"
+description: "AWS が発表した EKS Hybrid Nodes Gateway により、ネットワーク構成変更なしでクラウドとオンプレミスの Pod 間通信が実現します。ハイブリッドインフラ設計への影響を解説します。"
+date: "2026-05-08"
+status: "published"
+tags: ["AWS", "Kubernetes", "EKS", "HybridCloud", "CloudInfrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-eks-hybrid-nodes-gateway-2026"
+---
+
+AWS は2026年5月4日、EKS Hybrid Nodes Gateway を発表しました。クラウドとオンプレミスの Pod 間通信を、既存のネットワークインフラを変更することなく実現する機能です。ハイブリッドクラウド構成を持つチームにとって、運用コストを大幅に削減できる可能性があります。
+
+## これまでの課題
+
+オンプレミスの Kubernetes ノードを EKS クラスターに統合する「EKS Hybrid Nodes」は以前から存在していましたが、クラウドとオンプレミスの Pod 間通信を実現するためにはネットワーク側での追加設定が必要でした。具体的には以下のような作業が発生していました。
+
+- VPN や AWS Direct Connect の設定
+- Pod CIDR ルーティングの手動設定
+- ファイアウォールルールの変更
+- ネットワーク担当チームとの調整
+
+これらは技術的には実現可能ですが、構成の複雑さと変更管理のコストが実際の導入障壁になっていました。
+
+## EKS Hybrid Nodes Gateway の仕組み
+
+EKS Hybrid Nodes Gateway は、クラウドとオンプレミスの Pod 間通信を Gateway レイヤーで透過的に処理します。ネットワークインフラを変更しなくても Pod-to-Pod 通信が確立できます。
+
+```bash
+# EKS Hybrid Nodes Gateway を有効にしたクラスター作成
+aws eks create-cluster \
+  --name production-hybrid-cluster \
+  --kubernetes-version 1.36 \
+  --resources-vpc-config \
+    subnetIds=["subnet-0abc123","subnet-0def456"],\
+    securityGroupIds=["sg-0abc123"] \
+  --hybrid-node-config \
+    enabledNodeTypes=["onPremises"],\
+    remoteNetworkConfig='{"remotePodNetworks":[{"cidrs":["10.0.0.0/16"]}],"remoteNodeNetworks":[{"cidrs":["192.168.0.0/24"]}]}'
+```
+
+既存クラスターへの追加も可能です。
+
+```bash
+# 既存クラスターに Hybrid Nodes Gateway を追加
+aws eks update-cluster-config \
+  --name existing-cluster \
+  --hybrid-node-config \
+    enabledNodeTypes=["onPremises"],\
+    remoteNetworkConfig='{"remotePodNetworks":[{"cidrs":["10.0.0.0/16"]}]}'
+```
+
+## 実際の構成例
+
+クラウドに API Gateway サービス、オンプレミスにデータベースアクセス層を配置するハイブリッド構成の例です。
+
+```yaml
+# cloud-api.yaml — クラウド側の Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/compute-type: ec2  # クラウドノードに配置
+      containers:
+        - name: api-gateway
+          image: api-gateway:2.1.0
+          env:
+            - name: DATA_SERVICE_URL
+              # Kubernetes Service DNS — クラウド/オンプレミスの境界を越えて動作
+              value: "http://data-service.production.svc.cluster.local:8080"
+---
+# onprem-data.yaml — オンプレミス側の Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-service
+  namespace: production
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: data-service
+  template:
+    metadata:
+      labels:
+        app: data-service
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/compute-type: hybrid  # オンプレミスノードに配置
+      containers:
+        - name: data-service
+          image: data-service:1.5.0
+          # オンプレミスの DB に直接アクセス可能
+```
+
+Gateway によって、`api-gateway` Pod からは `data-service` が同一クラスター内の Service として見えます。Pod が物理的にどこにあるかを意識せずにサービスディスカバリーが機能します。
+
+## Kubernetes v1.36 との組み合わせ
+
+この Gateway 機能は Kubernetes v1.36 を前提としています。v1.36 では Declarative Validation が GA になり、API の信頼性と予測可能性が向上しています。不正な設定値はより早い段階でエラーとして検出されるため、ハイブリッド構成の設定ミスを未然に防ぎやすくなっています。
+
+## 採用前に確認すべきこと
+
+**レイテンシーの測定**
+
+クラウドとオンプレミスの物理的な距離によっては、Pod 間通信にレイテンシーが生じます。Gateway がネットワーク設定の問題を解決しても、物理距離の影響は残ります。同期処理を必要とするサービスをクラウドとオンプレミスに分散させる場合は、事前に実際の Round-trip Time を測定してください。
+
+**Network Policy の設計**
+
+オンプレミスの Pod がクラウドの Service と通信できるようになることで、攻撃面が広がる可能性があります。NetworkPolicy を使ってどの Pod が相互通信できるかを明示的に制御してください。
+
+```yaml
+# オンプレミス Pod の Egress を制限する NetworkPolicy
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-onprem-egress
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      location: on-premises
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              accepts-onprem-traffic: "true"
+      ports:
+        - port: 8080
+```
+
+## どのような組織に向いているか
+
+EKS Hybrid Nodes Gateway が最も価値を発揮するケースは以下のとおりです。
+
+- 規制・コンプライアンス要件で特定データをオンプレミスに保持しなければならない
+- オンプレミスの既存資産があり、全面的なクラウド移行が現実的でない
+- ワークロードをクラウドへ段階的に移行したい
+
+## webhani の見解
+
+EKS Hybrid Nodes Gateway は、ハイブリッドクラウド戦略を持つ企業にとって実質的な導入障壁を下げる変更です。ネットワーク変更が不要になることで、インフラチームの調整コストが削減され、Kubernetes への移行をより段階的に進めることができます。
+
+まずは非クリティカルなサービスでハイブリッド構成を試し、レイテンシーと NetworkPolicy の動作を確認してから本番ワークロードに適用することを推奨します。
+
+---
+
+*参考: Cloud Native Now, thenewstack.io, cloudnativenow.com*

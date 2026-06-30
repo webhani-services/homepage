@@ -1,0 +1,88 @@
+---
+title: "2026년의 Biome: ESLint와 Prettier를 교체해야 할 때, 그렇지 않을 때"
+description: "Biome의 Rust Toolchain은 ESLint와 Prettier가 1분 가까이 걸리는 1만 File의 Lint·Format을 1초 미만에 처리합니다. 하지만 속도만으로 결정이 나지는 않습니다. 실용적인 Migration Framework를 제시합니다."
+date: "2026-06-13"
+status: "published"
+tags: ["Biome", "ESLint", "Prettier", "TypeScript", "개발 도구"]
+thumbnail: ""
+author: "webhani"
+slug: "biome-rust-toolchain-eslint-prettier-2026"
+---
+
+JavaScript Toolchain은 조용히 JavaScript에서 Rust로 이동하고 있으며, Biome은 그 가장 분명한 사례입니다. Lint와 Format을 단일 Rust Binary로 묶어 ESLint와 Prettier를 모두 대체하며, 성능 격차는 미묘하지 않습니다. 공개 Benchmark에 따르면 Biome은 1만 File의 Lint를 약 0.8초(ESLint는 45.2초), Format을 0.3초(Prettier는 12.1초)에 처리한다고 합니다.
+
+속도는 표제입니다. 다만 "Migration을 할 것인가"는 더 섬세한 질문이며, 팀에게 진짜 중요한 것은 그 섬세함입니다.
+
+## 단일 Rust Binary가 계산식을 바꾸는 이유
+
+ESLint와 Prettier는 책임이 겹치고, 설정이 따로이며, Format Rule을 두고 오랫동안 충돌해 온 두 도구입니다. 표준 해법인 `eslint-config-prettier`로 충돌 Rule을 비활성화하는 것은 Architecture의 이음매에 붙인 반창고일 뿐입니다. Biome은 공유 Parser 위에서 두 작업을 한 번에 수행해, 그 이음매 자체를 없앱니다.
+
+단일 File에서는 차이를 체감할 수 없습니다. 격차가 효과를 내는 곳은 아픈 자리입니다. Pre-commit Hook, CI의 Lint Job, 대규모 Monorepo에서의 Editor 저장 시 Format. 45초에서 1초 미만으로 떨어지는 Lint Step은 개발자의 행동을 바꿉니다. 빠른 Feedback은 실행되고, 느린 Feedback은 건너뛰거나 Merge를 막는 CI로 밀려납니다.
+
+```bash
+# 설치와 초기화
+npm install --save-dev --save-exact @biomejs/biome
+npx biome init
+
+# eslint + prettier 호출 쌍을 대체한다
+npx biome check --write ./src
+```
+
+최소한의 `biome.json`이, 이전에 설정 File 두 개가 필요했던 내용을 커버합니다.
+
+```json
+{
+  "$schema": "https://biomejs.dev/schemas/2.3.0/schema.json",
+  "formatter": { "enabled": true, "indentStyle": "space" },
+  "linter": {
+    "enabled": true,
+    "rules": { "recommended": true }
+  }
+}
+```
+
+## 정직한 한계
+
+여기서 저희는 고객이 ESLint를 떼어내기 전에 한 번 멈춰 세웁니다. 2.x 계열의 Biome은 400개 이상의 Lint Rule을 갖추고 Type-aware Lint를 추가했습니다. 즉, 별도의 `tsc` 실행 없이 많은 TypeScript 인지 검사를 수행합니다. 그러나 세 가지 Gap은 여전히 현실입니다.
+
+1. **Plugin Ecosystem.** Framework 고유 Rule Set인 `eslint-plugin-react-hooks`, `eslint-plugin-next`, Accessibility Plugin에는 아직 완전한 Biome 대응물이 없습니다. Hooks Rule Lint가 당신의 React Codebase에서 핵심 역할을 한다면, ESLint를 완전히 버릴 수 없습니다.
+2. **Custom Rule.** 팀이 작성한 사내 ESLint Rule은 이식되지 않습니다.
+3. **Type-checking 자체.** Type-aware **Lint**는 Type-checking과 같지 않습니다. Biome은 완전한 Type 검증에서는 여전히 `tsc`에 의존합니다. Compiler를 보완하는 것이지 대체하는 것이 아닙니다.
+
+실무적 귀결은 이렇습니다. 많은 팀에게 2026년의 정직한 한 수는 "ESLint를 대체한다"가 아니라 "Biome을 Format과 핵심 Lint로 한정하고, Biome이 다루지 않는 Rule은 ESLint에 남기며, 이중 수정을 피하기 위해 중복 Rule을 비활성화한다"입니다.
+
+## 판단 Framework
+
+Migration 여부를 정하는 고객에게는 단순한 Test를 사용합니다.
+
+**Biome으로 전면 이전**이 타당한 경우: 프로젝트가 Framework 고유 Lint Plugin에 크게 의존하지 않는 JavaScript/TypeScript이고, 팀에 Custom ESLint Rule이 없으며, CI·Editor의 Lint Latency가 실제로 체감되는 통점일 때. 특히 Greenfield 프로젝트는 느린 Stack으로 시작할 이유가 거의 없습니다.
+
+**Biome으로 부분 이전**이 타당한 경우: `eslint-plugin-react-hooks`, Next.js Lint Rule, a11y Plugin에 의존할 때. 속도를 위해 Biome을 Formatter와 Base Linter로 쓰고, 전문 Rule을 위해 얇은 ESLint 설정을 남기며, 둘이 충돌하지 않도록 ESLint의 Format Rule을 끕니다.
+
+**ESLint + Prettier에 머무는 것**이 타당한 경우: Custom Rule에 큰 투자가 있고, Plugin 중심의 성숙한 설정이 잘 동작하며, Lint 속도가 실제 마찰을 만들지 않을 때. 잘 돌아가는 구성을 목적 없이 옮기는 것은 churn에 값하지 않습니다.
+
+## 일괄 전환을 피한 Migration
+
+이전을 결정했다면 점진적으로 진행합니다.
+
+```bash
+# 1. 기존 설정을 출발점으로 Biome에 가져오게 한다
+npx biome migrate eslint --write
+npx biome migrate prettier --write
+
+# 2. 먼저 Format부터 — 가장 저위험·고가치의 승부수
+npx biome format --write ./src
+
+# 3. Lint Rule Group을 조금씩 활성화하며 고쳐 나간다
+npx biome lint --write ./src
+```
+
+Format을 먼저. Format 변경은 기계적이고, 하나의 큰 diff로 Review하기 쉽습니다. 그 후 Lint Rule Group을 하나씩 켜서, 첫날에 팀이 위반의 산에 빠지지 않게 합니다.
+
+## 정리
+
+Biome은 더 넓은 흐름 — 속도를 위해 Toolchain이 Compile 언어로 옮겨가는 흐름 — 의 일부입니다. 적합한 프로젝트에는 실제 마찰을 제거합니다. 하나의 Binary, 하나의 설정, 1초 미만의 Feedback. 그러나 "더 빠르다"가 자동으로 "더 잘 맞는다"가 되지는 않습니다. 잘 이전하는 팀은 정직하게 Scope를 끊는 팀입니다. Biome이 준비된 곳에서는 속도를 취하고, 그 Ecosystem이 아직 대체 불가한 곳에서는 ESLint를 남기며, 빠른 도구가 있다는 이유만으로 잘 돌아가는 구성을 다시 쓰는 함정을 피하는 것입니다.
+
+---
+
+*출처: [Biome](https://biomejs.dev/), [Biome migration guide for 2026 — DEV Community](https://dev.to/pockit_tools/biome-the-eslint-and-prettier-killer-complete-migration-guide-for-2026-27m), [OXC vs ESLint vs Biome — PkgPulse](https://www.pkgpulse.com/guides/oxc-vs-eslint-vs-biome-javascript-linting-2026)*

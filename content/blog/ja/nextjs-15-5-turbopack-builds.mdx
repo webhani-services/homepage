@@ -1,0 +1,121 @@
+---
+title: "Next.js 15.5：Turbopack Builds が Beta に、Node.js Middleware が Stable へ"
+description: "Next.js 15.5 では Turbopack を使ったプロダクションビルドが Beta に到達し、Node.js Middleware が Stable になりました。移行時のポイントと実用的な注意点を解説します。"
+date: "2026-05-11"
+status: "published"
+tags: ["Next.js", "Turbopack", "TypeScript", "web-development", "frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-15-5-turbopack-builds"
+---
+
+## Next.js 15.5 の概要
+
+Next.js 15.5 がリリースされ、2 つの注目すべき変更が含まれています。
+
+1. **Turbopack Builds が Beta に昇格** — 開発サーバーだけでなく `next build` でも Turbopack が使えるようになりました
+2. **Node.js Middleware が Stable に** — Edge ランタイムの制約を受けず、通常の Node.js API を Middleware で利用できます
+
+また、TypeScript の改善として Typed Routes と Route Export の Validation が含まれています。
+
+## Turbopack Builds：何が変わるのか
+
+これまで Turbopack は開発サーバー（`next dev --turbopack`）でのみ利用可能でした。15.5 から `next build` でも Turbopack が使えるようになりました。
+
+```bash
+# 15.5 からの Turbopack Build（Beta）
+next build --turbopack
+
+# または package.json の scripts に追加
+# {
+#   "scripts": {
+#     "build": "next build --turbopack"
+#   }
+# }
+```
+
+Turbopack は Webpack と比較して大規模プロジェクトでの Build 時間を大幅に短縮できます。Beta 段階のため本番環境への適用は慎重に行う必要がありますが、CI 環境でのビルド時間短縮を試せる段階に来ています。
+
+### 注意点
+
+- 一部の Webpack Plugin や Loader は Turbopack と互換性がない場合があります
+- Beta 段階での本番採用は、事前に十分なテストが必要です
+- `next lint` は 15.5 で deprecated になっているため、ESLint の設定を直接使うようにしてください
+
+## Node.js Middleware の Stable 化
+
+これまでの Next.js Middleware は Edge ランタイム上で動作するため、使えない Node.js API が多くありました。15.5 からは Node.js Middleware が Stable になり、この制約が解消されます。
+
+```typescript
+// middleware.ts
+// Node.js Middleware（15.5 Stable）
+
+import { NextRequest, NextResponse } from "next/server";
+// Edge Runtime では使えなかった Node.js の標準 API が使える
+import { createHash } from "crypto";
+
+export function middleware(request: NextRequest) {
+  const token = request.cookies.get("session")?.value ?? "";
+
+  // crypto モジュールを直接使用（Edge Runtime では不可だった）
+  const hash = createHash("sha256").update(token).digest("hex");
+
+  const response = NextResponse.next();
+  response.headers.set("x-session-hash", hash);
+  return response;
+}
+
+export const config = {
+  matcher: ["/api/:path*", "/dashboard/:path*"],
+};
+```
+
+これにより、これまで API Route で行っていた一部の処理を Middleware に移動できるようになります。認証ミドルウェアや、セッション検証のパターンがシンプルになります。
+
+## TypeScript の改善
+
+**Typed Routes**
+Route の型安全性が向上し、`<Link href>` や `router.push()` に不正なパスを渡すと TypeScript エラーが出るようになっています。
+
+```typescript
+// next.config.mjs で有効化
+const nextConfig = {
+  experimental: {
+    typedRoutes: true,
+  },
+};
+```
+
+```tsx
+// ✅ 正しいパス
+<Link href="/dashboard">Dashboard</Link>
+
+// ❌ 存在しないパス → TypeScript エラー
+<Link href="/dashbord">Dashboard</Link>
+```
+
+**Route Export Validation**
+Page コンポーネントや Route Handler に不正な Export が含まれていると、ビルド時にエラーが出るようになりました。これまで無視されていたミスがビルドタイムで表面化します。
+
+## Next.js 16 の Deprecation 警告
+
+Next.js 15.5 では Next.js 16 に向けた Deprecation 警告が追加されています。現在のプロジェクトで警告が出ている場合は、16 へのアップグレードに備えて早めに対応しておくと良いでしょう。
+
+```bash
+# 現在の Deprecation 警告を確認
+next build 2>&1 | grep -i "warn\|deprecated"
+```
+
+## webhani の見解
+
+Next.js 15.5 の中でも、Node.js Middleware の Stable 化は実務への影響が大きい変更です。これまで Edge Runtime の制約で諦めていた処理をシンプルに Middleware に書けるようになります。
+
+Turbopack Build については Beta 段階なので、まずは CI でのビルド時間測定から始めることをお勧めします。Webpack との互換性確認を十分に行った上で、段階的に移行するアプローチが安全です。
+
+## まとめ
+
+- `next build --turbopack` で Turbopack Build が Beta として使用可能に
+- Node.js Middleware が Stable に（Edge Runtime の制約を脱却）
+- Typed Routes と Route Export Validation で TypeScript 体験が向上
+- `next lint` は Deprecated — ESLint 設定を直接使う構成に移行を
+- Next.js 16 への Deprecation 警告が追加 — 早めの対応を

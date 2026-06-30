@@ -1,0 +1,214 @@
+---
+title: "Next.js セキュリティパッチを読む：Middleware バイパス・Cache Poisoning・XSS の実態と対策"
+description: "Next.js が複数の深刻なセキュリティ脆弱性を修正するパッチをリリース。DoS、Middleware バイパス、XSS、SSRF、Cache Poisoning など App Router / Pages Router の両方に影響する問題の詳細と対策を解説します。"
+date: "2026-05-12"
+status: "published"
+tags: ["Next.js", "Security", "Web Development", "Middleware", "Cache"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-security-patches-2026"
+---
+
+## Next.js がセキュリティパッチをリリース
+
+Next.js が高・中・低の各深刻度にわたる複数のセキュリティ脆弱性を修正したリリースを公開しました。App Router と Pages Router の両方に影響する問題が含まれており、Next.js を本番環境で運用しているチームは早急な確認と対応が必要です。
+
+修正された脆弱性の種類：
+
+- **DoS（Denial of Service）**：特定のリクエストパターンでサーバーが過負荷になる
+- **Middleware バイパス**：認証・認可ロジックを Middleware で実装している場合に迂回される
+- **XSS（Cross-Site Scripting）**
+- **SSRF（Server-Side Request Forgery）**
+- **Cache Poisoning**
+
+## なぜこれは深刻か
+
+### Middleware バイパスの危険性
+
+Next.js の Middleware は認証チェックやアクセス制御に広く使われています。このバイパス脆弱性が悪用されると、認証をかけているはずのページや API Route に認証なしでアクセスされる可能性があります。
+
+```typescript
+// 脆弱な実装例 — Middleware だけに依存した認証
+// middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+
+export function middleware(request: NextRequest) {
+  const token = request.cookies.get("auth-token");
+  if (!token) {
+    return NextResponse.redirect(new URL("/login", request.url));
+  }
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ["/dashboard/:path*", "/api/protected/:path*"],
+};
+```
+
+この実装では、Middleware バイパスが発生した場合に `/dashboard` や `/api/protected` が無防備になります。
+
+```typescript
+// 改善例：API Route 内でも独立して認証を検証する
+// app/api/protected/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { verifyToken } from "@/lib/auth";
+
+export async function GET(request: NextRequest) {
+  const token = request.cookies.get("auth-token")?.value;
+
+  // Middleware に依存せず、Route ハンドラー内でも検証
+  if (!token || !(await verifyToken(token))) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  return NextResponse.json({ data: "protected data" });
+}
+```
+
+**原則：Middleware は最初の防衛線として機能させ、個々の API Route や Server Action でも独立した認証を行う。**
+
+### Cache Poisoning の影響範囲
+
+Cache Poisoning は、攻撃者が悪意のあるコンテンツをキャッシュに書き込み、後続のユーザーに配信されるようにする攻撃です。Next.js の App Router では積極的なキャッシュ戦略が採用されているため、この攻撃が成立した場合の影響範囲が広くなる可能性があります。
+
+```typescript
+// Server Component でのキャッシュ制御を明示する
+// app/page.tsx
+export const dynamic = "force-dynamic"; // キャッシュを完全に無効化
+
+export default async function Page() {
+  // fetch でも明示的なキャッシュ制御を行う
+  const userData = await fetch("https://api.example.com/user", {
+    cache: "no-store", // ユーザー別データはキャッシュしない
+  });
+
+  const publicData = await fetch("https://api.example.com/public", {
+    next: { revalidate: 300 }, // 公開データは5分で再検証
+  });
+
+  return <div>{/* ... */}</div>;
+}
+```
+
+動的コンテンツには `cache: 'no-store'` を設定し、静的コンテンツには適切な `revalidate` 値を設定することで、意図しないキャッシュ動作を防げます。
+
+## 即座に取るべき対応
+
+### 1. バージョンの確認とアップグレード
+
+```bash
+# 現在のバージョン確認
+npm list next
+
+# 最新版へのアップグレード
+npm install next@latest
+```
+
+Next.js の GitHub リリースページで対象バージョンの範囲を確認し、影響を受けるバージョンを使用している場合は速やかにアップグレードしてください。
+
+### 2. Middleware の実装を見直す
+
+Middleware に認証・認可ロジックを任せている箇所を特定し、個々の保護された Route でも独立した検証を追加してください。
+
+### 3. Content-Security-Policy の設定
+
+XSS への追加の防御層として、CSP ヘッダーを設定します。
+
+```typescript
+// next.config.mjs
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  async headers() {
+    return [
+      {
+        source: "/(.*)",
+        headers: [
+          {
+            key: "Content-Security-Policy",
+            value: [
+              "default-src 'self'",
+              "script-src 'self'",
+              "style-src 'self' 'unsafe-inline'",
+              "img-src 'self' data: https:",
+              "connect-src 'self' https://api.example.com",
+              "frame-ancestors 'none'",
+            ].join("; "),
+          },
+        ],
+      },
+    ];
+  },
+};
+
+export default nextConfig;
+```
+
+### 4. SSRF 対策：外部リクエストの URL バリデーション
+
+Server Actions や API Routes から外部 URL にリクエストを送る場合は、URL の検証を必ず行います。
+
+```typescript
+// SSRF 対策のサンプル
+const ALLOWED_HOSTS = new Set(["api.example.com", "cdn.example.com"]);
+
+function validateExternalUrl(url: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error("Invalid URL");
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("HTTP/HTTPS のみ許可");
+  }
+
+  if (!ALLOWED_HOSTS.has(parsed.hostname)) {
+    throw new Error(`ホスト ${parsed.hostname} は許可されていません`);
+  }
+
+  return parsed;
+}
+
+export async function fetchExternalData(url: string) {
+  const validated = validateExternalUrl(url); // 不正な URL は例外をスロー
+  const response = await fetch(validated.toString());
+  return response.json();
+}
+```
+
+Blocklist よりも Allowlist 方式の方が確実です。内部 IP アドレス範囲の漏れが防げます。
+
+### 5. 自動依存関係更新の設定
+
+```json
+// .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    allow:
+      - dependency-name: "next"
+```
+
+Dependabot や Renovate を設定することで、Next.js のパッチリリースに対する対応時間を大幅に短縮できます。
+
+## webhani の推奨事項
+
+1. **Middleware を唯一の認証手段にしない**：Defense in Depth（多層防御）の原則に従い、API Route や Server Action でも独立した認証を行う
+2. **動的コンテンツのキャッシュ設定を見直す**：意図せずセンシティブなデータがキャッシュされていないか確認する
+3. **CSP ヘッダーを設定する**：XSS への追加の防御層として有効
+4. **外部リクエストは Allowlist で制御する**：SSRF 対策には Blocklist より Allowlist が確実
+5. **依存関係の自動更新を設定する**：Dependabot や Renovate で Next.js のパッチを継続的に適用する
+
+セキュリティは「一度設定したら完了」ではなく、継続的な監視と対応が必要です。
+
+## まとめ
+
+- Next.js が DoS、Middleware バイパス、XSS、SSRF、Cache Poisoning の脆弱性を修正
+- App Router / Pages Router 両方に影響するため、Next.js 利用者は全員確認が必要
+- Middleware だけに認証を依存する実装は、バイパス攻撃に対して脆弱
+- 多層防御・明示的なキャッシュ制御・CSP 設定・URL バリデーションで防御を固める
+- Dependabot 等で Next.js のアップデートを継続的に管理することが重要

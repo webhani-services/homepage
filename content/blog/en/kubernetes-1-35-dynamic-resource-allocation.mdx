@@ -1,0 +1,163 @@
+---
+title: "Kubernetes 1.35: Dynamic Resource Allocation Hits Beta for AI/ML Workloads"
+description: "Dynamic Resource Allocation (DRA) graduates to beta in Kubernetes 1.35, bringing a fundamentally new way to manage GPUs and specialized hardware. Here's what changes for teams running AI/ML on Kubernetes."
+date: "2026-05-12"
+status: "published"
+tags: ["Kubernetes", "GPU", "AI/ML", "Cloud Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-35-dynamic-resource-allocation"
+---
+
+## The Problem DRA Solves
+
+Running AI workloads on Kubernetes has had a persistent friction point: the platform was designed around CPU and memory, and GPU resource management has been bolted on via the Device Plugin API rather than built in.
+
+The Device Plugin approach works with simple integer counts. You request one GPU, you get one GPU. But AI workloads often need more precision: a specific GPU model, a fraction of a GPU via MIG slicing, or two GPUs that share an NVLink connection for efficient distributed training.
+
+Kubernetes 1.35's Dynamic Resource Allocation graduating to beta is the platform's structural answer to this.
+
+## What Changed From Device Plugins
+
+The old Device Plugin approach:
+
+```yaml
+# Integer-only GPU request — no model selection, no memory constraints
+containers:
+  - name: trainer
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+```
+
+This tells Kubernetes "give me one GPU" with no way to express requirements like GPU memory size, interconnect topology, or hardware generation.
+
+DRA introduces `DeviceClass` and `ResourceClaim` objects that express resource requirements with precision:
+
+```yaml
+# DeviceClass — describes a category of hardware
+apiVersion: resource.k8s.io/v1beta1
+kind: DeviceClass
+metadata:
+  name: nvidia-h100
+spec:
+  selectors:
+    - cel:
+        expression: >
+          device.driver == "nvidia.com" &&
+          device.attributes["model"].string == "H100"
+```
+
+```yaml
+# ResourceClaim — a specific, detailed resource request
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: training-gpus
+spec:
+  devices:
+    requests:
+      - name: gpus
+        deviceClassName: nvidia-h100
+        allocationMode: ExactCount
+        count: 2
+        selectors:
+          - cel:
+              expression: >
+                device.attributes["memory"].quantity >= quantity("80Gi") &&
+                device.attributes["nvlink"].bool == true
+```
+
+This ResourceClaim says: "I need exactly 2 H100 GPUs with at least 80GB memory and NVLink enabled." The scheduler can now make a meaningful placement decision based on actual hardware topology.
+
+## Using DRA in a Pod
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: distributed-training
+spec:
+  resourceClaims:
+    - name: gpu-resources
+      resourceClaimName: training-gpus
+  containers:
+    - name: trainer
+      image: pytorch/pytorch:2.5-cuda12.4
+      resources:
+        claims:
+          - name: gpu-resources
+      command: ["torchrun", "--nproc_per_node=2", "train.py"]
+```
+
+The Pod references the ResourceClaim by name. Kubernetes won't schedule this Pod until the ResourceClaim can be satisfied — no partial allocations, no silent degradation to a lower-spec GPU.
+
+## GPU Slicing: The Multi-Tenancy Use Case
+
+One of the most practical wins from DRA is cleaner multi-tenant GPU sharing. NVIDIA MIG (Multi-Instance GPU) allows a single A100 or H100 to be partitioned into smaller isolated instances. Previously, managing MIG slices in Kubernetes required custom schedulers and operator-level workarounds.
+
+With DRA, MIG slices become first-class Kubernetes resources:
+
+```yaml
+# Request a specific MIG slice profile
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: small-inference-gpu
+spec:
+  devices:
+    requests:
+      - name: mig-slice
+        deviceClassName: nvidia-gpu-mig
+        count: 1
+        selectors:
+          - cel:
+              expression: 'device.attributes["migProfile"].string == "1g.10gb"'
+```
+
+An inference team can request a 10GB MIG slice, while a fine-tuning team requests a 40GB slice on the same physical GPU. The Kubernetes scheduler handles placement without manual partition management.
+
+## What's Not Ready Yet
+
+DRA is beta, not GA. Important caveats before planning a production migration:
+
+**Driver support varies**: DRA requires vendor-provided DRA drivers. NVIDIA has been actively investing in DRA support, but verify your specific GPU model and driver version. Not all hardware generations are equally supported.
+
+**API can still change**: Beta means the ResourceClaim and DeviceClass API can be modified before GA. Factor in manifest update costs if you adopt early.
+
+**Monitoring tooling is catching up**: Prometheus exporters and Grafana dashboards for DRA resource metrics are still maturing. Plan for reduced observability compared to established Device Plugin metrics.
+
+**Existing Device Plugins stay**: DRA doesn't replace the Device Plugin API — both run simultaneously. This enables gradual migration but also means managing two paradigms during the transition.
+
+## Coexistence Strategy
+
+```yaml
+# Existing workloads keep using Device Plugins (no changes needed)
+containers:
+  - name: legacy-ml-job
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+
+---
+# New AI workloads use DRA ResourceClaims
+resourceClaims:
+  - name: new-training-gpus
+    resourceClaimName: h100-nvlink-pair
+```
+
+Keep existing workloads on Device Plugins, test new AI workloads with DRA in staging, and migrate after verifying behavior and after the monitoring ecosystem catches up.
+
+## Recommendations for Platform Teams
+
+1. **Stand up a test cluster on 1.35+** — enable the DRA feature gate, deploy the NVIDIA DRA driver, and understand the operational model before it's GA and teams start depending on it
+2. **Measure GPU utilization before and after** — DRA enables better allocation, but verify it with metrics; utilization improvement isn't automatic
+3. **Check NVIDIA GPU Operator release notes** for your GPU generation's DRA driver availability
+4. **Treat beta adoption as a learning investment** — running DRA in staging now means being ready to deploy confidently when GA lands
+
+## Takeaways
+
+- Kubernetes 1.35 DRA beta enables precise GPU specification: model, memory, NVLink topology, MIG slice profile — all expressible in YAML
+- This directly addresses the long-standing limitation of integer-based GPU requests in Kubernetes
+- Multi-tenant GPU clusters gain the ability to manage MIG slices as native Kubernetes resources without custom scheduler plugins
+- Production adoption should wait for GA unless you have strong operational reasons to move faster; run it in staging now to get ahead of the curve

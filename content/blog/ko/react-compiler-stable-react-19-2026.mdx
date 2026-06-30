@@ -1,0 +1,145 @@
+---
+title: "React Compiler, React 19.2에서 Stable 릴리스 — 자동 메모이제이션의 실제"
+description: "React 19.2와 함께 React Compiler가 stable 상태로 출시됐습니다. useMemo/useCallback 없이 자동 메모이제이션이 가능하다는 이 기능의 실제 동작 방식과 기존 코드베이스 적용 포인트를 정리합니다."
+date: "2026-05-03"
+status: "published"
+tags: ["React", "ReactCompiler", "TypeScript", "Performance", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "react-compiler-stable-react-19-2026"
+---
+
+React 19.2 릴리스와 함께 React Compiler가 stable 상태에 도달했습니다. 2024년부터 실험적 기능으로 개발되어온 컴파일러가 드디어 프로덕션 사용 가능한 수준이 됐습니다. "useMemo와 useCallback을 직접 작성하지 않아도 된다"는 것이 핵심 가치인데, 실제로 무엇이 바뀌고 무엇이 그대로인지 정리합니다.
+
+## React Compiler가 해결하는 문제
+
+React는 컴포넌트의 props나 state가 변경될 때 다시 렌더링됩니다. 문제는 부모 컴포넌트가 리렌더링되면 변경이 없는 자식 컴포넌트도 함께 리렌더링된다는 점입니다.
+
+기존 해결책은 수동 메모이제이션이었습니다.
+
+```tsx
+// 기존: 수동으로 메모이제이션 처리
+const ExpensiveList = memo(({ items, onSelect }: Props) => {
+  return <ul>{items.map(item => <li key={item.id}>{item.name}</li>)}</ul>;
+});
+
+function Parent() {
+  const [count, setCount] = useState(0);
+
+  // useCallback 없이 함수를 생성하면 매 렌더마다 새 참조가 생성되어
+  // ExpensiveList의 memo() 최적화가 무효화됨
+  const handleSelect = useCallback((id: string) => {
+    console.log(id);
+  }, []);
+
+  const sortedItems = useMemo(() =>
+    items.sort((a, b) => a.name.localeCompare(b.name)),
+    [items]
+  );
+
+  return <ExpensiveList items={sortedItems} onSelect={handleSelect} />;
+}
+```
+
+이 패턴의 문제는 의존 배열 관리가 복잡해지고, useCallback 하나를 빠뜨리면 최적화가 조용히 깨지며, 최적화 코드가 실제 비즈니스 로직보다 더 장황해진다는 점입니다.
+
+## React Compiler가 하는 일
+
+React Compiler는 빌드 타임에 JavaScript AST를 분석하여 렌더 간 변경이 없는 값과 함수의 참조 동일성을 자동으로 보장합니다.
+
+```tsx
+// React Compiler 적용 후: 단순하게 작성 가능
+function Parent() {
+  const [count, setCount] = useState(0);
+
+  const handleSelect = (id: string) => {
+    console.log(id);
+  };
+
+  const sortedItems = items.sort((a, b) => a.name.localeCompare(b.name));
+
+  return <ExpensiveList items={sortedItems} onSelect={handleSelect} />;
+}
+```
+
+컴파일러는 `handleSelect`와 `sortedItems`가 `count` 변화에 의존하지 않는다고 판단하여 자동으로 메모이제이션합니다. `ExpensiveList`에 `memo()`를 감싸는 것도 컴파일러가 처리합니다.
+
+## 활성화 방법
+
+**Next.js**의 경우 `next.config.ts` 설정만 변경하면 됩니다.
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next';
+
+const nextConfig: NextConfig = {
+  experimental: {
+    reactCompiler: true,
+  },
+};
+
+export default nextConfig;
+```
+
+**Vite / 기타 번들러**에서는 Babel 플러그인을 사용합니다.
+
+```bash
+npm install babel-plugin-react-compiler
+```
+
+```javascript
+// babel.config.js
+module.exports = {
+  plugins: [
+    ['babel-plugin-react-compiler', {}],
+  ],
+};
+```
+
+## 컴파일러가 최적화하지 않는 경우
+
+React Compiler는 [React의 규칙(Rules of React)](https://react.dev/reference/rules)을 따르는 컴포넌트만 최적화합니다. Props나 State를 직접 변경하거나 외부 변수를 변경하는 코드는 최적화 대상에서 제외됩니다.
+
+```tsx
+// 컴파일러가 건너뜀 — Props 직접 변경은 React 규칙 위반
+function BadComponent({ data }: { data: number[] }) {
+  data.push(42); // Props 뮤테이션
+  return <div>{data.length}</div>;
+}
+```
+
+컴파일러는 최적화를 건너뛴 항목을 보고합니다. 기존 코드베이스에 적용하면 이전에는 보이지 않던 코드 품질 문제가 드러나는 부수 효과가 있습니다.
+
+## 수동 메모이제이션이 완전히 불필요해지는가
+
+대부분의 경우는 불필요해지지만, 일부는 여전히 유용합니다.
+
+**여전히 수동이 유용한 경우:**
+- 무거운 계산의 캐시 수명을 명시적으로 제어할 때
+- 참조 동일성에 의존하는 서드파티 라이브러리와의 통합
+- 디버깅 — 수동 `useMemo`는 최적화를 가시적이고 의도적으로 만듦
+
+기존의 `useMemo` / `useCallback`은 컴파일러와 공존하며 그대로 동작합니다. 컴파일러가 해당 케이스를 커버하는지 확인 후 점진적으로 제거할 수 있습니다.
+
+## 기존 프로젝트 마이그레이션 접근법
+
+1. `eslint-plugin-react-compiler`를 설치하고 규칙 위반부터 수정
+2. `{ compilationMode: 'annotation' }` 모드로 컴포넌트별 `'use memo'` 지시어로 opt-in
+3. 코드베이스가 정리되면 전체 컴파일 모드로 전환
+
+```tsx
+// Annotation 모드: 이 지시어가 있는 컴포넌트만 최적화
+function MyComponent() {
+  'use memo';
+  // ... 컴파일러가 최적화하는 코드
+}
+```
+
+이 방식으로 전체 코드베이스 감사 없이도 점진적 도입이 가능합니다.
+
+## 정리
+
+- React Compiler는 React 19.2부터 stable — 더 이상 실험적 기능이 아닙니다
+- 대부분의 수동 메모이제이션 패턴을 자동화하여 코드를 단순하게 유지합니다
+- React의 규칙을 따르는 컴포넌트만 최적화되며, 위반 사항은 보고되지만 중단되지 않습니다
+- 신규 프로젝트는 즉시 적용, 기존 프로젝트는 Lint 검사 후 점진적 도입을 권장합니다

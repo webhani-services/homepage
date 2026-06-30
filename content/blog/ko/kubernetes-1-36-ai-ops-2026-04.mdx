@@ -1,0 +1,99 @@
+---
+title: "Kubernetes v1.36과 AI 기반 클러스터 운영의 현재"
+description: "2026년 4월 말 출시되는 Kubernetes v1.36의 주요 변경사항과, AI 도구들이 클러스터 운영 방식을 어떻게 바꾸고 있는지 실무 관점에서 정리합니다."
+date: "2026-04-30"
+status: "published"
+tags: ["Kubernetes", "DevOps", "Cloud", "AI", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-36-ai-ops-2026-04"
+---
+
+Kubernetes v1.36이 2026년 4월 말 출시됩니다. 보안과 워크로드 관리 측면에서 실무에 영향을 주는 변경사항들이 포함되어 있으며, 동시에 AI 기반 클러스터 운영 도구들이 빠르게 확산되고 있습니다.
+
+## Kubernetes v1.36 주요 변경사항
+
+### kubelet API Authorization GA 승격
+
+가장 실용적인 변경사항은 fine-grained kubelet API authorization의 GA(General Availability) 승격입니다.
+
+kubelet API는 Pod 로그 조회, exec 세션, 메트릭 수집, 노드 수준 작업을 제어합니다. 기존에는 넓은 클러스터 권한이 있는 서비스 어카운트라면 kubelet API에도 광범위하게 접근할 수 있어, 클러스터 침해 시 횡적 이동 위험이 있었습니다.
+
+GA 승격으로 Webhook 모드의 안정적인 사용이 가능해졌습니다:
+
+```yaml
+# /var/lib/kubelet/config.yaml
+authorization:
+  mode: Webhook
+  webhook:
+    cacheAuthorizedTTL: 5m0s
+    cacheUnauthorizedTTL: 30s
+```
+
+기존 클러스터에서 v1.36으로 업그레이드하기 전에, CI/CD 파이프라인과 모니터링 에이전트가 kubelet API에 어떤 수준의 접근을 가지고 있는지 먼저 스테이징 환경에서 감사하는 것이 중요합니다. 사전 준비 없이 Webhook 모드로 전환하면 예상치 못한 접근 거부가 발생할 수 있습니다.
+
+### 일시정지된 Job의 리소스 수정 (Beta 승격)
+
+일시정지(suspend) 상태의 Job에서 컨테이너 리소스 요청/제한을 변경할 수 있는 기능이 Beta로 승격됩니다.
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+spec:
+  suspend: true  # 일시정지 상태
+  template:
+    spec:
+      containers:
+      - name: data-processor
+        image: processor:latest
+        resources:
+          requests:
+            cpu: "8"
+            memory: "16Gi"
+          limits:
+            cpu: "8"
+            memory: "16Gi"
+```
+
+기존에는 리소스 사양을 변경하려면 Job을 삭제하고 재생성해야 했습니다. 이제 Job을 일시정지한 상태에서 리소스를 조정하고 재개할 수 있어, 가변적인 리소스 요구사항을 가진 배치 파이프라인에서 실용적인 개선이 됩니다.
+
+## AI 기반 Kubernetes 운영 도구의 확산
+
+코어 릴리스와는 별개로, AI를 활용한 클러스터 운영 도구들이 빠르게 확산되고 있습니다. 패턴은 일관됩니다: Pod 이벤트, 로그, 메트릭, 토폴로지 등 여러 소스에서 상태를 수집하고, LLM으로 상관 분석을 수행해서 원시 시그널이 아닌 맥락 있는 진단을 제공합니다.
+
+### 인시던트 진단의 변화
+
+기존 알림 시스템은 단일 메트릭 임계값에 기반했습니다. 일반적인 흐름: 알림 발생 → 대시보드 확인 → 로그 조회 → 토폴로지 분석 → 원인 가설 → 검증. 비명확한 장애의 경우 10~30분이 소요됩니다.
+
+AI 기반 진단 도구는 여러 시그널을 자동으로 상관 분석합니다:
+
+```
+알림: Pod payment-service OOMKilled (10분 내 3회)
+
+AI 분석 결과:
+- 지난 24시간 메모리 사용량: 2.1GB → 3.8GB 증가
+- 상관 시그널: 동시간대 DB 쿼리 p99 레이턴시 450ms → 2.1s 급등
+- 상관 시그널: 14:00 배포 이후 업스트림 트래픽 40% 증가
+- 가설: 높은 동시 연결 수에서 메모리 누수 가능성 (커넥션 풀 관련)
+- 권장 조사: 커넥션 풀 설정 확인, 패턴 X의 쿼리 분석
+```
+
+AI가 인시던트를 해결하는 것이 아닙니다. 상관 분석 작업을 자동화해서 엔지니어가 가설 검증과 실제 조치에 집중할 수 있도록 지원합니다. 20분 걸리던 초기 분석을 2분으로 단축합니다.
+
+### 컨테이너 빌드 품질 자동화
+
+컨테이너 빌드 품질 측면에서는 Trivy(CVE 스캔), Hadolint(Dockerfile 정적 분석), Docker Scout(의존성 스캔)를 통합하고 AI로 상관 분석을 추가한 도구들이 확산되고 있습니다. 세 개의 개별 보고서 대신, 실제 구성에서 실질적인 위험도가 높은 문제를 우선순위화해서 제공합니다.
+
+## VM은 사라지지 않는다
+
+2020년경 "Kubernetes가 VM을 완전히 대체할 것"이라는 예측이 있었지만, 실제로는 그렇지 않습니다. 대규모 베어메탈 클러스터 관리의 복잡성과 비용 때문에, VM은 여전히 하이브리드 환경과 레거시 워크로드 통합에서 중요한 역할을 합니다. Cloud Provider 위의 VM 위에서 Kubernetes를 실행하는 구성이 여전히 표준 패턴입니다.
+
+인프라 예산 결정에서 Kubernetes와 VM은 경쟁 관계가 아닌 보완 관계로 봐야 합니다.
+
+## v1.36 업그레이드 실무 권장사항
+
+kubelet API authorization 변경은 업그레이드 전 준비가 가장 필요한 부분입니다. 스테이징 클러스터에서 먼저 기존 CI/CD 시스템과 모니터링 에이전트의 kubelet API 접근 패턴을 파악한 후 Webhook 모드로 전환하세요.
+
+일시정지 Job 리소스 수정 기능은 리스크가 낮습니다. 업그레이드 후 배치 워크로드에서 테스트해보면, Job 재생성 없이 리소스를 조정할 수 있는 실질적인 편의를 확인할 수 있습니다.
+
+AI-powered 운영 도구는 기존 오브저버빌리티 스택을 대체하는 것이 아니라 추가 레이어로 도입하는 것을 권장합니다. AI를 "정답"이 아닌 "가설 생성" 도구로 취급하면, 오진단의 위험을 줄이면서 진단 속도를 높이는 현실적인 효과를 얻을 수 있습니다.

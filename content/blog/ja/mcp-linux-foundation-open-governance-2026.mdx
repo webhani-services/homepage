@@ -1,0 +1,120 @@
+---
+title: "MCP が 9700 万インストールを突破 — Linux Foundation による Open Governance 体制へ"
+description: "Anthropic の Model Context Protocol (MCP) が 9700 万インストールを突破し、Linux Foundation の管理下へ移行。AI エージェント開発の基盤インフラとして定着しつつある現状と、開発者が今知っておくべきことを整理します。"
+date: "2026-05-03"
+status: "published"
+tags: ["MCP", "AI", "LLM", "OpenSource", "AgentDevelopment"]
+thumbnail: ""
+author: "webhani"
+slug: "mcp-linux-foundation-open-governance-2026"
+---
+
+Anthropic が 2024 年末に公開した Model Context Protocol (MCP) は、2026 年 3 月時点で累計 9700 万インストールを超えました。同時期に Linux Foundation がその標準化ガバナンスを引き受けることを発表し、MCP は特定企業のプロジェクトから業界共有インフラへと立場を変えつつあります。
+
+## MCP とは何か
+
+MCP は、LLM とその周辺ツール（ファイルシステム、DB、外部 API など）を接続する通信プロトコルです。以前は LLM ごと・ツールごとに独自の統合コードを書く必要がありましたが、MCP では **Host / Client / Server** の 3 層で責任を分離します。
+
+```
+┌─────────────────────────────────────────────┐
+│  Host Application  (Claude Desktop, IDE 等) │
+│  ┌─────────────┐                            │
+│  │ MCP Client  │ ─── JSON-RPC 2.0 ───────► │ MCP Server
+│  └─────────────┘                            │ (tools / resources / prompts)
+└─────────────────────────────────────────────┘
+```
+
+LLM は MCP Server が公開する **tools**（実行可能な操作）と **resources**（読み取り可能なデータ）を標準インターフェースで利用します。プロバイダが変わってもサーバー側の実装を使い回せる点が、エコシステムが急速に広がった理由です。
+
+## 9700 万インストールが示すもの
+
+わずか 1 年半でこの数字に達した背景には、主要エコシステムの対応速度があります。
+
+- **IDE 統合**: VS Code、JetBrains、Cursor など主要エディタが MCP ネイティブ対応を完了
+- **AI プロバイダー**: OpenAI、Google DeepMind、Mistral など競合各社も MCP 互換ツールを出荷
+- **クラウドベンダー**: AWS Bedrock が MCP サーバーとしての動作をサポート
+
+インストール数だけでなく、**競合プロバイダーが同じプロトコルを採用している**という事実が、標準としての強度を示しています。
+
+## Linux Foundation ガバナンスの意味
+
+Linux Foundation への移管は技術的な変更ではなく、**ガバナンスの変更**です。
+
+| 移管前 | 移管後 |
+|--------|--------|
+| Anthropic 単独の意思決定 | 中立的な多者間ガバナンス |
+| Anthropic のロードマップに依存 | コミュニティ RFC プロセス |
+| 競合企業が採用しにくい心理的障壁 | 中立インフラとして採用しやすい |
+
+過去に同様のパターンを辿ったプロジェクト（Kubernetes → CNCF、OpenTelemetry → CNCF）と比較すると、MCP も標準インフラとして長期定着する可能性が高いと判断できます。
+
+## 実装例: 最小構成の MCP Server (TypeScript)
+
+MCP Server の構造を理解するために、ファイルシステムを読み取るシンプルなサーバーを見てみます。
+
+```typescript
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import { readFile } from "fs/promises";
+
+const server = new Server(
+  { name: "file-reader", version: "1.0.0" },
+  { capabilities: { tools: {} } }
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: "read_file",
+      description: "Read a file at the given path",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Absolute file path" },
+        },
+        required: ["path"],
+      },
+    },
+  ],
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  if (req.params.name === "read_file") {
+    const { path } = req.params.arguments as { path: string };
+    const content = await readFile(path, "utf-8");
+    return { content: [{ type: "text", text: content }] };
+  }
+  throw new Error(`Unknown tool: ${req.params.name}`);
+});
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
+```
+
+`@modelcontextprotocol/sdk` は 2025 年に v1.0 が公開され、TypeScript / Python / Kotlin / Swift の各 SDK が提供されています。
+
+## webhani の視点: 今後の設計指針
+
+実際のプロジェクトで MCP を検討する際の判断基準を整理します。
+
+**採用を検討すべきケース**
+- 複数の AI モデル / プロバイダーを切り替える可能性がある
+- 社内ツールや DB に LLM からアクセスさせたい
+- 将来的に AI エージェントのエコシステムとの統合を見越している
+
+**現時点での注意点**
+- プロトコル自体はまだ進化中であり、セキュリティモデル（特にリモート MCP Server への信頼モデル）の仕様が固まりつつある段階
+- stdio ベースのローカル通信と HTTP/SSE ベースのリモート通信では攻撃面が異なるため、本番運用前にアクセス制御を設計する必要がある
+
+Linux Foundation による標準化で長期的な安定性が高まった今、社内ツール統合や AI エージェント基盤として真剣に評価するタイミングです。
+
+## まとめ
+
+- MCP は 9700 万インストールを突破し、事実上の AI エージェント統合標準になりつつある
+- Linux Foundation 移管により、単一企業依存リスクが軽減される
+- 主要 AI プロバイダー全社が MCP 対応済みで、エコシステムとして機能している
+- セキュリティモデルの設計を含め、今から小規模で試すのが現実的なアプローチ

@@ -1,0 +1,108 @@
+---
+title: "React Compiler 안정화와 TypeScript 주류화: 2026년 프론트엔드의 현재"
+description: "React 19.2에서 React Compiler가 안정 버전이 되어 수동 메모이제이션이 불필요해졌습니다. TypeScript 채택률이 67%에 달한 지금, Next.js 프로젝트의 기본 설정이 어떻게 바뀌는지 살펴봅니다."
+date: "2026-05-01"
+status: "published"
+tags: ["React", "TypeScript", "Next.js", "Frontend", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "react-compiler-typescript-frontend-2026"
+---
+
+## React Compiler 안정화가 의미하는 것
+
+React 19.2에서 React Compiler가 안정(Stable) 버전으로 출시되었습니다. 실질적인 변화는 `useMemo`, `useCallback`, `React.memo`를 통한 수동 메모이제이션 관리가 더 이상 기본 최적화 도구가 아니게 된다는 점입니다.
+
+Compiler는 빌드 타임에 컴포넌트를 분석하여 의존성을 자동으로 추적하고, 최적화된 코드를 생성합니다. 개발자는 순수한 로직을 작성하고 Compiler가 최적화를 처리합니다.
+
+**Before (React 19.1 이전)**:
+
+```tsx
+import { useMemo, useCallback } from 'react'
+
+function ProductList({ products, onSelect }: Props) {
+  const sorted = useMemo(
+    () => [...products].sort((a, b) => a.price - b.price),
+    [products]
+  )
+  const handleSelect = useCallback(
+    (id: string) => onSelect(id),
+    [onSelect]
+  )
+  return sorted.map(p => (
+    <ProductCard key={p.id} product={p} onSelect={handleSelect} />
+  ))
+}
+```
+
+**After (React 19.2 + Compiler)**:
+
+```tsx
+function ProductList({ products, onSelect }: Props) {
+  const sorted = [...products].sort((a, b) => a.price - b.price)
+  return sorted.map(p => (
+    <ProductCard key={p.id} product={p} onSelect={id => onSelect(id)} />
+  ))
+}
+```
+
+Compiler는 대부분의 경우 수동 메모이제이션과 동등하거나 더 나은 최적화를 제공합니다.
+
+### Next.js에서 활성화하기
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next'
+
+const config: NextConfig = {
+  experimental: {
+    reactCompiler: true,
+  },
+}
+
+export default config
+```
+
+기존 코드 대부분은 수정 없이 동작합니다. Compiler가 안전하게 최적화할 수 없는 경우(직접 DOM 조작, 특정 ref 패턴 등)에는 컴포넌트 수준에서 `'use no memo'` 디렉티브로 제외할 수 있습니다.
+
+## TypeScript가 기본값이 되었다
+
+2026년 기준, 개발자의 67%가 JavaScript보다 TypeScript를 더 많이 작성합니다. TypeScript를 사용하는 비용(설정, 타입 에러 수정)이 낮아지고, 이점은 그대로 유지된 결과입니다.
+
+새 프로젝트에서 활성화할 만한 `tsconfig.json` 옵션들:
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "moduleResolution": "bundler"
+  }
+}
+```
+
+`noUncheckedIndexedAccess`는 `arr[0]`을 잠재적으로 `undefined`로 표시하여 런타임 오류의 한 범주를 컴파일 타임에 차단합니다. 이전에는 너무 엄격하다고 여겨졌지만, AI Assistant가 타입 오류를 실시간으로 수정하는 현재는 활성화해두는 것이 실용적입니다.
+
+## Turbopack이 Webpack을 대체했다
+
+Next.js 15에서 Turbopack이 기본 Bundler가 되었습니다. 개발자 경험 향상은 두 가지 측면에서 두드러집니다.
+
+- **Dev Server 시작**: 대부분의 프로젝트에서 거의 즉각적으로 시작
+- **HMR**: 변경 사항이 수초가 아닌 수백 밀리초 내에 반영
+
+현재 Webpack Plugin을 사용 중이라면 마이그레이션 전에 호환성을 확인하세요. 아직 모든 Webpack Plugin이 Turbopack 등가물을 가지고 있지 않습니다. `next dev --turbopack` 실행 시 지원되지 않는 Plugin을 시작 시 보고합니다.
+
+## webhani의 기본 프로젝트 설정 변경사항
+
+이러한 변화를 반영하여 webhani의 신규 프로젝트 기준 설정을 업데이트했습니다.
+
+**React Compiler 기본 활성화** — 컴포넌트 Template에서 `useMemo`와 `useCallback`을 제거했습니다. Profiling에서 Compiler가 특정 케이스를 처리하지 못할 때만 다시 추가합니다.
+
+**`noUncheckedIndexedAccess` 활성화** — `tsconfig.json` 기준에 추가했습니다. 레거시 코드의 초기 타입 오류는 반복적인 런타임 버그를 마주하는 것보다 한 번 수정할 가치가 있습니다.
+
+**Turbopack 기본값** — 신규 프로젝트는 Turbopack으로 시작합니다. 커스텀 Webpack Plugin이 있는 프로젝트는 호환 대안이 나올 때까지 Webpack을 유지합니다.
+
+## 정리
+
+React Compiler 안정화, TypeScript 67% 채택, Turbopack 기본값은 모두 같은 방향의 변화입니다. 보일러플레이트 감소, 빠른 피드백 루프. 오늘 Next.js 프로젝트를 시작한다면 이것들은 실험적 선택이 아닌 합리적인 기본값입니다.

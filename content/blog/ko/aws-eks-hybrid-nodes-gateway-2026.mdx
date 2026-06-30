@@ -1,0 +1,154 @@
+---
+title: "AWS EKS Hybrid Nodes Gateway: 클라우드와 온프레미스 경계를 허물다"
+description: "AWS가 발표한 EKS Hybrid Nodes Gateway로 네트워크 인프라 변경 없이 클라우드와 온프레미스 간 Pod 통신이 가능해졌습니다. 하이브리드 인프라 설계에 미치는 영향을 분석합니다."
+date: "2026-05-08"
+status: "published"
+tags: ["AWS", "Kubernetes", "EKS", "HybridCloud", "CloudInfrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-eks-hybrid-nodes-gateway-2026"
+---
+
+AWS는 2026년 5월 4일 EKS Hybrid Nodes Gateway를 발표했습니다. 핵심 기능은 클라우드와 온프레미스 Node 간 Pod-to-Pod 통신을 네트워크 인프라 변경 없이 실현하는 것입니다.
+
+## 해결하는 문제
+
+온프레미스 Machine을 EKS Cluster의 Node로 등록하는 EKS Hybrid Nodes는 이전부터 존재했습니다. 제약은 네트워크였습니다. 클라우드와 온프레미스 Pod 간 통신을 위해서는 추가 설정이 필요했습니다.
+
+- VPN 또는 Direct Connect 설정
+- Pod CIDR 라우팅 수동 설정
+- Firewall Rule 변경
+- 네트워크 담당 팀과의 조율
+
+기술적으로 구현 가능하지만, 설정 복잡성과 변경 관리 비용이 실제 도입 장벽이었습니다.
+
+## Gateway의 동작 방식
+
+EKS Hybrid Nodes Gateway는 Cluster 레벨에서 Pod-to-Pod 라우팅을 투명하게 처리합니다. 클라우드 Pod와 온프레미스 Pod가 같은 Cluster 내에서 Kubernetes Service DNS로 서로를 찾을 수 있습니다.
+
+```bash
+# Hybrid Nodes Gateway를 활성화한 Cluster 생성
+aws eks create-cluster \
+  --name production-hybrid-cluster \
+  --kubernetes-version 1.36 \
+  --resources-vpc-config \
+    subnetIds=["subnet-abc123","subnet-def456"],\
+    securityGroupIds=["sg-abc123"] \
+  --hybrid-node-config \
+    enabledNodeTypes=["onPremises"],\
+    remoteNetworkConfig='{"remotePodNetworks":[{"cidrs":["10.0.0.0/16"]}],"remoteNodeNetworks":[{"cidrs":["192.168.0.0/24"]}]}'
+```
+
+기존 Cluster에 추가하는 방법:
+
+```bash
+aws eks update-cluster-config \
+  --name existing-cluster \
+  --hybrid-node-config \
+    enabledNodeTypes=["onPremises"],\
+    remoteNetworkConfig='{"remotePodNetworks":[{"cidrs":["10.0.0.0/16"]}]}'
+```
+
+## 실제 구성 예시
+
+클라우드에 API Gateway, 온프레미스에 데이터베이스 직접 접근이 필요한 Data Service를 배치하는 하이브리드 구성입니다.
+
+```yaml
+# 클라우드 측 API Gateway Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: production
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/compute-type: ec2  # 클라우드 Node에 배치
+      containers:
+        - name: api-gateway
+          image: api-gateway:2.1.0
+          env:
+            - name: DATA_SERVICE_URL
+              # Kubernetes Service DNS — 클라우드/온프레미스 경계를 넘어 동작
+              value: "http://data-service.production.svc.cluster.local:8080"
+---
+# 온프레미스 측 Data Service Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-service
+  namespace: production
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: data-service
+  template:
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/compute-type: hybrid  # 온프레미스 Node에 배치
+      containers:
+        - name: data-service
+          image: data-service:1.5.0
+          # 온프레미스 DB에 직접 접근 — 네트워크 변경 불필요
+```
+
+`api-gateway` Pod에서 `data-service`는 일반 Kubernetes Service와 동일하게 동작합니다. Gateway가 물리적 경계를 넘는 라우팅을 투명하게 처리합니다.
+
+## Kubernetes v1.36 요구사항
+
+Gateway는 Kubernetes v1.36이 필요합니다. v1.36에서는 Declarative Validation이 GA가 되어 설정 오류를 더 이른 단계에서 탐지할 수 있습니다. 하이브리드 구성처럼 설정이 복잡할수록 이 개선의 가치가 커집니다.
+
+## 도입 전 확인사항
+
+**Latency 측정**
+
+Gateway는 네트워크 설정 문제를 해결하지만 물리적 거리는 해결하지 못합니다. 온프레미스가 다른 데이터센터에 있다면, 클라우드 내 통신보다 높은 Latency가 발생합니다. 동기 처리가 필요한 서비스를 경계를 넘어 분산하기 전에 실제 Round-trip Time을 측정하세요.
+
+**Network Policy 설계**
+
+Gateway로 온프레미스 Pod가 클라우드 Service에 접근할 수 있게 되므로 공격 Surface가 넓어질 수 있습니다. NetworkPolicy로 통신 가능한 Pod를 명시적으로 제한하세요.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-onprem-egress
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      location: on-premises
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              accepts-onprem-traffic: "true"
+      ports:
+        - port: 8080
+```
+
+## 도입에 적합한 상황
+
+다음에 해당하는 조직에 가장 유용합니다.
+
+- 규제 또는 Compliance 요건으로 특정 데이터를 온프레미스에 유지해야 하는 경우
+- 온프레미스 인프라 자산이 있어 전면 클라우드 전환이 어려운 경우
+- Workload를 클라우드로 단계적으로 이전하려는 경우
+
+## webhani의 관점
+
+EKS Hybrid Nodes Gateway는 하이브리드 Kubernetes 도입의 실질적 장벽을 낮춥니다. 이전에는 네트워크 설정을 위해 여러 팀이 조율해야 했던 작업이 사라지고, 인프라 팀은 연결 설정보다 Workload 배치에 집중할 수 있게 됩니다.
+
+Non-critical Workload부터 시작해 Latency 특성과 NetworkPolicy 동작을 검증한 뒤 Production Traffic을 하이브리드 구성으로 전환하는 접근을 권장합니다.
+
+---
+
+*참고: Cloud Native Now, thenewstack.io*

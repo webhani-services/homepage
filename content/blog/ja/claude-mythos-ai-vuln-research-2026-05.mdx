@@ -1,0 +1,127 @@
+---
+title: "Claude Mythos: AIがゼロデイ脆弱性発見を変える"
+description: "AnthropicのClaude Mythos Previewは、主要なOSとブラウザ全体でゼロデイ脆弱性を大量に発見しました。Project Glasswingの概要と、企業セキュリティチームへの実践的な影響を解説します。"
+date: "2026-05-15"
+status: "published"
+tags: ["AI", "Security", "Claude", "Cybersecurity", "LLM"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-mythos-ai-vuln-research-2026-05"
+---
+
+Anthropicが4月に発表したClaude Mythos Previewは、セキュリティ研究の世界に新しい基準を打ち立てました。主要なOSとWebブラウザ全体に存在する数千ものゼロデイ脆弱性を発見したこのモデルは、AI駆動のオフェンシブセキュリティがどれほどの水準に達したかを示しています。
+
+## Claude Mythosとは何か
+
+Claude Mythosは、Anthropicが構築した専門的なセキュリティ研究向けAIエージェントです。通常のClaude（Claude Opus 4.7など）が汎用的なコーディングと推論を行うのに対し、Mythosはオフェンシブセキュリティの文脈で特化したエージェンティック推論を行います。
+
+英国のAI Safety Institute（AISI）の評価によると、MythosはCTF形式の32ステップのサイバーレンジを端から端まで解決しました。より注目すべきは、実際の本番環境にあるソフトウェアに対して実行可能なexploitを生成した点です。
+
+その一例として、MythosはブラウザのrendererとOSのサンドボックスの両方を脱出するexploitを作成しました。このexploitは4つの脆弱性をチェーンし、複雑なJITヒープスプレーを含んでいました。セキュリティ研究者が数週間かけて開発するような成果物を、AIが自律的に生成したことになります。
+
+## Project Glasswing：防御側への展開
+
+Anthropicは、Mythosを一般公開するのではなく、Project Glasswingという取り組みを通じてコントロールされた形でのみ提供しています。
+
+参加組織にはAWS、Apple、Microsoft、Google、CrowdStrike、Palo Alto Networksなどが含まれ、合計40以上の組織がアクセスを受けています。これらのパートナーは、自社のファウンデーショナルシステムにある脆弱性を発見・修正するためにMythosを使用します。
+
+Anthropicの長期的な目標は、Mythosクラスのモデルを防御的なサイバーセキュリティ目的で安全に大規模展開することです。現時点ではコントロールされた研究用途に限定されていますが、この方向性は明確です。
+
+## 企業セキュリティチームへの影響
+
+Mythosの登場が示すのは、オフェンシブセキュリティの自動化が新しいフェーズに入ったということです。これはセキュリティチームにとって2つの意味を持ちます。
+
+**脅威モデルの見直し**
+
+従来の脅威モデルは、高度な攻撃者の数が限られているという前提を持っていました。AI駆動のオフェンシブツールが普及すると、この前提は崩れます。Mythosが発見したようなゼロデイ脆弱性を悪用する攻撃が、より広範な攻撃者によって実行される可能性が高まります。
+
+**防御の自動化が必須になる**
+
+攻撃が自動化されれば、防御も自動化しなければなりません。手動のペネトレーションテストを年1〜2回実施するモデルは、継続的なAI駆動の脆弱性スキャンに移行する必要があります。
+
+## 実践的な対応：CI/CDへのセキュリティ統合
+
+企業が今すぐ取り組める防御策として、セキュリティスキャンをCI/CDパイプラインに組み込むことが挙げられます。
+
+```yaml
+# .github/workflows/security.yml
+name: Security Scan
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Semgrep SAST
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: "p/owasp-top-ten p/javascript"
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Dependency vulnerability scan
+        run: |
+          npm audit --audit-level=high
+          npx better-npm-audit audit
+
+      - name: Secret scanning
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+```
+
+これに加えて、コンテナイメージのスキャンやInfrastructure as Codeのセキュリティチェックも組み込むことで、多層的な防御を実現できます。
+
+```yaml
+  container-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t app:${{ github.sha }} .
+
+      - name: Scan container image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "app:${{ github.sha }}"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+
+      - name: Upload results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-results.sarif"
+```
+
+## 「Mythosクラス」が意味するもの
+
+Anthropicが使う「Mythosクラス」という表現は、単一モデルではなく能力のカテゴリを指しています。Mythosが示した能力水準、すなわち既知の脆弱性パターンを超えて、複数の脆弱性を組み合わせた複雑なexploitを自律的に生成する能力、は今後の防御側AIシステムの標準になっていくでしょう。
+
+セキュリティベンダーはすでにこの方向性に動いています。CrowdStrikeやPalo Alto NetworksがProject Glasswingに参加しているのは偶然ではありません。次世代のセキュリティ製品はMythosクラスのAIを活用して、攻撃者と同じ視点で脆弱性を探索する機能を持つことになります。
+
+## webhaniとしての見解
+
+Mythosのような研究は、セキュリティが「年次レビュー」から「継続的なプロセス」へと移行する必然性を示しています。
+
+我々が顧客に推奨するアプローチは以下の通りです：
+
+1. **シフトレフト**：セキュリティチェックをコード作成時点に近づける（IDEプラグイン、pre-commitフック）
+2. **CI/CD統合**：すべてのPRでSAST、依存関係スキャン、シークレット検出を実行する
+3. **継続的なペネトレーションテスト**：年次から継続的なモデルへの移行
+4. **インシデントレスポンスの準備**：Mythosクラスの攻撃に備えたプレイブックの整備
+
+AIが攻撃の速度と精度を向上させる以上、防御側も同じ速度で進化する必要があります。
+
+---
+
+*参考：[Claude Mythos Preview](https://red.anthropic.com/2026/mythos-preview/) | [Project Glasswing](https://www.anthropic.com/glasswing) | [AISI評価](https://www.aisi.gov.uk/blog/our-evaluation-of-claude-mythos-previews-cyber-capabilities)*

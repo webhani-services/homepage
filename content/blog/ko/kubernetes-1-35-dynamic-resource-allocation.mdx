@@ -1,0 +1,168 @@
+---
+title: "Kubernetes 1.35 Dynamic Resource Allocation Beta: AI/ML GPU 관리의 새로운 기준"
+description: "Kubernetes 1.35에서 Dynamic Resource Allocation(DRA)이 Beta로 승격되었습니다. GPU 등 특수 하드웨어 리소스를 더 정밀하게 관리할 수 있게 되면서, AI/ML 워크로드 운영 방식이 크게 달라질 전망입니다."
+date: "2026-05-12"
+status: "published"
+tags: ["Kubernetes", "GPU", "AI/ML", "Cloud Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-35-dynamic-resource-allocation"
+---
+
+## DRA가 해결하는 문제
+
+2026년, AI/ML 워크로드는 Kubernetes 위에서 실행되는 표준 서비스가 되었습니다. 하지만 GPU 같은 특수 하드웨어를 Kubernetes에서 효율적으로 관리하는 것은 여전히 어려운 과제였습니다.
+
+기존 Device Plugin API는 단순한 정수 단위 할당만 지원합니다. "GPU 1개 주세요"는 가능하지만, "80GB 메모리를 가진 H100 GPU를 NVLink로 연결된 상태로 2개 주세요"는 표현할 수 없었습니다.
+
+Kubernetes 1.35에서 Dynamic Resource Allocation(DRA)이 Beta로 승격된 것은 이 문제에 대한 직접적인 해답입니다.
+
+## 기존 Device Plugin의 한계
+
+```yaml
+# 기존 방식 — 정수 단위 GPU 요청만 가능
+containers:
+  - name: trainer
+    resources:
+      limits:
+        nvidia.com/gpu: 1  # GPU 모델, 메모리 크기, 연결 형태 지정 불가
+```
+
+이 방식으로는 다음을 표현할 수 없습니다:
+
+- 특정 GPU 모델(H100 vs A100)
+- GPU 메모리 크기 조건(80GB 이상)
+- NVLink 연결 여부
+- MIG(Multi-Instance GPU) 슬라이싱 프로파일
+
+## DRA의 새로운 접근 방식
+
+DRA는 `DeviceClass`와 `ResourceClaim`이라는 새로운 API 객체를 도입합니다.
+
+```yaml
+# DeviceClass — GPU 카테고리 정의
+apiVersion: resource.k8s.io/v1beta1
+kind: DeviceClass
+metadata:
+  name: nvidia-h100
+spec:
+  selectors:
+    - cel:
+        expression: >
+          device.driver == "nvidia.com" &&
+          device.attributes["model"].string == "H100"
+```
+
+```yaml
+# ResourceClaim — 구체적인 리소스 요청
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: training-gpus
+spec:
+  devices:
+    requests:
+      - name: gpus
+        deviceClassName: nvidia-h100
+        allocationMode: ExactCount
+        count: 2
+        selectors:
+          - cel:
+              expression: >
+                device.attributes["memory"].quantity >= quantity("80Gi") &&
+                device.attributes["nvlink"].bool == true
+```
+
+이 ResourceClaim은 "80GB 이상 메모리, NVLink 활성화된 H100 GPU 2개"를 요청합니다. 기존 Device Plugin API에서는 불가능했던 표현입니다.
+
+## Pod에서 DRA 활용
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: distributed-training
+spec:
+  resourceClaims:
+    - name: gpu-resources
+      resourceClaimName: training-gpus
+  containers:
+    - name: trainer
+      image: pytorch/pytorch:2.5-cuda12.4
+      resources:
+        claims:
+          - name: gpu-resources
+      command: ["torchrun", "--nproc_per_node=2", "train.py"]
+```
+
+Pod는 ResourceClaim을 이름으로 참조합니다. ResourceClaim 조건을 만족하는 노드가 없으면 스케줄러는 Pod를 배치하지 않습니다. 사양이 낮은 GPU에 암묵적으로 배치되는 일이 없습니다.
+
+## 멀티테넌트 GPU 관리: MIG 슬라이싱
+
+DRA의 가장 실용적인 가치 중 하나는 MIG(Multi-Instance GPU) 슬라이싱의 네이티브 지원입니다. H100 한 장을 여러 팀이 나눠 쓸 때, DRA를 통해 슬라이스를 Kubernetes 리소스로 선언적으로 관리할 수 있습니다.
+
+```yaml
+# 소규모 추론 워크로드 — 10GB MIG 슬라이스 요청
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: inference-gpu-slice
+spec:
+  devices:
+    requests:
+      - name: mig-slice
+        deviceClassName: nvidia-gpu-mig
+        count: 1
+        selectors:
+          - cel:
+              expression: 'device.attributes["migProfile"].string == "1g.10gb"'
+```
+
+추론 팀은 10GB 슬라이스를, 파인튜닝 팀은 40GB 슬라이스를 같은 물리 GPU에서 독립적으로 사용할 수 있습니다. 커스텀 스케줄러 플러그인 없이 Kubernetes 네이티브로 가능합니다.
+
+## 아직 준비되지 않은 것들
+
+DRA는 Beta 단계이므로 운영 도입에는 신중한 계획이 필요합니다.
+
+**드라이버 지원 현황**: DRA를 활용하려면 GPU 벤더가 DRA 호환 드라이버를 제공해야 합니다. NVIDIA는 적극적으로 지원 중이지만, 사용 중인 GPU 모델과 드라이버 버전을 반드시 확인해야 합니다.
+
+**API 안정성**: Beta 단계의 API는 GA 전에 변경될 수 있습니다. 조기 도입 시 매니페스트 업데이트 비용을 고려해야 합니다.
+
+**모니터링 도구 성숙도**: DRA 리소스 메트릭을 지원하는 Prometheus Exporter나 Grafana 대시보드는 아직 따라오는 중입니다.
+
+**기존 Device Plugin과의 공존**: DRA는 Device Plugin API를 대체하지 않으며 함께 운영할 수 있습니다. 단계적 전환이 가능하지만, 두 가지 패러다임을 동시에 관리해야 합니다.
+
+## 단계적 전환 전략
+
+```yaml
+# 기존 워크로드 — Device Plugin 유지 (변경 없음)
+containers:
+  - name: legacy-job
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+
+---
+# 신규 AI 워크로드 — DRA ResourceClaim 사용
+resourceClaims:
+  - name: new-training-gpus
+    resourceClaimName: h100-nvlink-pair
+```
+
+기존 워크로드는 Device Plugin을 유지하고, 신규 AI 워크로드는 스테이징에서 DRA로 테스트한 후 동작 검증과 툴링 성숙을 확인하고 순차 마이그레이션합니다.
+
+## webhani 권장 사항
+
+AI/ML 워크로드를 Kubernetes에서 운영하거나 계획 중인 팀에게:
+
+1. **1.35+ 테스트 클러스터 구축**: DRA Feature Gate를 활성화하고 NVIDIA DRA 드라이버를 배포해 GA 전에 운영 모델을 파악
+2. **GPU 활용률 측정**: DRA 도입 전후 GPU 이용률을 모니터링해 효과를 정량화
+3. **NVIDIA GPU Operator 릴리스 노트 확인**: 사용 중인 GPU 모델의 DRA 드라이버 지원 여부 확인
+4. **GA 이후 운영 도입 계획**: Beta 도입은 학습 투자로, GA 이후를 운영 기준으로 설정
+
+## 정리
+
+- Kubernetes 1.35 DRA Beta: GPU 모델, 메모리 크기, NVLink, MIG 슬라이싱 등을 YAML로 선언 가능
+- 기존 Device Plugin의 단순 정수 할당 한계를 근본적으로 해결하는 접근 방식
+- 멀티테넌트 GPU 클러스터에서 MIG 슬라이싱을 커스텀 플러그인 없이 네이티브로 관리 가능
+- 운영 환경 도입은 GA 이후를 권장; 지금은 스테이징에서 운영 모델 파악에 집중

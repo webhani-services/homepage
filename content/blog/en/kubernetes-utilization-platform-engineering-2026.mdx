@@ -1,0 +1,129 @@
+---
+title: "8% CPU Utilization: Kubernetes Waste and the Platform Engineering Response"
+description: "The 2026 CAST AI report shows the average Kubernetes cluster runs at 8% CPU and 5% GPU utilization. Here's why it happens, how to fix it with VPA and Karpenter, and why Platform Engineering is becoming the structural solution."
+date: "2026-05-01"
+status: "published"
+tags: ["Kubernetes", "DevOps", "Platform Engineering", "Cloud", "Cost Optimization"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-utilization-platform-engineering-2026"
+---
+
+## The 8% problem
+
+The 2026 CAST AI State of Kubernetes Optimization Report puts average CPU utilization at 8% and GPU utilization at 5%. Resources provisioned, mostly not used.
+
+This isn't a Kubernetes problem — it's an incentive problem. Teams over-request to avoid incidents. Schedulers honor those requests. Nodes stay large and mostly idle.
+
+## Why over-provisioning persists
+
+The mechanism is straightforward. Kubernetes resource configuration uses `requests` and `limits`:
+
+```yaml
+resources:
+  requests:
+    cpu: "500m"    # What the scheduler uses for placement
+    memory: "512Mi"
+  limits:
+    cpu: "2000m"   # What the container can actually use
+    memory: "2Gi"
+```
+
+When an OOMKilled event hits production, the natural response is to raise memory limits. When a CPU spike causes latency, requests go up. Each incident adds margin on top of margin. Nobody removes the buffer later because production stability is correctly valued higher than cost efficiency.
+
+The result: requests trend up, actual usage stays flat, and the cluster needs more nodes to accommodate the inflated requests.
+
+## Fixing it with VPA
+
+Vertical Pod Autoscaler watches actual resource consumption and recommends (or applies) tighter requests/limits:
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: api-server-vpa
+spec:
+  targetRef:
+    apiVersion: "apps/v1"
+    kind: Deployment
+    name: api-server
+  updatePolicy:
+    updateMode: "Off"  # Start here — recommendations only, no changes
+```
+
+Start with `updateMode: "Off"` to see recommendations without making changes. Move to `"Initial"` (applies on new Pods only) before enabling `"Auto"`. The observability step matters — VPA can under-recommend for bursty workloads.
+
+## Node-level efficiency with Karpenter
+
+AWS Karpenter (equivalent: GKE Node Autoprovision) selects instance types dynamically based on actual pending Pod requests:
+
+```yaml
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: general
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["c5.large", "c5.xlarge", "m5.large", "m5.xlarge"]
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+    consolidateAfter: 30s
+```
+
+`consolidationPolicy: WhenUnderutilized` tells Karpenter to actively consolidate workloads onto fewer nodes and terminate idle ones. This is more aggressive than Cluster Autoscaler's scale-down behavior.
+
+## Why Platform Engineering is the structural fix
+
+VPA and Karpenter address the symptoms. The root cause is that Kubernetes configuration is too complex for most developers to get right consistently.
+
+Internal Developer Platforms (IDPs) abstract that complexity. Developers get a self-service interface for deployments; platform teams maintain standardized templates with sensible defaults. The 2026 estimate puts 80%+ of enterprises with an IDP in production or active development, up from 45% just a few years ago.
+
+Backstage is the most common open-source foundation:
+
+```typescript
+// Exposing cost data inside Backstage
+import { createPlugin, createRoutableExtension } from '@backstage/core-plugin-api'
+
+export const costInsightsPlugin = createPlugin({
+  id: 'cost-insights',
+})
+
+export const CostInsightsPage = costInsightsPlugin.provide(
+  createRoutableExtension({
+    name: 'CostInsightsPage',
+    component: () =>
+      import('./components/CostInsightsPage').then(m => m.CostInsightsPage),
+    mountPoint: rootRouteRef,
+  }),
+)
+```
+
+Making cost visible inside the developer portal — rather than only in the platform team's dashboards — changes the conversation. Developers can see the cost impact of their resource requests directly.
+
+## Docker Kanvas
+
+Docker's January 2026 Kanvas launch takes a different angle: bridging local Docker architecture to Kubernetes deployment artifacts directly. A `docker-compose.yml` becomes a starting point for generating Kubernetes manifests or Helm charts, reducing the local-to-production gap.
+
+It's early, but it targets a real friction point for teams that run Docker locally and Kubernetes in production.
+
+## What we actually do
+
+At webhani, these are our current baselines for Kubernetes cost management:
+
+- **VPA in Recommend mode first** — 2 weeks of data before applying recommendations
+- **Weekly resource review** — compare requests vs. actual usage per namespace
+- **Dev/staging auto scale-down** — scheduled downscaling nights and weekends
+- **GitOps for all resource changes** — every change tracked and reviewable
+
+The 8% figure is a system-level average. Individual workloads can be well-optimized. The goal is systematic visibility and a feedback loop that makes over-provisioning the exception, not the default.
+
+## Summary
+
+Kubernetes underutilization is a habit problem, not a technology problem. VPA and Karpenter automate the mechanics; Platform Engineering addresses the organizational layer. Start with visibility — you cannot fix what you cannot see.

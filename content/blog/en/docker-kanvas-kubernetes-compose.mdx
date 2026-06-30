@@ -1,0 +1,92 @@
+---
+title: "Docker Kanvas: Deploy to Kubernetes Using Docker Compose Syntax"
+description: "Docker Kanvas bridges local Docker Compose workflows and Kubernetes production deployments. Here's how it works, where it fits, and what its current limitations are."
+date: "2026-05-05"
+status: "published"
+tags: ["Docker", "Kubernetes", "DevOps", "Cloud", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-kubernetes-compose"
+---
+
+Docker's Kanvas platform addresses a friction point that's been part of cloud development for years: the conceptual gap between Docker Compose for local development and Kubernetes for production. Here's what Kanvas actually does and how to think about where it fits in your stack.
+
+## The Problem
+
+Most development teams use Docker Compose locally. The format is ergonomic — a small YAML file starts a multi-container environment, environment variables map cleanly from `.env` files, and the mental model stays close to just running services.
+
+Production is a different story. Kubernetes requires separate resource definitions for Deployments, Services, Ingresses, ConfigMaps, PersistentVolumeClaims, and more. The gap between these two worlds adds cognitive overhead for developers and creates a class of deployment failures that don't surface in local testing.
+
+## What Kanvas Does
+
+Kanvas sits between your `docker-compose.yml` and the Kubernetes API. Developers write and maintain familiar Compose files; Kanvas translates them into Kubernetes manifests and manages the deployment.
+
+```yaml
+# Your existing docker-compose.yml
+services:
+  api:
+    image: myapp-api:latest
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+    depends_on:
+      - db
+      - cache
+
+  db:
+    image: postgres:16
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  cache:
+    image: redis:7-alpine
+
+volumes:
+  pg_data:
+```
+
+Kanvas reads this, produces corresponding Kubernetes resources, and handles the deployment to your cluster. No Helm chart syntax, no Kustomize overlays required to get started.
+
+## Relationship to Helm and Kustomize
+
+Kanvas isn't a replacement for Helm or Kustomize — it's an alternative entry point.
+
+**Helm** is strong for packaging and release management, but the learning curve is real. Chart templating, values files, and release lifecycle management are non-trivial to get right.
+
+**Kustomize** is built into `kubectl` and handles environment-specific overlays cleanly, but it starts from Kubernetes manifests, not Docker Compose.
+
+**Kanvas** starts from where most developers already are. As a project matures and requires Kubernetes-native features — custom resource definitions, fine-grained network policies, pod disruption budgets — you can layer in Kubernetes-specific configuration on top of the Compose-based foundation, or migrate to Helm when the packaging use case arises.
+
+## Current Limitations
+
+Kanvas is a newer product with real gaps to understand before adopting it for critical workloads.
+
+**Stateful services.** Compose `volumes` map to Kubernetes PersistentVolumeClaims, but storage class selection and access mode configuration often need manual tuning for production database workloads. Don't assume the auto-conversion produces production-ready persistence config for databases.
+
+**Multi-cluster deployments.** The current tooling focuses on single-cluster deployments. Multi-region or federated cluster scenarios need separate tooling.
+
+**CI/CD integration maturity.** GitHub Actions and ArgoCD integration patterns exist, but the community ecosystem isn't as deep as Helm's. Expect more manual configuration when wiring Kanvas into existing pipelines.
+
+**Complex networking.** Compose `ports` and `networks` map reasonably to Kubernetes Services and NetworkPolicies for simple cases, but advanced traffic management — weighted routing, circuit breaking, mTLS — still requires service mesh configuration that Kanvas doesn't abstract.
+
+## Where It Makes Sense
+
+Kanvas is a strong fit for:
+
+- Application teams that own their own deployments but don't have deep Kubernetes expertise
+- Small teams or startups without dedicated infrastructure engineers
+- Internal tooling and non-critical services that need to run in a cluster without significant ops investment
+
+For large-scale microservices or regulated production environments, a hybrid approach — Kanvas for the initial Compose-to-Kubernetes translation, with Kubernetes-native config layered on top — is more realistic than treating Kanvas as a complete solution.
+
+## Connection to Platform Engineering
+
+The platform engineering movement has gained significant momentum in 2026. Infrastructure teams build Internal Developer Platforms (IDPs) that abstract Kubernetes complexity away from application developers. Kanvas aligns with this pattern naturally: Docker Compose as the developer-facing interface, Kanvas as the translation and deployment layer underneath.
+
+For smaller organizations looking to start a platform engineering practice without building custom abstraction layers from scratch, Kanvas can serve as the foundation of that developer interface without requiring significant infrastructure investment upfront.
+
+## Summary
+
+Docker Kanvas doesn't eliminate Kubernetes complexity — it defers some of it and makes the entry point lower. If your team is already running Docker Compose locally and deploying to Kubernetes with friction, Kanvas is worth evaluating for non-critical services first. Understand what the translation output looks like, verify it matches your expectations, and make an informed decision about how far it takes you before committing to it for production workloads.

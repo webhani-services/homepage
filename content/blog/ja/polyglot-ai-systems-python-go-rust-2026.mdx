@@ -1,0 +1,199 @@
+---
+title: "Polyglot AI System の設計 — Python・Go・Rust の役割分担"
+description: "本番 AI システムは単一言語では設計しない。Python で RAG Pipeline、Go で API Gateway、Rust で WASM Sandbox。各レイヤーの責務と境界線を整理します。"
+date: "2026-05-26"
+status: "published"
+tags: ["Python", "Go", "Rust", "Architecture", "AI System"]
+thumbnail: ""
+author: "webhani"
+slug: "polyglot-ai-systems-python-go-rust-2026"
+---
+
+Production AI システムのアーキテクチャが収束しつつあります。AI/ML ロジックは Python、API Gateway と Orchestration は Go、信頼できないコードの実行は Rust の WebAssembly Sandbox という分業です。これは技術的な好みではなく、各言語が持つ特性と成熟したエコシステムに基づいた合理的な選択です。
+
+## なぜ単一言語では足りないのか
+
+AI システムの各レイヤーには、それぞれ異なる要件があります。
+
+**ML Pipeline 層**: PyTorch・TensorFlow・Hugging Face などの主要 ML ライブラリは Python ファーストです。RAG の実装、Embedding の生成、LLM の呼び出し、これらはほぼ Python で完結します。
+
+**API / Orchestration 層**: 高い並行処理性能と低いリソース消費が求められます。Goroutine ベースの Go は、数万の同時接続を少ないメモリで処理できます。
+
+**サンドボックス実行層**: ユーザー提供コードや LLM が生成したコードを安全に実行する必要がある場合、Rust + WebAssembly が最も信頼できる選択肢です。メモリ安全性がコンパイル時に保証されます。
+
+```
+┌─────────────────────────────────────────────────┐
+│                 Client (Browser / App)           │
+└──────────────────────┬──────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────┐
+│           Go API Gateway                         │
+│  - Auth / Rate Limiting                          │
+│  - Request Routing                               │
+│  - Load Balancing                                │
+└──────────┬─────────────────────┬────────────────┘
+           │                     │
+┌──────────▼──────────┐ ┌────────▼───────────────┐
+│  Python ML Service  │ │  Rust WASM Sandbox      │
+│  - RAG Pipeline     │ │  - Code Execution       │
+│  - LLM API Calls    │ │  - Untrusted Input      │
+│  - Embedding        │ │  - Resource Isolation   │
+└─────────────────────┘ └────────────────────────┘
+```
+
+## Python: ML Pipeline の中心
+
+Python の役割は ML ロジックの実装に集中させます。Web フレームワークとして FastAPI を使い、Async/Await でスループットを確保します。
+
+```python
+from fastapi import FastAPI
+from anthropic import AsyncAnthropic
+from sentence_transformers import SentenceTransformer
+
+app = FastAPI()
+client = AsyncAnthropic()
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+@app.post("/rag/query")
+async def rag_query(query: str, context_docs: list[str]):
+    # Embedding 生成
+    query_embedding = embedder.encode(query)
+    doc_embeddings = embedder.encode(context_docs)
+
+    # コサイン類似度で Top-K を選択
+    similarities = cosine_similarity([query_embedding], doc_embeddings)[0]
+    top_indices = similarities.argsort()[-3:][::-1]
+    relevant_docs = [context_docs[i] for i in top_indices]
+
+    # LLM 呼び出し
+    context = "\n\n".join(relevant_docs)
+    response = await client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        messages=[{
+            "role": "user",
+            "content": f"Context:\n{context}\n\nQuestion: {query}"
+        }]
+    )
+    return {"answer": response.content[0].text}
+```
+
+Python Service は ML 処理に特化させ、認証・レート制限・ルーティングは Go に任せます。責務の分離がシステム全体の保守性を高めます。
+
+## Go: API Gateway と Orchestration
+
+Go は Python Service と外部クライアントの間に置く API Gateway として機能します。Goroutine の軽量さを活かし、複数の Python Service への並行リクエストを効率よく処理できます。
+
+```go
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "net/http"
+    "sync"
+    "time"
+)
+
+type RAGRequest struct {
+    Query       string   `json:"query"`
+    ContextDocs []string `json:"context_docs"`
+}
+
+// 複数の ML Service に並行リクエストを送る
+func fanOutToServices(ctx context.Context, req RAGRequest) ([]ServiceResult, error) {
+    services := []string{
+        "http://python-service-1:8000/rag/query",
+        "http://python-service-2:8000/rag/query",
+    }
+
+    results := make([]ServiceResult, len(services))
+    var wg sync.WaitGroup
+    var mu sync.Mutex
+    var firstErr error
+
+    for i, svc := range services {
+        wg.Add(1)
+        go func(idx int, url string) {
+            defer wg.Done()
+
+            ctxWithTimeout, cancel := context.WithTimeout(ctx, 10*time.Second)
+            defer cancel()
+
+            result, err := callService(ctxWithTimeout, url, req)
+            mu.Lock()
+            defer mu.Unlock()
+            if err != nil && firstErr == nil {
+                firstErr = err
+                return
+            }
+            results[idx] = result
+        }(i, svc)
+    }
+
+    wg.Wait()
+    return results, firstErr
+}
+
+func main() {
+    mux := http.NewServeMux()
+    mux.HandleFunc("POST /api/rag", handleRAG)
+    http.ListenAndServe(":8080", mux)
+}
+```
+
+Go での並行処理は、複数の Python Service を束ねて Ensemble 結果を返すような Orchestration に適しています。コンテキストのキャンセル伝播も標準ライブラリで完結します。
+
+## Rust: WASM サンドボックス実行
+
+LLM が生成したコードをユーザー環境で実行する必要がある場合、Rust + WebAssembly が最も安全な選択です。Wasmtime などの WASM Runtime を使えば、コードを完全に隔離された環境で実行できます。
+
+```rust
+use wasmtime::{Engine, Module, Store, Linker};
+use anyhow::Result;
+
+pub struct WasmSandbox {
+    engine: Engine,
+}
+
+impl WasmSandbox {
+    pub fn new() -> Self {
+        WasmSandbox {
+            engine: Engine::default(),
+        }
+    }
+
+    pub fn execute(&self, wasm_bytes: &[u8], input: &str) -> Result<String> {
+        let module = Module::new(&self.engine, wasm_bytes)?;
+        let mut store = Store::new(&self.engine, ());
+        let linker = Linker::new(&self.engine);
+
+        // メモリアクセス・システムコールを制限した環境で実行
+        let instance = linker.instantiate(&mut store, &module)?;
+        let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+        run.call(&mut store, ())?;
+
+        Ok("execution_complete".to_string())
+    }
+}
+```
+
+Rust の所有権モデルはメモリ安全性をコンパイル時に保証します。WASM Sandbox と組み合わせることで、LLM 生成コードがホストシステムに影響を与えるリスクをほぼゼロにできます。
+
+## サービス間通信の設計
+
+Python・Go・Rust のサービスが協調するには、境界を明確にしたインターフェース設計が重要です。
+
+| 通信パターン | 適した場面 |
+|------------|----------|
+| HTTP/REST  | 同期呼び出し、シンプルなリクエスト/レスポンス |
+| gRPC       | 高スループット、型安全な内部通信 |
+| Message Queue | 非同期処理、LLM の長時間タスク |
+
+ML Pipeline は応答時間が長くなりがちです。Go から Python への呼び出しは非同期化し、結果を Webhook や Message Queue で受け取る設計にするとタイムアウトの問題を避けられます。
+
+## webhani の見方
+
+このアーキテクチャはオーバーエンジニアリングに見えるかもしれません。しかし、AI システムが本番環境で稼働し始めると、ML ロジックの更新・API の安定性・コード実行の安全性が同時に求められます。これらを単一の Python アプリで全て担うと、変更のサイクルとリスクが混在します。
+
+全てのプロジェクトがこの分業を必要とするわけではありません。小規模な AI アプリであれば FastAPI 単体で十分です。スケールと要件に応じて、どこで境界を引くかを判断するのが設計の本質です。最初から複雑にする必要はありませんが、規模が大きくなったときにどう分割するかのイメージを持って設計することが重要です。

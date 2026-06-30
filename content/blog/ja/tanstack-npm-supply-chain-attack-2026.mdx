@@ -1,0 +1,133 @@
+---
+title: "TanStackとMistralのnpm Supply Chain攻撃：今すぐCI/CDシークレットを確認すべき理由"
+description: "週間数千万ダウンロードのTanStack RouterとMistral AI npmパッケージが供給チェーン攻撃「mini Shai-Hulud」に巻き込まれました。GitHub・クラウド・CI/CDのクレデンシャルが流出した可能性があります。"
+date: "2026-05-21"
+status: "published"
+tags: ["Security", "npm", "Supply-Chain", "CI/CD", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "tanstack-npm-supply-chain-attack-2026"
+---
+
+「mini Shai-Hulud」と名付けられたnpm供給チェーン攻撃が、TanStack RouterとMistral AIのnpmパッケージを標的にしました。TanStack Routerは`@tanstack/react-router`など複数のパッケージで合計数千万の週間ダウンロードを持つため、影響範囲が広い可能性があります。
+
+## 何が起きたか
+
+攻撃者は正規のnpmパッケージに悪意のあるコードを注入しました。このコードは実行環境から以下の情報を収集して外部サーバーに送信します：
+
+- 環境変数に含まれるGitHubトークンやAWSキー
+- CI/CDシステムのシークレット（GitHub Actions, CircleCI等）
+- クラウドプロバイダーのクレデンシャル
+
+影響を受けた可能性があるパッケージには`@tanstack/react-router`、`@tanstack/history`、`@tanstack/router-core`と、いくつかのMistral AIパッケージが含まれます。別途Trend Microが開示したTeamPCPキャンペーンでは、Docker Hub、VS Code/OpenVSX、GitHub Actionsも対象になっています。
+
+## 確認すべきこと
+
+### 1. lockfileの確認
+
+`package-lock.json`または`yarn.lock`の差分を確認し、TanStackやMistral関連パッケージのバージョンが意図しないタイミングで変わっていないか確認します。
+
+```bash
+# git historyでlockfileの変更を確認
+git log --oneline --follow -- package-lock.json | head -20
+
+# 特定のパッケージのバージョン履歴を確認
+git log -p -- package-lock.json | grep -A 2 "tanstack"
+```
+
+### 2. CI/CDシークレットのローテーション
+
+影響を受けたパッケージをインストールしたことがある環境のシークレットを、念のためローテーションすることを検討してください。特に：
+
+- GitHubのPersonal Access Token
+- AWS/GCP/Azure のアクセスキー
+- CI/CDシステムのAPIキーやトークン
+- コンテナレジストリのクレデンシャル
+
+```bash
+# GitHub Actionsのシークレット一覧確認（gh CLIが必要）
+gh secret list --repo owner/repo
+
+# シークレットの更新
+gh secret set AWS_ACCESS_KEY_ID --repo owner/repo
+```
+
+### 3. 依存関係のaudit
+
+```bash
+# npm audit で既知の脆弱性を確認
+npm audit
+
+# 影響を受けたパッケージの現在のバージョンを確認
+npm list @tanstack/react-router @tanstack/history @tanstack/router-core
+```
+
+## 根本的な防御策
+
+今回のインシデントは個別の対応だけでなく、構造的な防御策を整えるきっかけにすべきです。
+
+### パッケージのintegrity検証
+
+`npm ci`は`package-lock.json`のSHA512ハッシュを検証するため、`npm install`より安全です。CI/CD環境では必ず`npm ci`を使用してください。
+
+```yaml
+# GitHub Actions例
+- name: Install dependencies
+  run: npm ci  # npm install ではなく npm ci を使う
+```
+
+### CI/CDの最小権限原則
+
+CI環境で使用するトークンは必要最小限のスコープに絞ります。
+
+```yaml
+# GitHub Actionsでの権限の明示的な制限
+permissions:
+  contents: read
+  id-token: write  # OIDC認証に必要な場合のみ
+  # write権限はデプロイに必要なものだけに限定
+```
+
+### 環境変数のスコープ制限
+
+すべての環境変数をCI実行全体に渡すのではなく、必要なステップにのみ渡すようにします。
+
+```yaml
+- name: Deploy to production
+  env:
+    AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  run: |
+    # このステップのみクレデンシャルにアクセスできる
+    ./deploy.sh
+```
+
+### Dependabotやrenovateによる依存関係の自動監視
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    # セキュリティアップデートを自動マージ
+    open-pull-requests-limit: 10
+```
+
+## npmのSupply Chain攻撃が増えている背景
+
+npmエコシステムはオープンな公開レジストリのため、パッケージの公開に強い制約がありません。攻撃者は以下の方法で正規パッケージに侵入します：
+
+- メンテナーのアカウント乗っ取り（フィッシング、パスワード流出）
+- 類似名パッケージの公開（typosquatting）
+- 依存パッケージへの遡及的な侵入
+
+人気パッケージのメンテナーアカウントを標的にすることで、一度の攻撃で数千万の環境に到達できる——これが供給チェーン攻撃の危険性です。
+
+## まとめ
+
+TanStack RouterやMistral AIパッケージを使用しているチームは、lockfileの確認とシークレットのローテーションを優先してください。同時に、今回のインシデントを機に`npm ci`の徹底、CI/CDの最小権限設定、依存関係の自動監視といった構造的な防御策を見直すことをお勧めします。
+
+Supply Chain攻撃は「自分たちが書いたコード」ではなく「信頼していたサードパーティ」が攻撃経路になる点で、通常の脆弱性対応とは異なる発想が必要です。

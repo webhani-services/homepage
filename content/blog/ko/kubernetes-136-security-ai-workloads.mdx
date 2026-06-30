@@ -1,0 +1,139 @@
+---
+title: "Kubernetes v1.36: 보안 기본값 강화와 AI 워크로드 지원 성숙"
+description: "Kubernetes v1.36에서 GA로 승격된 주요 기능과 Ingress NGINX 퇴역이 클러스터 운영에 미치는 실질적 영향을 정리합니다."
+date: "2026-05-22"
+status: "published"
+tags: ["Kubernetes", "DevOps", "cloud-infrastructure", "security", "AI"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-136-security-ai-workloads"
+---
+
+## v1.36의 주요 변경사항
+
+2026년 5월에 출시된 Kubernetes v1.36(코드명 Haru)에는 70가지 개선사항이 포함되어 있습니다. 보안 강화와 AI 워크로드 지원이 핵심 테마이며, 다음 세 가지 기능이 General Availability(GA)로 승격되었습니다:
+
+1. **User Namespaces** — 컨테이너 UID를 호스트로부터 격리
+2. **Mutating Admission Policies** — 외부 Webhook 없이 CEL 기반 리소스 변경 정책
+3. **Fine-Grained Kubelet API Authorization** — Kubelet 엔드포인트별 세분화된 접근 제어
+
+운영 측면에서는 2026년 3월 24일 Ingress NGINX 프로젝트가 공식 퇴역(retired)되었으므로, 해당 Controller를 사용 중인 클러스터는 마이그레이션 계획이 필요합니다.
+
+## User Namespaces: 컨테이너 격리 강화
+
+User Namespaces는 컨테이너 내부의 UID를 호스트의 비특권 UID에 매핑합니다. 컨테이너 내에서 `root`로 실행되는 프로세스가 호스트에서는 일반 사용자로 동작하게 됩니다. 이를 통해 애플리케이션 수정 없이 컨테이너 탈출 취약점의 한 유형을 차단할 수 있습니다.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: build-runner
+spec:
+  hostUsers: false  # User Namespaces 활성화
+  containers:
+  - name: builder
+    image: your-builder:latest
+    securityContext:
+      runAsUser: 0  # 컨테이너 내부에서는 root
+      # 호스트에서는 비특권 UID로 매핑됨
+```
+
+`hostUsers: false` 설정만으로 활성화됩니다. 빌드 도구나 레거시 앱처럼 컨테이너 수준 root 권한이 필요하지만, 호스트 root 권한은 부여하고 싶지 않은 워크로드에 유용합니다.
+
+**프로덕션 적용 전 확인사항:** containerd 1.7 이상이 필요합니다. 노드의 런타임 버전을 확인하고, 비프로덕션 클러스터에서 먼저 호환성을 검증하세요.
+
+## Mutating Admission Policies: 운영 복잡도 감소
+
+Admission Webhook은 유연하지만 운영 부담이 있습니다. 별도의 서비스 배포, TLS 인증서 관리, 가용성 관리가 필요하며, Webhook 장애 시 리소스 생성 자체가 차단될 수 있습니다.
+
+Mutating Admission Policies는 CEL(Common Expression Language)을 사용해 API 서버 내부에서 실행됩니다. 외부 서비스 의존성이 없고 레이턴시가 낮으며 관리할 인프라가 줄어듭니다.
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: inject-team-label
+spec:
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      resources: ["pods"]
+      operations: ["CREATE"]
+  mutations:
+  - patchType: ApplyConfiguration
+    applyConfiguration:
+      expression: |
+        Object{
+          metadata: Object.metadata{
+            labels: {"team": "platform"}
+          }
+        }
+```
+
+이 예시는 별도 Webhook 서비스 없이 새로 생성되는 모든 Pod에 `team` 레이블을 자동으로 추가합니다. 기본 리소스 제한 설정, 환경 변수 정규화, 사이드카 Annotation 주입 등 일반적인 패턴에 활용할 수 있습니다.
+
+외부 데이터 조회가 필요한 복잡한 변환 로직은 여전히 Webhook이 필요합니다. 하지만 일반적인 패턴 대부분은 CEL로 단순하고 안정적으로 처리할 수 있습니다.
+
+## Fine-Grained Kubelet API Authorization
+
+일상적인 클러스터 운영에서 눈에 잘 띄지 않지만, 규제 환경과 멀티테넌트 클러스터에서 중요한 기능입니다. 이전 버전에서는 Kubelet API 접근 제어가 거칠었습니다. v1.36 GA에서는 엔드포인트별 인가가 가능해져, 모니터링 Agent에 `/metrics` 접근만 허용하고 `/exec`나 `/logs`는 차단할 수 있습니다.
+
+노드 Agent가 침해되더라도 피해 범위를 인가된 Kubelet API로 제한할 수 있습니다.
+
+## AI 워크로드 지원: DRA 안정화
+
+Dynamic Resource Allocation(DRA)은 GPU, FPGA, 커스텀 가속기를 Pod에 동적으로 할당하는 메커니즘으로 v1.36에서 계속 안정화되고 있습니다. 정적인 `nvidia.com/gpu` 리소스 모델은 동일한 GPU 풀에서는 잘 동작하지만, 여러 Pod 간 GPU 공유, 특정 메모리 특성의 GPU 선택, 분수 GPU 할당이 필요한 경우 한계가 있습니다.
+
+```yaml
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: inference-gpu
+spec:
+  resourceClassName: gpu.company.com
+---
+apiVersion: v1
+kind: Pod
+spec:
+  resourceClaims:
+  - name: gpu
+    resourceClaimName: inference-gpu
+  containers:
+  - name: inference-server
+    image: your-inference:latest
+    resources:
+      claims:
+      - name: gpu
+```
+
+DRA를 사용하면 Pod 스펙에 모든 것을 정적으로 선언하는 대신, 스케줄링 시점에 GPU 드라이버가 특정 디바이스와 설정을 협상합니다. 추론 워크로드가 다양해질수록 중요성이 커집니다.
+
+## Ingress NGINX 퇴역: 마이그레이션 경로
+
+CNCF의 `kubernetes/ingress-nginx` Controller(nginx.org의 NGINX Inc. Controller와 별개)를 사용 중이라면 마이그레이션이 필요합니다. 더 이상 릴리스, 버그 수정, 보안 취약점 패치가 없습니다.
+
+| 선택지 | 성숙도 | 비고 |
+|--------|--------|------|
+| Gateway API + Envoy Gateway | 안정 | 신규 배포에 권장 |
+| Gateway API + Cilium | 안정 | Cilium CNI 사용 시 적합 |
+| NGINX Inc. Controller | 안정 | 기존 설정 호환성 높음 |
+| Traefik | 안정 | 설정이 간단하고 미들웨어 지원 강력 |
+
+Gateway API가 생태계의 장기적인 방향입니다. 신규 클러스터를 구성하거나 마이그레이션 여유가 있다면 지금이 적기입니다. 복잡한 Ingress 설정을 가진 기존 클러스터는 NGINX Inc. Controller가 가장 낮은 마찰로 이전할 수 있는 경로입니다.
+
+## 업그레이드 체크리스트
+
+프로덕션 클러스터를 v1.36으로 업그레이드하기 전에:
+
+1. `kubectl deprecations`로 제거된 API 버전 확인
+2. Admission Webhook 호환성 검토
+3. 컨테이너 런타임 버전 확인 (User Namespaces는 containerd ≥ 1.7 필요)
+4. 프로덕션과 유사한 워크로드로 스테이징 환경에서 검증
+5. Ingress NGINX를 사용 중이라면 마이그레이션 일정 계획
+
+## 마치며
+
+v1.36은 보안 강화와 운영 복잡도 감소를 동시에 달성한 릴리스입니다. Mutating Admission Policies가 그 대표적인 예입니다. AI 워크로드 개선은 점진적이지만 GPU 워크로드가 클러스터 운영에서 차지하는 비중이 커질수록 실질적인 가치를 발휘합니다.
+
+Ingress NGINX 퇴역이 가장 시급한 사안입니다. 해당된다면 다른 업그레이드보다 마이그레이션을 우선순위에 두세요.

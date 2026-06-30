@@ -1,0 +1,116 @@
+---
+title: "React Compiler Goes Stable: What It Actually Changes for Your Codebase"
+description: "React Compiler reached stable status in React 19.2, making manual memoization with useMemo and useCallback largely optional. Here's what changes in practice and how to evaluate migration."
+date: "2026-05-05"
+status: "published"
+tags: ["React", "React Compiler", "Performance", "TypeScript", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "react-compiler-stable-react-19"
+---
+
+React Compiler reaching stable status in React 19.2 is a meaningful shift — not a minor version bump. It moves from an optional experiment to a feature teams should actively evaluate. Here's what it changes and what to think through before enabling it.
+
+## The Problem It Solves
+
+React's rendering model re-executes component functions on every state or prop change. To prevent expensive recalculations and unnecessary child re-renders, developers have historically used `useMemo`, `useCallback`, and `React.memo` manually.
+
+The problem: manual memoization is error-prone.
+
+```tsx
+// Typical pre-compiler code
+const SearchResults = ({ query, filters }: { query: string; filters: Filter[] }) => {
+  const filteredResults = useMemo(
+    () => expensiveFilter(allResults, query, filters),
+    [allResults, query, filters] // miss a dep? stale results. add too many? defeats the purpose
+  );
+
+  const handleSelect = useCallback((id: string) => {
+    onSelect(id);
+  }, [onSelect]); // is onSelect stable? depends on the parent
+
+  return <ResultList items={filteredResults} onSelect={handleSelect} />;
+};
+```
+
+Dependency arrays require tracking exactly which values a computation depends on. Get it wrong and you either have stale data or redundant recalculations — both silent failures. Code review time spent validating dependency arrays is significant and uninspiring work.
+
+## What the Compiler Does
+
+React Compiler analyzes component functions at build time and automatically inserts memoization where needed. The developer writes straightforward code; the compiler produces the optimized output.
+
+```tsx
+// With React Compiler enabled
+const SearchResults = ({ query, filters }: { query: string; filters: Filter[] }) => {
+  // No useMemo — compiler handles it
+  const filteredResults = expensiveFilter(allResults, query, filters);
+
+  // No useCallback — compiler handles it
+  const handleSelect = (id: string) => {
+    onSelect(id);
+  };
+
+  return <ResultList items={filteredResults} onSelect={handleSelect} />;
+};
+```
+
+The compiled output is equivalent in performance to the manually memoized version, with the compiler having full static visibility into the dependency graph.
+
+## Setup
+
+React 19.2 with `babel-plugin-react-compiler`:
+
+```bash
+npm install react@19.2 react-dom@19.2 babel-plugin-react-compiler
+```
+
+Add to your Babel config:
+
+```json
+{
+  "plugins": ["babel-plugin-react-compiler"]
+}
+```
+
+For Next.js 16:
+
+```typescript
+// next.config.ts
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  experimental: {
+    reactCompiler: true,
+  },
+};
+
+export default nextConfig;
+```
+
+## Migration Considerations
+
+**Strict Mode is a prerequisite.** The compiler assumes React Strict Mode semantics: side-effect-free render functions and idempotent rendering. Projects already on Strict Mode — which should be most — are well-positioned.
+
+**Existing `useMemo`/`useCallback` stays in place.** The compiler doesn't remove your existing memoization. You can migrate gradually, though during the transition period you may have redundant memoization in some places.
+
+**The ESLint plugin surfaces incompatible patterns.** Run `eslint-plugin-react-compiler` before enabling the compiler to identify components that use patterns the compiler can't safely optimize (direct mutation, non-idiomatic side effects).
+
+```bash
+npm install --save-dev eslint-plugin-react-compiler
+```
+
+**Third-party library interactions.** The compiler transforms your code, not library internals. Components that rely heavily on library-level side effects or unconventional ref patterns may need manual review.
+
+## What Changes in Code Review
+
+Before the compiler: a non-trivial portion of review time went to verifying dependency arrays and checking whether `React.memo` was applied correctly at component boundaries.
+
+After the compiler: those checks move to the build pipeline. Reviews can focus on logic correctness and component design instead. The residual knowledge requirement is understanding *why* the compiler can't optimize a given pattern — which is a more interesting problem than validating dependency arrays.
+
+## Performance Ceiling and Floor
+
+The performance ceiling of React Compiler is the same as hand-tuned memoization. The floor is higher because it eliminates the class of bugs caused by incorrect dependency arrays. There's no trade-off in the performance contract — you get at least as much optimization as careful manual work, without the manual work.
+
+## Assessment
+
+React Compiler stable is worth enabling on new projects immediately. For existing codebases, the ESLint plugin gives you a concrete answer on migration cost without committing to the change. Manual memoization won't disappear overnight, but this is a real shift for the React ecosystem — one that changes what good React code looks like and what code review focuses on.

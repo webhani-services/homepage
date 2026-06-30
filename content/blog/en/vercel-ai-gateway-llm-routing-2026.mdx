@@ -1,0 +1,90 @@
+---
+title: "Vercel AI Gateway: Unified LLM Access for Next.js Applications"
+description: "Vercel AI Gateway consolidates access to 100+ AI models through a single endpoint, with built-in fallbacks, cost tracking, and observability. A practical guide to integrating it in Next.js apps."
+date: "2026-05-02"
+status: "published"
+tags: ["Vercel", "AI", "LLM", "Next.js", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "vercel-ai-gateway-llm-routing-2026"
+---
+
+Building AI-powered web apps increasingly means working with multiple LLM providers — different models for different tasks, cost tiers, or reliability requirements. Managing separate SDK dependencies, authentication patterns, and observability for each provider adds real complexity.
+
+Vercel AI Gateway centralizes this access layer: one endpoint, one authentication pattern, and built-in observability for all model calls. It supports 100+ models across providers with sub-20ms routing latency and automatic failover.
+
+## Basic Integration
+
+The gateway works through AI SDK v6's provider string pattern. No provider-specific imports are needed in your application code.
+
+```typescript
+// app/api/chat/route.ts
+import { streamText } from "ai";
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+
+  const result = await streamText({
+    model: "anthropic/claude-sonnet-4-6",
+    messages,
+  });
+
+  return result.toDataStreamResponse();
+}
+```
+
+Switching models is a one-line change to the model string. The authentication, streaming handling, and SDK integration don't change.
+
+## Fallback Configuration
+
+For production workloads, you want automatic failover when a provider has issues. The gateway handles this declaratively:
+
+```typescript
+const result = await streamText({
+  model: "anthropic/claude-opus-4-7",
+  fallback: [
+    "openai/gpt-5.5",
+    "google/gemini-3-1-pro",
+  ],
+  messages,
+});
+```
+
+The gateway tries each fallback in order if the primary model fails or is slow to respond. Your application code sees a single result either way.
+
+## Observability Without Extra Instrumentation
+
+The Vercel dashboard surfaces per-model request counts, token usage, time-to-first-token, and cost — without any manual instrumentation in your code. Since all requests flow through the gateway, the data is already there.
+
+This is particularly useful when running experiments across models. You can compare actual cost and latency in production without adding logging to each API call.
+
+## Budget Controls
+
+Monthly spending limits per model prevent unexpected cost overruns:
+
+```json
+{
+  "ai": {
+    "gateway": {
+      "budgets": [
+        { "model": "anthropic/claude-opus-4-7", "monthly": 500 },
+        { "model": "openai/gpt-5.5", "monthly": 200 }
+      ]
+    }
+  }
+}
+```
+
+When a model hits its budget, requests are automatically routed to the configured fallback rather than failing.
+
+## Trade-offs
+
+Vercel AI Gateway is tightly coupled to the Vercel platform. The upside is zero infrastructure setup — the gateway is available immediately when you deploy. The downside is reduced portability.
+
+For teams that need to run on multiple cloud providers, or want fine-grained control over routing logic (latency-based routing, semantic routing, custom load balancing), a self-hosted solution like LiteLLM gives more flexibility. But for projects already on the Vercel stack, the convenience-to-complexity ratio is hard to beat.
+
+## Takeaway
+
+Vercel AI Gateway solves the practical problem of managing LLM provider diversity in production Next.js apps. It standardizes access, removes per-provider SDK boilerplate, and provides observability without instrumentation overhead.
+
+If you're adding AI features to a Vercel-hosted app, routing through the gateway rather than wiring provider SDKs directly is worth considering as a default — it keeps model selection flexible and cost visible.

@@ -1,0 +1,242 @@
+---
+title: "Vercel AI SDK 6 の Agent 抽象化と Tool 承認フロー、MCP サポートを整理する"
+description: "Vercel AI SDK 6 が導入した createAgent()、needsApproval フラグ、MCP クライアント、OpenTelemetry トレーシングの実装方法を整理します。v5 からの破壊的変更と移行ポイントも合わせて解説します。"
+date: "2026-05-10"
+status: "published"
+tags: ["Vercel", "AI SDK", "Agents", "MCP", "TypeScript"]
+thumbnail: ""
+author: "webhani"
+slug: "vercel-ai-sdk-6-agents-2026"
+---
+
+Vercel AI SDK 6 は、v5 までの実験的な機能群を整理しつつ、実用レベルの Agent 開発に必要な基盤を提供するバージョンです。`createAgent()` の導入、Tool ごとの承認フロー、MCP クライアントの組み込みサポートが主な追加点です。本記事では各機能の実装方法と、v5 からの移行時に注意すべき破壊的変更を整理します。
+
+## createAgent() — 再利用可能な Agent オブジェクト
+
+v5 まで、Agent のロジックは `generateText()` や `streamText()` の呼び出しごとに記述する必要がありました。SDK 6 では `createAgent()` で Agent を一度定義し、API Route、バックグラウンドジョブ、スクリプトなど複数のコンテキストで使い回せます。
+
+```typescript
+import { createAgent } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { searchWeb, fetchPage, summarize } from "./tools";
+
+const researchAgent = createAgent({
+  model: openai("gpt-4o"),
+  system: "You are a research assistant. Retrieve information and summarize findings concisely.",
+  tools: {
+    searchWeb,
+    fetchPage,
+    summarize,
+  },
+  maxSteps: 10,
+});
+
+// API Route での使用
+export async function POST(req: Request) {
+  const { topic } = await req.json();
+  const result = await researchAgent.generate(`Research this topic: ${topic}`);
+  return Response.json({ summary: result.text });
+}
+```
+
+`createAgent()` は内部的に `generateText()` と同等の処理を行いますが、設定をオブジェクトに閉じ込めることでコードの重複を排除できます。同じ Agent をバックグラウンドジョブの `runJob()` 内で呼んでも、スクリプトの `main()` 内で呼んでも動作は一貫しています。
+
+## needsApproval — Tool ごとの承認フロー
+
+Agent が外部システムに書き込む処理（DB 更新、メール送信、Webhook 呼び出しなど）を自律的に実行させたくない場面があります。SDK 6 は Tool レベルで `needsApproval: true` フラグを設定することで、実行を一時停止し、人間の承認を待つ仕組みを提供します。
+
+```typescript
+import { createAgent, tool } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { z } from "zod";
+
+const deployAgent = createAgent({
+  model: openai("gpt-4o"),
+  system: "You manage infrastructure deployments.",
+  tools: {
+    analyzeChanges: tool({
+      description: "Analyze the diff and estimate risk",
+      parameters: z.object({ prUrl: z.string() }),
+      execute: async ({ prUrl }) => analyzeChanges(prUrl),
+    }),
+    triggerDeploy: tool({
+      description: "Trigger a production deployment",
+      parameters: z.object({ prUrl: z.string(), environment: z.string() }),
+      needsApproval: true, // この Tool は人間の承認が必要
+      execute: async ({ prUrl, environment }) => triggerDeploy(prUrl, environment),
+    }),
+  },
+});
+
+// Agent の実行
+const result = await deployAgent.generate("Deploy PR #42 to production");
+
+if (result.status === "requires-approval") {
+  // 承認待ち状態を永続化する
+  await db.pendingApprovals.create({
+    agentState: result.state,
+    toolCall: result.pendingToolCall,
+    requestedAt: new Date(),
+  });
+  return Response.json({ status: "pending", id: result.state.id });
+}
+```
+
+承認後は保存した `state` を使って Agent を再開します。
+
+```typescript
+// 承認 API Route
+export async function POST(req: Request) {
+  const { approvalId } = await req.json();
+  const approval = await db.pendingApprovals.findById(approvalId);
+
+  const resumed = await deployAgent.resume({
+    state: approval.agentState,
+    approved: true,
+  });
+
+  return Response.json({ result: resumed.text });
+}
+```
+
+`needsApproval` は Tool ごとに個別に設定できるため、読み取り系 Tool と書き込み系 Tool を同じ Agent に共存させながら、書き込みだけ承認フローに乗せるといった設計が自然に表現できます。
+
+## createMcpClient() — MCP サーバーへの直接接続
+
+Model Context Protocol（MCP）サーバーを SDK 呼び出しに接続するための `createMcpClient()` が組み込まれました。外部パッケージを追加せずに使えます。
+
+```typescript
+import { createAgent, createMcpClient } from "ai";
+import { openai } from "@ai-sdk/openai";
+
+const githubMcp = createMcpClient({
+  transport: {
+    type: "stdio",
+    command: "npx",
+    args: ["-y", "@modelcontextprotocol/server-github"],
+    env: { GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_TOKEN! },
+  },
+});
+
+const codeReviewAgent = createAgent({
+  model: openai("gpt-4o"),
+  system: "You review pull requests and provide actionable feedback.",
+  tools: await githubMcp.getTools(), // MCP サーバーが提供する Tool を取得
+});
+
+const review = await codeReviewAgent.generate(
+  "Review PR #123 in the webhani/homepage repository"
+);
+
+await githubMcp.close();
+```
+
+HTTP ベースの MCP サーバーにも接続できます。
+
+```typescript
+const remoteMcp = createMcpClient({
+  transport: {
+    type: "http",
+    url: "https://mcp.example.com/api",
+    headers: { Authorization: `Bearer ${process.env.MCP_TOKEN}` },
+  },
+});
+```
+
+`getTools()` は MCP サーバーが公開する Tool の一覧を取得し、SDK の Tool 型に自動変換します。既存の MCP エコシステムの Tool 群を Agent にそのまま組み込めるのが利点です。
+
+## OpenTelemetry トレーシング
+
+Agent のステップごとに何が起きているかを可視化するために、OpenTelemetry との連携が整備されました。
+
+```typescript
+import { registerOTel } from "@vercel/otel";
+
+// アプリケーションのエントリポイントで登録
+registerOTel({ serviceName: "my-ai-app" });
+```
+
+```typescript
+import { createAgent } from "ai";
+import { openai } from "@ai-sdk/openai";
+
+const agent = createAgent({
+  model: openai("gpt-4o"),
+  tools: { searchWeb, fetchPage },
+  experimental_telemetry: {
+    isEnabled: true,
+    functionId: "research-agent",
+    metadata: {
+      userId: "user-123",
+      sessionId: "session-456",
+    },
+  },
+});
+
+const result = await agent.generate("Find recent news about TypeScript 6");
+```
+
+各 Tool 呼び出し、LLM リクエスト、ステップ間の遷移が個別の Span として記録されます。Jaeger や Honeycomb などの OTLP 対応バックエンドで、Agent の実行経路とレイテンシを可視化できます。
+
+## Per-Tool Strict Mode
+
+JSON Schema のバリデーション方針を Tool ごとに切り替えられます。`strict: true` にすると追加プロパティを許可しない厳密なバリデーションが適用され、`strict: false` では LLM が余分なフィールドを返しても許容します。
+
+```typescript
+const agent = createAgent({
+  model: openai("gpt-4o"),
+  tools: {
+    // 構造化データが重要な Tool は strict
+    createInvoice: tool({
+      parameters: invoiceSchema,
+      strict: true,
+      execute: async (params) => createInvoice(params),
+    }),
+    // 自由形式の入力を受け付ける Tool は lenient
+    searchDocuments: tool({
+      parameters: searchSchema,
+      strict: false,
+      execute: async (params) => searchDocuments(params),
+    }),
+  },
+});
+```
+
+一つの Agent 内で strict と lenient を混在させられるのが SDK 6 の特徴です。
+
+## v5 からの破壊的変更
+
+主な変更点を三点まとめます。
+
+**1. `experimental_tools` → `tools`**
+
+```typescript
+// v5
+const result = await generateText({
+  experimental_tools: { searchWeb },
+});
+
+// v6
+const result = await generateText({
+  tools: { searchWeb },
+});
+```
+
+**2. Chat SDK のトランスクリプト形式変更**
+
+`useChat()` が返すメッセージ形式が変更されました。カスタムの永続化ロジックを実装している場合は、新しいスキーマへの移行が必要です。公式ドキュメントに移行スクリプトのサンプルが掲載されています。
+
+**3. `LanguageModel` 型の変更**
+
+`LanguageModel` 型を直接参照しているカスタムラッパーや型定義は更新が必要です。
+
+```typescript
+// v6 の型インポート
+import type { LanguageModelV2 } from "ai";
+```
+
+## まとめ
+
+SDK 6 の変更は実験的な機能の安定化が中心です。`createAgent()` は Agent ロジックの散在を防ぎ、`needsApproval` は自律実行と人間の監視を両立させます。MCP クライアントの組み込みは、既存の MCP エコシステムとの接続コストを下げます。
+
+移行で注意が必要なのは `experimental_tools` のリネームと Chat SDK のトランスクリプト形式変更の二点です。どちらも機械的な置き換えで対応できますが、トランスクリプトを DB に永続化している場合はデータ移行スクリプトの用意が必要になります。新規プロジェクトであれば v6 を最初から採用することを推奨します。

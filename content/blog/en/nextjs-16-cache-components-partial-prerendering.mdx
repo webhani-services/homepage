@@ -1,0 +1,164 @@
+---
+title: "Next.js 16 Cache Components and Partial Pre-Rendering in Practice"
+description: "Next.js 16 makes Partial Pre-Rendering and Cache Components stable. Here's how they change your rendering strategy and when to use them."
+date: "2026-06-04"
+status: "published"
+tags: ["Next.js", "React", "Web Development", "Performance", "Caching"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-cache-components-partial-prerendering"
+---
+
+Next.js 16 stabilizes two features that change how you think about page rendering: Partial Pre-Rendering (PPR) and Cache Components. Together, they dissolve the binary choice between "fast static pages" and "flexible dynamic pages."
+
+## What PPR Actually Does
+
+Before PPR, a single dynamic component made the entire page dynamic. Static generation was all-or-nothing at the page level.
+
+PPR splits a page into two parts at build time: a static shell (generated once, served from CDN) and dynamic slots wrapped in `<Suspense>` boundaries (rendered per-request and streamed in). The browser receives the shell instantly, then the dynamic content fills in as it resolves.
+
+```
+Build time:   [Static shell] + [Suspense fallbacks] → CDN
+Request time: [Static shell] + [Dynamic content]    → streamed to client
+```
+
+Time to First Byte stays low because the shell is already at the CDN edge. Dynamic content streams in without holding up the initial render.
+
+## Cache Components
+
+React's `cache` function, now stable in Next.js 16, memoizes async function results within a request and across the render tree.
+
+```tsx
+// app/components/ProductList.tsx
+import { cache } from "react";
+
+const getProducts = cache(async (categoryId: string) => {
+  const res = await fetch(`/api/products?category=${categoryId}`, {
+    next: { revalidate: 300 }, // revalidate every 5 minutes
+  });
+  return res.json();
+});
+
+export async function ProductList({ categoryId }: { categoryId: string }) {
+  const products = await getProducts(categoryId);
+
+  return (
+    <ul>
+      {products.map((p) => (
+        <li key={p.id}>
+          {p.name} — ${p.price}
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+Two things happen here. First, if `ProductList` is rendered multiple times in the same request with the same `categoryId`, the fetch fires only once. Second, `next: { revalidate: 300 }` tells Next.js to treat this data as stale after 5 minutes and regenerate it in the background on the next request — ISR behavior at the component level rather than the page level.
+
+## Setting Up PPR
+
+Enable it in `next.config.mjs`:
+
+```js
+// next.config.mjs
+const nextConfig = {
+  experimental: {
+    ppr: true,
+  },
+};
+
+export default nextConfig;
+```
+
+Then in your page, wrap dynamic components in `<Suspense>`:
+
+```tsx
+// app/products/[id]/page.tsx
+import { Suspense } from "react";
+import { ProductDetail } from "@/components/ProductDetail";
+import { UserRecommendations } from "@/components/UserRecommendations";
+import { RelatedProducts } from "@/components/RelatedProducts";
+
+export const experimental_ppr = true;
+
+export default function ProductPage({ params }: { params: { id: string } }) {
+  return (
+    <div className="product-page">
+      {/* Static: generated at build time */}
+      <nav aria-label="breadcrumb">...</nav>
+
+      {/* Dynamic: depends on the specific product */}
+      <Suspense fallback={<ProductSkeleton />}>
+        <ProductDetail id={params.id} />
+      </Suspense>
+
+      {/* Dynamic: depends on user session */}
+      <Suspense fallback={<RecommendationSkeleton />}>
+        <UserRecommendations productId={params.id} />
+      </Suspense>
+
+      {/* Cached dynamic: refreshed every 5 minutes */}
+      <Suspense fallback={<div>Loading related...</div>}>
+        <RelatedProducts categoryId="electronics" />
+      </Suspense>
+    </div>
+  );
+}
+```
+
+The `<Suspense>` boundary is where PPR draws the line between static and dynamic. Everything outside `<Suspense>` becomes part of the static shell.
+
+## Composing Cache Policies
+
+Cache Components nest naturally, so you can set different TTLs at different levels of the component tree:
+
+```tsx
+// Header — cached 1 hour
+async function SiteHeader() {
+  const config = await getSiteConfig(); // cache + revalidate: 3600
+  return <header style={{ background: config.brandColor }}>{config.siteName}</header>;
+}
+
+// Product detail — cached 5 minutes
+async function ProductDetail({ id }: { id: string }) {
+  const product = await getProduct(id); // cache + revalidate: 300
+  return (
+    <section>
+      <h1>{product.name}</h1>
+      <p>{product.description}</p>
+    </section>
+  );
+}
+
+// Inventory status — no cache (real-time)
+async function InventoryBadge({ productId }: { productId: string }) {
+  const stock = await getStockLevel(productId);
+  return <span>{stock > 0 ? "In stock" : "Out of stock"}</span>;
+}
+```
+
+This granularity was not practical before. Previously you'd either cache the whole page or cache nothing.
+
+## PPR vs. Traditional ISR
+
+| | Traditional ISR | PPR + Cache Components |
+|---|---|---|
+| Cache granularity | Page level | Component level |
+| Mix static and dynamic | No | Yes |
+| User-session content | Not possible | Via `<Suspense>` |
+| Revalidation control | Per page | Per component |
+
+## What to Watch For
+
+**Suspense boundary placement matters.** The static shell's size and usefulness depend entirely on where you draw the `<Suspense>` boundaries. A useful heuristic: anything that requires a user session or real-time data gets its own `<Suspense>`; everything else can be in the shell or cached.
+
+**Skeleton sizing.** The fallback content renders in place while dynamic content loads. If the skeleton dimensions don't match the real content, you'll get layout shifts. Match heights carefully or use a `min-height` constraint.
+
+**Test the shell independently.** With PPR, your static shell is a first-class artifact. Disable JavaScript in the browser and confirm the page structure is navigable and meaningful.
+
+## Takeaway
+
+PPR and Cache Components move Next.js rendering decisions from the page level to the component level. You no longer have to choose between performance and dynamism for a whole page — you can get both by being explicit about which parts need to be fresh and which can be cached.
+
+Start by identifying the slowest dynamic components on your high-traffic pages. Those are the first candidates for Cache Components with a 5-10 minute revalidation window. Then wrap genuinely per-user content in `<Suspense>` and let PPR handle the rest.

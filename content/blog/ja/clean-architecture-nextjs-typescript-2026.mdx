@@ -1,0 +1,237 @@
+---
+title: "Next.js + TypeScript + TanStack Query で実践するクリーンアーキテクチャ"
+description: "Next.js App Router と TanStack Query を組み合わせたクリーンアーキテクチャの実践パターンを解説します。関心の分離を保ちながらスケールするフロントエンド設計の具体例を紹介します。"
+date: "2026-05-23"
+status: "published"
+tags: ["Next.js", "TypeScript", "TanStack Query", "Architecture", "React"]
+thumbnail: ""
+author: "webhani"
+slug: "clean-architecture-nextjs-typescript-2026"
+---
+
+Next.js App Router が普及した現在、フロントエンドにおける「クリーンアーキテクチャ」の実践方法は以前より具体的に議論されるようになっています。Server Components と Client Components の混在、API Route、TanStack Query によるキャッシュ管理——これらをどう整理するかによって、プロジェクトの長期的な保守性が大きく変わります。
+
+本記事では、webhani での実務経験をもとに、Next.js + TypeScript + TanStack Query 構成でのクリーンアーキテクチャの実践パターンを紹介します。
+
+## なぜアーキテクチャを意識するのか
+
+「動けばいい」という発想でコンポーネントに全ロジックを詰め込むと、プロジェクトが成長するにつれて以下の問題が発生します。
+
+- データ取得ロジックと UI ロジックが混在してテストが書けない
+- 同じ API 呼び出しがコンポーネント間で重複し、変更箇所が増える
+- 型定義がコンポーネントごとにバラバラになり、バグの温床になる
+
+クリーンアーキテクチャの目的は「変更に強い設計」です。依存の向きを明確にし、各層が持つ責務を限定することで、修正コストを下げます。
+
+## 推奨するレイヤー構造
+
+```
+src/
+├── app/                    # Next.js App Router (ルーティング層)
+│   ├── (routes)/
+│   │   └── users/
+│   │       ├── page.tsx    # Server Component
+│   │       └── [id]/
+│   │           └── page.tsx
+│   └── api/                # API Route Handlers
+│       └── users/
+│           └── route.ts
+├── features/               # 機能単位のモジュール
+│   └── users/
+│       ├── api.ts          # API 呼び出し関数
+│       ├── queries.ts      # TanStack Query 定義
+│       ├── types.ts        # 型定義
+│       └── components/     # 機能固有 UI
+├── lib/                    # 共通ユーティリティ
+│   └── api-client.ts       # HTTP クライアント設定
+└── components/             # 汎用 UI コンポーネント
+```
+
+重要なのは、`features/` ディレクトリで機能単位に分割することです。`users/` 機能に必要なものはすべて `features/users/` に収め、機能間の依存を最小化します。
+
+## 各層の実装パターン
+
+### 1. 型定義層 (`types.ts`)
+
+```typescript
+// features/users/types.ts
+export interface User {
+  id: string;
+  name: string;
+  email: string;
+  role: 'admin' | 'member';
+  createdAt: string;
+}
+
+export interface CreateUserInput {
+  name: string;
+  email: string;
+  role: 'admin' | 'member';
+}
+
+export interface UpdateUserInput extends Partial<CreateUserInput> {
+  id: string;
+}
+```
+
+型定義は最初に定義し、API 関数・Query・コンポーネントすべてがここを参照します。型が一元管理されることで、API の変更がコンパイルエラーとして検出できます。
+
+### 2. API 呼び出し層 (`api.ts`)
+
+```typescript
+// features/users/api.ts
+import { apiClient } from '@/lib/api-client';
+import type { User, CreateUserInput, UpdateUserInput } from './types';
+
+export async function fetchUsers(): Promise<User[]> {
+  return apiClient.get('/api/users');
+}
+
+export async function fetchUserById(id: string): Promise<User> {
+  return apiClient.get(`/api/users/${id}`);
+}
+
+export async function createUser(input: CreateUserInput): Promise<User> {
+  return apiClient.post('/api/users', input);
+}
+
+export async function updateUser({ id, ...input }: UpdateUserInput): Promise<User> {
+  return apiClient.patch(`/api/users/${id}`, input);
+}
+```
+
+この層は Pure な非同期関数のみで構成します。React への依存はなく、Node.js 環境でもブラウザ環境でも動作します。テストは `vi.mock` で `apiClient` をモックするだけで書けます。
+
+### 3. TanStack Query 層 (`queries.ts`)
+
+```typescript
+// features/users/queries.ts
+import {
+  useQuery,
+  useMutation,
+  useQueryClient,
+  queryOptions,
+} from '@tanstack/react-query';
+import { fetchUsers, fetchUserById, createUser, updateUser } from './api';
+import type { CreateUserInput, UpdateUserInput } from './types';
+
+// Query キーを一元管理
+export const userKeys = {
+  all: ['users'] as const,
+  detail: (id: string) => ['users', id] as const,
+};
+
+// queryOptions でサーバー・クライアント間で共有可能な定義
+export const usersQueryOptions = queryOptions({
+  queryKey: userKeys.all,
+  queryFn: fetchUsers,
+  staleTime: 1000 * 60 * 5, // 5 分
+});
+
+export function useUser(id: string) {
+  return useQuery({
+    queryKey: userKeys.detail(id),
+    queryFn: () => fetchUserById(id),
+  });
+}
+
+export function useCreateUser() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: createUser,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: userKeys.all });
+    },
+  });
+}
+
+export function useUpdateUser() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: updateUser,
+    onSuccess: (updated) => {
+      queryClient.setQueryData(userKeys.detail(updated.id), updated);
+      queryClient.invalidateQueries({ queryKey: userKeys.all });
+    },
+  });
+}
+```
+
+Query キーを `userKeys` として集約することで、`invalidateQueries` の対象を安全に管理できます。文字列リテラルが散在すると、キャッシュの無効化漏れが起きやすくなります。
+
+### 4. Server Component でのデータ取得
+
+```typescript
+// app/(routes)/users/page.tsx
+import { HydrationBoundary, dehydrate } from '@tanstack/react-query';
+import { getQueryClient } from '@/lib/query-client';
+import { usersQueryOptions } from '@/features/users/queries';
+import { UserList } from '@/features/users/components/UserList';
+
+export default async function UsersPage() {
+  const queryClient = getQueryClient();
+
+  // サーバーサイドでデータをプリフェッチ
+  await queryClient.prefetchQuery(usersQueryOptions);
+
+  return (
+    <HydrationBoundary state={dehydrate(queryClient)}>
+      <UserList />
+    </HydrationBoundary>
+  );
+}
+```
+
+`queryOptions` で定義した設定を Server Component と Client Component で共有できるのが TanStack Query v5 の強みです。サーバーでプリフェッチしたキャッシュがクライアントに引き継がれるため、不要なウォーターフォールが発生しません。
+
+### 5. Client Component での利用
+
+```typescript
+// features/users/components/UserList.tsx
+'use client';
+
+import { useSuspenseQuery } from '@tanstack/react-query';
+import { usersQueryOptions } from '../queries';
+
+export function UserList() {
+  const { data: users } = useSuspenseQuery(usersQueryOptions);
+
+  return (
+    <ul>
+      {users.map((user) => (
+        <li key={user.id}>
+          <span>{user.name}</span>
+          <span>{user.email}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+`useSuspenseQuery` を使うことで、データが存在することが型レベルで保証され、`data?.` のようなオプショナルチェーンが不要になります。
+
+## テスト戦略
+
+このアーキテクチャのテスト戦略は層ごとに分けます。
+
+| 層 | テスト方法 |
+|----|---------|
+| `api.ts` | `apiClient` をモックしてユニットテスト |
+| `queries.ts` | `@testing-library/react` + `QueryClientProvider` でフックテスト |
+| Components | MSW でネットワークをモックして統合テスト |
+| `app/` pages | Playwright で E2E テスト |
+
+## webhani としての見解
+
+このアーキテクチャの核心は「依存の向きの統一」です。UI コンポーネントが API 呼び出しを直接行わず、常に Query 層を経由することで、キャッシュ戦略の一元管理が可能になります。
+
+プロジェクト初期はシンプルな実装から始め、規模が拡大したときに段階的にこの構造に移行することも十分可能です。重要なのはルールを厳守することではなく、「変更が一箇所に閉じる」設計の意図を理解した上で、チームの判断で適用範囲を決めることです。
+
+## まとめ
+
+- `features/` 単位の分割でモジュール間の依存を最小化
+- 型定義・API 関数・TanStack Query 定義を明確に分離
+- `queryOptions` で Server / Client 間のキャッシュ定義を共有
+- `usersQueryOptions` のような Query キーの集約でキャッシュ無効化を安全に管理
+- テストは層ごとに戦略を分ける

@@ -1,0 +1,133 @@
+---
+title: "LLM에서 Agentic Workflow로: Code with Claude 2026에서 배운 것들"
+description: "Code with Claude 2026 컨퍼런스에서 공개된 AI Agent의 최신 동향과 Agentic Workflow가 개발 현장에 가져오는 변화를 정리합니다."
+date: "2026-05-14"
+status: "published"
+tags: ["AI", "LLM", "Claude", "agentic-workflow", "developer-tools"]
+thumbnail: ""
+author: "webhani"
+slug: "ai-agentic-workflows-2026"
+---
+
+지금까지 LLM은 주로 "프롬프트를 보내면 응답을 받는" 단방향 도구로 사용되어 왔습니다. 그런데 2026년을 기점으로 이 패러다임이 크게 바뀌고 있습니다.
+
+2026년 5월 Anthropic이 개최한 개발자 컨퍼런스 "Code with Claude 2026"에서는 AI Agent가 목표를 향해 계획, 실행, 수정을 자율적으로 반복하는 "Agentic Workflow"가 핵심 주제로 다뤄졌습니다. 이 글에서는 컨퍼런스의 주요 내용을 정리하고 실무 적용 방법을 살펴봅니다.
+
+## Agentic Workflow란 무엇인가
+
+기존 LLM 활용 방식과 Agentic Workflow의 차이를 간단히 비교하면 다음과 같습니다.
+
+```
+기존 방식:  사용자 → 프롬프트 → LLM → 응답 → 사용자가 다음 단계 결정
+Agentic:   사용자 → 목표 → Agent [계획 → 실행 → 평가 → 반복] → 결과
+```
+
+Code with Claude 2026에서 강조된 Agentic Workflow의 핵심 구성 요소는 네 가지입니다.
+
+1. **Goal-Oriented Planning**: 고수준 목표를 실행 가능한 서브태스크로 분해
+2. **Contextual Memory**: 여러 Tool 호출과 반복 실행에 걸쳐 상태를 유지
+3. **Multi-Modal Integration**: 텍스트, 코드 실행, 외부 API를 하나의 Loop 안에서 결합
+4. **Adaptive Decision-Making**: 중간 결과에 따라 실행 계획을 동적으로 수정
+
+## 기본 구현 구조
+
+실제로 Agentic Loop를 구현하는 최소 구조는 다음과 같습니다.
+
+```python
+import anthropic
+from typing import Callable
+
+client = anthropic.Anthropic()
+
+def run_agent(
+    goal: str,
+    tools: list[dict],
+    tool_handlers: dict[str, Callable],
+    max_iterations: int = 10
+) -> str:
+    messages = [{"role": "user", "content": goal}]
+
+    for _ in range(max_iterations):
+        response = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=4096,
+            tools=tools,
+            messages=messages
+        )
+
+        if response.stop_reason == "end_turn":
+            return extract_text(response.content)
+
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                handler = tool_handlers.get(block.name)
+                if handler:
+                    result = handler(**block.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(result)
+                    })
+
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+
+    return "최대 반복 횟수 초과"
+```
+
+이 패턴의 핵심은 Agent가 Tool 호출 결과를 다시 입력으로 받아 다음 행동을 결정한다는 점입니다.
+
+## Code with Claude 2026 주요 발표 내용
+
+**Claude Code Rate Limit 2배 인상**: Pro, Max, Enterprise 사용자의 5시간 제한이 두 배로 늘었습니다. 장시간 실행되는 Agentic Task에서 자주 제한에 걸리던 문제가 해소될 것으로 보입니다.
+
+**Anthropic과 SpaceX 파트너십**: SpaceX의 Colossus 데이터 센터 전용량을 Anthropic이 사용하는 파트너십이 발표되었습니다. 대규모 Agentic Workload에 대한 인프라 대응이 강화될 전망입니다.
+
+**Claude Opus 4.7이 LMArena 1위**: 현재 Frontier Model 중 Reasoning 성능이 가장 높습니다. Agentic 시스템에서 추론 품질은 Agent의 에러 복구 능력과 직결되므로 중요한 지표입니다.
+
+**SubQ (1,200만 토큰 Context Window)**: 스타트업 Subquadratic이 1,200만 토큰의 Context Window를 가진 LLM을 발표했습니다. 장기 Agentic Task에서 Context 관리 부담이 크게 줄어들 가능성이 있습니다.
+
+## 신뢰성 있는 시스템 설계하기
+
+Agentic 시스템에서 가장 흔히 발생하는 문제는 "오류의 연쇄"입니다. Agent가 잘못된 가정을 하면 이후 Tool 호출이 모두 그 위에 쌓입니다. 이를 방지하기 위한 세 가지 실천 방법을 소개합니다.
+
+**1. 단계별 Tool 호출 제한**
+
+한 번에 2~3개 이상의 Tool을 호출하기 전에 체크포인트를 두세요. Agent가 진행 상황을 요약하게 만들면 디버깅도 쉬워집니다.
+
+**2. 명시적 실패 상태 정의**
+
+막혔을 때 Agent가 계속 재시도하는 대신 명확히 신호를 보내도록 설계합니다.
+
+```python
+system_prompt = """
+두 번 시도 후 서브태스크를 완료할 수 없는 경우:
+'STUCK: <이유>'로 응답하세요.
+우회 방법을 시도하지 마세요. 막힌 상황을 명확히 알려주세요.
+"""
+```
+
+**3. 구조화된 중간 출력**
+
+다음 서브태스크로 넘어가기 전에 완료한 내용을 구조화된 형식으로 요약하게 합니다. 체크포인트 역할과 함께 디버깅 컨텍스트로도 활용됩니다.
+
+## Agentic Workflow를 적용할 곳
+
+모든 Task에 Agentic Workflow가 필요한 것은 아닙니다. webhani의 프로젝트 경험에서 도출한 기준입니다.
+
+| Task 유형 | Agentic 적합 여부 |
+|---|---|
+| 코드 리뷰 → 수정 → 테스트 실행 | 적합 |
+| 로그 분석 → 원인 파악 → 수정안 제시 | 적합 |
+| 문서 번역 | 비적합 (단일 LLM 호출로 충분) |
+| 데이터 형식 변환 | 비적합 (결정론적 코드가 더 안정적) |
+| 다중 소스 조사 → 보고서 작성 | 적합 |
+
+중간 결과에 따라 분기가 필요하고, 그 분기를 미리 예측할 수 없는 Task라면 Agentic이 가치 있습니다. 모든 경로를 미리 알 수 있다면 일반 코드가 더 예측 가능하고 디버깅도 쉽습니다.
+
+## 마치며
+
+LLM이 도구에서 협력자로 바뀌는 흐름은 분명히 가속되고 있습니다. Code with Claude 2026이 보여준 것은 Agentic 시스템이 실험적 단계를 넘어 이미 Production에서 운영되고 있다는 현실입니다.
+
+처음부터 크게 시작할 필요는 없습니다. 수동으로 여러 단계를 거쳐야 하는 워크플로 하나를 골라 Agent로 대체해 보세요. 안정성을 확인하고, 모니터링을 갖춘 후 범위를 넓혀가는 것이 지속 가능한 방법입니다.

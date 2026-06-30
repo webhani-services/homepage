@@ -1,0 +1,159 @@
+---
+title: "eBPFとCilium: AI時代のKubernetesネットワーキングが変わる理由"
+description: "2026年、CiliumはKubernetes最多採用CNIになりました。eBPFベースのネットワーキングがなぜAI WorkloadとVMware Migrationに適しているのか、従来のiptablesとの違いと実践的な設定例を解説します。"
+date: "2026-06-07"
+status: "published"
+tags: ["Kubernetes", "eBPF", "Cilium", "Networking", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "ebpf-cilium-kubernetes-networking-2026"
+---
+
+## Ciliumが主流になった背景
+
+2026年現在、CiliumはKubernetes本番環境で最も広く採用されているCNI（Container Network Interface）です。Google・Microsoft・AWSのインフラ、そして数千の企業クラスターで稼働しています。
+
+この状況は数年前と大きく異なります。従来はFlannelやCalicoが主流でした。なぜCiliumが選ばれるようになったのか。その答えはLinuxカーネルに組み込まれた技術、eBPFにあります。
+
+## eBPFとiptablesの根本的な違い
+
+Kubernetesのネットワークは長らくiptablesに依存してきました。PodとServiceのルーティングルールをiptablesの静的なチェーンで管理する仕組みです。
+
+問題はスケールです。Cluster内のServiceが増えるにつれ、iptablesのルール数が線形に増加します。10,000 Serviceで100,000以上のルールになり、パケットがこれを逐次チェックするため遅延が増大します。
+
+```
+iptablesの問題:
+- O(n) ルール参照: ルール数に比例して遅延増加
+- Kernel/Userspace間の頻繁なコンテキストスイッチ
+- Dynamic RuleのUpdate時にTable全体をReload
+- Observabilityが乏しい（何が起きているか見えにくい）
+```
+
+eBPFは別のアプローチをとります。検証済みのサンドボックスプログラムをLinuxカーネル内で直接実行し、パケットをカーネルネットワークスタックに到達する前に処理します。
+
+```
+eBPFの特徴:
+- Kernel内でのネイティブ実行: Userspace切り替えなし
+- Hash MapによるO(1)ルックアップ: Serviceが増えても遅延一定
+- リアルタイムの更新: Table全体のReloadが不要
+- 豊富なObservability: Hubbleでフロー全体を可視化
+```
+
+## AI WorkloadがeBPFを必要とする理由
+
+従来のMicroservicesとAI推論サービスでは、ネットワークパターンが根本的に異なります。
+
+**East-Westトラフィックの激増**
+
+AI推論ServiceはGPUサーバーへのRPCコール、モデルキャッシュへのアクセス、メッセージキューへの接続を高頻度で行います。Cluster内部（East-West）のトラフィックが、外部からの受信（North-South）をはるかに上回ります。
+
+**トポロジー認識の必要性**
+
+マルチGPU TrainingジョブはNVLinkで接続されたGPU群を同一ノードやラック内に配置する必要があります。Ciliumのトポロジー認識ルーティングはこうした要件に対応できます。
+
+**マイクロセグメンテーションの強化**
+
+GPU Nodeへのアクセスを特定のWorkloadだけに制限するネットワークポリシーは、セキュリティ上重要です。eBPFベースのCiliumはこのポリシーを最小限のオーバーヘッドで強制できます。
+
+## CiliumのBasic Setup
+
+```yaml
+# Helmを使ったCiliumのインストール
+helm repo add cilium https://helm.cilium.io/
+helm install cilium cilium/cilium --version 1.16.0 \
+  --namespace kube-system \
+  --set kubeProxyReplacement=true \  # kube-proxyを完全にCiliumで置換
+  --set hubble.relay.enabled=true \   # Observabilityを有効化
+  --set hubble.ui.enabled=true
+```
+
+`kubeProxyReplacement=true`を設定すると、CiliumがkubeProxyを完全に置き換えます。iptablesのルールが不要になり、eBPFによるO(1)のServiceルックアップが有効になります。
+
+## Hubble: eBPFベースのObservability
+
+CiliumにはHubbleという組み込みのObservabilityツールがあります。従来のネットワーク監視では不可能だったレベルの可視性を提供します。
+
+```bash
+# HubbleCLIでリアルタイムのフローを確認
+hubble observe --namespace production --follow
+
+# 特定のServiceへの失敗したリクエストを確認
+hubble observe \
+  --to-pod production/inference-server \
+  --verdict DROPPED \
+  --last 100
+```
+
+Hubbleが収集するメトリクスをPrometheusに送り、Grafanaで可視化することで、どのPodが誰とどの頻度で通信しているか、どこでパケットがドロップされているかが一目でわかります。
+
+## NetworkPolicyの記述
+
+CiliumはKubernetes標準のNetworkPolicyと、より表現力の高い`CiliumNetworkPolicy`の両方をサポートします。
+
+```yaml
+# GPU Nodeへのアクセスをinference-serverだけに制限
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: gpu-access-policy
+  namespace: production
+spec:
+  endpointSelector:
+    matchLabels:
+      app: inference-server
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        kubernetes.io/hostname: gpu-node-01
+    toPorts:
+    - ports:
+      - port: "50051"
+        protocol: TCP
+```
+
+`CiliumNetworkPolicy`ではL7レベルのポリシー（特定のHTTP MethodやPathだけを許可するなど）も記述できます。
+
+## VMware MigrationにおけるCiliumの役割
+
+2026年、多くの企業がVMware環境からKubernetesへの移行を進めています。ネットワークはこの移行で最大の摩擦ポイントの一つです。
+
+VMware Kubernetes Service（VKS）はバージョン3.6からCiliumをCNIとして標準サポートしています。これにより、既存のVMwareネットワークポリシーをKubernetes環境に段階的に移行できます。
+
+```
+VMware → Kubernetes Migration での Ciliumの価値:
+- NSX-Tのポリシーとの整合性を保ちながら移行
+- 既存のIPアドレス空間を維持したBGPルーティング
+- ハイブリッド環境（VMware + K8s）での統一ポリシー管理
+```
+
+## Tetragonによるランタイムセキュリティ
+
+CiliumプロジェクトにはTetragonという実行時セキュリティツールも含まれています。eBPFを使い、Kernel levleでプロセスの実行・ファイルアクセス・ネットワーク接続を監視します。
+
+```yaml
+# Tetragonポリシー: 特定のプロセスによるネットワーク接続を監視
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: monitor-network-calls
+spec:
+  kprobes:
+  - call: "tcp_connect"
+    syscall: false
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchBinaries:
+      - operator: In
+        values:
+        - "/usr/bin/python3"  # Pythonプロセスのネットワーク接続を追跡
+```
+
+これにより、コンテナ内で予期しないプロセスがネットワーク接続を試みた場合に即座に検知できます。
+
+## Webhaniの見解
+
+eBPFとCiliumへの移行は、「より良いiptables」を採用するというよりも、ネットワーキングレイヤーそのものの設計思想を変えることです。Observable、Programmable、AI WorkloadにReady — この3つが現代のKubernetesネットワーキングに求められており、CiliumはそのすべてをeBPFで実現しています。
+
+AI WorkloadのKubernetes運用、VMware Migrationのネットワーク設計、またはeBPFベースのObservability構築に取り組まれている場合は、ぜひご相談ください。

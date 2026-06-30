@@ -1,0 +1,130 @@
+---
+title: "Next.js 2026년 5월 보안 릴리스: 13개 취약점과 대응 방법"
+description: "Next.js가 13개의 보안 취약점을 한 번에 패치했습니다. 각 취약점 유형의 영향과 안전한 업그레이드 절차를 정리합니다."
+date: "2026-05-17"
+status: "published"
+tags: ["Next.js", "Security", "Web Development", "Vercel"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-security-release-may-2026"
+---
+
+Vercel이 이번 주 Next.js의 협력적 보안 릴리스를 발표했습니다. DoS(서비스 거부), Middleware 및 Proxy 우회, SSRF(서버 사이드 요청 위조), Cache Poisoning, XSS(크로스 사이트 스크립팅)의 5개 카테고리에 걸쳐 총 13개의 취약점을 한 번에 수정했습니다. 공식 가이드에 따르면 패치 적용이 유일한 완전한 대응책입니다. WAF 규칙이나 설정 변경은 일시적인 완화에 불과합니다.
+
+## 즉시 업그레이드하세요
+
+```bash
+# 현재 버전 확인
+npx next --version
+
+# 최신 패치 버전으로 업그레이드
+npm install next@latest
+
+# 설치된 버전 확인
+npm ls next
+```
+
+업그레이드 후에는 Staging 환경에서 테스트 스위트를 실행한 뒤 Production에 배포하세요. 패치는 주로 보안 수정이지만, 수정된 동작에 의존하던 코드가 있는지 확인이 필요합니다.
+
+## Middleware 및 Proxy 우회 취약점
+
+Next.js Middleware를 인증/인가에 사용하고 있다면 이 카테고리가 특히 중요합니다. 영향받는 버전에서 특정 요청 패턴이 Middleware를 우회해 보호된 Route에 세션 없이 접근할 수 있는 취약점이 있습니다.
+
+```typescript
+// middleware.ts의 표준 인증 패턴
+import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+
+export function middleware(request: NextRequest) {
+  const session = request.cookies.get("session-token");
+
+  if (!session?.value) {
+    return NextResponse.redirect(new URL("/login", request.url));
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ["/dashboard/:path*", "/api/private/:path*"]
+};
+```
+
+이 패턴 자체는 올바르지만, 패치 미적용 버전에서는 특정 변형된 요청이 이 검증을 우회할 수 있습니다. Middleware로 인증을 처리하고 있다면 이 업그레이드를 긴급으로 처리하세요.
+
+## Cache Poisoning
+
+ISR(Incremental Static Regeneration)이나 Next.js Data Cache를 사용하는 경우, Cache Poisoning 취약점에 노출됩니다. Cache Poisoning은 악의적인 콘텐츠가 Cache에 기록되어 정상 사용자에게 제공되는 공격입니다.
+
+패치 적용 후 공개 페이지의 Cache를 명시적으로 무효화하세요.
+
+```typescript
+import { revalidatePath, revalidateTag } from "next/cache";
+
+export async function clearCaches() {
+  revalidatePath("/", "layout");
+  revalidatePath("/blog");
+  revalidatePath("/products");
+}
+```
+
+보안 패치 배포 후 이 함수를 실행해 기존에 오염된 Cache가 없는지 확인하세요.
+
+## SSRF
+
+사용자 입력을 URL에 포함해 외부 요청을 하는 Server Action이나 Route Handler가 있다면 SSRF 위험이 있습니다. 프레임워크 수준의 패치와 별개로, 애플리케이션 코드에서도 URL 검증을 추가하세요.
+
+```typescript
+const ALLOWED_HOSTS = new Set(["api.example.com", "cdn.example.com"]);
+
+function validateUrl(rawUrl: string): URL {
+  const url = new URL(rawUrl); // 유효하지 않은 URL은 예외 발생
+  if (!ALLOWED_HOSTS.has(url.hostname)) {
+    throw new Error(`허용되지 않는 호스트: ${url.hostname}`);
+  }
+  return url;
+}
+
+export async function fetchExternalData(userUrl: string) {
+  const url = validateUrl(userUrl);
+  const response = await fetch(url.toString());
+  return response.json();
+}
+```
+
+## XSS
+
+Next.js는 기본적으로 JSX 출력을 이스케이프 처리하므로 대부분의 렌더링 경로는 보호됩니다. 이번 릴리스의 XSS 취약점은 특정 조건에서 일반 이스케이프를 우회하는 프레임워크 수준의 벡터를 대상으로 합니다.
+
+애플리케이션 측 방어로는, 사용자 생성 콘텐츠를 Raw HTML로 렌더링할 경우 반드시 DOMPurify 같은 Sanitize 라이브러리를 사용하세요.
+
+```typescript
+import DOMPurify from "isomorphic-dompurify";
+
+// Raw HTML 렌더링 전에 반드시 Sanitize
+const sanitized = DOMPurify.sanitize(userContent);
+```
+
+프레임워크 패치는 필요조건이지만 충분조건은 아닙니다. Raw HTML 문자열을 렌더링하는 코드가 있다면 반드시 점검하세요.
+
+## 업그레이드 체크리스트
+
+1. `npx next --version`으로 현재 버전 확인
+2. `npm install next@latest`로 업그레이드
+3. `npm ls next`로 설치 버전 확인
+4. Staging 환경에서 테스트 스위트 실행
+5. 배포 후 ISR/Cache 내용 revalidate
+6. Middleware 인증 로직 정확성 재검토
+7. Raw HTML 렌더링 사용 위치 감사
+
+Vercel 호스팅 프로젝트의 경우 WAF 임시 완화가 이미 적용되어 있을 수 있지만, 이것이 패치를 대체하지는 않습니다.
+
+## Next.js 15.5 기능 업데이트
+
+보안 수정과 함께 Next.js 15.5에는 다음 기능이 포함됩니다.
+
+- **Turbopack Builds (Beta)**: `next build --turbopack`이 Production 빌드에 대응
+- **Node.js Middleware (안정화)**: Middleware에서의 완전한 Node.js Runtime 지원이 안정 버전으로 — Edge와 호환되지 않던 패키지도 이제 사용 가능
+- **TypeScript 타입 안전 Route**: `next/link`의 `href`와 Navigation 메서드가 컴파일 타임에 잘못된 경로를 감지
+
+대규모 Application 업그레이드 전에 공식 15.5 Changelog를 확인하고 Breaking Change 여부를 검토하세요. 13개의 보안 취약점이 포함된 릴리스인 만큼, 이번 주 안에 대응하는 것을 강력히 권장합니다.

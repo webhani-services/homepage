@@ -1,0 +1,140 @@
+---
+title: "Kubernetes Node Readiness Controller: Reliable Pod Scheduling in Production"
+description: "Released in February 2026, the Kubernetes Node Readiness Controller fixes a long-standing scheduling gap where pods were assigned to nodes before GPU drivers, network agents, or storage backends were ready. Here's how it works and why it matters for production clusters."
+date: "2026-06-03"
+status: "published"
+tags: ["kubernetes", "devops", "scheduling", "cloud-native", "production"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-node-readiness-controller-2026"
+---
+
+The Kubernetes project released the Node Readiness Controller (NRC) in February 2026 under `kubernetes-sigs`. It addresses a scheduling reliability problem that has been a known pain point in production clusters for years: pods being scheduled onto nodes that the kubelet reports as `Ready`, but that aren't actually capable of running them yet.
+
+## The Problem
+
+When a node joins a cluster, Kubernetes marks it `Ready` once the kubelet's built-in health checks pass. That's the signal the scheduler uses to start assigning pods. The trouble is that in modern production environments, "kubelet is healthy" and "node is ready for workloads" are often different things.
+
+**GPU nodes**: GPU firmware and driver loading can take minutes. A pod scheduled immediately after kubelet reports `Ready` will fail — the device isn't available yet, and the pod enters `CrashLoopBackOff`.
+
+**CNI initialization**: Network agents like Cilium or Calico may not be fully operational by the time the scheduler starts placing networking-dependent pods on the node. Connection failures follow.
+
+**Storage backend availability**: CSI drivers or NFS mounts may not be ready when pods with volume claims are scheduled.
+
+The common workarounds — init containers, startup scripts via DaemonSets, manual taint/untaint operations — work in isolation but are inconsistent across teams and easy to get wrong. NRC provides a declarative, cluster-level solution.
+
+## How NRC Works
+
+NRC introduces a `NodeReadinessRule` CRD. You use it to define custom readiness conditions that a node must meet before the scheduler is allowed to place pods on it.
+
+```yaml
+apiVersion: nodeness.kubernetes-sigs.io/v1alpha1
+kind: NodeReadinessRule
+metadata:
+  name: gpu-node-readiness
+  namespace: kube-system
+spec:
+  nodeSelector:
+    matchLabels:
+      node-type: gpu
+  conditions:
+    - type: "GpuDriverReady"
+      status: "True"
+      requiredForScheduling: true
+    - type: "NvidiaDevicePluginReady"
+      status: "True"
+      requiredForScheduling: true
+  timeout: 300s
+  onTimeout: TaintOnly
+```
+
+When this rule is active, NRC automatically places a `node.kubernetes.io/not-ready:NoSchedule` taint on matching nodes until all listed conditions are satisfied. Once the conditions are met, the taint is automatically removed and scheduling proceeds normally.
+
+## Setting Up Custom Conditions
+
+The conditions in `NodeReadinessRule` are node-level Kubernetes conditions — values written into the node's `.status.conditions` array. Your initialization code (typically a DaemonSet) is responsible for writing these values.
+
+```yaml
+# DaemonSet that checks GPU availability and reports the condition
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-readiness-reporter
+spec:
+  selector:
+    matchLabels:
+      app: gpu-readiness-reporter
+  template:
+    spec:
+      tolerations:
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoSchedule"
+      nodeSelector:
+        node-type: gpu
+      containers:
+        - name: reporter
+          image: bitnami/kubectl:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while true; do
+                if nvidia-smi -L > /dev/null 2>&1; then
+                  kubectl patch node $NODE_NAME --type=json \
+                    -p='[{"op":"add","path":"/status/conditions/-","value":{"type":"GpuDriverReady","status":"True"}}]' \
+                    --subresource=status
+                fi
+                sleep 15
+              done
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+```
+
+The toleration for `not-ready:NoSchedule` is required. This DaemonSet must be able to start even while the node is tainted — since it's the one responsible for clearing that taint. Without the toleration, the DaemonSet never starts, the condition never gets reported, and the node stays tainted indefinitely.
+
+## Automatic Taint Lifecycle
+
+The key value NRC delivers is automating the taint/untaint cycle. Previously, you'd manage this manually:
+
+```bash
+# Manual taint when node starts initializing
+kubectl taint nodes gpu-node-1 gpu-init=pending:NoSchedule
+
+# Manual removal after initialization — easy to forget
+kubectl taint nodes gpu-node-1 gpu-init-
+```
+
+With NRC, the taint lifecycle is controlled by the `NodeReadinessRule` spec. The controller adds and removes taints as node conditions change, consistently and without human intervention. The class of bugs where someone forgot to remove a taint and pods never got scheduled on that node goes away entirely.
+
+## Timeout Behavior
+
+The `timeout` and `onTimeout` fields handle nodes that never reach the ready state:
+
+```yaml
+spec:
+  timeout: 300s
+  onTimeout: TaintOnly   # Keep the taint, don't evict running pods
+  # onTimeout: Delete    # Remove the node from the cluster entirely
+```
+
+`TaintOnly` is the safer default for most cases: nodes that fail initialization are blocked from receiving new pods, but existing workloads aren't disrupted. Use `Delete` only when you're confident that a failed initialization means the node needs hardware replacement and shouldn't remain in the cluster.
+
+## Rollout Checklist
+
+NRC is in alpha as of early 2026. Before deploying to production:
+
+1. **Test in staging first.** Alpha CRDs can have API changes between minor versions. Pin to a specific NRC release and test upgrade paths before applying to production.
+
+2. **Map your node initialization sequences.** For each node type in your cluster, document what conditions must be true before the node can reliably accept workloads. Use that as the basis for your `NodeReadinessRule` definitions.
+
+3. **Verify DaemonSet tolerations.** Any DaemonSet responsible for reporting readiness conditions must tolerate `not-ready:NoSchedule`. Missing this toleration is the most common misconfiguration.
+
+## Summary
+
+The Kubernetes Node Readiness Controller solves a real production problem with a clean, declarative approach. It's particularly valuable for clusters running GPU workloads, custom CNI plugins, or any infrastructure where node initialization extends beyond the kubelet's basic health checks.
+
+The core mechanism is straightforward enough to evaluate now, even in alpha. If your team has been managing node readiness through manual taints or workarounds in init containers, NRC is worth adding to your evaluation list. The GA transition will be smoother if you've already understood the operational model.

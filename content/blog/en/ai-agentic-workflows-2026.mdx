@@ -1,0 +1,135 @@
+---
+title: "From LLMs to Agentic Workflows: What Code with Claude 2026 Revealed"
+description: "At Code with Claude 2026, Anthropic showcased the shift from reactive LLMs to autonomous agentic workflows. Here's what it means for developers building production systems."
+date: "2026-05-14"
+status: "published"
+tags: ["AI", "LLM", "Claude", "agentic-workflow", "developer-tools"]
+thumbnail: ""
+author: "webhani"
+slug: "ai-agentic-workflows-2026"
+---
+
+For most of their existence, LLMs have operated as sophisticated autocomplete engines — you send a prompt, you get a response. That model is giving way to something fundamentally different.
+
+At Code with Claude 2026, Anthropic's developer conference in May, the central theme was the shift from one-shot LLM calls to agentic workflows: systems where AI autonomously plans, executes, and corrects its way toward a goal. Here's a technical breakdown of what was demonstrated and what it means in practice.
+
+## The Core Difference: Reactive vs. Agentic
+
+A traditional LLM integration is stateless and prompt-driven. You hand it context, it generates output, and your code handles the rest. An agentic workflow inverts this: the agent holds the loop.
+
+```
+Traditional:  User → Prompt → LLM → Output → User decides next step
+Agentic:      User → Goal → Agent [Plan → Execute → Evaluate → Repeat] → Result
+```
+
+The four pillars emphasized at the conference were:
+
+1. **Goal-Oriented Planning** — decomposing a high-level objective into executable subtasks
+2. **Contextual Memory** — maintaining state across multiple tool calls and iterations
+3. **Multi-Modal Integration** — combining text, code execution, and external APIs within one loop
+4. **Adaptive Decision-Making** — changing the execution plan based on intermediate results
+
+## Building a Minimal Agentic Loop
+
+The simplest production-grade agentic implementation follows this pattern:
+
+```python
+import anthropic
+from typing import Callable
+
+client = anthropic.Anthropic()
+
+def run_agent(
+    goal: str,
+    tools: list[dict],
+    tool_handlers: dict[str, Callable],
+    max_iterations: int = 10
+) -> str:
+    messages = [{"role": "user", "content": goal}]
+
+    for _ in range(max_iterations):
+        response = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=4096,
+            tools=tools,
+            messages=messages
+        )
+
+        if response.stop_reason == "end_turn":
+            return extract_text(response.content)
+
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                handler = tool_handlers.get(block.name)
+                if handler:
+                    result = handler(**block.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(result)
+                    })
+
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+
+    return "Max iterations reached"
+```
+
+This loop is intentionally simple. In production, you'll add error handling, checkpointing, and logging — but the core pattern stays the same.
+
+## What Changed at Code with Claude 2026
+
+A few announcements directly affect how developers build agentic systems:
+
+**Rate limits doubled for Claude Code**: Pro, Max, and Enterprise users now have twice the previous five-hour limit. Long-running agentic tasks were frequently hitting these ceilings.
+
+**Anthropic + SpaceX compute partnership**: Anthropic announced it will use all capacity of SpaceX's Colossus datacenter. This signals a significant scaling push, which should translate to better availability for high-throughput agentic workloads.
+
+**Claude Opus 4.7 leads LMArena**: The current frontier model is now rated #1 on LMArena, which matters for agentic systems where reasoning quality directly determines whether the agent recovers from errors or spirals into failure.
+
+**SubQ — 12M token context window**: Miami-based startup Subquadratic announced an LLM with a 12-million-token context window, which significantly reduces the context management burden for long-running agentic tasks.
+
+## Designing for Reliability
+
+The failure mode most teams encounter first is the "spiral": an agent makes a wrong assumption, and subsequent tool calls compound the error. Three practices reduce this risk:
+
+**1. Bounded tool calls per step**
+
+Don't let the agent call more than 2-3 tools before surfacing a checkpoint. Having the agent summarize its progress also makes debugging significantly easier.
+
+**2. Explicit failure states**
+
+Define what "stuck" looks like and have the agent surface it rather than retry indefinitely.
+
+```python
+system_prompt = """
+If you cannot complete a subtask after two attempts, respond with:
+'STUCK: <reason>'
+Do not attempt workarounds. Signal the blockage explicitly.
+"""
+```
+
+**3. Structured intermediate outputs**
+
+Have the agent write structured summaries of what it accomplished before moving to the next subtask. This doubles as both debugging context and a checkpointing mechanism.
+
+## Where Agentic Workflows Actually Help
+
+Not every workflow benefits from full autonomy. The honest answer from our project experience at webhani:
+
+| Task type | Agentic? |
+|---|---|
+| Code review → fix → test cycle | Yes |
+| Log analysis → diagnosis → remediation plan | Yes |
+| Translating a document | No — single LLM call is sufficient |
+| Data format conversion | No — deterministic code is more reliable |
+| Multi-source research → report | Yes |
+
+The rule of thumb: if a task requires branching based on intermediate results, and those branches aren't predictable in advance, agentic is worth it. If you can enumerate all paths ahead of time, traditional code is more predictable and debuggable.
+
+## Takeaways
+
+The shift from LLMs as tools to LLMs as collaborators is real and accelerating. Code with Claude 2026 made clear that agentic systems aren't experimental — teams are running them in production today.
+
+Start with a narrow scope. Pick one workflow where the agent replaces a multi-step manual process. Get it stable, instrument it well, then expand. The architecture above scales; the discipline of starting small is what makes it sustainable.

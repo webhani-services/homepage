@@ -1,0 +1,166 @@
+---
+title: "Amazon S3 Files and AWS Interconnect Multicloud: New Cloud Primitives for AI/ML Workloads"
+description: "Two services announced at What's Next with AWS 2026 — Amazon S3 Files and AWS Interconnect Multicloud — address specific friction points in multicloud AI/ML pipelines. Here's what they actually do and when to use them."
+date: "2026-05-10"
+status: "published"
+tags: ["AWS", "S3", "Multicloud", "Cloud Infrastructure", "AI/ML"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-s3-files-multicloud-interconnect-2026"
+---
+
+At What's Next with AWS 2026 (May 4, 2026), AWS announced two services: Amazon S3 Files and AWS Interconnect Multicloud. Neither is flashy, but both address concrete friction points that come up when designing AI/ML workloads across clouds. This post covers what each service does, where it fits, and where it does not.
+
+## Amazon S3 Files
+
+### The problem it solves
+
+Standard S3 GET requests carry tens of milliseconds of overhead — HTTP round-trip, request signing, response parsing. That's fine for infrequent object retrieval, but it compounds quickly in ML training loops where DataLoaders are pulling batches continuously or checkpoints are written every few hundred steps.
+
+S3 Files reduces that overhead to sub-millisecond by exposing an S3 bucket as a POSIX-compatible filesystem on AWS compute. The bucket mounts like a local disk. Training scripts read and write files without any SDK calls.
+
+### How to mount
+
+```bash
+# Mount an S3 bucket as a filesystem on an EC2 instance or SageMaker job
+aws s3files mount s3://my-training-data /mnt/training-data \
+  --region us-east-1 \
+  --read-ahead-size 4MB
+
+# Verify the mount
+df -h /mnt/training-data
+ls /mnt/training-data/dataset/
+```
+
+After mounting, no changes to training code are required:
+
+```python
+# No SDK calls — standard file I/O against an S3-backed path
+import torch
+from torch.utils.data import DataLoader
+
+dataset = MyDataset("/mnt/training-data/dataset/")
+loader = DataLoader(dataset, batch_size=32, num_workers=8)
+
+for step, batch in enumerate(loader):
+    loss = model(batch)
+    loss.backward()
+    optimizer.step()
+
+    if step % 100 == 0:
+        # Checkpoint writes go directly to S3 through the mount
+        torch.save(model.state_dict(), f"/mnt/training-data/checkpoints/step_{step}.pt")
+```
+
+Multiple training nodes can mount the same bucket simultaneously, which makes S3 Files a straightforward option for shared data access in distributed training without coordinating a separate shared filesystem.
+
+### How it compares to FSx for Lustre and EFS
+
+S3 Files is not a replacement for FSx for Lustre or EFS in every scenario. The tradeoffs are real:
+
+```
+                    S3 Files      FSx for Lustre       EFS
+Latency             ~1ms          <1ms (high throughput) low–mid
+Setup complexity    low           high (cluster)         medium
+Cost                S3 rates      higher                 medium
+Data persistence    S3-native     requires S3 sync       persistent
+Cross-region share  yes           no                     no
+Spot resilience     high          low (cluster-bound)    medium
+```
+
+FSx for Lustre still has the edge in aggregate throughput for large-scale distributed training (think 200+ GPUs hammering a shared filesystem). But for most workloads — especially those already storing data in S3 — S3 Files removes a layer of infrastructure that previously required setup, monitoring, and cost justification.
+
+### When to use it
+
+Use S3 Files when:
+- Your training data already lives in S3 and you want to avoid rewriting DataLoaders
+- You're running Spot-based training jobs and need frequent checkpointing with minimal overhead
+- You want shared data access across multiple training nodes without standing up a separate filesystem
+- You're currently using FSx for Lustre but want to reduce management overhead and the data doesn't require peak Lustre throughput
+
+Skip it (for now) when:
+- You're running large-scale distributed training where aggregate filesystem throughput is the bottleneck
+- Your team already has FSx for Lustre or EFS running smoothly and the migration cost isn't worth it
+
+## AWS Interconnect Multicloud
+
+### The problem it solves
+
+Running workloads across AWS and another cloud provider (GCP, Azure) typically means one of two things: traffic goes over the public internet, or you build and maintain your own private connectivity stack — AWS Direct Connect on one side, GCP Cloud Interconnect or Azure ExpressRoute on the other, BGP routing in between, and careful IP CIDR planning to avoid overlaps. That last option is the right one for enterprises with strict network policies, but it requires ongoing effort to maintain.
+
+Interconnect Multicloud is a managed service that handles this. You configure a connection through the AWS console or API, approve it on the other cloud provider's side, and AWS manages the private link between the VPCs. No self-hosted appliances, no per-pair BGP configuration.
+
+### Configuration
+
+```bash
+# Create a private connection from AWS VPC to GCP VPC
+aws interconnect create-connection \
+  --connection-name "aws-to-gcp-prod" \
+  --provider gcp \
+  --remote-vpc-id "projects/my-project/global/networks/prod-vpc" \
+  --bandwidth 10Gbps \
+  --region us-east-1
+
+# Check connection status
+aws interconnect describe-connection \
+  --connection-name "aws-to-gcp-prod"
+```
+
+The GCP side requires approving the incoming connection request in the GCP console or via gcloud — no router configuration needed on either end.
+
+### What this unblocks
+
+The most common scenario this fixes: enterprises that want to call GCP Vertex AI or Azure OpenAI Service from workloads running in AWS VPCs, but have network policies that prohibit direct internet egress.
+
+```
+Before (problematic for strict network policies):
+AWS Training Node (VPC) → NAT Gateway → Public Internet → GCP Vertex AI
+
+After (Interconnect Multicloud):
+AWS Training Node (VPC) → AWS Interconnect → Private Backbone → GCP VPC → Vertex AI
+```
+
+Traffic stays off the public internet. No firewall exception requests, no compliance carve-outs. The path is private from VPC to VPC.
+
+The second scenario: data egress cost management. Internet-bound data transfer between cloud providers carries public egress rates. Private interconnect pricing is typically structured differently — check current rates before assuming savings, as the math depends on volume and the specific provider pair. For ML pipelines moving large model artifacts or datasets between clouds regularly, the pricing structure matters.
+
+### When to use it
+
+Use Interconnect Multicloud when:
+- You already operate across AWS and GCP or Azure, and managing private connectivity is operational overhead
+- Network security policies block direct internet egress from AWS workloads to other providers' APIs
+- You need consistent, low-latency private connectivity between cloud environments for latency-sensitive workloads
+- Data transfer volumes between clouds are large enough that egress cost optimization matters
+
+Skip it when:
+- Your architecture is single-cloud and there's no near-term multicloud requirement
+- Transfer volumes are small and existing internet-based connectivity or VPN is sufficient
+
+## Combining S3 Files and Interconnect Multicloud
+
+The two services compose naturally for multicloud AI/ML pipelines:
+
+```
+Multicloud ML pipeline with both services:
+
+Source data (GCP BigQuery / GCS)
+      ↓  Interconnect Multicloud (private transfer to AWS)
+AWS S3 (unified data lake)
+      ↓  S3 Files (mounted as filesystem)
+AWS EC2 / SageMaker Training Job
+      ↓  Checkpoints written back to S3 via mount
+      ↓  Trained model artifacts transferred via Interconnect
+GCP Vertex AI / Azure ML (inference endpoints)
+```
+
+Training nodes read from and write to S3 as if it were a local filesystem. Completed model artifacts move to the inference cloud over a private connection. The full pipeline runs without public internet exposure.
+
+One constraint to keep in mind: S3 Files mounts are for AWS-side compute (EC2, SageMaker, ECS tasks). GCP or Azure compute instances cannot mount an S3 Files endpoint directly. The pattern is: do data processing and training on AWS, then move outputs to the other cloud via Interconnect.
+
+## Adoption guidance
+
+**Amazon S3 Files** — try it now if you're already using S3 as training storage. The mount-based approach is low-risk: you can validate it against a non-critical training job before committing. The main thing to test is read throughput under your specific DataLoader parallelism and batch size.
+
+**AWS Interconnect Multicloud** — relevant only if you're operating across cloud providers. If you are, and private connectivity has been on the backlog, this is worth evaluating as a managed alternative to a DIY Direct Connect setup. Run through the pricing for your actual transfer volumes before committing — the business case depends on your numbers.
+
+Neither service requires a full architectural overhaul. Both can be introduced incrementally, which makes the evaluation straightforward.

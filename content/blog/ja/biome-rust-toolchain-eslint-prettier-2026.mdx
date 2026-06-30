@@ -1,0 +1,88 @@
+---
+title: "2026年のBiome：ESLintとPrettierを置き換えるべき時、そうでない時"
+description: "BiomeのRust製ツールチェーンは、ESLintとPrettierが1分近くかかる1万ファイルのLint・整形を1秒未満でこなします。しかし速さだけで判断は決まりません。実践的な移行フレームワークを示します。"
+date: "2026-06-13"
+status: "published"
+tags: ["Biome", "ESLint", "Prettier", "TypeScript", "開発ツール"]
+thumbnail: ""
+author: "webhani"
+slug: "biome-rust-toolchain-eslint-prettier-2026"
+---
+
+JavaScriptのツールチェーンは、静かにJavaScriptからRustへ移行しつつあり、Biomeはその最も明確な例です。LintとFormatを単一のRustバイナリにまとめ、ESLintとPrettierの両方を置き換えます。性能差は微妙なものではありません。公開ベンチマークでは、Biomeは1万ファイルのLintを約0.8秒（ESLintは45.2秒）、整形を0.3秒（Prettierは12.1秒）でこなすとされています。
+
+速さは見出しです。ただ「移行すべきか」はもっと繊細な問いであり、チームにとって本当に重要なのはその繊細さのほうです。
+
+## 単一のRustバイナリが計算式を変える理由
+
+ESLintとPrettierは、責務が重なり、設定が別々で、整形ルールを巡って長く衝突してきた2つのツールです。標準的な対処法——`eslint-config-prettier`で衝突ルールを無効化する——は、アーキテクチャの継ぎ目に貼った絆創膏にすぎません。Biomeは共有パーサー上で両方の仕事を1パスで行い、その継ぎ目自体をなくします。
+
+単一ファイルでは差は知覚できません。差が効いてくるのは痛い場所です。pre-commitフック、CIのLintジョブ、大規模モノレポでのエディタ保存時整形。45秒から1秒未満に落ちるLintステップは、開発者の行動を変えます。速いフィードバックは実行され、遅いフィードバックはスキップされるか、マージをブロックするCIへ押しやられます。
+
+```bash
+# インストールと初期化
+npm install --save-dev --save-exact @biomejs/biome
+npx biome init
+
+# eslint + prettier の呼び出しペアを置き換える
+npx biome check --write ./src
+```
+
+最小限の`biome.json`が、これまで2つの設定ファイルを要した内容をカバーします。
+
+```json
+{
+  "$schema": "https://biomejs.dev/schemas/2.3.0/schema.json",
+  "formatter": { "enabled": true, "indentStyle": "space" },
+  "linter": {
+    "enabled": true,
+    "rules": { "recommended": true }
+  }
+}
+```
+
+## 正直な限界
+
+ここで私たちは、顧客がESLintを引き剥がす前に一度立ち止まらせます。2.x系のBiomeは400以上のLintルールを備え、型認識Lintを追加しました。つまり、別途`tsc`を走らせずに多くのTypeScript認識チェックを行えます。しかし、3つのギャップは依然として現実です。
+
+1. **プラグインのエコシステム。** フレームワーク固有のルールセット——`eslint-plugin-react-hooks`、`eslint-plugin-next`、アクセシビリティ系プラグイン——には、まだ完全なBiome相当物がありません。HooksルールのlintがあなたのReactコードベースで重要な役割を担っているなら、ESLintを完全には捨てられません。
+2. **カスタムルール。** チームが書いた社内ESLintルールは移植されません。
+3. **型チェックそのもの。** 型認識の **Lint** は、型チェックと同じではありません。Biomeは完全な型検証では依然として`tsc`に依存します。コンパイラを補完するものであり、置き換えるものではありません。
+
+実務上の帰結はこうです。多くのチームにとって2026年の正直な一手は「ESLintを置き換える」ではなく、「Biomeを整形と中核Lintに限定し、Biomeが扱わないルールはESLintに残し、二重修正を避けるため重複ルールを無効化する」ことです。
+
+## 判断フレームワーク
+
+移行の可否を決める顧客には、シンプルなテストを使います。
+
+**Biomeへ全面移行** が妥当なのは、プロジェクトがフレームワーク固有Lintプラグインに強く依存しないJavaScript/TypeScriptで、チームにカスタムESLintルールがなく、CI・エディタのLintレイテンシが実感される痛点である場合。特にグリーンフィールドのプロジェクトには、遅いスタックで始める理由がほとんどありません。
+
+**Biomeへ部分移行** が妥当なのは、`eslint-plugin-react-hooks`、Next.jsのlintルール、a11yプラグインに依存している場合。速さを得るためにBiomeをFormatterとベースLinterに使い、専門ルール用に薄いESLint設定を残し、両者が衝突しないようESLintの整形ルールをオフにします。
+
+**ESLint + Prettierに留まる** のが妥当なのは、カスタムルールへの大きな投資があり、プラグイン中心の成熟した設定が機能しており、Lint速度が実際の摩擦を生んでいない場合。動いている構成を目的もなく移行するのは、churnに見合いません。
+
+## 一斉切り替えを避けた移行
+
+移行を決めたら、段階的に行います。
+
+```bash
+# 1. 既存設定を出発点としてBiomeに取り込ませる
+npx biome migrate eslint --write
+npx biome migrate prettier --write
+
+# 2. まず整形から——最も低リスクで高価値な勝ち筋
+npx biome format --write ./src
+
+# 3. Lintルールグループを少しずつ有効化し、直しながら進める
+npx biome lint --write ./src
+```
+
+整形を最初に。整形変更は機械的で、1つの大きなdiffとしてレビューしやすいものです。その後、Lintルールグループを1つずつオンにし、初日にチームが違反の山に溺れないようにします。
+
+## まとめ
+
+Biomeは、より広い潮流——速さのためにツールチェーンがコンパイル言語へ移る流れ——の一部です。適したプロジェクトには、実際の摩擦を取り除きます。1つのバイナリ、1つの設定、1秒未満のフィードバック。しかし「速い」が自動的に「適合する」になるわけではありません。うまく移行するチームは、正直にスコープを切るチームです。Biomeが準備できている所では速さを取り、そのエコシステムがまだ代替不能な所ではESLintを残し、速いツールがあるという理由だけで動いている構成を書き直す罠を避けるのです。
+
+---
+
+*出典: [Biome](https://biomejs.dev/), [Biome migration guide for 2026 — DEV Community](https://dev.to/pockit_tools/biome-the-eslint-and-prettier-killer-complete-migration-guide-for-2026-27m), [OXC vs ESLint vs Biome — PkgPulse](https://www.pkgpulse.com/guides/oxc-vs-eslint-vs-biome-javascript-linting-2026)*

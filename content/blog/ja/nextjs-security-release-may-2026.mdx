@@ -1,0 +1,127 @@
+---
+title: "Next.js 2026年5月のセキュリティリリース: 13件の脆弱性と対応指針"
+description: "Next.jsが2026年5月に13件のセキュリティ問題を一括修正しました。各脆弱性の影響範囲と今すぐ取るべき対応を解説します。"
+date: "2026-05-17"
+status: "published"
+tags: ["Next.js", "Security", "Web Development", "Vercel", "TypeScript"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-security-release-may-2026"
+---
+
+Vercelは今週、Next.jsの協調的なセキュリティリリースを実施しました。13件の脆弱性アドバイザリを一度に修正するという規模は、Next.jsのリリース履歴の中でも大きなものです。修正対象の脆弱性カテゴリはDoS（サービス妨害）、Middlewareおよびプロキシバイパス、SSRF（サーバーサイドリクエストフォージェリ）、キャッシュポイズニング、XSS（クロスサイトスクリプティング）の5種類にわたります。
+
+唯一の完全な対策はパッチ適用です。VercelはWAFルールや設定の変更による緩和策を提供していますが、根本的な解決はバージョンアップのみです。
+
+## 影響を受けるバージョンと更新先
+
+```bash
+# 現在のバージョン確認
+npx next --version
+
+# 最新パッチへの更新
+npm install next@latest
+
+# インストールされたバージョンの確認
+npm ls next
+```
+
+`package-lock.json` が更新されていることを必ず確認してください。依存関係の解決によっては、意図したバージョンに更新されていないケースがあります。
+
+## Middlewareとプロキシバイパス
+
+Next.jsのMiddlewareで認証チェックや認可ロジックを実装している場合、このカテゴリは特に注意が必要です。特定の条件下でMiddlewareがバイパスされる脆弱性は、認証フローを迂回する攻撃に直結します。
+
+```typescript
+// middleware.ts の典型的な認証パターン
+import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+
+export function middleware(request: NextRequest) {
+  const session = request.cookies.get("session-token");
+
+  if (!session?.value) {
+    return NextResponse.redirect(new URL("/login", request.url));
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ["/dashboard/:path*", "/api/protected/:path*"]
+};
+```
+
+このパターン自体は問題ありませんが、パッチ未適用のバージョンでは特定のリクエスト形式でこの検証が迂回される可能性があります。Middlewareで認証を行っている場合は修正バージョンへのアップデートを最優先にしてください。
+
+## キャッシュポイズニング
+
+Next.jsのISR（Incremental Static Regeneration）やData Cacheを使用している場合、キャッシュポイズニングの脆弱性は悪意あるコンテンツがキャッシュに書き込まれ、正規ユーザーに配信されるリスクを生じさせます。
+
+パッチ適用後にキャッシュを明示的にrevalidateすることを推奨します。
+
+```typescript
+import { revalidatePath } from "next/cache";
+
+export async function POST(request: Request) {
+  revalidatePath("/blog");
+  revalidatePath("/", "layout");
+  return Response.json({ revalidated: true });
+}
+```
+
+## SSRF（サーバーサイドリクエストフォージェリ）
+
+Server Actionsやサーバーサイドのfetch処理においてユーザー入力をURLに含める実装がある場合、SSRFのリスクを評価してください。パッチ適用に加えて、URLの検証ロジックの見直しも推奨します。
+
+```typescript
+const ALLOWED_HOSTS = new Set(["api.example.com", "assets.example.com"]);
+
+function validateExternalUrl(url: string): URL {
+  const parsed = new URL(url); // 不正なURLは例外をスロー
+  if (!ALLOWED_HOSTS.has(parsed.hostname)) {
+    throw new Error(`Host ${parsed.hostname} is not allowed`);
+  }
+  return parsed;
+}
+
+export async function fetchData(userUrl: string) {
+  const url = validateExternalUrl(userUrl);
+  const response = await fetch(url.toString());
+  return response.json();
+}
+```
+
+## XSS（クロスサイトスクリプティング）
+
+Next.jsはデフォルトでJSXのエスケープ処理を行いますが、Reactが提供する生HTMLの挿入APIやサーバーサイドでHTMLを直接組み立てている箇所は確認が必要です。パッチ適用後もアプリケーションコードを見直す機会として活用してください。
+
+アプリケーション側でできるXSS対策として、ユーザー生成コンテンツを扱う場合はDOMPurifyなどのサニタイズライブラリを必ず経由することを推奨します。
+
+```typescript
+import DOMPurify from "isomorphic-dompurify";
+
+// サーバーサイドでサニタイズしてから使用
+const sanitized = DOMPurify.sanitize(userContent);
+```
+
+## 今すぐ取るべき手順
+
+1. `npx next --version` で現在のバージョンを確認する
+2. `npm install next@latest` で最新のパッチバージョンに更新する
+3. `npm ls next` でインストールされたバージョンを確認する
+4. ステージング環境でテストスイートを実行する
+5. ISR/Cacheを使用している場合はrevalidateを実行する
+6. 本番環境にデプロイする
+
+VercelホスティングのプロジェクトはWAFルールによる一時的な緩和が適用されている可能性がありますが、パッチ適用の代替とはなりません。
+
+## Next.js 15.5 の追加アップデート
+
+セキュリティ修正と合わせて、Next.js 15.5では以下の機能更新も含まれています。
+
+- **Turbopack Builds (ベータ)**: `next build --turbopack` が本番ビルドに対応
+- **Node.js Middleware (安定版)**: Middlewareでの完全なNode.jsランタイムサポートが安定版に
+- **TypeScript改善**: 型付きルート、ルートエクスポートの検証
+
+大規模なアプリケーションではアップデート前に公式のMigration Guideで破壊的変更の有無を確認することを推奨します。今回のセキュリティリリースは13件という規模からも、早急な対応が求められます。

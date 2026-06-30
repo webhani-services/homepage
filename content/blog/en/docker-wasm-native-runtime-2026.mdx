@@ -1,0 +1,177 @@
+---
+title: "Docker Native WebAssembly Support: A Practical Look at Wasm Containers"
+description: "Docker's native WebAssembly runtime support in 2026 opens new options for edge workloads and lightweight microservices. Here's how Wasm containers compare to Linux containers and when to reach for each."
+date: "2026-05-28"
+status: "published"
+tags: ["Docker", "WebAssembly", "Wasm", "Container", "Cloud Native"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-wasm-native-runtime-2026"
+---
+
+Docker's 2026 update expanded its runtime support beyond Linux containers to include WebAssembly (Wasm) modules natively. You can now run WASI-compliant Wasm binaries with a standard `docker run` command, using the same tooling you already use for container images.
+
+This isn't a replacement for Linux containers. Wasm containers occupy a different space — they start in milliseconds, pack into tiny binaries, and run without a Linux kernel. Understanding where that trade-off works is the practical question.
+
+## How Docker Runs Wasm
+
+Docker builds on containerd, and Wasm support is handled through a shim called `runwasi`. This allows Docker to treat a Wasm module as a first-class runtime target alongside Linux containers.
+
+```bash
+# Run a Wasm image directly with Docker
+docker run --platform wasi/wasm \
+  --runtime=io.containerd.wasmedge.v1 \
+  my-org/my-wasm-app:latest
+```
+
+Several Wasm runtimes are available:
+
+| Runtime | Notes |
+|---|---|
+| `io.containerd.wasmedge.v1` | High performance, production-grade |
+| `io.containerd.wasmtime.v1` | Bytecode Alliance reference impl, stability-focused |
+| `io.containerd.spin.v2` | Fermyon Spin — purpose-built for HTTP and event handlers |
+
+## Linux Container vs. Wasm Container: Key Differences
+
+| Property | Linux Container | Wasm Container |
+|---|---|---|
+| Cold start | 100ms to several seconds | 1–10ms |
+| Image size | Tens of MB to GB | Hundreds of KB to a few MB |
+| System calls | Direct (Linux kernel) | Sandboxed via WASI |
+| CPU architecture | Arch-specific (amd64/arm64) | Architecture-neutral |
+| Ecosystem compatibility | High | Limited (Rust, Go, C/C++ primary) |
+
+Wasm containers win on startup time and portability. The same `.wasm` binary runs on x86, ARM, or anywhere else without recompilation.
+
+## Building a Wasm Container with Rust
+
+Here is a minimal Dockerfile for a Rust service compiled to WASI:
+
+```dockerfile
+# Build stage
+FROM rust:1.80-slim AS builder
+
+RUN rustup target add wasm32-wasip1
+
+WORKDIR /app
+COPY . .
+RUN cargo build --target wasm32-wasip1 --release
+
+# Runtime stage
+FROM wasmedge/slim-runtime:0.11.0
+COPY --from=builder /app/target/wasm32-wasip1/release/my_app.wasm /app.wasm
+
+ENTRYPOINT ["wasmedge", "/app.wasm"]
+```
+
+```rust
+// src/main.rs — a WASI-compatible request handler
+use std::io::{self, Read};
+
+fn main() {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).unwrap();
+
+    let output = process(&input);
+    println!("{}", output);
+}
+
+fn process(input: &str) -> String {
+    serde_json::json!({
+        "status": "ok",
+        "input_length": input.len()
+    })
+    .to_string()
+}
+```
+
+The build output is a single `.wasm` file, typically under 2MB for a service like this.
+
+## Mixing Wasm and Linux Containers in Docker Compose
+
+In practice, Wasm containers work best alongside Linux containers, not instead of them. A common pattern is using Wasm for lightweight request processing while relying on Linux containers for stateful services.
+
+```yaml
+# docker-compose.yml
+services:
+  # Standard Linux containers for infrastructure
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: secret
+
+  redis:
+    image: redis:8-alpine
+
+  # Wasm container for the lightweight validation layer
+  request-validator:
+    image: my-org/validator:latest
+    platform: wasi/wasm
+    runtime: io.containerd.wasmedge.v1
+    ports:
+      - "8080:8080"
+
+  # Linux container for the main API
+  api-gateway:
+    build: ./api-gateway
+    ports:
+      - "3000:3000"
+    depends_on:
+      - request-validator
+      - postgres
+```
+
+The validator starts nearly instantly and uses minimal memory. The API gateway handles anything that needs the Node.js ecosystem, file I/O, or database access.
+
+## Kubernetes and Wasm
+
+Kubernetes 1.35+ supports Wasm workloads via `RuntimeClass`. Nodes with a Wasm runtime installed can be targeted explicitly:
+
+```yaml
+# Define the RuntimeClass
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: wasmedge
+handler: wasmedge
+
+---
+# Use it in a Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wasm-validator
+spec:
+  template:
+    spec:
+      runtimeClassName: wasmedge
+      containers:
+        - name: validator
+          image: my-org/validator:latest
+          ports:
+            - containerPort: 8080
+```
+
+This keeps Wasm workloads isolated to nodes that support them, without affecting the rest of your cluster.
+
+## When to Use Wasm Containers
+
+**Good fit:**
+
+- **Edge functions**: CDN edge nodes where cold start latency is a hard constraint
+- **Plugin systems**: Running untrusted third-party logic in a sandboxed environment
+- **High-frequency short-lived processes**: Validation, transformation, and routing where startup cost matters
+- **Cross-platform library distribution**: Ship a single `.wasm` artifact that any language can call
+
+**Not a good fit:**
+
+- Applications that depend on Node.js, Python, or Ruby ecosystems
+- Services needing direct filesystem access or complex OS interactions
+- GPU workloads — CUDA/ROCm access via WASI is not mature yet
+
+## Where Things Stand
+
+Docker's native Wasm support lowers the barrier to experimenting with Wasm containers significantly. The toolchain is stable enough for production workloads in the right contexts — specifically, stateless, CPU-bound processes where startup time and binary size matter.
+
+For new edge functions or plugin systems, Wasm containers are worth evaluating alongside traditional Linux containers. For general web application backends, Linux containers remain the practical default.

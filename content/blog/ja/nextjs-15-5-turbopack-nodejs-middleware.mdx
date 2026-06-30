@@ -1,0 +1,151 @@
+---
+title: "Next.js 15.5 の Node.js Middleware と Turbopack Production Build を整理する"
+description: "Next.js 15.5 で安定化した Node.js Middleware と beta 提供が始まった Turbopack Production Build の詳細と、TypeScript DX の改善点を解説します。"
+date: "2026-05-08"
+status: "published"
+tags: ["Next.js", "TypeScript", "Frontend", "Turbopack", "Middleware"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-15-5-turbopack-nodejs-middleware"
+---
+
+Next.js 15.5 では、実務に直接影響する3つの変更が加わりました。Node.js Middleware の安定化、Turbopack による Production Build のベータ提供、そして TypeScript DX の改善です。それぞれの変更点と実際の影響を整理します。
+
+## Node.js Middleware の安定化
+
+これまで Next.js の Middleware は Edge Runtime で動作していました。Edge Runtime は軽量で起動が速い反面、Node.js の標準 API を使えないという制限がありました。`fs`、`crypto`、ネイティブモジュール、重い認証ライブラリなどは利用できませんでした。
+
+15.5 で Middleware が Node.js Runtime で安定稼働するようになったことで、この制限が実質的に解消されました。
+
+```typescript
+// middleware.ts — Node.js Runtime で安定稼働
+import { NextRequest, NextResponse } from 'next/server'
+import { createHash } from 'crypto' // Node.js の crypto モジュールが使用可能に
+
+export async function middleware(request: NextRequest) {
+  const authHeader = request.headers.get('authorization')
+
+  if (!authHeader?.startsWith('Bearer ')) {
+    return NextResponse.json({ error: 'Missing token' }, { status: 401 })
+  }
+
+  const token = authHeader.slice(7)
+
+  // Node.js の crypto を使ったトークン検証
+  const tokenHash = createHash('sha256').update(token).digest('hex')
+  const isValid = await validateTokenHash(tokenHash)
+
+  if (!isValid) {
+    return NextResponse.redirect(new URL('/login', request.url))
+  }
+
+  return NextResponse.next()
+}
+
+export const config = {
+  matcher: ['/api/:path*', '/dashboard/:path*']
+}
+```
+
+実務で特に影響が大きいのは認証フローです。JWT 検証、セッション管理、ヘビーな暗号化処理を Middleware に集約できるようになりました。これまで Route Handler に分散させていたロジックを整理するリファクタリングの機会でもあります。
+
+## Turbopack Production Build のベータ
+
+`next build --turbopack` コマンドでプロダクションビルドに Turbopack を使えるようになりました。Vercel の社内プロジェクト（vercel.com、v0.app、nextjs.org）での運用実績があります。
+
+```bash
+# Turbopack でプロダクションビルド
+next build --turbopack
+```
+
+```json
+// package.json に追加する場合
+{
+  "scripts": {
+    "build": "next build --turbopack"
+  }
+}
+```
+
+ビルド速度の改善幅はプロジェクトの規模と構成によって異なりますが、大規模なコードベースほど効果が出やすい傾向があります。
+
+注意点: ベータ段階のため、一部のプラグインや設定と互換性の問題が残っている可能性があります。本番適用前に CI/CD 環境で既存の Webpack 設定との互換性を確認してください。
+
+## TypeScript DX の改善
+
+### Typed Routes の安定化
+
+Link コンポーネントの `href` が型安全になりました。存在しないルートを指定するとコンパイルエラーになります。
+
+```typescript
+import Link from 'next/link'
+
+// ✅ 型チェックが通る（/about ページが存在する場合）
+<Link href="/about">About</Link>
+
+// ❌ コンパイルエラー（/nonexistent ページが存在しない場合）
+<Link href="/nonexistent">壊れたリンク</Link>
+```
+
+next.config.ts で有効化します。
+
+```typescript
+// next.config.ts
+const nextConfig = {
+  experimental: {
+    typedRoutes: true // 15.5 から stable に
+  }
+}
+
+export default nextConfig
+```
+
+### PageProps / LayoutProps ヘルパー型
+
+```typescript
+// app/blog/[slug]/page.tsx
+import type { PageProps } from 'next/types'
+
+export default function BlogPost({ params, searchParams }: PageProps) {
+  // params の型が自動で付く — 手動の型定義が不要
+  return <article>{params.slug}</article>
+}
+
+export async function generateMetadata({ params }: PageProps) {
+  return {
+    title: `Post: ${params.slug}`
+  }
+}
+```
+
+### next typegen コマンド
+
+型定義ファイルをフルビルドなしに生成できる新しいコマンドが追加されました。
+
+```bash
+# 型定義のみを生成（フルビルドより高速）
+npx next typegen
+```
+
+CI でビルドを伴わない型チェックを行う際に役立ちます。
+
+## 既存プロジェクトへの影響
+
+Edge Runtime を前提としていた Middleware コードは確認が必要です。特に以下を確認してください。
+
+```typescript
+// Node.js Runtime に移行する場合は以下を削除
+export const runtime = 'edge'
+```
+
+Typed Routes を有効にすると、存在しないルートへの `Link` がすべてエラーとして検出されます。大規模プロジェクトでは一時的に多くのエラーが出る可能性があります。まず `npx next typegen` で範囲を確認してから修正を進めてください。
+
+## webhani の見解
+
+Node.js Middleware の安定化は、Edge Runtime の制約を回避するための複雑な実装を解消できる変更です。認証ロジックを Route Handler と Middleware に分散させていたコードを整理する機会として捉えてください。
+
+Turbopack Production Build は、大規模プロジェクトを抱えるチームにとって試す価値があります。ただしベータ段階であることを念頭に置き、まず CI/CD の検証環境で試してから本番展開を判断することを推奨します。
+
+---
+
+*参考: Next.js Blog, InfoQ "Next.js 15.5 Ships", nextjs.org*

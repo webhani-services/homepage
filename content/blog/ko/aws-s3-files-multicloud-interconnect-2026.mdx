@@ -1,0 +1,169 @@
+---
+title: "Amazon S3 Files와 AWS Interconnect Multicloud: AI/ML 워크로드를 위한 새로운 Cloud Primitive"
+description: "What's Next with AWS 2026에서 발표된 Amazon S3 Files와 AWS Interconnect Multicloud를 분석합니다. Multicloud AI/ML Pipeline의 실질적인 마찰 지점을 해소하는 두 서비스의 동작 원리와 적용 시점을 정리합니다."
+date: "2026-05-10"
+status: "published"
+tags: ["AWS", "S3", "Multicloud", "Cloud Infrastructure", "AI/ML"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-s3-files-multicloud-interconnect-2026"
+---
+
+2026년 5월 4일 열린 What's Next with AWS 2026에서 AWS는 두 가지 서비스를 발표했습니다. Amazon S3 Files와 AWS Interconnect Multicloud입니다. 겉보기에는 단순한 기능 추가처럼 보이지만, AI/ML 워크로드를 설계하는 엔지니어 입장에서는 지금까지 실질적인 불편함이었던 부분을 직접 건드리는 변화입니다. 각각 무엇이 바뀌는지, 언제 써야 하는지 정리합니다.
+
+## Amazon S3 Files
+
+### 어떤 문제를 해결하는가
+
+기존 S3 GET 요청은 HTTP 오버헤드로 인해 수십 ms의 Latency가 발생합니다. 가끔 Object를 조회하는 용도라면 문제없지만, ML Training에서 DataLoader가 지속적으로 Batch를 읽거나 수백 Step마다 Checkpoint를 쓰는 상황이라면 이 Latency가 빠르게 누적됩니다.
+
+S3 Files는 이 오버헤드를 1ms 미만으로 줄이고, AWS Compute 위에서 S3 Bucket을 POSIX 파일시스템으로 Mount할 수 있게 합니다. Training Script는 SDK 호출 없이 표준 File I/O로 S3 데이터를 읽고 씁니다.
+
+### Mount 방법
+
+```bash
+# EC2 또는 SageMaker Training Job에서 S3 Bucket을 파일시스템으로 Mount
+aws s3files mount s3://my-training-data /mnt/training-data \
+  --region ap-northeast-2 \
+  --read-ahead-size 4MB
+
+# Mount 확인
+df -h /mnt/training-data
+ls /mnt/training-data/dataset/
+```
+
+Mount 이후에는 Training Code 수정이 필요 없습니다.
+
+```python
+# SDK 변경 불필요 — 표준 File I/O로 S3 데이터에 접근
+import torch
+from torch.utils.data import DataLoader
+
+dataset = MyDataset("/mnt/training-data/dataset/")
+loader = DataLoader(dataset, batch_size=32, num_workers=8)
+
+for step, batch in enumerate(loader):
+    loss = model(batch)
+    loss.backward()
+    optimizer.step()
+
+    if step % 100 == 0:
+        # Checkpoint를 Mount된 경로에 쓰면 S3에 직접 저장됨
+        torch.save(model.state_dict(), f"/mnt/training-data/checkpoints/step_{step}.pt")
+```
+
+여러 Training Node가 동일한 Bucket을 동시에 Mount할 수 있어, 별도의 공유 파일시스템 없이 분산 Training에서의 데이터 공유도 처리됩니다.
+
+### FSx for Lustre, EFS와 비교
+
+S3 Files가 모든 상황에서 FSx for Lustre나 EFS를 대체하는 것은 아닙니다. 각 서비스의 특성은 다음과 같습니다.
+
+```
+                    S3 Files      FSx for Lustre       EFS
+Latency             ~1ms          <1ms (고처리량)       낮음~중간
+설정 복잡도          낮음           높음 (Cluster)       중간
+비용                S3 요금         높음                중간
+데이터 영속성        S3 네이티브     S3 동기화 필요       영속
+Cross-region 공유   가능           불가                 불가
+Spot 내결함성        높음           낮음 (Cluster 의존)   중간
+```
+
+수백 개의 GPU가 동시에 접근하는 대규모 분산 Training에서는 FSx for Lustre의 집계 처리량이 여전히 유리합니다. 하지만 대부분의 워크로드, 특히 이미 S3에 데이터를 저장하고 있다면, S3 Files는 별도 Infrastructure 없이 바로 적용할 수 있는 합리적인 선택입니다.
+
+### 도입을 고려할 시점
+
+다음 상황이라면 S3 Files를 먼저 검토하세요.
+
+- Training 데이터가 이미 S3에 있고 DataLoader를 재작성하고 싶지 않을 때
+- Spot Instance 기반 Training에서 Checkpoint 빈도를 높여 내결함성을 개선하고 싶을 때
+- 여러 Training Node가 데이터를 공유해야 하는데 공유 파일시스템 구축이 부담스러울 때
+- FSx for Lustre를 사용 중이지만 Cluster 관리 부담을 줄이고 싶을 때
+
+반대로 다음 상황이라면 FSx for Lustre를 유지하는 것이 낫습니다.
+
+- 200개 이상의 GPU를 사용하는 대규모 분산 Training으로 최대 파일시스템 처리량이 필요한 경우
+- 이미 FSx for Lustre나 EFS가 안정적으로 운영 중이고 마이그레이션 비용이 이점보다 클 때
+
+## AWS Interconnect Multicloud
+
+### 어떤 문제를 해결하는가
+
+AWS와 다른 Cloud Provider(GCP, Azure)를 함께 사용하는 경우, Provider 간 Private 연결을 구성하려면 상당한 작업이 필요했습니다. AWS Direct Connect, GCP Cloud Interconnect 또는 Azure ExpressRoute를 각각 설정하고, BGP 라우팅을 관리하며, VPC 간 IP CIDR이 겹치지 않도록 설계해야 했습니다. Cloud Pair가 늘어날수록 이 작업은 배가됩니다.
+
+AWS Interconnect Multicloud는 이를 Managed Service로 제공합니다. 자체 Appliance 불필요, Cloud Pair별 VPN 설정 불필요. AWS Console 또는 API에서 설정하면 AWS가 VPC 간 Private Link를 관리합니다.
+
+### 설정 방법
+
+```bash
+# AWS VPC에서 GCP VPC로 Private 연결 생성
+aws interconnect create-connection \
+  --connection-name "aws-to-gcp-prod" \
+  --provider gcp \
+  --remote-vpc-id "projects/my-project/global/networks/prod-vpc" \
+  --bandwidth 10Gbps \
+  --region ap-northeast-2
+
+# 연결 상태 확인
+aws interconnect describe-connection \
+  --connection-name "aws-to-gcp-prod"
+```
+
+GCP 측에서는 들어오는 연결 요청을 GCP Console이나 gcloud CLI로 승인하는 작업이 필요하지만, Router 설정은 양쪽 모두 불필요합니다.
+
+### 어떤 상황이 해소되는가
+
+가장 흔한 시나리오는 이것입니다. AWS VPC에서 실행되는 워크로드가 GCP Vertex AI나 Azure OpenAI Service를 호출해야 하지만, 기업 네트워크 정책이 Public Internet Egress를 금지하는 경우입니다.
+
+```
+기존 방식 (엄격한 네트워크 정책에서 문제):
+AWS Training Node (VPC) → NAT Gateway → Public Internet → GCP Vertex AI
+
+Interconnect Multicloud 사용 후:
+AWS Training Node (VPC) → AWS Interconnect → Private Backbone → GCP VPC → Vertex AI
+```
+
+Public Internet을 경유하지 않으므로 Firewall 예외 신청이 필요 없고, 보안 감사 대응도 간소화됩니다.
+
+두 번째 시나리오는 Data Egress 비용 관리입니다. Cloud Provider 간 데이터 전송은 Public Egress 요금이 적용되는데, Private Interconnect는 요금 구조가 다릅니다. 실제 절감 여부는 전송량과 Provider 조합에 따라 다르므로, 도입 전 현재 전송량을 기준으로 요금을 직접 비교해보는 것을 권장합니다. 대규모 모델 Artifact나 Dataset을 정기적으로 Cloud 간에 이동시키는 ML Pipeline이라면 이 요금 구조가 설계 의사결정에 영향을 줍니다.
+
+### 도입을 고려할 시점
+
+다음 상황이라면 Interconnect Multicloud를 검토하세요.
+
+- AWS와 GCP 또는 Azure를 함께 운영하고 있고, Provider 간 Private 연결 관리가 운영 부담이 될 때
+- 네트워크 보안 정책으로 인해 AWS 워크로드에서 다른 Provider의 API로 직접 접근이 제한될 때
+- Cloud 간 데이터 전송량이 많아 Egress 비용 최적화가 필요할 때
+
+반대로 다음 상황이라면 우선순위를 낮춰도 됩니다.
+
+- Single Cloud 구성으로 운영 중이고 Multicloud 전환 계획이 없을 때
+- 전송 데이터량이 적고 기존 VPN이나 Internet 기반 연결로 충분할 때
+
+## 두 서비스를 함께 사용하는 패턴
+
+두 서비스를 조합하면 Cloud를 넘나드는 ML Pipeline을 Private Network 안에서 완성할 수 있습니다.
+
+```
+Multicloud ML Pipeline 예시:
+
+소스 데이터 (GCP BigQuery / GCS)
+      ↓  Interconnect Multicloud (Private 전송)
+AWS S3 (통합 Data Lake)
+      ↓  S3 Files (파일시스템으로 Mount)
+AWS EC2 / SageMaker Training Job
+      ↓  Checkpoint → S3 Files를 통해 S3에 기록
+      ↓  학습 완료된 모델 → Interconnect를 통해 GCP로 전송
+GCP Vertex AI / Azure ML (Inference Endpoint)
+```
+
+Training Node는 S3 데이터를 로컬 파일처럼 읽고, Checkpoint를 S3에 씁니다. 완성된 모델은 Private 연결을 통해 Inference Cloud로 이동합니다. 전 구간이 Public Internet 없이 처리됩니다.
+
+한 가지 주의할 점은, S3 Files Mount는 AWS Compute(EC2, SageMaker, ECS Task)에서만 동작한다는 것입니다. GCP나 Azure의 Compute Instance에서 S3 Files를 직접 Mount하는 것은 현재 지원되지 않습니다. 데이터 처리와 Training은 AWS 측에서 수행하고, 결과물을 Interconnect를 통해 다른 Cloud로 전송하는 설계가 됩니다.
+
+## 도입 판단 정리
+
+**Amazon S3 Files** — 이미 S3를 Training Storage로 사용하고 있다면 지금 바로 검토할 가치가 있습니다. Mount 방식이므로 기존 Code 변경 없이 비핵심 Training Job에 먼저 적용해 검증할 수 있습니다. DataLoader 병렬성과 Batch 크기에 따른 실제 읽기 처리량을 측정해보는 것이 첫 번째 단계입니다.
+
+**AWS Interconnect Multicloud** — Cloud Provider를 여럿 운영하는 경우에만 해당됩니다. 만약 그렇다면, 그리고 Private 연결 구성이 미뤄지고 있던 과제라면, DIY Direct Connect 구성의 Managed 대안으로 평가할 만합니다. 실제 전송량을 기준으로 요금을 먼저 계산한 뒤 결정하세요.
+
+두 서비스 모두 전체 Architecture를 바꿀 필요 없이 점진적으로 도입할 수 있습니다. 부분 적용 후 검증하는 방식으로 접근하면 리스크를 최소화할 수 있습니다.

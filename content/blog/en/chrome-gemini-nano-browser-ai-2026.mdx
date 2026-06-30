@@ -1,0 +1,114 @@
+---
+title: "Gemini Nano in Chrome: What Browser-Native AI Means for Web Developers"
+description: "Google has shipped Gemini Nano as a default install in Chrome, exposing JavaScript APIs for on-device AI. Here's what works, what doesn't, and where it fits in a real-world web app."
+date: "2026-05-07"
+status: "published"
+tags: ["AI", "Chrome", "JavaScript", "Browser API", "LLM"]
+thumbnail: ""
+author: "webhani"
+slug: "chrome-gemini-nano-browser-ai-2026"
+---
+
+Google has shipped Gemini Nano — a roughly 4GB on-device language model — as a default install in Chrome, and is progressively exposing a set of JavaScript APIs for interacting with it. This changes the calculus for certain categories of AI features in web applications.
+
+## The API Surface
+
+The core APIs either available or in active Origin Trial:
+
+- **Prompt API** — General-purpose prompting, synchronous or streaming
+- **Translation API** — On-device text translation
+- **Summarization API** — Text summarization
+- **Rewrite API** — Tone adjustment and paraphrasing
+
+All of these run entirely in the browser. No user text is sent to a server.
+
+## Using the Prompt API
+
+```javascript
+const session = await window.ai.languageModel.create({
+  systemPrompt: "You are a helpful assistant for a Japanese e-commerce site.",
+});
+
+const response = await session.prompt("What is your return policy?");
+console.log(response);
+
+// Streaming is supported
+const stream = await session.promptStreaming("A long question...");
+for await (const chunk of stream) {
+  process.stdout.write(chunk);
+}
+```
+
+The API shape is deliberately close to what developers already know from server-side AI SDKs, which lowers the migration cost for teams already building AI-integrated UIs.
+
+## Translation API in Practice
+
+```javascript
+const translator = await window.translation.createTranslator({
+  sourceLanguage: "en",
+  targetLanguage: "ja",
+});
+
+document.getElementById("input").addEventListener("input", async (e) => {
+  const translated = await translator.translate(e.target.value);
+  document.getElementById("output").textContent = translated;
+});
+```
+
+Replacing a round-trip to DeepL or Google Translate with an in-browser call eliminates one network dependency and reduces latency significantly for lightweight use cases — responses typically land in the 50–200ms range.
+
+## Hardware Requirements and Graceful Degradation
+
+Gemini Nano is optimized for devices with GPU or NPU acceleration. The capability check is essential before using any of these APIs:
+
+```javascript
+const capabilities = await window.ai.languageModel.capabilities();
+
+if (capabilities.available === "readily") {
+  // Model is ready to use
+} else if (capabilities.available === "after-download") {
+  // Usable after background download completes
+} else {
+  // Device doesn't meet requirements — fall back to server API
+  return callServerSideAPI(input);
+}
+```
+
+This means any production implementation must treat the browser API as an enhancement layer, not a primary dependency. Mobile devices and low-end laptops will frequently hit the `"no"` path.
+
+## The Privacy Angle
+
+For applications dealing with sensitive text — internal documents, forms containing PII, healthcare-adjacent use cases — processing entirely on-device removes a class of data-handling concern that server-side APIs carry. This is a concrete advantage, not a marketing claim.
+
+Offline functionality is a secondary benefit. Applications targeting environments with unreliable connectivity (field work, areas with poor signal) gain meaningful resilience.
+
+## Where It Actually Makes Sense
+
+After evaluating these APIs against the kinds of projects webhani works on, here is a realistic breakdown:
+
+**Good fit:**
+- Autocomplete and writing suggestions in rich text editors
+- Lightweight real-time translation previews in multilingual UIs
+- Summarizing user-entered content before submission (e.g., support ticket pre-processing)
+
+**Keep using server-side APIs:**
+- Production-quality translation where accuracy matters
+- Long document processing (Gemini Nano's context window is limited)
+- Traffic with significant iOS/Safari share — Chrome-only for now
+- Mobile-first products where hardware requirements won't be met reliably
+
+## Origin Trial Status
+
+As of May 2026, most of these APIs are in Chrome Origin Trial. You need a registered token to enable them:
+
+```html
+<meta http-equiv="origin-trial" content="YOUR_TOKEN_HERE">
+```
+
+W3C standardization is underway, and other browsers are watching. Do not design a production feature that depends on this today without a solid fallback for non-Chrome environments.
+
+## Practical Recommendation
+
+Browser-native AI is not a replacement for server-side inference. The right framing is that it is a new runtime target for lightweight AI features that do not require cloud-scale reasoning.
+
+Start with capability detection, implement a server-side fallback, and deploy the browser AI path as an enhancement for Chrome Desktop users. That architecture delivers incremental value now without betting on a capability that is not yet universally available.

@@ -1,0 +1,119 @@
+---
+title: "Next.js 15.5: Turbopack Build Beta와 Node.js Middleware 안정화"
+description: "Next.js 15.5에서 Turbopack이 프로덕션 빌드까지 확장되고, Node.js Middleware가 안정 버전으로 전환됩니다. 주요 변경 사항과 실무 적용 시 주의점을 정리합니다."
+date: "2026-05-11"
+status: "published"
+tags: ["Next.js", "Turbopack", "TypeScript", "web-development", "middleware"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-15-5-turbopack-builds"
+---
+
+## Next.js 15.5 주요 변경 사항
+
+Next.js 15.5에서 눈에 띄는 변경이 두 가지 있습니다.
+
+1. **Turbopack Build Beta 전환** — `next build --turbopack` 명령어로 프로덕션 빌드에서도 Turbopack 사용 가능
+2. **Node.js Middleware 안정화** — Edge Runtime 제약이 없어지고 전체 Node.js API를 Middleware에서 사용 가능
+
+TypeScript 개선 사항(Typed Routes, Route Export Validation)과 Next.js 16을 대비한 Deprecation 경고도 포함되어 있습니다.
+
+## Turbopack Build: 개발 서버에서 프로덕션으로
+
+이전까지 Turbopack은 `next dev --turbopack`의 개발 서버에서만 활용 가능했습니다. 15.5부터는 빌드에도 적용됩니다.
+
+```bash
+# Turbopack 빌드 실행
+next build --turbopack
+
+# package.json에 추가하는 경우
+# {
+#   "scripts": {
+#     "build": "next build --turbopack"
+#   }
+# }
+```
+
+대규모 프로젝트에서 Turbopack은 Webpack 대비 빌드 시간을 크게 단축할 수 있습니다. 현재는 Beta 단계이므로 프로덕션 적용 전에 다음 사항을 반드시 확인해야 합니다.
+
+### 전환 전 확인 사항
+
+- Turbopack과 호환되지 않는 Webpack 플러그인이 있는지 점검
+- 커스텀 로더 동작 차이 확인 — 단순 smoke test가 아닌 전체 번들 출력 검증 필요
+- `next lint`는 15.5에서 deprecated — ESLint 설정 직접 사용으로 전환 필요
+
+## Node.js Middleware 안정화
+
+기존 Next.js Middleware는 Edge Runtime에서 동작하여 `crypto`, `bcrypt` 등 많은 Node.js 모듈을 사용할 수 없었습니다. 이 제약이 15.5에서 해소됩니다.
+
+```typescript
+// middleware.ts — Node.js 전체 API 사용 가능 (15.5 Stable)
+import { NextRequest, NextResponse } from "next/server";
+import { createHash } from "crypto"; // Edge Runtime에서는 사용 불가했던 모듈
+
+export function middleware(request: NextRequest) {
+  const token = request.cookies.get("session")?.value ?? "";
+
+  // crypto 모듈을 Middleware에서 직접 사용
+  const hash = createHash("sha256").update(token).digest("hex");
+
+  const response = NextResponse.next();
+  response.headers.set("x-session-hash", hash);
+  return response;
+}
+
+export const config = {
+  matcher: ["/api/:path*", "/dashboard/:path*"],
+};
+```
+
+이제 인증 미들웨어, 세션 검증, 요청 변환 로직을 API Route를 거치지 않고 Middleware에서 직접 처리할 수 있습니다.
+
+## TypeScript 개선
+
+**Typed Routes**
+`next.config.mjs`에서 `experimental.typedRoutes`를 활성화하면 `<Link href>`와 `router.push()`에서 유효하지 않은 경로를 TypeScript 오류로 잡을 수 있습니다.
+
+```typescript
+// next.config.mjs
+const nextConfig = {
+  experimental: {
+    typedRoutes: true,
+  },
+};
+```
+
+```tsx
+// ✅ 올바른 경로
+<Link href="/dashboard">Dashboard</Link>
+
+// ❌ 존재하지 않는 경로 → TypeScript 오류
+<Link href="/dashbord">Dashboard</Link>
+```
+
+**Route Export Validation**
+페이지 컴포넌트나 Route Handler에 잘못된 Export가 있을 경우 빌드 시 오류가 발생하도록 개선되었습니다. 기존에는 무시되던 오류들이 빌드 타임에 노출됩니다.
+
+## Next.js 16 대비 Deprecation 경고
+
+15.5에는 Next.js 16에서 제거될 기능들에 대한 경고가 추가되었습니다. 미리 점검해두면 향후 업그레이드 시 부담을 줄일 수 있습니다.
+
+```bash
+# Deprecation 경고 확인
+next build 2>&1 | grep -i "warn\|deprecated"
+```
+
+## webhani의 관점
+
+이번 릴리즈에서 가장 실용적인 변화는 Node.js Middleware의 안정화입니다. 기존 Edge Runtime 제약으로 인해 API Route로 우회하던 인증 로직을 Middleware에서 직접 처리할 수 있어 아키텍처가 단순해집니다.
+
+Turbopack Build는 Beta 단계이므로 우선 CI 빌드 시간 측정을 통해 효과를 확인하고, Webpack 플러그인 호환성 검증 후 단계적으로 적용하는 것을 권장합니다.
+
+## 요약
+
+- `next build --turbopack`: Turbopack Build Beta 사용 가능
+- Node.js Middleware 안정화: `crypto` 등 전체 Node.js API 사용 가능
+- Typed Routes: 네비게이션 링크에 컴파일 타임 타입 안전성 추가
+- Route Export Validation: 잘못된 Export를 빌드 타임에 감지
+- `next lint` deprecated: ESLint 직접 설정으로 전환 필요
+- Next.js 16 Deprecation 경고 확인 및 조기 대응 권장

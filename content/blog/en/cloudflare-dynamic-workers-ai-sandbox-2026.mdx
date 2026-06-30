@@ -1,0 +1,157 @@
+---
+title: "Cloudflare Dynamic Workers: A Faster Sandbox for AI-Generated Code"
+description: "Dynamic Workers lets a Worker spin up another Worker from runtime-supplied code in its own V8 isolate — 100x faster cold starts than Docker, far less memory. Here's what that means for AI agent sandboxing."
+date: "2026-05-10"
+status: "published"
+tags: ["Cloudflare", "AI", "Edge Computing", "Serverless", "Agents"]
+thumbnail: ""
+author: "webhani"
+slug: "cloudflare-dynamic-workers-ai-sandbox-2026"
+---
+
+When you're building an AI agent that generates and executes code, sandbox isolation is unavoidable. The default approach has been Docker containers, or managed services like E2B and Modal. Cloudflare's Dynamic Workers — currently in Beta — offers a different execution model that's worth understanding if your agent pipeline is primarily JavaScript or TypeScript.
+
+## What Dynamic Workers Actually Does
+
+A standard Cloudflare Worker runs code that was fixed at deploy time. Dynamic Workers changes that: a running Worker can create a new Worker from a code string supplied at runtime, and that new Worker runs in its own isolated V8 isolate.
+
+The key properties: the dynamically created Worker cannot access the parent Worker's global scope, other requests, or any bound resources it wasn't explicitly given. It's a genuine sandbox, not just a function call.
+
+```typescript
+// A Worker that receives AI-generated code and executes it safely
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const { code, input } = await request.json() as {
+      code: string;
+      input: unknown;
+    };
+
+    const result = await runInSandbox(code, input);
+    return Response.json({ result });
+  },
+};
+
+async function runInSandbox(code: string, input: unknown): Promise<unknown> {
+  const worker = await DynamicWorker.create({
+    script: code,
+    limits: {
+      cpuMs: 5000,       // max CPU time per execution
+      memoryMb: 128,     // max memory per isolate
+    },
+  });
+
+  return await worker.run(input);
+}
+```
+
+The dynamically created Worker is destroyed after execution. Each invocation starts clean with no shared state between runs.
+
+## Performance vs. Docker
+
+The performance gap is real. Docker container cold starts range from ~500ms to several seconds depending on image size and host environment. A V8 isolate initializes in single-digit milliseconds. For an AI agent making dozens of parallel code execution calls, that difference compounds quickly.
+
+| Metric | Docker Container | Dynamic Workers |
+|--------|-----------------|-----------------|
+| Cold start | 500ms – 3s | 5ms – 30ms |
+| Memory per sandbox | 50MB – 500MB+ | 5MB – 20MB |
+| Scale-out | Seconds | Near-instant |
+
+"100x faster" and "10-100x less memory" are accurate at the right comparison points — a warm V8 isolate against a Docker container starting from scratch. What the benchmarks don't show: isolate startup is fast but not zero. Larger scripts have more JIT compilation overhead. Measure with your actual workload before committing to the architecture.
+
+## Durable Workflows Without Pre-Registration
+
+Dynamic Workers handles single executions well. Multi-step agent workflows — run code, wait for a result, proceed based on output — need persistent state. The `@cloudflare/dynamic-workflows` package adds that layer.
+
+Unlike standard Cloudflare Workflows (which require pre-registered workflow classes), `@cloudflare/dynamic-workflows` lets you define and instantiate workflows entirely at runtime:
+
+```typescript
+import { DynamicWorkflow } from "@cloudflare/dynamic-workflows";
+
+interface AgentTask {
+  taskId: string;
+  steps: Array<{
+    code: string;
+    input: unknown;
+  }>;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const task = await request.json() as AgentTask;
+
+    const workflow = await DynamicWorkflow.create(env.WORKFLOWS, {
+      id: task.taskId,
+      steps: task.steps.map((step, i) => ({
+        name: `step-${i}`,
+        run: async (ctx) => {
+          // Each step runs in its own Dynamic Worker sandbox
+          const worker = await ctx.createWorker(step.code);
+          const result = await worker.run(step.input);
+          return result;
+        },
+        // Built-in retry with exponential backoff
+        retries: {
+          limit: 3,
+          backoff: "exponential",
+          delay: "1 second",
+        },
+      })),
+    });
+
+    return Response.json({
+      workflowId: workflow.id,
+      status: "started",
+    });
+  },
+};
+```
+
+Workflows support `sleep`, `resume`, and `retry` natively. A workflow can pause to wait for human approval, external webhook, or a long-running computation, then resume exactly where it left off — durable state is handled by a Durable Object under the hood.
+
+## Cloudflare Sandboxes and Mesh
+
+Two related offerings complement Dynamic Workers in an agent architecture:
+
+**Cloudflare Sandboxes** provides persistent shell and filesystem environments for agents. Where Dynamic Workers is optimized for stateless code execution (compute + API calls), Sandboxes handles the cases that need file I/O, multi-command shell sessions, or build tools. Think of them as covering different parts of the agent's work: Dynamic Workers for running generated functions, Sandboxes for running scripts that need a real filesystem.
+
+**Cloudflare Mesh** adds scoped network access control. You can whitelist exactly which external endpoints a given agent can reach, blocking everything else by default:
+
+```typescript
+const worker = await DynamicWorker.create({
+  script: agentGeneratedCode,
+  network: {
+    allowedOrigins: [
+      "https://api.openai.com",
+      "https://your-internal-api.example.com",
+    ],
+    defaultPolicy: "deny",
+  },
+});
+```
+
+This matters for AI agent pipelines specifically: you want the agent's generated code to be able to call the APIs it needs without having unrestricted outbound access to anything on the internet.
+
+## Hard Limits to Know Before You Build
+
+**Language support**: JavaScript, TypeScript, and WASM only. No Python. If your agent generates Python code — common for data analysis, scientific computing, or ML tasks — Dynamic Workers cannot run it. E2B, Modal, and similar services exist precisely for that case.
+
+**Execution model constraints**: Dynamic Workers inherits Cloudflare Workers' execution limits. CPU time is capped per request (50ms default on the bundled plan, up to 30 seconds on Unbound). Long-running file processing or large data transformations that take minutes don't fit this model. Cloudflare Sandboxes is the better fit there.
+
+**Cold start is near-zero, not zero**: V8 isolate initialization takes a few milliseconds. Script compilation adds more time proportional to code size. For latency-sensitive paths, pre-warm your Worker if the API permits it.
+
+**Beta status**: APIs may change. Don't put Dynamic Workers on a critical production path without a plan for API instability.
+
+## When to Use What
+
+| Requirement | Best Fit |
+|-------------|----------|
+| Execute AI-generated JS/TS at scale, fast | Dynamic Workers |
+| Execute Python or multi-language code | E2B / Modal |
+| Agent needs persistent filesystem or shell | Cloudflare Sandboxes |
+| Multi-step workflow with sleep/resume | @cloudflare/dynamic-workflows |
+| Control which APIs an agent can reach | Cloudflare Mesh |
+| Long-running compute (minutes+) | Docker / dedicated VM |
+
+Dynamic Workers fits best when your agent pipeline generates JavaScript or TypeScript code and you're optimizing for low latency and low overhead per execution. The combination of near-zero cold starts, per-isolate resource limits, and tight network control with Mesh gives you a sandbox that's practical to run at scale without dedicated container infrastructure.
+
+The limitation is real: JavaScript/TypeScript only. If Python support is non-negotiable, the Docker/E2B path remains the right one. But for JS/TS agent workloads, this is worth testing now even while it's in Beta.

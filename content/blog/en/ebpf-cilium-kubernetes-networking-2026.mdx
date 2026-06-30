@@ -1,0 +1,172 @@
+---
+title: "eBPF and Cilium: Why Kubernetes Networking Looks Different in the AI Era"
+description: "Cilium is now the most widely adopted Kubernetes CNI in production. Here's why eBPF-based networking matters for AI workloads and VMware migrations, how it differs from iptables under the hood, and what a practical Cilium setup looks like."
+date: "2026-06-07"
+status: "published"
+tags: ["Kubernetes", "eBPF", "Cilium", "Networking", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "ebpf-cilium-kubernetes-networking-2026"
+---
+
+## Why Cilium Won
+
+In 2026, Cilium is the most widely deployed Kubernetes CNI in production — running at Google, Microsoft, AWS, and thousands of enterprises. A few years ago, Flannel and Calico dominated that conversation.
+
+The shift happened because of eBPF. Not as a marketing term, but as a fundamental change in where and how network policy is enforced.
+
+## iptables vs. eBPF: The Underlying Difference
+
+Kubernetes networking has historically depended on iptables to route traffic between pods and services. The mechanism: a chain of static rules that every packet traverses until it finds a match.
+
+The problem is algorithmic. As service count grows, the iptables rule count grows linearly. At 10,000 services you have 100,000+ rules. Each packet checks rules sequentially. Latency grows proportionally with cluster size.
+
+```
+iptables limitations at scale:
+- O(n) rule traversal: latency increases with service count
+- Frequent context switches between kernel and userspace
+- Full table reload required for any rule update
+- Limited observability: hard to see what's actually happening
+```
+
+eBPF takes a different path. Verified sandbox programs run *inside* the Linux kernel, processing packets before they reach the full network stack. Rules are stored in hash maps with O(1) lookups. Updates apply incrementally without table reloads.
+
+```
+eBPF advantages:
+- Kernel-native execution: no userspace round-trips
+- O(1) service lookup: latency stays flat as cluster grows
+- Incremental updates: no table reload required
+- Rich observability via Hubble: full flow visibility
+```
+
+## Why AI Workloads Specifically Need This
+
+Traditional microservices and AI inference services have fundamentally different network profiles.
+
+**East-west traffic intensity**: An inference service generates high-frequency RPCs to GPU servers, model caches, and message queues. Internal cluster traffic (east-west) vastly exceeds inbound external traffic (north-south). iptables's linear lookup overhead compounds at this traffic volume in ways that don't matter for typical web services.
+
+**Topology awareness**: Multi-GPU training jobs require co-located GPUs connected via NVLink. Cilium's topology-aware routing can express and enforce these placement constraints at the network layer.
+
+**Fine-grained microsegmentation**: Restricting GPU node access to specific workloads is a security requirement. eBPF enforces these policies at kernel speed with negligible overhead.
+
+## Setting Up Cilium
+
+```yaml
+# Install via Helm — replace kube-proxy entirely with Cilium
+helm repo add cilium https://helm.cilium.io/
+helm install cilium cilium/cilium --version 1.16.0 \
+  --namespace kube-system \
+  --set kubeProxyReplacement=true \
+  --set hubble.relay.enabled=true \
+  --set hubble.ui.enabled=true
+```
+
+Setting `kubeProxyReplacement=true` removes the need for kube-proxy entirely. Cilium takes over service routing with O(1) eBPF hash map lookups instead of iptables chains.
+
+## Hubble: Observability Built In
+
+Cilium ships with Hubble, a flow observability tool that uses eBPF to capture network activity at the kernel level without adding network hops or sidecar proxies.
+
+```bash
+# Real-time flow monitoring for a namespace
+hubble observe --namespace production --follow
+
+# Find dropped packets to a specific service
+hubble observe \
+  --to-pod production/inference-server \
+  --verdict DROPPED \
+  --last 100
+
+# Measure service-to-service request rates
+hubble observe \
+  --from-pod production/api-gateway \
+  --to-pod production/inference-server \
+  --protocol http
+```
+
+Hubble metrics feed into Prometheus and Grafana with a standard integration. The result: a network topology map showing which pods communicate, at what rate, and where failures occur — without any application-level instrumentation.
+
+## Writing Network Policy
+
+Cilium supports standard Kubernetes `NetworkPolicy` and extends it with `CiliumNetworkPolicy` for cases that the standard API can't express.
+
+```yaml
+# Restrict GPU node access to authorized inference workloads only
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: gpu-node-access
+  namespace: production
+spec:
+  endpointSelector:
+    matchLabels:
+      app: inference-server
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        kubernetes.io/hostname: gpu-node-01
+    toPorts:
+    - ports:
+      - port: "50051"  # gRPC inference endpoint
+        protocol: TCP
+```
+
+`CiliumNetworkPolicy` also supports L7 policies — allowing specific HTTP methods or paths, not just IP/port combinations. This is useful for restricting which services can call which API endpoints without running a full service mesh.
+
+## Cilium in VMware Migrations
+
+A significant driver of Cilium adoption in 2026 is VMware-to-Kubernetes migration. Networking is consistently the most friction-heavy part of these migrations — existing IP address spaces, policy models, and operational practices don't map cleanly to Kubernetes defaults.
+
+VMware Kubernetes Service (VKS) added official Cilium support in version 3.6. This creates a path where the same CNI handles traffic in both the legacy VMware environment and the Kubernetes clusters, simplifying the transition period.
+
+```
+Cilium value in VMware migration:
+- BGP routing preserves existing IP address space
+- Policy models align across VMware NSX-T and Kubernetes
+- Gradual migration: unified CNI across hybrid environments
+- Operational continuity: same tooling before and after cutover
+```
+
+## Tetragon: Runtime Security via eBPF
+
+The Cilium project also ships Tetragon, a runtime security tool that uses eBPF to monitor process execution, file access, and network connections at the kernel level — without container modifications.
+
+```yaml
+# Track network connections from Python processes
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: python-network-audit
+spec:
+  kprobes:
+  - call: "tcp_connect"
+    syscall: false
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchBinaries:
+      - operator: In
+        values:
+        - "/usr/bin/python3"
+```
+
+This policy generates an audit event whenever a Python process opens a TCP connection. If an inference server starts making unexpected outbound connections — a common indicator of supply chain compromise — Tetragon surfaces it immediately.
+
+## Migration Path from Flannel or Calico
+
+Replacing a running CNI requires care. The general approach:
+
+1. Deploy Cilium in "migration mode" alongside the existing CNI
+2. Migrate one node pool at a time, testing connectivity between Cilium-managed and legacy pods
+3. Complete cutover, remove the old CNI
+
+For clusters where downtime is unacceptable, Cilium's documentation covers a live migration procedure. Most teams find a maintenance window simpler.
+
+## Webhani's Take
+
+Adopting Cilium and eBPF is less about getting better iptables and more about changing what the networking layer can do. Observable, programmable, AI-workload-ready — these three properties matter more as clusters grow in size and complexity.
+
+The performance difference between iptables and eBPF is measurable but not the primary argument. The primary argument is operational: Hubble's observability changes how teams debug network issues, and `CiliumNetworkPolicy`'s expressiveness changes how teams implement security posture.
+
+For teams running AI services on Kubernetes or managing VMware migrations, Cilium is worth evaluating seriously — not as a future investment, but as the current production standard.

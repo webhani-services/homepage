@@ -1,0 +1,178 @@
+---
+title: "Kubernetes에서 AI/ML 워크로드 운영하기: DRA와 GPU 스케줄링 실전"
+description: "Kubernetes 1.35에서 Dynamic Resource Allocation이 Beta로 승격되며 GPU 스케줄링이 더 실용적이 됐습니다. 변경된 내용과 실전 패턴을 정리합니다."
+date: "2026-05-13"
+status: "published"
+tags: ["Kubernetes", "GPU", "AI/ML", "DevOps", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-ai-gpu-workloads-2026-05"
+---
+
+Kubernetes 1.36이 Volume Group Snapshot GA와 DRA(Dynamic Resource Allocation) 업데이트를 포함해 출시됐습니다. AI 워크로드가 Infrastructure의 주요 관심사가 된 지금, Kubernetes의 GPU 관리 기능이 어떻게 발전했는지 정리합니다.
+
+## 기존 GPU 스케줄링의 한계
+
+DRA 이전에는 Kubernetes에서 GPU를 요청하는 방법이 하나뿐이었습니다:
+
+```yaml
+resources:
+  limits:
+    nvidia.com/gpu: "1"
+```
+
+이 방식은 동작하지만 조악합니다. GPU 전체를 받거나 아무것도 못 받거나 — 분할 할당, 하드웨어 속성 선택, Pod 간 공유는 불가능합니다. 소규모 추론 작업이 많은 시스템에서는 GPU 리소스 대부분이 유휴 상태가 됩니다.
+
+## DRA가 바꾸는 것
+
+DRA는 `ResourceClaim` API를 도입해 하드웨어 요구사항 선언을 Pod 스케줄링에서 분리합니다. "GPU 한 개"를 요청하는 대신, 필요한 하드웨어 특성을 선언합니다:
+
+```yaml
+apiVersion: resource.k8s.io/v1alpha3
+kind: ResourceClaimTemplate
+metadata:
+  name: inference-gpu-claim
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpu
+          deviceClassName: nvidia.com/gpu
+          selectors:
+            - cel:
+                expression: >
+                  device.attributes["nvidia.com/gpu"].memory >= 16
+```
+
+Pod는 직접 리소스 한도를 선언하는 대신 Claim을 참조합니다:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llm-inference-pod
+spec:
+  resourceClaims:
+    - name: gpu
+      resourceClaimTemplateName: inference-gpu-claim
+  containers:
+    - name: server
+      image: your-registry/inference-server:latest
+      resources:
+        claims:
+          - name: gpu
+```
+
+DRA의 Binding 조건 평가는 Kubernetes 1.35에서 Beta로 승격됐습니다. 완전한 Production 안정성은 아직 진행 중이지만, 중요도가 낮은 워크로드에는 충분히 사용할 수 있습니다.
+
+## 현재 실전에서 쓰는 패턴
+
+DRA가 성숙하는 동안, 아래 패턴이 검증된 기본 구성입니다.
+
+### Taint와 Toleration으로 GPU Node 격리
+
+```bash
+# 클러스터 초기 설정 시 GPU Node에 Label과 Taint 부여
+kubectl label nodes gpu-node-1 nvidia.com/gpu.present=true
+kubectl taint nodes gpu-node-1 nvidia.com/gpu=present:NoSchedule
+```
+
+```yaml
+spec:
+  tolerations:
+    - key: "nvidia.com/gpu"
+      operator: "Equal"
+      value: "present"
+      effect: "NoSchedule"
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  containers:
+    - name: trainer
+      image: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+```
+
+### Namespace 단위 GPU Quota
+
+팀 간 리소스 독점을 방지합니다:
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ml-team-gpu-quota
+  namespace: ml-team
+spec:
+  hard:
+    requests.nvidia.com/gpu: "4"
+    limits.nvidia.com/gpu: "4"
+```
+
+### 학습은 Job, 추론은 Deployment
+
+학습은 유한하고 추론은 상시 실행입니다. `Job`을 사용하면 학습 완료 시 GPU가 자동으로 해제됩니다:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: finetune-job
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: trainer
+          image: your-registry/trainer:latest
+          resources:
+            limits:
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: weights
+              mountPath: /models
+              readOnly: true
+      volumes:
+        - name: weights
+          persistentVolumeClaim:
+            claimName: pretrained-weights-pvc
+```
+
+## GPU 워크로드 모니터링
+
+AI 워크로드에는 CPU/Memory 지표만으로 부족합니다. NVIDIA DCGM Exporter를 Prometheus 스택에 추가합니다:
+
+```yaml
+# dcgm-exporter helm chart values.yaml
+serviceMonitor:
+  enabled: true
+  interval: 15s
+
+metrics:
+  - DCGM_FI_DEV_GPU_UTIL        # GPU 사용률 (%)
+  - DCGM_FI_DEV_FB_USED         # GPU Memory 사용량 (MB)
+  - DCGM_FI_DEV_FB_FREE         # GPU Memory 여유 (MB)
+  - DCGM_FI_PROF_GR_ENGINE_ACTIVE  # SM (Streaming Multiprocessor) 활성도
+```
+
+이를 통해 GPU가 할당됐는지가 아니라 실제 얼마나 활용되는지를 Grafana에서 확인할 수 있습니다.
+
+## 권장 사항
+
+**GPU Node Pool을 CPU 워크로드와 분리하세요.** GPU와 CPU 워크로드를 같은 Node에 혼재시키면 스케줄링, 비용 추적, Auto Scaling이 복잡해집니다. Cloud Provider의 전용 Node Group이나 Node Pool을 사용하세요.
+
+**모델 Weight 파일은 Storage 설계의 핵심입니다.** 수 GB에서 수백 GB에 달하는 모델 파일은 First-class Infrastructure 관심사입니다. `ReadOnlyMany` 접근 모드의 PersistentVolume을 사용하면 여러 추론 Pod가 같은 Weight를 공유할 수 있습니다.
+
+**GPU 요청은 보수적으로 시작하세요.** MIG(Multi-Instance GPU)나 Time-slicing으로 최적화하기 전에 실제 사용 패턴을 먼저 파악하세요. 복잡성 추가는 실제 필요가 확인된 이후에 합니다.
+
+## 마무리
+
+Kubernetes GPU 관리는 대부분의 AI/ML Infrastructure에 적합한 플랫폼이 될 만큼 성숙했습니다. DRA의 발전으로 GPU 스케줄링이 더 표현력 있게 변하고 있지만, Taint 기반 격리, ResourceQuota, Job 기반 학습이라는 실전 패턴은 여전히 견고한 기반입니다.
+
+핵심 아키텍처 결정은 AI 워크로드를 처음부터 First-class Citizen으로 다루는 것입니다. 전용 Node Pool, 전용 Namespace, GPU 전용 모니터링 — 이것들은 혼합 워크로드 클러스터에 나중에 추가하는 것보다 처음부터 설계에 반영하는 편이 훨씬 쉽습니다.

@@ -1,0 +1,149 @@
+---
+title: "Kubernetes v1.36 Haru: 보안 강화와 AI Workload 지원"
+description: "Kubernetes v1.36 'Haru'가 2026년 첫 번째 메이저 Release로 공개되었습니다. User Namespaces GA, CEL 기반 Admission Policy, AI Workload 지원 강화 등 70개 Enhancement를 실무 관점으로 정리했습니다."
+date: "2026-05-27"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "DevOps", "Security", "AI"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-136-haru-security-ai-workloads"
+---
+
+## Kubernetes v1.36 개요
+
+Kubernetes v1.36 'Haru(春, 봄)'는 2026년 첫 번째 메이저 Release입니다. 70개의 Enhancement를 포함하며, 보안 강화와 AI Workload 지원이 핵심 영역입니다. 대부분의 변경사항은 "수동 설정 없이 기본적으로 안전하게 동작하면서, 그것을 적용하는 운영 부담은 줄인다"는 방향으로 이루어졌습니다.
+
+## GA로 승격된 주요 기능
+
+### User Namespaces
+
+User Namespaces는 Container의 UID/GID를 Host OS의 UID/GID와 분리합니다. Container 내부에서 root로 동작하는 Process가 Host OS에서는 비특권 UID로 매핑되어, Container 탈출 공격의 피해 범위를 크게 제한합니다.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: isolated-runner
+spec:
+  hostUsers: false  # User Namespaces 활성화
+  containers:
+  - name: runner
+    image: ci-runner:latest
+    securityContext:
+      runAsUser: 0  # Container 내부에서는 root...
+      # ...하지만 Host에서는 UID 65536+로 매핑
+```
+
+CI Runner, Script 실행 환경, 사용자 제출 코드를 실행하는 Workload에서 특히 중요합니다. `securityContext.runAsNonRoot` 단독 사용보다 훨씬 강력한 격리를 제공합니다.
+
+### Mutating Admission Policies
+
+CEL(Common Expression Language) 기반의 Mutating Admission Policies가 GA가 되었습니다. Webhook Server 없이 CEL 표현식으로 Admission 시 Resource를 변경할 수 있습니다.
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: default-resource-limits
+spec:
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE"]
+      resources: ["pods"]
+  mutations:
+  - patchType: "ApplyConfiguration"
+    applyConfiguration:
+      expression: |
+        Object{
+          spec: Object.spec{
+            containers: request.object.spec.containers.map(c,
+              c.with({
+                resources: c.resources.with({
+                  limits: c.?resources.?limits.orValue({}).with({
+                    "memory": c.?resources.?limits.?memory.orValue("256Mi"),
+                    "cpu": c.?resources.?limits.?cpu.orValue("500m")
+                  })
+                })
+              })
+            )
+          }
+        }
+```
+
+Webhook 기반 Admission Controller를 CEL Policy로 교체하면 Webhook Deployment, TLS 관리 부담이 사라지고 Admission Webhook Latency 문제도 제거됩니다. 운영 절감 효과가 시간이 지날수록 누적됩니다.
+
+### Fine-Grained Kubelet API Authorization
+
+Kubelet API에 Endpoint 수준의 인가가 가능해졌습니다. 기존에는 Kubelet API 접근에 `system:kubelet-api-admin` 권한이 필요했지만, v1.36부터는 Monitoring Agent, Log Collector, CI System이 필요한 특정 Endpoint에 대한 권한만 요청할 수 있습니다.
+
+멀티테넌트 또는 멀티팀 Cluster에서 최소 권한 원칙을 실천하기 훨씬 쉬워집니다.
+
+## AI Workload 개선사항
+
+### Dynamic Resource Allocation (DRA)
+
+DRA는 GPU, FPGA 등 특수 하드웨어의 Scheduling을 담당합니다. v1.36에서 API가 개선되고 Production ML Workload에서의 안정성이 높아졌습니다.
+
+```yaml
+apiVersion: resource.k8s.io/v1alpha3
+kind: ResourceClaim
+metadata:
+  name: training-gpu
+spec:
+  resourceClassName: nvidia-gpu
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: distributed-training
+spec:
+  resourceClaims:
+  - name: gpu
+    resourceClaimName: training-gpu
+  containers:
+  - name: trainer
+    image: pytorch:2.4
+    resources:
+      claims:
+      - name: gpu
+```
+
+### Topology-Aware Scheduling
+
+분산 학습 Job에서 GPU 간 통신 대역폭(NVLink, NVSwitch)이 중요한 경우, Topology-Aware Scheduling은 같은 Training Group의 Pod들이 동일한 Interconnect Topology를 가진 Node에 배치되도록 합니다. Data-parallel, Model-parallel Workload의 학습 처리량에 직접적인 영향을 미칩니다.
+
+## Upgrade 전 확인 사항
+
+**Deprecated API 사용 현황 확인.** Kubernetes Deprecation은 예측 가능한 일정을 따르지만, Upgrade 전에 미리 파악해야 합니다:
+
+```bash
+# Deprecated API 호출 확인
+kubectl get --raw /metrics | grep apiserver_requested_deprecated_apis
+
+# hostUsers: true인 Pod 확인 (User Namespaces 영향 대상)
+kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}: hostUsers={.spec.hostUsers}{"\n"}{end}'
+```
+
+**보안 Default 변경사항을 Staging에서 먼저 테스트하세요.** v1.36에서는 여러 보안 관련 Default가 강화됩니다. 암묵적으로 완화된 설정에 의존하던 Workload가 다르게 동작할 수 있습니다. Production Node 업데이트 전에 반드시 테스트 환경에서 검증하세요.
+
+**Upgrade 경로.** Kubernetes는 n-1 Minor Version에서의 Upgrade를 지원합니다. v1.34나 v1.35에서라면 `kubeadm`으로 표준 경로를 따를 수 있습니다:
+
+```bash
+# 현재 버전 확인
+kubectl version --short
+
+# Upgrade 전 Node drain
+kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data
+```
+
+## 정리
+
+v1.36은 수동 설정 없이 기본적으로 안전한 동작을 하도록 만드는 방향으로 발전했습니다. 가장 실무적으로 중요한 세 가지 변경사항:
+
+1. **User Namespaces GA** — CI Runner와 Untrusted 실행 환경에 즉시 도입 검토
+2. **CEL Admission Policies** — Webhook 기반 Admission Controller를 점진적으로 마이그레이션; 운영 절감 효과 누적
+3. **DRA 개선** — Kubernetes에서 ML Training Job을 운영 중이라면 현재 GPU Scheduling 대비 DRA를 Benchmark해보세요
+
+신규 Cluster는 v1.36을 바로 채택하는 것을 권장합니다. 기존 Cluster는 Deprecation 확인 후 Staging에서 검증하고 진행하세요.

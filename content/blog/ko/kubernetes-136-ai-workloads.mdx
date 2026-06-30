@@ -1,0 +1,173 @@
+---
+title: "Kubernetes v1.36과 AI 워크로드: MLOps 플랫폼을 K8s에서 운영하기"
+description: "Kubernetes v1.36은 Pod-Level Resource Managers를 Alpha 기능으로 추가하여 GPU 리소스 관리를 개선했습니다. 2026년 K8s에서 MLOps를 실용적으로 운영하는 방법을 정리합니다."
+date: "2026-05-04"
+status: "published"
+tags: ["Kubernetes", "MLOps", "AI", "Cloud Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-136-ai-workloads"
+---
+
+Kubernetes v1.36은 Pod-Level Resource Managers를 Alpha 기능으로 도입했습니다. GPU와 하드웨어 Accelerator 스케줄링을 개선하는 이 기능은, ML 학습 및 추론 워크로드가 Kubernetes의 주요 오케스트레이션 레이어로 자리 잡은 현실을 반영합니다.
+
+2026년 현재 가장 많은 리소스를 소비하는 Kubernetes 워크로드는 전통적인 마이크로서비스가 아니라 MLOps 파이프라인, 모델 추론 Service, 대규모 데이터 처리 Job입니다. 이 변화는 Cluster 설계와 운영 방식에도 영향을 미칩니다.
+
+## ML 워크로드의 특수성
+
+일반 Web Application과 ML 워크로드는 인프라 요구 사항이 근본적으로 다릅니다.
+
+| 항목 | Web App | ML 워크로드 |
+|------|---------|-----------|
+| 리소스 패턴 | 안정적 CPU/Memory | 버스트 GPU 사용 |
+| 실행 방식 | 지속적 | 배치/간헐적 |
+| 스케일링 | 수평 Pod 스케일링 | GPU Node Pool 관리 |
+| 데이터 | Stateless | 대용량 영구 Dataset |
+| 장애 복구 | 재시작 | Checkpoint 필수 |
+
+## Pod-Level Resource Managers
+
+기존 Kubernetes 리소스 관리 — CPU/Memory Requests와 Limits — 는 GPU를 위해 설계되지 않았습니다. Device Plugin 프레임워크가 GPU 스케줄링을 처리했지만, 여러 GPU 간의 세밀한 할당과 동적 재구성은 여전히 어려웠습니다.
+
+Pod-Level Resource Managers는 더 표현력 있는 모델을 제공합니다.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ml-training-job
+spec:
+  containers:
+    - name: trainer
+      image: my-ml-trainer:latest
+      resources:
+        requests:
+          cpu: "4"
+          memory: "16Gi"
+          nvidia.com/gpu: "2"
+        limits:
+          cpu: "8"
+          memory: "32Gi"
+          nvidia.com/gpu: "2"
+  resourceClaims:
+    - name: gpu-resource
+      resourceClaimTemplateName: gpu-claim-template
+```
+
+## 학습 Job 실제 설정
+
+분산 학습에는 Kubernetes `Job` Resource를 사용하여 GPU Node 간 병렬 실행을 관리합니다.
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-training
+spec:
+  completions: 4
+  parallelism: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: trainer
+          image: pytorch/pytorch:2.5-cuda12.1
+          command: ["python", "train.py"]
+          args:
+            - "--epochs=100"
+            - "--checkpoint-dir=/checkpoints"
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: checkpoints
+              mountPath: /checkpoints
+      volumes:
+        - name: checkpoints
+          persistentVolumeClaim:
+            claimName: model-checkpoints-pvc
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+```
+
+`restartPolicy: OnFailure`와 Checkpoint Volume을 함께 사용하면, 실패한 Pod이 처음부터가 아닌 마지막 Checkpoint에서 재개됩니다. 수 시간이 걸리는 학습 Job에서는 필수적인 설정입니다.
+
+## 추론 Service 배포
+
+학습 후 모델을 서비스로 배포할 때는 낮은 Latency, 수평 스케일링, 모델 버전 업데이트를 위한 Graceful Rollout이 필요합니다.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: inference
+  template:
+    metadata:
+      labels:
+        app: inference
+    spec:
+      containers:
+        - name: inference
+          image: my-inference-server:latest
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: inference-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: inference-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+GPU Node는 비용이 높으므로, HPA와 `cluster-autoscaler`, Scale-down 안정화 Policy를 함께 구성하여 추론 트래픽이 없을 때 유휴 GPU Node가 불필요하게 실행되지 않도록 관리하는 것이 중요합니다.
+
+## MLOps를 위한 Internal Developer Platform
+
+2026년 Platform Engineering 트렌드는 ML 워크플로우로 확장됩니다. ML 엔지니어가 Kubernetes YAML을 직접 관리하지 않고도 학습 Job과 추론 Service를 배포할 수 있는 셀프서비스 플랫폼 구축이 확산되고 있습니다.
+
+일반적인 조합: Backstage (Developer Portal) + ArgoCD (GitOps) + Kubeflow (ML Pipeline 오케스트레이션). 이 추상화 레이어는 데이터 사이언티스트의 개발 속도를 높이면서, 인프라 팀이 보안, 비용, Observability 기준을 유지할 수 있게 합니다.
+
+## 실용적인 다음 단계
+
+ML 워크로드를 Kubernetes로 이전할 때:
+
+1. Kubeflow 투자 전에 `Job` Resource로 학습 작업을 먼저 시작합니다
+2. Node Taint + Toleration으로 GPU Node를 일반 워크로드와 격리합니다
+3. Dataset은 Container Image에 포함시키지 않고 PVC에서 Mount합니다
+4. 장시간 Job을 실행하기 전에 학습 Script에 Checkpoint를 추가합니다
+5. GPU 리소스 Limit을 Request와 동일하게 설정합니다 — GPU 스케줄링은 Burstable 리소스에서 안정적으로 동작하지 않습니다
+
+v1.36의 Pod-Level Resource Managers는 아직 Alpha이므로 프로덕션 적용은 이르지만, Kubernetes가 AI 워크로드에 필요한 하드웨어와 스케줄링 패턴을 위한 First-class 지원을 구축하는 방향은 명확하며, K8s 기반 MLOps의 운영 패턴은 빠르게 성숙해가고 있습니다.

@@ -1,0 +1,81 @@
+---
+title: "Vite 8 + Rolldown：Rustベースのバンドラーがビルドを最大30倍高速化"
+description: "2026年3月にリリースされたVite 8は、RustベースのバンドラーRolldownを統合し、プロダクションビルド速度を従来比10〜30倍に改善しました。変更内容と実践的な移行方法を解説します。"
+date: "2026-05-04"
+status: "published"
+tags: ["Vite", "Rolldown", "Frontend", "Build Tools", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "vite8-rolldown-faster-builds"
+---
+
+2026年3月にリリースされたVite 8は、Rustで書かれたバンドラーRolldownをデフォルトのプロダクションバンドラーとして統合しました。週あたり6,500万ダウンロードを誇るViteにおいて、ビルド速度が10〜30倍改善されるという変化は、大規模コードベースとCI/CDパイプラインに実質的な影響をもたらします。
+
+## Rolldownとは何か
+
+RolldownはRollupをRustで再実装したバンドラーです。既存のRollupプラグインとの互換性を維持しながら、RustのネイティブパフォーマンスによってJavaScriptベースのバンドラーの限界を突破しています。
+
+SWC、OXC、Biomeがすでにこの方向性を示していました。JavaScriptツールチェーンの中核コンポーネントをRustで再実装し、シングルスレッドのJS実行とGarbage Collectionのオーバーヘッドを回避するアプローチです。RolldownはこのトレンドのViteにおける集大成といえます。
+
+## 実際のビルド速度
+
+公開されているベンチマーク（中規模Reactプロジェクト、1,000〜5,000モジュール）:
+
+| モジュール数 | Rollup（Vite 7） | Rolldown（Vite 8） | 改善倍率 |
+|------------|----------------|------------------|--------|
+| 1,000 | ~4.2秒 | ~0.4秒 | 約10倍 |
+| 3,000 | ~18秒 | ~0.8秒 | 約22倍 |
+| 5,000 | ~45秒 | ~1.5秒 | 約30倍 |
+
+モノレポ環境で複数パッケージを順番にビルドする場合は、改善効果がさらに大きくなります。
+
+## Vite 8への移行
+
+ほとんどのプロジェクトでは、シンプルなアップグレードで対応できます。
+
+```bash
+npm install vite@8 --save-dev
+```
+
+RolldownはVite 8のデフォルトバンドラーです。追加設定なしに既存の`vite.config.ts`がそのまま動作します。
+
+```typescript
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  build: {
+    rollupOptions: {
+      // 既存のRollupオプションはRolldownでも有効
+      output: {
+        manualChunks: {
+          vendor: ["react", "react-dom"],
+        },
+      },
+    },
+  },
+});
+```
+
+### 注意が必要なケース
+
+**カスタムRollupプラグイン**: 大部分のRollupプラグインはRolldownと互換性がありますが、低レベルのhookを使用するプラグインは動作確認が必要です。移行前にRolldownの互換性テーブルを確認してください。
+
+**CommonJSモジュールの相互運用**: RolldownはよりstrictなESM処理を行います。Node.jsのモジュール解決の挙動に依存するレガシーCJSパッケージは、互換性ラッパーが必要になる場合があります。
+
+**Source Mapの形式**: デバッグ設定が特定のSource Map出力に依存している場合は、移行後に明示的に確認してください。
+
+## CI以外での影響
+
+ビルド速度の改善は開発ループ全体にも効いてきます。
+
+- **Vite開発サーバーの起動**: 初期の依存関係プリバンドルが高速化
+- **vitestの実行**: VitestをViteと併用している場合、テスト実行速度にも恩恵
+- **`vite build && vite preview`のサイクル**: ほとんどのプロジェクトでローカルプロダクションプレビューがほぼ即時に
+
+## まとめ
+
+RolldownはVite 8の実験的機能ではなく、デフォルトの動作です。新規プロジェクトならVite 8が明確な選択肢です。既存のVite 7プロジェクトも、標準的な設定であれば移行リスクは低く、数百モジュール以上のコードベースでは効果が顕著に現れます。
+
+バンドルステップで30秒以上かかるCIビルドがあるなら、このアップグレードだけでも大幅な時間短縮が見込めます。

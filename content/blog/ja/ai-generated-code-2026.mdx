@@ -1,0 +1,154 @@
+---
+title: "2026年のAIコーディング：コードの42%がAI生成に — 開発ワークフローへの影響"
+description: "2026年、React開発者のコードの42%がAI生成という調査結果が注目を集めています。GitHub Copilot、Claude Code、Cursor等のAIツールが開発現場をどう変えているか、実践的な観点から解説します。"
+date: "2026-05-04"
+status: "published"
+tags: ["AI", "LLM", "Developer Tools", "React", "Productivity"]
+thumbnail: ""
+author: "webhani"
+slug: "ai-generated-code-2026"
+---
+
+Belitsoft社の調査によると、2026年時点でReact開発者が書くコードの42%がAIツールによって生成されており、2027年末には65%に達すると予測されています。90%以上の開発者が業務でAIコーディングツールを日常的に使用しているという数字とあわせて、開発の形が大きく変わりつつあることが分かります。
+
+## 現場でのAI活用状況
+
+GitHub Copilot、Claude Code、Cursorなどのツールが普及し、AIはもはや「補助ツール」ではなく「開発パートナー」として機能しています。特に注目すべき変化は次の3点です。
+
+### Boilerplateの自動生成
+
+コンポーネントのスキャフォールディング、型定義、テストコードなど、繰り返し発生するコードの大部分をAIが担うようになっています。
+
+```tsx
+// 「TypeScriptでページネーション付きデータテーブルを作成して」と依頼した場合の例
+import { useState } from "react";
+
+interface Column<T> {
+  key: keyof T;
+  header: string;
+  render?: (value: T[keyof T], row: T) => React.ReactNode;
+}
+
+interface DataTableProps<T> {
+  data: T[];
+  columns: Column<T>[];
+  pageSize?: number;
+}
+
+export function DataTable<T extends { id: string | number }>({
+  data,
+  columns,
+  pageSize = 20,
+}: DataTableProps<T>) {
+  const [page, setPage] = useState(0);
+  const total = Math.ceil(data.length / pageSize);
+  const rows = data.slice(page * pageSize, (page + 1) * pageSize);
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="min-w-full text-sm">
+        <thead>
+          <tr>
+            {columns.map((col) => (
+              <th key={String(col.key)} className="px-4 py-2 text-left font-medium">
+                {col.header}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.id}>
+              {columns.map((col) => (
+                <td key={String(col.key)} className="px-4 py-2">
+                  {col.render ? col.render(row[col.key], row) : String(row[col.key])}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="flex gap-2 mt-4">
+        <button onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={page === 0}>
+          前へ
+        </button>
+        <span>{page + 1} / {total}</span>
+        <button
+          onClick={() => setPage((p) => Math.min(total - 1, p + 1))}
+          disabled={page === total - 1}
+        >
+          次へ
+        </button>
+      </div>
+    </div>
+  );
+}
+```
+
+AI生成のコードは「動作する」が「レビューが必要」です。型の厳密さやエッジケースの処理は人間がチェックする必要があります。
+
+### テスト駆動のペアプログラミング
+
+AIはテストコードの生成において特に効果を発揮します。仕様をプロンプトで渡すと、Vitest/Jest形式のテストケースを即座に生成できます。
+
+```typescript
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { DataTable } from "./DataTable";
+
+const mockData = [
+  { id: 1, name: "Alice", role: "Engineer" },
+  { id: 2, name: "Bob", role: "Designer" },
+];
+
+const columns = [
+  { key: "name" as const, header: "Name" },
+  { key: "role" as const, header: "Role" },
+];
+
+test("全行が表示される", () => {
+  render(<DataTable data={mockData} columns={columns} />);
+  expect(screen.getByText("Alice")).toBeInTheDocument();
+  expect(screen.getByText("Bob")).toBeInTheDocument();
+});
+
+test("ページネーションが正しく動作する", async () => {
+  const largeData = Array.from({ length: 25 }, (_, i) => ({
+    id: i,
+    name: `User ${i}`,
+    role: "Dev",
+  }));
+  render(<DataTable data={largeData} columns={columns} pageSize={10} />);
+  expect(screen.getByText("1 / 3")).toBeInTheDocument();
+  await userEvent.click(screen.getByText("次へ"));
+  expect(screen.getByText("2 / 3")).toBeInTheDocument();
+});
+```
+
+実装とテストを同じプロンプトで生成させることで、TDDに近い思考プロセスを自然に促せます。
+
+### コードレビューの変化
+
+AI生成コードが増えることで、コードレビューの焦点が「書き方」から「設計の妥当性」と「ビジネスロジックの正確性」に移っています。ボイラープレートを指摘する時間が減り、アーキテクチャや仕様との整合性に集中できるようになっています。
+
+## AI生成コードのリスクと対策
+
+AIが生成するコードには、見た目は正しく動くが潜在的な問題を含むケースがあります。
+
+| リスク | 具体例 | 対策 |
+|--------|--------|------|
+| セキュリティの見落とし | SQLインジェクション、XSS | レビューチェックリストの整備 |
+| パフォーマンス上の問題 | N+1クエリ、不要なre-render | Profilerとテストで検証 |
+| 過剰な抽象化 | 使われないhook、不要なContext | YAGNIの原則を守る |
+| 陳腐化したパターン | 古いAPIの使用 | ライブラリのバージョンを明示 |
+
+## 実践的なアプローチ
+
+AIツールを効果的に使うために推奨するワークフロー:
+
+1. **プロンプトに仕様を明示する**: 「TypeScriptで」「Zodでバリデーションして」など制約を含める
+2. **生成後に必ずレビューする**: 特にエラーハンドリングとエッジケースを確認
+3. **テストを一緒に生成する**: 実装と同時にテストを生成させることで品質を担保
+4. **プロジェクトのコンテキストを渡す**: CLAUDE.mdにアーキテクチャの制約を記述し、AI生成コードがプロジェクトのパターンに沿うようにする
+
+AI生成コードは「速い下書き」として扱い、最終的な品質責任は開発者が持つという姿勢が重要です。2027年に向けてこの割合はさらに増加する見通しですが、AIを使いこなす開発者とそうでない開発者の生産性差は今後も広がっていくでしょう。

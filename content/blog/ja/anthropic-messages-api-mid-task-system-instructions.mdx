@@ -1,0 +1,160 @@
+---
+title: "Messages API の新機能: タスク途中でシステム指示を更新する"
+description: "Anthropic の Messages API が messages 配列内への system エントリ挿入をサポートし、Prompt Cache を維持したままタスク途中で Claude への指示を切り替えられるようになりました。"
+date: "2026-06-04"
+status: "published"
+tags: ["Claude", "Anthropic", "LLM", "API", "Prompt Engineering"]
+thumbnail: ""
+author: "webhani"
+slug: "anthropic-messages-api-mid-task-system-instructions"
+---
+
+Anthropic の Messages API に、エージェント開発で実用的なアップデートが加わりました。`messages` 配列の中に `role: "system"` のエントリを挿入できるようになり、長いタスクの途中で Claude への指示を動的に更新できるようになっています。
+
+## これまでの制約と問題点
+
+従来の API では、システムプロンプトはリクエストのトップレベル `system` パラメータにのみ設定できました。エージェントが複数ターンにわたってツールを呼び出しながらタスクを進める中で指示を変えたい場合、現実的な手段は 2 つしかありませんでした。
+
+**方法 A: ユーザーターンとして偽装**
+
+システム的な指示をユーザーメッセージとして差し込む方法です。Claude はユーザーターンを会話の文脈として扱うため、システムプロンプトほどの重みを持ちません。「以降は〇〇してください」という指示をユーザーとして送ると、Claude がそれを命令ではなく会話の一部として解釈しやすくなります。
+
+**方法 B: system パラメータを更新して再送**
+
+新しい指示を `system` に書いてリクエストを再送する方法です。指示は確実に反映されますが、問題は Prompt Cache です。大きなシステムプロンプト（数千トークン規模）をキャッシュしている場合、`system` を変更するたびにキャッシュが無効化され、コストが跳ね上がります。
+
+## 新しいアプローチ
+
+新しい API では、`messages` 配列の途中に `system` エントリを挿入できます。
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+messages = [
+    {"role": "user", "content": "このコードベースのセキュリティを確認してください。"},
+    {
+        "role": "assistant",
+        "content": "コードを確認しました。認証周りに気になる点が 3 つあります。..."
+    },
+    # タスク途中でシステム指示を更新
+    {
+        "role": "system",
+        "content": "次のフェーズでは、パフォーマンスの問題に絞ってレビューしてください。セキュリティ問題はすでに記録済みです。"
+    },
+    {"role": "user", "content": "では、ボトルネックになりそうな箇所を教えてください。"},
+]
+
+response = client.messages.create(
+    model="claude-opus-4-8-20260101",
+    max_tokens=2048,
+    system="あなたはシニアエンジニアとして技術レビューを行います。",
+    messages=messages,
+)
+```
+
+トップレベルの `system` パラメータは変更せずそのままにしておくことがポイントです。最初のシステムプロンプトはキャッシュが有効なまま維持され、追加の指示だけが会話の文脈として注入されます。
+
+## 実践的なユースケース
+
+### フェーズ分割型のエージェント
+
+コード分析エージェントを例にすると、フェーズごとに Claude の焦点を変えながら一つの会話を継続できます。
+
+```python
+def multi_phase_analysis(code: str, client: anthropic.Anthropic) -> dict:
+    base_system = "あなたはコードアナリストです。指示されたフェーズに集中して分析してください。"
+    messages = [
+        {"role": "user", "content": f"以下のコードを分析してください:\n\n```python\n{code}\n```"},
+    ]
+
+    # フェーズ 1: バグと論理エラー
+    r1 = client.messages.create(
+        model="claude-opus-4-8-20260101",
+        max_tokens=1024,
+        system=base_system,
+        messages=messages + [
+            {"role": "system", "content": "バグや論理エラーのみを報告してください。"}
+        ],
+    )
+    bugs = r1.content[0].text
+    messages.append({"role": "assistant", "content": bugs})
+
+    # フェーズ 2: パフォーマンス
+    messages.append({
+        "role": "system",
+        "content": "バグの分析は完了しました。次はアルゴリズムの計算量やメモリ効率に絞ってください。"
+    })
+    messages.append({"role": "user", "content": "パフォーマンス上の問題点を教えてください。"})
+
+    r2 = client.messages.create(
+        model="claude-opus-4-8-20260101",
+        max_tokens=1024,
+        system=base_system,
+        messages=messages,
+    )
+
+    return {"bugs": bugs, "performance": r2.content[0].text}
+```
+
+### 権限に基づく動的な制約
+
+ユーザーのロールに応じて、タスク実行中に Claude がアクセスできる情報の範囲を絞り込むケースです。
+
+```python
+def build_messages_with_permission(
+    user_messages: list[dict],
+    user_role: str,
+) -> list[dict]:
+    messages = list(user_messages)
+
+    if user_role == "guest":
+        messages.insert(0, {
+            "role": "system",
+            "content": "公開情報のみを参照して回答してください。価格情報や顧客データへの言及は避けてください。"
+        })
+    elif user_role == "analyst":
+        messages.insert(0, {
+            "role": "system",
+            "content": "集計データと統計情報へのアクセスは許可されています。個人を特定できる情報は除外してください。"
+        })
+
+    return messages
+```
+
+## Prompt Cache との設計上の注意
+
+`messages` 内の `system` エントリはキャッシュ対象になりません。キャッシュ効率を最大化するには、次の原則を守ることが重要です。
+
+- **変わらないもの** (大きなコンテキスト、ドキュメント全文、ロールの定義) → トップレベル `system` に配置
+- **タスク内で変化するもの** (フェーズ固有の指示、動的な制約) → `messages` 内に挿入
+
+```python
+# キャッシュ対象: 大きくて変わらない部分
+system_prompt = f"""
+あなたはコードレビューアシスタントです。
+
+## レビュー対象プロジェクト
+{project_description}
+
+## コーディング規約
+{coding_standards}
+"""
+
+# キャッシュ対象外: タスクごとに変わる部分
+dynamic_messages = [
+    {
+        "role": "system",
+        "content": f"現在のフェーズ: {current_phase}。このフェーズの成果物: {expected_output}"
+    }
+]
+```
+
+500 トークン以上かつリクエスト間で変わらないものは `system` に、フェーズやユーザーによって変化するものは `messages` に入れるのが実用的な判断基準です。
+
+## まとめ
+
+`messages` 内への `system` エントリ挿入は、エージェント設計の柔軟性を高めながらキャッシュコストを維持するための実用的な手段です。特にフェーズ分割型のタスクや権限制御が必要なシステムで効果を発揮します。
+
+設計のコツは「何を固定し、何を変化させるか」を最初から明確にしておくことです。大きなコンテキストはトップレベルに固定してキャッシュし、タスクの進行に応じた調整だけを動的に注入する構成が、コストとコントロールのバランスを保つうえで最も実用的です。

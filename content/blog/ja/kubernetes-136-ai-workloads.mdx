@@ -1,0 +1,171 @@
+---
+title: "Kubernetes v1.36 と AIワークロード：MLOpsプラットフォームをK8sで運用する実践ガイド"
+description: "Kubernetes v1.36でPod-Level Resource Managersがアルファ機能として追加されました。AIワークロードがK8sの中心的な用途になりつつある2026年、MLOpsを効率的に運用するための考え方と設定例を整理します。"
+date: "2026-05-04"
+status: "published"
+tags: ["Kubernetes", "MLOps", "AI", "Cloud Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-136-ai-workloads"
+---
+
+Kubernetes v1.36でPod-Level Resource Managersがアルファ機能として追加されました。GPUなどの特殊ハードウェアリソースをより柔軟に管理できるこの機能は、MLOpsワークロードを念頭に置いた設計です。2026年現在、KubernetesはAIサービスの基盤インフラとして機能するフェーズに完全に入っています。
+
+## AIワークロードがK8sに求めるもの
+
+通常のWebアプリケーションとMLOpsワークロードでは、インフラへの要求が根本的に異なります。
+
+| 観点 | Webアプリ | MLOpsワークロード |
+|------|----------|----------------|
+| リソースパターン | 安定したCPU/Memory | バースト的なGPU使用 |
+| 実行形態 | 継続的 | バッチ/断続的 |
+| スケーリング | 水平スケール | GPUノードプール管理 |
+| データ | ステートレス | 大容量データセット |
+| 障害耐性 | 再起動で回復 | チェックポイント必須 |
+
+## Pod-Level Resource Managersの意義
+
+従来のKubernetesリソース管理はCPUとMemoryのrequests/limitsを中心に設計されており、GPUはDevice Pluginフレームワークで対応してきました。しかし複数GPU間の細かいリソース割り当てや動的な再設定は困難でした。
+
+Pod-Level Resource Managersはより表現力のあるモデルを提供します。
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ml-training-job
+spec:
+  containers:
+    - name: trainer
+      image: my-ml-trainer:latest
+      resources:
+        requests:
+          cpu: "4"
+          memory: "16Gi"
+          nvidia.com/gpu: "2"
+        limits:
+          cpu: "8"
+          memory: "32Gi"
+          nvidia.com/gpu: "2"
+  resourceClaims:
+    - name: gpu-resource
+      resourceClaimTemplateName: gpu-claim-template
+```
+
+## ML Training Jobの実践的な設定
+
+分散学習にはKubernetesの`Job`リソースを使って、GPUノード間での並列実行を管理するパターンが一般的です。
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-training
+spec:
+  completions: 4
+  parallelism: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: trainer
+          image: pytorch/pytorch:2.5-cuda12.1
+          command: ["python", "train.py"]
+          args:
+            - "--epochs=100"
+            - "--checkpoint-dir=/checkpoints"
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: checkpoints
+              mountPath: /checkpoints
+      volumes:
+        - name: checkpoints
+          persistentVolumeClaim:
+            claimName: model-checkpoints-pvc
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+```
+
+`restartPolicy: OnFailure`とチェックポイントVolumeを組み合わせることで、失敗したPodが最初からではなく最後のチェックポイントから再開できます。長時間の学習ジョブでは特に重要な設定です。
+
+## 推論サービスのデプロイ
+
+学習後のモデルをサービスとして公開する際は、低Latency、水平スケーリング、モデル更新時のGraceful Rolloutが必要です。
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: inference
+  template:
+    metadata:
+      labels:
+        app: inference
+    spec:
+      containers:
+        - name: inference
+          image: my-inference-server:latest
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: inference-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: inference-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+GPUノードはコストが高いため、`cluster-autoscaler`とスケールダウン安定化ポリシーを組み合わせて、アイドル状態のGPUノードが不要に稼働し続けないよう管理することが重要です。
+
+## Internal Developer Platform（IDP）との統合
+
+2026年のKubernetesのトレンドの一つがPlatform Engineeringです。MLエンジニアがKubernetesのYAMLを直接操作せずに学習ジョブと推論サービスをデプロイできる、セルフサービス型プラットフォームの構築が広がっています。
+
+一般的な構成: Backstage（Developerポータル）+ ArgoCD（GitOps）+ Kubeflow（MLパイプラインオーケストレーション）。この抽象化レイヤーにより、データサイエンティストの開発速度を高めながら、インフラチームがセキュリティ・コスト・Observabilityの基準を維持できます。
+
+## 実践的な次のステップ
+
+MLワークロードをKubernetesに移行する際の推奨手順:
+
+1. Kubeflowへの投資前に`Job`リソースで学習作業を試す
+2. Node Taint + TolerationでGPUノードを一般ワークロードから分離する
+3. データセットはImageに含めずPVCからマウントする
+4. 長時間ジョブを実行する前に学習スクリプトにチェックポイントを追加する
+5. GPUリソースのLimitはRequestと同じ値に設定する（GPUスケジューリングはBurstableリソースでは適切に動作しない）
+
+v1.36のPod-Level Resource ManagersはAlphaのためプロダクション適用はまだ早いですが、KubernetesがAIワークロードに必要なハードウェアとスケジューリングパターンへのFirst-classサポートを構築している方向性は明確です。

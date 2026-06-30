@@ -1,0 +1,118 @@
+---
+title: "Next.js 15.5: Turbopack Builds Beta and Node.js Middleware Stable"
+description: "Next.js 15.5 brings Turbopack builds out of dev-only and makes Node.js Middleware stable. Here's what changed, what it means for your project, and what to watch out for."
+date: "2026-05-11"
+status: "published"
+tags: ["Next.js", "Turbopack", "TypeScript", "web-development", "middleware"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-15-5-turbopack-builds"
+---
+
+## What Changed in Next.js 15.5
+
+Two changes stand out in Next.js 15.5:
+
+1. **Turbopack builds hit beta** — `next build --turbopack` is now a supported option for production builds
+2. **Node.js Middleware is stable** — Middleware no longer runs on the Edge Runtime, so you get full Node.js API access
+
+There are also TypeScript improvements — typed routes and route export validation — plus early deprecation warnings targeting Next.js 16.
+
+## Turbopack Builds: From Dev to Production
+
+Until 15.5, Turbopack was limited to the development server (`next dev --turbopack`). Now it extends to production builds:
+
+```bash
+# Run a Turbopack build
+next build --turbopack
+
+# Or add it to package.json
+# {
+#   "scripts": {
+#     "build": "next build --turbopack"
+#   }
+# }
+```
+
+For large projects, Turbopack can reduce build times significantly compared to Webpack. The beta label means it's ready for testing and CI profiling, but production adoption should wait until you've validated compatibility with your plugin stack.
+
+### What to check before switching
+
+- Webpack plugins with no Turbopack equivalent will fail or be silently skipped
+- Custom loaders may behave differently — test your entire bundle output, not just a smoke test
+- `next lint` is deprecated in 15.5 — move to direct ESLint configuration if you haven't already
+
+## Node.js Middleware is Now Stable
+
+The old Edge Runtime constraint in Next.js Middleware was a persistent friction point. If you needed `crypto`, `bcrypt`, or any module that touches the file system, you had to push the logic out to an API route. That changes in 15.5:
+
+```typescript
+// middleware.ts — full Node.js access in 15.5
+import { NextRequest, NextResponse } from "next/server";
+import { createHash } from "crypto"; // Previously unavailable in Edge Runtime
+
+export function middleware(request: NextRequest) {
+  const token = request.cookies.get("session")?.value ?? "";
+  const hash = createHash("sha256").update(token).digest("hex");
+
+  const response = NextResponse.next();
+  response.headers.set("x-session-hash", hash);
+  return response;
+}
+
+export const config = {
+  matcher: ["/api/:path*", "/dashboard/:path*"],
+};
+```
+
+This unlocks cleaner auth middleware patterns, session validation, and request transformation logic that previously required an extra API hop.
+
+## TypeScript Improvements
+
+**Typed Routes**
+Enable `experimental.typedRoutes` in `next.config.mjs` and `<Link href>` / `router.push()` will accept only valid routes as defined by your file-based routing.
+
+```typescript
+// next.config.mjs
+const nextConfig = {
+  experimental: {
+    typedRoutes: true,
+  },
+};
+```
+
+```tsx
+// ✅ Valid — /dashboard exists in your file structure
+<Link href="/dashboard">Dashboard</Link>
+
+// ❌ TypeScript error — /dashbord does not exist
+<Link href="/dashbord">Dashboard</Link>
+```
+
+**Route Export Validation**
+Invalid exports from page components or route handlers now produce build-time errors rather than silent failures. This catches issues like exporting unexpected named functions from a page file.
+
+## Next.js 16 Deprecation Warnings
+
+15.5 adds warnings for patterns that will break in Next.js 16. Run a build and pipe it through grep to see what needs attention:
+
+```bash
+next build 2>&1 | grep -i "warn\|deprecated"
+```
+
+Addressing these now avoids a time-pressured upgrade later.
+
+## Our Take
+
+Node.js Middleware going stable is the most immediately useful change in this release. The Edge Runtime limitation was a real constraint in production auth setups, and removing it simplifies middleware architecture considerably.
+
+Turbopack builds are worth profiling in CI now — build time data collected during the beta phase will inform a smoother migration when it reaches stable.
+
+## Takeaways
+
+- `next build --turbopack` is beta — test before adopting in production
+- Node.js Middleware is stable — `crypto`, full Node.js APIs are now available
+- Typed routes add compile-time safety to navigation
+- Route export validation catches more bugs at build time
+- `next lint` is deprecated — migrate to direct ESLint config
+- Review deprecation warnings for the upcoming Next.js 16 upgrade

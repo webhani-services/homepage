@@ -1,0 +1,208 @@
+---
+title: "Production LLMのToken Budget管理：コスト爆発を防ぐ実践的アプローチ"
+description: "AI予算の肥大化を引き起こすTokenmaxxing問題の解説と、Production環境でのLLM Token消費を効率化するPrompt Caching・Context Trimmingなどの実装パターンを紹介します。"
+date: "2026-05-28"
+status: "published"
+tags: ["LLM", "Cost Optimization", "AI Architecture", "Anthropic", "Production"]
+thumbnail: ""
+author: "webhani"
+slug: "token-budget-management-llm-2026"
+---
+
+LLMをProduction環境で運用するチームにとって、Token消費のコントロールは今や無視できないインフラ課題です。2026年5月、The New Stackが「Tokenmaxxing」という現象を取り上げ、AI予算が静かに、しかし確実に膨らんでいく実態を報じました。
+
+Claude Opus 4.7やGPT-5.5といったFrontier Modelが普及するにつれ、1リクエストあたりのコストは高く、スケールするほど影響が大きくなります。この記事では、Tokenmaxxingが発生する仕組みと、Production環境で機能するToken Budget管理のパターンを解説します。
+
+## Tokenmaxxingとは何か
+
+「Tokenmaxxing」は単一の問題ではなく、複数の非効率が積み重なってToken消費が雪だるま式に増大する現象の総称です。
+
+**主な原因：**
+
+- **Context汚染**: 関連性の薄い過去の会話履歴をすべてRequestに含め続ける
+- **冗長なSystem Prompt**: 同じ内容を繰り返したり過度に長くなったSystem Prompt
+- **Streaming失敗の再送**: Network障害によるPartial Responseの再送でInput Tokenが二重計上される
+- **Agent間の重複受け渡し**: Multi-agentシステムで各Agentに全状態を渡してしまう
+
+Frontier Modelでは1リクエストのToken消費が2倍になれば、月間APIコストも2倍になります。1日数百万リクエストを処理するシステムでは、これは非常に大きな差です。
+
+## まず消費量を計測する
+
+最適化の前に現状を把握します。API Clientにシンプルなラッパーを追加するだけで、どのEndpointで何Tokenが使われているかが見えてきます。
+
+```typescript
+interface UsageSample {
+  model: string;
+  endpoint: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheHitTokens: number;
+  timestamp: Date;
+}
+
+class TokenTracker {
+  private samples: UsageSample[] = [];
+  private alertThreshold: number;
+
+  constructor(alertThreshold = 50_000) {
+    this.alertThreshold = alertThreshold;
+  }
+
+  record(sample: UsageSample): void {
+    this.samples.push(sample);
+    const total = sample.inputTokens + sample.outputTokens;
+    if (total > this.alertThreshold) {
+      console.warn(
+        `[Token Alert] ${sample.endpoint}: ${total.toLocaleString()} tokens`
+      );
+    }
+  }
+
+  summarizeByEndpoint(): Record<string, number> {
+    return this.samples.reduce((acc, s) => {
+      const key = `${s.model}::${s.endpoint}`;
+      acc[key] = (acc[key] ?? 0) + s.inputTokens + s.outputTokens;
+      return acc;
+    }, {} as Record<string, number>);
+  }
+}
+```
+
+## 戦略1：Prompt Cachingを有効化する
+
+AnthropicのPrompt Cachingは、繰り返し使われるSystem PromptやDocument Contextのコストを通常の約10分の1に削減します。System Promptが1,000 Tokenを超えているなら、Cachingを有効にしない理由はほとんどありません。
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+const SYSTEM_PROMPT = `あなたはwebhani Inc.のTechnical Consultantです。
+クライアントの技術的な質問に対して、実践的で具体的なアドバイスを提供します。
+以下の原則に従って回答してください：
+...（数百Tokenにわたる詳細な指示）`;
+
+async function queryWithCache(userMessage: string) {
+  const response = await client.messages.create({
+    model: "claude-opus-4-7",
+    max_tokens: 1024,
+    system: [
+      {
+        type: "text",
+        text: SYSTEM_PROMPT,
+        cache_control: { type: "ephemeral" }, // キャッシュを有効化
+      },
+    ],
+    messages: [{ role: "user", content: userMessage }],
+  });
+
+  const cached = response.usage.cache_read_input_tokens ?? 0;
+  const written = response.usage.cache_creation_input_tokens ?? 0;
+  console.log(`Cache: ${cached} read, ${written} written`);
+  return response;
+}
+```
+
+初回はCacheが作成されますが、2回目以降は`cache_read_input_tokens`にカウントされ低コストで処理されます。
+
+## 戦略2：Context Windowの選択的トリミング
+
+会話履歴をそのまま蓄積するのではなく、重要度でメッセージをフィルタリングします。
+
+```typescript
+interface ScoredMessage {
+  role: "user" | "assistant";
+  content: string;
+  relevanceScore: number; // 0.0〜1.0
+  tokenCount: number;
+}
+
+function buildOptimizedContext(
+  history: ScoredMessage[],
+  maxContextTokens: number,
+  keepRecentCount = 4
+): ScoredMessage[] {
+  // 直近のやり取りは必ず保持
+  const recent = history.slice(-keepRecentCount);
+  const recentTokens = recent.reduce((sum, m) => sum + m.tokenCount, 0);
+
+  // 残りのBudgetで重要度順に追加
+  const older = history.slice(0, -keepRecentCount);
+  const sorted = [...older].sort((a, b) => b.relevanceScore - a.relevanceScore);
+
+  const selected: ScoredMessage[] = [];
+  let remaining = maxContextTokens - recentTokens;
+
+  for (const msg of sorted) {
+    if (remaining < msg.tokenCount) continue;
+    selected.push(msg);
+    remaining -= msg.tokenCount;
+  }
+
+  // 時系列順に並び直す
+  return [
+    ...selected.sort((a, b) => older.indexOf(a) - older.indexOf(b)),
+    ...recent,
+  ];
+}
+```
+
+## 戦略3：Structured OutputでResponse量を削減
+
+下流がコードで処理するResponseは、自然言語ではなくJSONで受け取ります。同じ情報量でもJSON形式は自然言語説明より30〜50%Token数が少なくなる傾向があります。
+
+```typescript
+// ❌ 自然言語で詳細を求める（Token消費が多い）
+const verbosePrompt = `
+  このコードを詳しく分析して、バグがあれば行番号と原因、
+  修正方法を丁寧に説明してください。
+`;
+
+// ✅ 構造化で返してもらう（Token効率が良い）
+const structuredPrompt = `
+以下のコードのバグを分析し、このJSON形式だけで返してください。
+説明文は不要です。
+
+{"issues":[{"line":<行番号>,"severity":"error"|"warning","summary":"<10語以内>","fix":"<修正コード>"}]}
+
+コード:
+\`\`\`
+${codeBlock}
+\`\`\`
+`;
+```
+
+## Multi-agentシステムでのBudget配分
+
+複数のAgentを連携させるシステムでは、役割ごとにToken Budgetを割り当てます。無制限にTokenを消費できるAgentはTokenmaxxingを引き起こしやすくなります。
+
+```typescript
+const AGENT_BUDGETS = {
+  planner: 8_000,    // 計画立案：簡潔さが求められる
+  executor: 20_000,  // 実行：最も複雑なタスクを担当
+  reviewer: 5_000,   // レビュー：差分の確認に集中
+  summarizer: 3_000, // 要約：短いOutputが前提
+} as const;
+
+type AgentRole = keyof typeof AGENT_BUDGETS;
+
+async function runAgentWithBudget(role: AgentRole, prompt: string) {
+  return client.messages.create({
+    model: "claude-opus-4-7",
+    max_tokens: AGENT_BUDGETS[role],
+    messages: [{ role: "user", content: prompt }],
+  });
+}
+```
+
+## 実装の優先順位
+
+コスト削減施策を導入する際の推奨順序は次の通りです。
+
+1. **計測基盤の整備** — どこでTokenが消費されているか可視化する
+2. **Prompt Cachingの有効化** — System Promptが長い場合は即効性が高い
+3. **Context管理の見直し** — 不要な会話履歴の包含を排除する
+4. **Output形式の最適化** — Structured OutputでResponse量を圧縮する
+5. **Budget Alertの設定** — 閾値超過時に自動で通知を受け取る
+
+LLMのコストはProductionでスケールするほど効いてきます。デプロイ初期にこれらの施策を組み込んでおくことで、規模が拡大しても予算内での運用が続けられます。

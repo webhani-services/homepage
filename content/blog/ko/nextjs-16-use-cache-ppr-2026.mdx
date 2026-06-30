@@ -1,0 +1,304 @@
+---
+title: "Next.js 16 use cache 디렉티브와 Partial Pre-Rendering 실전 가이드"
+description: "Next.js 16의 `use cache` 디렉티브와 PPR(Partial Pre-Rendering)은 복잡했던 fetch 기반 캐시 모델을 대체하는 새로운 패러다임입니다. 기존 방식의 문제점부터 실전 코드 예시, 마이그레이션 전략까지 정리합니다."
+date: "2026-05-24"
+status: "published"
+tags: ["nextjs", "react", "performance", "caching", "ppr"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-use-cache-ppr-2026"
+---
+
+Next.js 16이 가져온 가장 큰 변화 중 하나는 캐시 모델의 전면 개편입니다. `use cache` 디렉티브와 Partial Pre-Rendering(PPR)은 단순한 API 업데이트가 아니라, 오랫동안 개발자들을 혼란스럽게 해온 fetch 기반 캐시 구조를 근본부터 바꾸는 시도입니다.
+
+## 기존 캐시 방식의 문제점
+
+### 복잡했던 Next.js 14/15의 캐시 구조
+
+Next.js 13에서 도입된 fetch 기반 캐시는 이론적으로는 강력했지만, 실제로 사용하면서 예측하기 어려운 동작들로 많은 팀들이 고생했습니다. Router Cache, Full Route Cache, Request Memoization, Data Cache라는 네 개의 독립적인 캐시 레이어가 어떻게 상호작용하는지를 이해하지 못하면 스테일 데이터 버그를 만나기 쉬웠습니다.
+
+```typescript
+// Next.js 14 방식 — fetch 옵션으로 캐시 제어
+async function getProduct(id: string) {
+  const res = await fetch(`https://api.example.com/products/${id}`, {
+    next: { revalidate: 3600, tags: [`product-${id}`] },
+  });
+  return res.json();
+}
+
+// DB 같은 non-fetch 데이터 소스에는 unstable_cache를 사용해야 했음
+import { unstable_cache } from "next/cache";
+
+const getCachedProduct = unstable_cache(
+  async (id: string) => db.product.findUnique({ where: { id } }),
+  ["product"],
+  { revalidate: 3600 }
+);
+```
+
+`unstable_cache`라는 이름이 솔직하게 드러내듯, 이 API는 설계상의 한계를 안고 있는 임시방편에 가까웠습니다. Closure 직렬화 문제로 인자를 캐시 키에 포함시키는 것도 번거로웠고, 다른 캐시 레이어와의 상호작용도 불투명했습니다. Prisma나 Drizzle 같은 ORM을 사용하는 팀들은 fetch 없이 데이터를 가져오는 경우 캐시 전략 자체를 포기하거나 복잡한 래퍼를 만들어야 했습니다.
+
+## `use cache` 디렉티브 개요
+
+`use cache`는 React의 `"use client"`, `"use server"`와 동일한 선언적 패턴을 따릅니다. 파일 최상단이나 함수 내부 최상단에 배치하면, 해당 스코프 전체를 캐시 대상으로 지정할 수 있습니다. fetch 여부와 관계없이 모든 비동기 작업에 적용할 수 있다는 것이 가장 큰 차이점입니다.
+
+### 파일 레벨 캐시
+
+```typescript
+// app/components/CategoryList.tsx
+"use cache";
+
+import { getCategories } from "@/lib/db";
+
+export async function CategoryList() {
+  const categories = await getCategories();
+
+  return (
+    <ul>
+      {categories.map((cat) => (
+        <li key={cat.id}>
+          <a href={`/category/${cat.slug}`}>{cat.name}</a>
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+파일 최상단에 `"use cache"`를 배치하면 해당 파일에서 export되는 모든 함수가 캐시됩니다. 변경이 드문 데이터를 다루는 컴포넌트에 적합한 방식입니다.
+
+### 함수 레벨 캐시와 `cacheTag()`, `cacheLife()` 활용
+
+```typescript
+// app/lib/products.ts
+import {
+  unstable_cacheTag as cacheTag,
+  unstable_cacheLife as cacheLife,
+} from "next/cache";
+
+export async function getProductById(id: string) {
+  "use cache";
+  cacheLife("hours");
+  cacheTag(`product-${id}`, "products");
+
+  const res = await fetch(`https://api.example.com/products/${id}`);
+  return res.json();
+}
+
+export async function getStockInfo(productId: string) {
+  "use cache";
+  cacheLife("seconds"); // 재고는 빠르게 변할 수 있음
+  cacheTag(`stock-${productId}`);
+
+  return db.inventory.findUnique({ where: { productId } });
+}
+```
+
+같은 파일 내에서도 함수마다 다른 캐시 전략을 적용할 수 있습니다. 상품 정보는 `cacheLife("hours")`로 장시간 캐시하고, 재고 정보는 `cacheLife("seconds")`로 짧게 유지하는 식으로 데이터의 변경 빈도에 맞게 세밀하게 조정할 수 있습니다.
+
+### `cacheLife()` 상세 설정
+
+```typescript
+import { unstable_cacheLife as cacheLife } from "next/cache";
+
+export async function getPopularArticles() {
+  "use cache";
+  // 내장 프리셋: "seconds", "minutes", "hours", "days", "weeks", "max"
+  cacheLife("hours");
+
+  return db.article.findMany({
+    where: { featured: true },
+    orderBy: { views: "desc" },
+    take: 10,
+  });
+}
+
+export async function getUserDashboard(userId: string) {
+  "use cache";
+  // 커스텀 설정
+  cacheLife({
+    stale: 60,       // 60초간 클라이언트 캐시 유효
+    revalidate: 300, // 5분 후 백그라운드에서 재검증
+    expire: 3600,    // 1시간 후 강제 만료
+  });
+
+  return db.dashboard.findMany({ where: { userId } });
+}
+```
+
+세 가지 값 각각의 역할이 명확합니다. `stale`은 브라우저가 캐시를 신선하다고 간주하는 시간, `revalidate`는 stale-while-revalidate 방식으로 백그라운드에서 갱신하는 주기, `expire`는 캐시를 무조건 파기하는 최대 수명입니다.
+
+### `cacheTag()`로 On-Demand 재검증
+
+```typescript
+// app/lib/posts.ts
+import { unstable_cacheTag as cacheTag } from "next/cache";
+
+export async function getPost(slug: string) {
+  "use cache";
+  cacheTag(`post-${slug}`, "posts");
+
+  return db.post.findUnique({ where: { slug } });
+}
+
+// app/api/webhooks/cms/route.ts
+import { revalidateTag } from "next/cache";
+
+export async function POST(request: Request) {
+  const { type, slug } = await request.json();
+
+  if (type === "post.updated") {
+    revalidateTag(`post-${slug}`); // 특정 포스트만 무효화
+  } else if (type === "bulk.publish") {
+    revalidateTag("posts"); // 전체 포스트 캐시 무효화
+  }
+
+  return Response.json({ revalidated: true });
+}
+```
+
+`cacheTag`와 `revalidateTag`의 조합으로 CMS Webhook, 관리자 액션 등 외부 이벤트에 반응하여 특정 캐시를 즉시 무효화할 수 있습니다. 이전처럼 캐시 태그를 데이터 패칭 코드와 분리된 곳에서 관리할 필요가 없어집니다.
+
+## Partial Pre-Rendering (PPR)과의 조합
+
+### PPR의 기본 개념
+
+PPR은 하나의 페이지 안에서 정적 컨텐츠와 동적 컨텐츠를 분리하여 렌더링하는 방식입니다. 기존에는 페이지 단위로 "전체 정적(SSG)" 또는 "전체 동적(SSR)"을 선택해야 했습니다. PPR은 정적인 Shell을 즉시 CDN에서 제공하고, 동적인 부분만 서버에서 스트리밍합니다.
+
+```typescript
+// next.config.ts
+const nextConfig = {
+  experimental: {
+    ppr: "incremental", // 페이지별로 opt-in 가능
+  },
+};
+```
+
+### PPR 페이지 구성 예시
+
+```typescript
+// app/products/[id]/page.tsx
+export const experimental_ppr = true;
+
+import { Suspense } from "react";
+import { ProductInfo } from "@/components/ProductInfo";
+import { StockStatus } from "@/components/StockStatus";
+import { PersonalizedRecs } from "@/components/PersonalizedRecs";
+
+export default async function ProductPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = await params;
+
+  return (
+    <main>
+      {/* use cache로 캐시됨 → 정적 Shell의 일부로 즉시 제공 */}
+      <ProductInfo productId={id} />
+
+      {/* Suspense로 감싸인 동적 컨텐츠 → 스트리밍 */}
+      <Suspense fallback={<StockPlaceholder />}>
+        <StockStatus productId={id} />
+      </Suspense>
+
+      <Suspense fallback={<RecsPlaceholder />}>
+        <PersonalizedRecs productId={id} />
+      </Suspense>
+    </main>
+  );
+}
+```
+
+```typescript
+// app/components/ProductInfo.tsx
+"use cache";
+
+import {
+  unstable_cacheTag as cacheTag,
+  unstable_cacheLife as cacheLife,
+} from "next/cache";
+
+export async function ProductInfo({ productId }: { productId: string }) {
+  cacheTag(`product-${productId}`);
+  cacheLife("hours");
+
+  const product = await db.product.findUnique({ where: { id: productId } });
+
+  return (
+    <section>
+      <h1>{product.name}</h1>
+      <p>{product.description}</p>
+      <p className="price">{product.price.toLocaleString()}원</p>
+    </section>
+  );
+}
+```
+
+이 구조에서 `ProductInfo`는 `use cache`로 캐시되어 정적 Shell에 포함됩니다. 사용자가 페이지를 요청하면 상품 이름, 설명, 가격이 포함된 HTML이 CDN 캐시에서 즉시 전송됩니다. 재고 상태와 개인화 추천은 Suspense 경계 안에서 동적으로 스트리밍되어 처음 렌더링을 막지 않습니다.
+
+### 실제 성능 변화
+
+같은 상품 페이지를 기준으로 세 가지 방식을 비교하면 차이가 명확합니다.
+
+- **Full SSR**: 모든 데이터가 준비될 때까지 TTFB가 지연됨
+- **Full SSG**: 재고, 가격 같은 실시간 정보를 반영하지 못함
+- **PPR + use cache**: 정적 Shell은 CDN에서 밀리초 단위로 응답, 동적 데이터는 Shell 렌더링 이후 스트리밍
+
+쇼핑몰처럼 "상품 정보는 자주 안 바뀌지만 재고·가격은 실시간이어야 하는" 케이스에서 이 조합의 효과가 가장 두드러집니다.
+
+## Turbopack 기본값 전환의 실질적 의미
+
+Next.js 16부터 `next dev`는 기본적으로 Turbopack을 사용합니다. 별도 플래그 없이도 Turbopack이 활성화됩니다. `use cache`와의 관계에서 중요한 점은, Turbopack이 `"use cache"` 경계를 컴파일 단위로 인식하고 HMR 업데이트를 더 정교하게 수행한다는 것입니다.
+
+기존에 Server Component를 수정할 때마다 관련 없는 컴포넌트들까지 리로드되던 문제가 줄어듭니다. `use cache`로 지정된 컴포넌트를 수정하면 해당 컴포넌트의 캐시 경계만 무효화됩니다.
+
+webpack Plugin을 많이 사용하는 프로젝트라면 호환성 확인이 필요합니다. 필요한 경우 `next.config.ts`에서 `bundler: "webpack"`으로 명시하면 기존처럼 동작합니다. 하지만 새 프로젝트라면 Turbopack을 그대로 사용하는 것을 권장합니다.
+
+## 마이그레이션 고려사항
+
+### `unstable_cache` 교체
+
+```typescript
+// 이전 방식
+import { unstable_cache } from "next/cache";
+
+const getUser = unstable_cache(
+  async (id: string) => db.user.findUnique({ where: { id } }),
+  ["user"],
+  { revalidate: 3600 }
+);
+
+// 새 방식
+async function getUser(id: string) {
+  "use cache";
+  cacheLife("hours");
+  cacheTag(`user-${id}`);
+  return db.user.findUnique({ where: { id } });
+}
+```
+
+`unstable_cache`는 클로저 직렬화 문제로 인자를 캐시 키에 포함시키기가 번거로웠습니다. `use cache`에서는 함수 인자가 자연스럽게 캐시 키로 사용되어 이 문제가 해결됩니다.
+
+### fetch 옵션 정리
+
+`"use cache"` 스코프 안에서는 fetch에 `next: { revalidate }` 나 `cache: "force-cache"`를 전달할 필요가 없습니다. 함수 전체가 캐시되기 때문에 내부의 fetch 옵션은 무시됩니다. 중복된 캐시 옵션을 제거하면 코드가 깔끔해집니다.
+
+### PPR 단계적 도입
+
+```typescript
+// next.config.ts
+const nextConfig = {
+  experimental: {
+    ppr: "incremental",
+  },
+};
+```
+
+`incremental` 모드에서는 각 페이지 파일에서 `export const experimental_ppr = true`를 선언한 페이지에만 PPR이 적용됩니다. 한 번에 전체 앱에 적용하기보다 트래픽이 많은 페이지부터 시작해서 TTFB 변화를 측정하며 점진적으로 확대하는 것이 안전합니다.
+
+## webhani의 관점
+
+`use cache`와 PPR의 조합은 "정적이냐 동적이냐"라는 이분법적 선택을 컴포넌트 단위로 세분화한 것입니다. 이전에는 페이지 전체의 캐시 전략을 하나로 통일해야 했지만, 이제는 같은 페이지 안에서도 컴포넌트별로 다른 캐시 생명주기를 선언적으로 표현할 수 있습니다.
+
+특히 `unstable_cache`에서 `use cache`로의 전환은 코드 양이 줄고 의도가 명확해지는 방향이라, 마이그레이션 비용 대비 얻는 이점이 큽니다. Next.js 15 이하를 사용 중인 팀이라면 Next.js 16 업그레이드와 함께 캐시 레이어를 `use cache`로 정리하는 작업을 병행하는 것을 권장합니다. PPR은 `incremental` 모드로 조심스럽게 시작하면 기존 동작을 깨지 않고 도입할 수 있습니다.

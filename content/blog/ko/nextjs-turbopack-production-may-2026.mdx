@@ -1,0 +1,119 @@
+---
+title: "Next.js 15.5와 Turbopack: Rust 기반 빌드의 프로덕션 진입"
+description: "Turbopack 빌드 베타, Node.js Middleware 안정화, next lint 비권장 — Next.js 15.5 변경 사항과 실무 영향"
+date: "2026-05-16"
+status: "published"
+tags: ["Next.js", "Turbopack", "React", "TypeScript", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-turbopack-production-may-2026"
+---
+
+Next.js 15.5가 출시되었습니다. Turbopack 프로덕션 빌드 베타 도달, 안정적인 Node.js Middleware, TypeScript 개선, `next lint` 비권장이 포함된 이번 릴리스는 Next.js 16 업그레이드를 준비 중인 팀에게 특히 중요한 내용을 담고 있습니다.
+
+## Turbopack 빌드: 프로덕션 베타
+
+Vercel이 개발하는 Rust 기반 번들러 Turbopack은 Next.js 14부터 Dev Server에서 사용 가능했습니다. 15.5에서는 `next build` 프로덕션 빌드가 드디어 베타에 도달했습니다.
+
+Webpack 대비 성능 특성:
+
+| 시나리오 | 개선 수준 |
+|----------|-----------|
+| 대규모 프로젝트 초기 빌드 | 최대 700배 빠름 |
+| Dev Server 콜드 스타트 | 거의 즉시 |
+| Hot Module Replacement | 크게 단축 |
+
+실제 체감 차이는 프로젝트 규모와 설정에 따라 다릅니다. 수백 개의 컴포넌트와 복잡한 의존성 그래프를 가진 프로젝트일수록 효과가 두드러집니다.
+
+### 활성화 방법
+
+```bash
+# CLI 플래그로 활성화
+next build --turbopack
+```
+
+베타 단계이므로 기존 Webpack 커스터마이징과의 호환성을 반드시 확인하세요:
+
+- 커스텀 로더(예: React SVG 컴포넌트용 SVGR)
+- Sentry 등의 Webpack 플러그인
+- `next.config.mjs`의 `webpack` 콜백 로직
+
+프로덕션 전환 전에 CI에서 Webpack 빌드와 Turbopack 빌드를 병렬로 실행하고 출력을 비교해 차이를 조기에 발견하는 것을 권장합니다.
+
+## 안정적인 Node.js Middleware
+
+Middleware가 이제 완전한 Node.js 환경에서 실행됩니다. Edge Runtime의 제약으로 사용할 수 없었던 Node.js 내장 모듈을 이제 Middleware에서 직접 사용할 수 있습니다.
+
+```typescript
+// middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+import { createHash } from "crypto"; // Middleware에서 이제 사용 가능
+
+export function middleware(request: NextRequest) {
+  const token = request.headers.get("x-api-token") ?? "";
+  const hash = createHash("sha256").update(token).digest("hex");
+
+  if (!isValidToken(hash)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: "/api/:path*",
+};
+
+function isValidToken(hash: string): boolean {
+  const validHashes = process.env.VALID_TOKEN_HASHES?.split(",") ?? [];
+  return validHashes.includes(hash);
+}
+```
+
+이는 표준 Node.js를 실행하는 Vercel의 Fluid Compute 환경과의 정합성을 맞춘 것입니다. Edge Runtime 제약으로 우회 로직을 작성했거나 별도 API Route를 사용했다면, 이제 Middleware에서 직접 처리하도록 단순화할 수 있습니다.
+
+## `next lint` 비권장
+
+`next lint` 명령이 비권장으로 지정되었으며 Next.js 16에서 제거될 예정입니다. ESLint를 직접 호출하는 방식으로 전환을 권장합니다.
+
+```json
+// package.json
+{
+  "scripts": {
+    "lint": "eslint src --ext .ts,.tsx,.js,.jsx"
+  }
+}
+```
+
+`next lint`가 제공하던 동일한 규칙 세트를 유지하려면 Next.js ESLint 패키지를 명시적으로 설정하세요:
+
+```json
+// .eslintrc.json
+{
+  "extends": ["next/core-web-vitals", "next/typescript"]
+}
+```
+
+## TypeScript 개선
+
+React 19의 Server Components와 Activity API에 대한 타입 정의가 개선되어 서버 사이드 코드에서 `any` 캐스팅과 수동 타입 어노테이션의 필요성이 줄어듭니다.
+
+```typescript
+// async Server Component의 타입 추론 개선 예시
+interface UserProfileProps {
+  userId: string;
+}
+
+async function UserProfile({ userId }: UserProfileProps) {
+  const user = await fetchUser(userId); // 반환 타입이 정확하게 추론됨
+  return <div>{user.name}</div>;
+}
+```
+
+## 실무 적용 방법
+
+**신규 프로젝트**: 처음부터 Turbopack을 활성화하고 초기 단계에서 빌드 품질을 검증합니다.
+
+**기존 프로젝트**: 먼저 Dev Server에서 Turbopack을 활성화해 개발 경험을 개선하고, CI에서 Webpack 빌드와 Turbopack 빌드를 병렬로 실행해 출력을 비교한 후 완전히 전환합니다.
+
+`next lint` 비권장 대응은 지금 처리하면 거의 비용이 들지 않습니다. Next.js 16 업그레이드 과정에서 함께 처리하면 더 복잡해집니다. 다음 스프린트에서 미리 처리해두는 것을 권장합니다.

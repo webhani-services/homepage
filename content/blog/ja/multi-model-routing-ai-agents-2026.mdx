@@ -1,0 +1,129 @@
+---
+title: "マルチモデルルーティング：複数のLLMを使い分けるAI Agent設計"
+description: "2026年春、主要なフロンティアモデルが短期間に相次いでリリースされました。一つのLLMに依存するアーキテクチャの限界が見えてきた今、タスクに応じてモデルを切り替えるマルチモデルルーティングの実践的な設計を解説します。"
+date: "2026-05-01"
+status: "published"
+tags: ["AI", "LLM", "Agent", "Architecture", "Python"]
+thumbnail: ""
+author: "webhani"
+slug: "multi-model-routing-ai-agents-2026"
+---
+
+## 一つのモデルへの依存が終わる時代
+
+2026年3〜4月、AIモデルのリリースが異常なペースで続きました。Claude Opus 4.7（4月16日）、GPT-5.5（4月23日）、DeepSeek V4 Preview（4月24日）、さらにLlama 4、Qwen 3、Gemma 4も同じ6週間の窓に集中しました。
+
+これだけ選択肢が増えると、「どのモデルを使うべきか」という問いの立て方自体が変わってきます。正解は「用途によって使い分ける」——マルチモデルルーティングです。
+
+## なぜ一つのモデルでは不十分か
+
+どのモデルにも強みと弱みがあります。
+
+| モデル | 強み | 弱み |
+|---|---|---|
+| Claude Opus 4.7 | 長時間のAgentワークフロー、構造化出力の精度 | Tokenコストが高い |
+| GPT-5.5 | ツール連携が多いAgentタスク、SWE-bench Pro 57.7% | 基本Tierのコンテキスト制限 |
+| DeepSeek V4 | コスト効率が高いコード生成タスク | 複雑な推論での一貫性 |
+| Llama 4 / GLM-5.1 | オンプレ・オフライン環境、データ主権 | セットアップの手間 |
+
+単一モデルに固定すると、コスト・レイテンシ・品質のどこかで妥協が生じます。
+
+## マルチモデルルーティングの設計パターン
+
+ルーティング戦略は主に3種類あります。
+
+### 1. タスクタイプベースのルーティング
+
+タスクの種類に応じてモデルを固定する最もシンプルなアプローチです。
+
+```python
+from litellm import completion
+
+ROUTING_TABLE = {
+    "code_generation": "deepseek/deepseek-chat",
+    "structured_output": "anthropic/claude-opus-4-7",
+    "tool_use_agent": "openai/gpt-5.5",
+    "local_inference": "ollama/llama4",
+}
+
+def route_completion(task_type: str, messages: list, **kwargs):
+    model = ROUTING_TABLE.get(task_type, "anthropic/claude-sonnet-4-6")
+    return completion(model=model, messages=messages, **kwargs)
+```
+
+### 2. 複雑度スコアリングによるルーティング
+
+クエリの複雑さを動的に評価し、シンプルなタスクは安価なモデルへ振り分けます。
+
+```python
+def estimate_complexity(prompt: str) -> float:
+    """0.0 (simple) から 1.0 (complex) のスコアを返す"""
+    factors = [
+        len(prompt) > 2000,
+        any(kw in prompt.lower() for kw in ["implement", "refactor", "analyze"]),
+        prompt.count("\n") > 10,
+        "```" in prompt,  # コードブロックを含む
+    ]
+    return sum(factors) / len(factors)
+
+def cost_aware_route(prompt: str) -> str:
+    score = estimate_complexity(prompt)
+    if score >= 0.75:
+        return "anthropic/claude-opus-4-7"
+    elif score >= 0.4:
+        return "openai/gpt-5.5"
+    return "deepseek/deepseek-chat"
+```
+
+### 3. フォールバック付きルーティング
+
+プライマリモデルがレート制限やタイムアウトで失敗した場合に自動で次のモデルへ切り替えます。
+
+```python
+import litellm
+
+response = litellm.completion(
+    model="anthropic/claude-opus-4-7",
+    messages=[{"role": "user", "content": prompt}],
+    fallbacks=["openai/gpt-5.5", "deepseek/deepseek-chat"],
+    timeout=30,
+)
+```
+
+## 実装時の注意点
+
+### Provider固有のパラメータに注意する
+
+`temperature`や`max_tokens`は概ね共通ですが、`tool_choice`や`response_format`の仕様はProviderによって異なります。こうした設定はアプリケーションロジックに散在させず、ルーティング設定にまとめておくことが重要です。
+
+### コスト追跡を最初から組み込む
+
+マルチモデル環境では、どのモデルにいくら使っているかが見えにくくなります。LiteLLMは呼び出しごとのコスト推定を提供しています。
+
+```python
+cost = litellm.completion_cost(completion_response=response)
+print(f"Cost: ${cost:.6f}")
+```
+
+タスクタイプ別にコストをタグ付けし、最初のプロダクションデプロイ前にDashboardを用意しておきましょう。
+
+### Provider非依存のプロンプトを書く
+
+「あなたはClaudeです」のような記述はルーティングを妨げます。システムプロンプトはモデルのアイデンティティではなく、役割とタスクを中心に書くことで、モデルを切り替えても品質を維持できます。
+
+## webhaniでの現在の組み合わせ
+
+webhaniが構築するAI Agentシステムでは、以下の組み合わせが現在最も安定しています。
+
+- **企画・要件定義フェーズ**: Claude Opus 4.7（長いコンテキスト、高い指示追従性）
+- **コード生成・補完**: DeepSeek V4（コスパが良く、コード品質が高い）
+- **エージェントループのオーケストレーション**: GPT-5.5（ツール連携の安定性）
+- **プロトタイプ・内部ツール**: Llama 4（データをクラウドに送れないケース）
+
+この割り当ては固定ではなく、BenchmarkやProviderの価格変動に応じて毎月見直します。
+
+## まとめ
+
+2026年のAI Agent開発において、「どのモデルが最強か」という問いは意味をなさなくなってきました。重要なのは、タスクの特性・コスト・レイテンシに応じてモデルを適切に組み合わせるアーキテクチャ設計です。
+
+LiteLLMのような抽象化レイヤーを使えば、モデルの切り替えをアプリケーションロジックから分離できます。まずは小さなルーティングテーブルから始めて、実際のコスト・品質データをもとに改善していくアプローチが現実的です。

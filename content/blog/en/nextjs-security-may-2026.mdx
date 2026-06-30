@@ -1,0 +1,142 @@
+---
+title: "Next.js May 2026 Security Release: 13 CVEs to Patch Now"
+description: "Next.js 15.5.18 and 16.2.6 fix 13 vulnerabilities including middleware bypass, SSRF via WebSocket upgrades, and a DoS in React Server Components. WAF mitigation is not reliable — patch immediately."
+date: "2026-05-29"
+status: "published"
+tags: ["Next.js", "Security", "CVE", "web development", "vulnerability"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-security-may-2026"
+---
+
+# Next.js May 2026 Security Release: 13 CVEs to Patch Now
+
+Vercel published a coordinated security release for Next.js in May 2026. The patched versions are **15.5.18** and **16.2.6**, covering 13 advisories: 7 rated High, 4 Moderate, and 2 Low. If you're running Next.js 14 or earlier, no patch is available — you'll need to upgrade to a supported version.
+
+The advisory states clearly: **WAF-layer mitigation is not reliable** for these issues. Patching is the only complete fix.
+
+## Notable Vulnerabilities
+
+### SSRF via WebSocket Upgrade
+
+An unauthenticated attacker can craft a WebSocket upgrade request using an absolute-form URI:
+
+```http
+GET http://169.254.169.254/latest/meta-data/ HTTP/1.1
+Connection: Upgrade
+Upgrade: websocket
+Host: your-app.com
+```
+
+Next.js's upgrade handler proxied these requests without validating the target host. On cloud infrastructure, this creates a path to AWS IMDS (Instance Metadata Service), internal APIs, or any host reachable on port 80 from the server. IAM credential theft is a realistic outcome on AWS EC2 or ECS instances.
+
+### Middleware Bypass via RSC Prefetch Requests
+
+When App Router prefetches route segments, it generates requests with an `.rsc` suffix — for example, `/dashboard.rsc` alongside the normal `/dashboard` request. The middleware matcher was not consistently applied to these `.rsc` variants.
+
+```typescript
+// middleware.ts
+export const config = {
+  matcher: ['/dashboard/:path*'],
+}
+
+// Before the patch: an attacker could request /dashboard.rsc
+// and bypass the middleware authorization check entirely
+```
+
+If you're using middleware for authentication or authorization in an App Router application, this is a high-severity issue. Prefetch requests could reach protected routes without triggering any auth checks.
+
+### React Server Components DoS (CVE-2026-23870)
+
+This one is upstream in React 19's Server Components runtime, not Next.js itself. Certain RSC payloads trigger a memory leak that can crash the server process. Any framework using React 19's server component infrastructure is affected, not just Next.js.
+
+### CSP Nonce Leak via beforeInteractive Scripts
+
+The combination of `beforeInteractive` scripts and CSP nonces leaks the nonce value under specific conditions. A leaked nonce effectively voids Content Security Policy protection for that page load, opening an XSS vector.
+
+## Why WAF Won't Save You
+
+Most of these attacks use normal-looking HTTP requests — the same methods, the same endpoints that legitimate users hit. A WAF inspects request shape and known attack signatures; it can't see inside Next.js's internal routing and proxy logic to detect that a WebSocket upgrade target has been redirected to a metadata service.
+
+Vercel's advisory explicitly states the vulnerabilities "cannot be reliably blocked at the WAF layer." Take that at face value.
+
+## Affected Versions
+
+| Series | Patched Version |
+|--------|----------------|
+| Next.js 15.x | 15.5.18 |
+| Next.js 16.x | 16.2.6 |
+| Next.js 14.x and earlier | End of life — no patch |
+
+## Upgrade Path
+
+```bash
+# Check current version
+cat package.json | grep '"next"'
+
+# Upgrade to latest
+npm install next@latest
+# or
+yarn upgrade next
+# or
+pnpm update next
+```
+
+After upgrading:
+
+```bash
+# Verify the build succeeds
+npm run build
+
+# Run your test suite — especially auth flows
+npm test
+```
+
+If you have end-to-end tests that cover authenticated routes, run them now. The middleware matcher changes in this patch shouldn't break correctly-implemented auth flows, but verification is essential.
+
+## Design Implications: Defense in Depth
+
+The middleware bypass vulnerability exposes a common architectural assumption: **middleware is sufficient for access control**.
+
+It's not. Middleware runs at the edge and handles the common case efficiently, but it should be the first line of defense — not the only one. Each route handler and server component that serves sensitive data should verify authorization independently.
+
+```typescript
+// Route handler: don't rely on middleware alone
+export async function GET(req: Request) {
+  const session = await getServerSession(authOptions)
+  if (!session?.user) {
+    return new Response('Unauthorized', { status: 401 })
+  }
+  // protected logic here
+}
+
+// Server component: same principle applies
+async function AdminDashboard() {
+  const session = await getServerSession(authOptions)
+  if (!session?.user?.isAdmin) {
+    redirect('/login')
+  }
+  // render admin content
+}
+```
+
+This defense-in-depth approach means a bypass at one layer doesn't expose the underlying resource. The middleware bypass CVE is a concrete demonstration of why this matters in practice — not just in theory.
+
+## For Teams Still on Next.js 14
+
+If you're running 14.x, the only real mitigation is to upgrade to 15.5.18. There is no backport. If an immediate upgrade isn't feasible:
+
+1. Temporarily disable WebSocket proxying at the infrastructure layer if not actively used
+2. Add explicit host validation at the network boundary
+3. Audit all routes relying on middleware for authorization and add redundant checks at the route level
+
+These are workarounds. Treat them as temporary while you prepare the upgrade.
+
+## Key Takeaways
+
+- 13 CVEs patched in Next.js 15.5.18 and 16.2.6 — upgrade immediately
+- WebSocket-based SSRF can expose cloud instance metadata on AWS/GCP deployments
+- Middleware bypass via RSC prefetch affects any App Router app using middleware for auth
+- WAF cannot reliably block these vulnerabilities — patching is the only complete mitigation
+- Next.js 14 and earlier have no patch; upgrade to a supported version
+- Defense-in-depth: don't rely on middleware alone for authorization

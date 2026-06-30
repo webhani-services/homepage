@@ -1,0 +1,209 @@
+---
+title: "React 19.2の新機能: ActivityコンポーネントとuseEffectEventで変わる開発体験"
+description: "React 19.2でStableになったActivityコンポーネントとuseEffectEventフックの実用的な使い方を解説。非表示UIの状態保持とEffect内のイベント処理が、どのように複雑なバグを防ぐかを具体的なコード例で紹介します。"
+date: "2026-06-07"
+status: "published"
+tags: ["React", "React 19", "Frontend", "JavaScript", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "react-19-2-activity-useeffectevent-2026"
+---
+
+## React 19.2が安定版として提供するもの
+
+React 19.2は2025年10月1日にリリースされました。このバージョンで特に実用的な2つの機能がStableになっています。`<Activity>`コンポーネントと`useEffectEvent`フックです。どちらも「あると便利」ではなく、これまで回避策が必要だったパターンを根本から解決するものです。
+
+React Compilerについては別記事で解説しているため、今回はこの2つに絞って掘り下げます。
+
+## Activityコンポーネント: 非表示UIの状態を保持する
+
+### 課題: 再Mountのコスト
+
+Tabやモーダル、Dashboardウィジェットなど「表示/非表示を切り替えるUI」では、これまで2つの選択肢しかありませんでした。
+
+1. 非表示時にComponentをUnmountする → 再表示時にStateが失われ、再フェッチが発生する
+2. `display: none`でCSSで隠す → DOMに残り続けてメモリを消費し、Accessibilityの問題も生じる
+
+```tsx
+// これまでの典型的なパターン（どちらも課題あり）
+
+// パターン1: Unmount方式 — StateとDOMが失われる
+function TabPanel({ activeTab }) {
+  return (
+    <>
+      {activeTab === "home" && <HomeTab />}
+      {activeTab === "settings" && <SettingsTab />}
+    </>
+  );
+}
+
+// パターン2: CSS非表示 — DOMに残り続ける
+function TabPanel({ activeTab }) {
+  return (
+    <>
+      <HomeTab style={{ display: activeTab === "home" ? "block" : "none" }} />
+      <SettingsTab style={{ display: activeTab === "settings" ? "block" : "none" }} />
+    </>
+  );
+}
+```
+
+### Activityの解決策
+
+`<Activity>`はこの問題を明確なAPIで解決します。`mode="hidden"`のとき、Reactは**DOMをデタッチしつつStateとメモリは保持**します。
+
+```tsx
+import { Activity } from "react";
+
+function TabPanel({ activeTab }) {
+  return (
+    <>
+      <Activity mode={activeTab === "home" ? "visible" : "hidden"}>
+        <HomeTab />
+      </Activity>
+      <Activity mode={activeTab === "settings" ? "visible" : "hidden"}>
+        <SettingsTab />
+      </Activity>
+    </>
+  );
+}
+```
+
+`mode="visible"`になったとき、DOMは再Mountではなく「再アタッチ」されます。Stateはそのまま、スクロール位置も維持、再フェッチも不要です。
+
+### 実用的なユースケース
+
+**Prerendering**: ユーザーが次に操作しそうな画面を事前に`mode="hidden"`で準備しておき、切り替え時に即座に表示できます。
+
+```tsx
+function Dashboard() {
+  const [view, setView] = useState<"chart" | "table">("chart");
+
+  return (
+    <div>
+      <button onClick={() => setView("chart")}>Chart</button>
+      <button onClick={() => setView("table")}>Table</button>
+
+      {/* 両方のViewをActivityで管理 — 切り替えが即座になる */}
+      <Activity mode={view === "chart" ? "visible" : "hidden"}>
+        <DataChart />  {/* 重いD3.jsのレンダリングを保持 */}
+      </Activity>
+      <Activity mode={view === "table" ? "visible" : "hidden"}>
+        <DataTable />  {/* フィルタ/ソートのStateを保持 */}
+      </Activity>
+    </div>
+  );
+}
+```
+
+## useEffectEventフック: Effectとイベントの分離
+
+### 課題: useEffectの依存配列の問題
+
+`useEffect`の依存配列は、Reactの中でも特に扱いが難しい部分の一つです。「最新の値を参照したいが、Effectを再実行させたくない」というケースが頻繁に発生します。
+
+```tsx
+// よくある問題のあるパターン
+function ChatRoom({ roomId, userId }) {
+  const [messages, setMessages] = useState([]);
+
+  useEffect(() => {
+    const socket = createSocket(roomId);
+    
+    socket.on("message", (msg) => {
+      // userIdをログに記録したいが、userIdが変わるたびにEffectが再実行される
+      console.log(`${userId} received: ${msg}`);
+      setMessages(prev => [...prev, msg]);
+    });
+
+    return () => socket.disconnect();
+  }, [roomId, userId]); // userIdを依存配列に入れるとsocketが再接続される問題
+}
+```
+
+この場合`userId`を依存配列に入れるとSocketが再接続され、外すとLintの警告が出てバグの原因になります。
+
+### useEffectEventの解決策
+
+`useEffectEvent`は「Effectの外側のロジック」と「Effectのライフサイクル」を分離します。
+
+```tsx
+import { useEffect, useEffectEvent } from "react";
+
+function ChatRoom({ roomId, userId }) {
+  const [messages, setMessages] = useState([]);
+
+  // useEffectEventでラップした関数は常に最新のuserIdを参照するが、
+  // 依存配列に含める必要がない
+  const onMessage = useEffectEvent((msg: string) => {
+    console.log(`${userId} received: ${msg}`); // 常に最新のuserIdを参照
+    setMessages(prev => [...prev, msg]);
+  });
+
+  useEffect(() => {
+    const socket = createSocket(roomId);
+    socket.on("message", onMessage); // 依存配列への追加不要
+    return () => socket.disconnect();
+  }, [roomId]); // roomIdだけでよい — userIdの変更でSocketが再接続されない
+}
+```
+
+`useEffectEvent`でラップした関数は「イベントハンドラー」として扱われ、常に最新のprops/stateを参照しますが、Effectの再実行をトリガーしません。
+
+### 実践的な使用例
+
+**アナリティクスの送信**
+
+```tsx
+function ProductPage({ productId, category }) {
+  const logVisit = useEffectEvent(() => {
+    // categoryが変わっても再送信しない
+    analytics.track("page_view", { productId, category });
+  });
+
+  useEffect(() => {
+    logVisit();
+  }, [productId]); // productIdが変わったときだけトラッキング
+}
+```
+
+**外部ストアの購読**
+
+```tsx
+function StockTicker({ symbol, onAlert }) {
+  const handlePriceChange = useEffectEvent((price: number) => {
+    // onAlertコールバックが変わっても購読を再構築しない
+    if (price > threshold) onAlert(symbol, price);
+  });
+
+  useEffect(() => {
+    const sub = market.subscribe(symbol, handlePriceChange);
+    return () => sub.unsubscribe();
+  }, [symbol]);
+}
+```
+
+## その他のReact 19.2のアップデート
+
+### cacheSignal API
+
+`cache()`でDeduplicateした非同期リクエストのライフサイクルを検知できます。
+
+```tsx
+import { cache } from "react";
+
+const getUser = cache(async (id: string, { signal }: { signal: AbortSignal }) => {
+  const response = await fetch(`/api/users/${id}`, { signal });
+  return response.json();
+});
+```
+
+### Web Streams対応
+
+SSR環境でWeb Streams APIが使えるようになり、Node.js・Deno・Edge Runtimeでの一貫した動作が実現されました。
+
+## Webhaniの見解
+
+`<Activity>`と`useEffectEvent`は、Reactのコード品質に直接関係する追加です。特に`useEffectEvent`は「useEffectの依存配列の問題」という長年の頭痛を、クリーンなAPIで解決します。
+
+どちらも「新しいことができるようになった」というよりも「これまで危うい回避策が必要だったものを安全に書けるようになった」という性質の変更です。既存のコードに`useEffect`の依存配列問題を抱えているなら、`useEffectEvent`への移行を検討する価値があります。

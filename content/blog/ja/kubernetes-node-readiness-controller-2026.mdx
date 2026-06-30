@@ -1,0 +1,155 @@
+---
+title: "Kubernetes Node Readiness Controller：Pod Scheduling の信頼性を根本から改善する"
+description: "2026年2月にリリースされた Kubernetes Node Readiness Controller は、GPU ノードやストレージドライバなどの初期化が完了する前に Pod がスケジュールされる長年の問題を解決する。本番環境での導入を前提に解説する。"
+date: "2026-06-03"
+status: "published"
+tags: ["kubernetes", "devops", "scheduling", "cloud-native", "production"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-node-readiness-controller-2026"
+---
+
+2026年2月、Kubernetes コミュニティは Node Readiness Controller (NRC) を正式に発表した。これは `kubernetes-sigs` 傘下のプロジェクトとして開発されており、クラスターの Pod Scheduling における長年の課題——ノードが本当に「準備できている」状態かどうかの判定——を解決することを目的としている。
+
+## 問題の背景
+
+Kubernetes では、ノードが `Ready` ステータスになると、Scheduler がそのノードへの Pod 割り当てを開始する。しかし `Ready` の判定は kubelet が管理するデフォルトのヘルスチェックに基づいており、現代の本番環境では不十分なケースが多い。
+
+具体的には次のような状況で問題が起きる。
+
+**GPU ノードの起動**
+GPU Firmware やドライバのロードには数分かかることがある。kubelet が `Ready` を報告した直後、Scheduler が GPU を要求する Pod を割り当てても、実際には GPU が使えないため Pod は `CrashLoopBackOff` に陥る。
+
+**Network Agent の初期化**
+Cilium や Calico などの CNI Plugin が完全に起動する前にネットワーク関連の Pod がスケジュールされ、接続エラーが発生する。
+
+**Storage Backend の確認待ち**
+CSI Driver や NFS マウントが完了していない状態で、ストレージを必要とする Pod が起動しようとする。
+
+従来の解決策は、DaemonSet で起動スクリプトを実行したり、init Container を使ったりといった場当たり的なアプローチが多く、クラスター全体での一貫した管理が難しかった。
+
+## Node Readiness Controller の仕組み
+
+NRC は `NodeReadinessRule` という CRD（Custom Resource Definition）を導入する。これにより、特定のノードグループに対してカスタムの Ready 条件を宣言的に定義できる。
+
+```yaml
+apiVersion: nodeness.kubernetes-sigs.io/v1alpha1
+kind: NodeReadinessRule
+metadata:
+  name: gpu-node-readiness
+  namespace: kube-system
+spec:
+  nodeSelector:
+    matchLabels:
+      node-type: gpu
+  conditions:
+    - type: "GpuDriverReady"
+      status: "True"
+      requiredForScheduling: true
+    - type: "NvidiaDevicePluginReady"
+      status: "True"
+      requiredForScheduling: true
+  timeout: 300s
+  onTimeout: TaintOnly
+```
+
+このルールが適用されると、NRC は `GpuDriverReady` と `NvidiaDevicePluginReady` の両条件が `True` になるまで、対象ノードに `node.kubernetes.io/not-ready:NoSchedule` Taint を自動的に付与し、Pod のスケジュールを防ぐ。条件が満たされると Taint は自動解除される。
+
+## カスタム Condition の設定
+
+`NodeReadinessRule` で定義する条件は、ノードの `.status.conditions` 配列に書き込まれる Kubernetes の Node Condition だ。初期化コード（通常は DaemonSet）がこの値を書き込む役割を担う。
+
+```yaml
+# GPU の可用性を確認して Condition を報告する DaemonSet
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-readiness-reporter
+spec:
+  selector:
+    matchLabels:
+      app: gpu-readiness-reporter
+  template:
+    spec:
+      tolerations:
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoSchedule"
+      nodeSelector:
+        node-type: gpu
+      containers:
+        - name: reporter
+          image: bitnami/kubectl:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while true; do
+                if nvidia-smi -L > /dev/null 2>&1; then
+                  kubectl patch node $NODE_NAME --type=json \
+                    -p='[{"op":"add","path":"/status/conditions/-","value":{"type":"GpuDriverReady","status":"True"}}]' \
+                    --subresource=status
+                fi
+                sleep 15
+              done
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+```
+
+重要な点は、この DaemonSet 自体に `not-ready:NoSchedule` の Toleration が必要だということだ。Taint が付いているノードでも DaemonSet が起動できなければ、Condition を報告する手段がなくなり、ノードは永遠に Taint 状態のままになる。
+
+## Taint 管理の自動化
+
+NRC の最大の価値は Taint/Untaint サイクルの自動化だ。従来は次のような手動操作が必要だった。
+
+```bash
+# ノード起動時に手動で Taint を追加
+kubectl taint nodes gpu-node-1 gpu-init=pending:NoSchedule
+
+# 初期化完了後に手動削除（忘れやすい）
+kubectl taint nodes gpu-node-1 gpu-init-
+```
+
+NRC を使えば、`NodeReadinessRule` の仕様に基づき、Controller が Node Condition の変化に反応して Taint を自動的に追加・削除する。「Taint の削除忘れで Pod が永遠にスケジュールされない」といった人為的ミスのリスクがなくなる。
+
+## Timeout の挙動
+
+初期化が完了しないノードに対する挙動は `timeout` と `onTimeout` で制御する。
+
+```yaml
+spec:
+  timeout: 300s
+  onTimeout: TaintOnly   # Taint を維持、実行中 Pod の退去なし
+  # onTimeout: Delete    # クラスターからノードを削除
+```
+
+`TaintOnly` が大多数のユースケースで安全なデフォルトだ。初期化に失敗したノードは新しい Pod を受け付けないが、既存のワークロードは退去されない。`Delete` は、初期化失敗がハードウェアの交換が必要な問題であることが確実な場合にのみ使用する。
+
+## 本番導入前のチェックリスト
+
+NRC は 2026年初頭時点で Alpha 段階だ。本番導入前に確認すべき点を挙げる。
+
+**1. Staging 環境での検証**
+Alpha CRD は Minor バージョン間で API 変更が入る可能性がある。特定の NRC バージョンを固定し、アップグレードパスを検証してから本番に適用する。
+
+**2. ノードの初期化シーケンスの洗い出し**
+クラスター内の各ノードタイプが本当に「使用可能」になるために必要な条件を列挙し、それを `NodeReadinessRule` として定義する。
+
+**3. DaemonSet の Toleration 確認**
+Condition を報告する DaemonSet に `not-ready:NoSchedule` の Toleration が付いているかを確認する。これを忘れると DaemonSet が起動せず、ノードが永遠に Taint 状態になる。
+
+## webhani の見解
+
+AI/ML ワークロードのクラウド運用が増えるに連れ、GPU ノードの適切な初期化管理は避けられない課題になっている。NRC はこの問題に対する Kubernetes ネイティブの解答であり、既存のパッチワーク的なアプローチを置き換える可能性が高い。
+
+現在 Alpha 段階ではあるが、アーキテクチャを今から理解しておくことで、GA 時点での迅速な導入判断が可能になる。手動 Taint 管理や init Container 回避策を使っている環境は、特に NRC の評価を始めるタイミングとして適切だ。
+
+## まとめ
+
+- `NodeReadinessRule` CRD でノードグループごとの Ready 条件を宣言的に定義できる
+- GPU ドライバ、CNI、CSI など複雑な初期化シーケンスを持つ環境での Scheduling 信頼性が向上する
+- Taint 管理が自動化され、人為的ミスのリスクが低減する
+- 現在 Alpha 段階のため、Staging での検証を経てから本番導入すること

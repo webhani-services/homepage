@@ -1,0 +1,134 @@
+---
+title: "Next.js 15.5: Turbopack Is Now the Default Bundler"
+description: "With Next.js 15.5, Turbopack becomes the default bundler for both dev and production builds, and Node.js Middleware is now stable. Here's what changed and what to check before upgrading."
+date: "2026-06-03"
+status: "published"
+tags: ["nextjs", "turbopack", "web-development", "typescript", "bundler"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-155-turbopack-default-2026"
+---
+
+Next.js 15.5 ships Turbopack as the default bundler for both development and production builds. Webpack remains available via an explicit flag, but new projects now use Turbopack end-to-end. Alongside that, Node.js Middleware has graduated to stable — meaning you can finally use full Node.js APIs inside middleware, not just the edge runtime subset.
+
+## Turbopack in Production: What It Actually Means
+
+Turbopack has been the default dev server bundler for a while. The gap was production builds, where Webpack was still the default. That changes with 15.5.
+
+The main practical benefits:
+
+**Consistent bundling behavior.** When dev and production use the same bundler, a class of subtle environment mismatch bugs goes away — things like tree-shaking differences, module resolution edge cases, or polyfill behavior that diverge between Webpack's dev and production modes.
+
+**Faster builds at scale.** Turbopack's incremental, parallel compilation shows meaningful gains on larger apps. Benchmarks from the Next.js team report 20–40% build time reduction for mid-to-large codebases.
+
+If you need to stay on Webpack for compatibility reasons, it's a single flag:
+
+```bash
+next dev --webpack
+next build --webpack
+```
+
+## Checking Webpack Plugin Compatibility
+
+If your `next.config.mjs` uses Webpack plugins or loaders directly, some may need Turbopack-specific configuration. Common ones like `@svgr/webpack` have migration paths:
+
+```javascript
+// next.config.mjs
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  turbopack: {
+    rules: {
+      "*.svg": {
+        loaders: ["@svgr/webpack"],
+        as: "*.js",
+      },
+    },
+  },
+};
+
+export default nextConfig;
+```
+
+Before upgrading, audit your Webpack plugin usage against the Turbopack compatibility list. If you have plugins with no Turbopack equivalent, the `--webpack` flag gives you time to migrate at your own pace.
+
+## Node.js Middleware: No More Edge Restrictions
+
+The other meaningful change is Node.js Middleware going stable. Until now, middleware ran on Vercel's Edge Runtime (a V8 isolate), which meant no filesystem access, limited npm compatibility, and restrictions that forced awkward workarounds for anything beyond simple request inspection.
+
+With Node.js Middleware, you can use the full Node.js API surface:
+
+```typescript
+// middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+import { verifyToken } from "@/lib/auth";  // any Node.js-compatible library
+
+export async function middleware(request: NextRequest) {
+  const token = request.cookies.get("auth_token")?.value;
+
+  if (!token) {
+    return NextResponse.redirect(new URL("/login", request.url));
+  }
+
+  const payload = await verifyToken(token);  // crypto, db clients, etc. all work
+
+  if (!payload) {
+    return NextResponse.redirect(new URL("/login", request.url));
+  }
+
+  const response = NextResponse.next();
+  response.headers.set("x-user-id", payload.userId);
+  return response;
+}
+
+export const config = {
+  matcher: ["/dashboard/:path*", "/api/private/:path*"],
+};
+```
+
+One trade-off worth knowing: Node.js Middleware has higher cold start latency than Edge Middleware on Vercel. For latency-sensitive paths where global edge distribution matters, Edge Middleware may still be worth the constraints. For most auth and logging use cases, Node.js Middleware is the better default.
+
+## TypeScript Improvements
+
+**Typed Routes** generate type-safe URL strings from your actual route tree. This catches href typos at compile time:
+
+```typescript
+import Link from "next/link";
+
+export function Nav() {
+  return (
+    <nav>
+      <Link href="/about">About</Link>       {/* ✓ valid */}
+      <Link href="/abuot">About</Link>       {/* ✗ compile error */}
+      <Link href="/blog/[slug]">Blog</Link>  {/* ✓ dynamic route */}
+    </nav>
+  );
+}
+```
+
+Enable it in `next.config.mjs`:
+
+```javascript
+const nextConfig = {
+  experimental: {
+    typedRoutes: true,
+  },
+};
+```
+
+**Route Export Validation** catches invalid exports from `page.tsx` and `route.ts` files at compile time rather than at runtime — a quiet but useful improvement for larger codebases where a bad export can be hard to track down.
+
+## `next lint` Deprecation
+
+The `next lint` command is deprecated in 15.5 and scheduled for removal in Next.js 16. Switch to running ESLint directly:
+
+```bash
+npx eslint .
+```
+
+Update your `package.json` scripts now to avoid a breaking change on the next major upgrade.
+
+## Summary
+
+Next.js 15.5 delivers two meaningful runtime changes: Turbopack in production and stable Node.js Middleware. Combined with TypeScript compile-time improvements, this release closes several long-standing gaps between what Next.js promised and what it delivered in practice.
+
+Before upgrading: audit Webpack plugin compatibility, benchmark your build times to confirm Turbopack's improvement for your codebase, and update your lint scripts. The `--webpack` flag is your escape hatch if anything breaks.

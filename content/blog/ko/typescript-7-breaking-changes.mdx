@@ -1,0 +1,141 @@
+---
+title: "TypeScript 7.0 주요 Breaking Change 대비 가이드"
+description: "TypeScript 6.0이 마지막 JS 기반 릴리즈가 되면서, 7.0에서는 --strict 기본값 활성화, --target es5 제거, --baseUrl 제거, --moduleResolution node10 제거 등의 Breaking Change가 예정되어 있습니다."
+date: "2026-06-10"
+status: "published"
+tags: ["TypeScript", "Migration", "JavaScript", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-7-breaking-changes"
+---
+
+TypeScript 6.0이 올해 초 출시되면서 마지막 JS 기반 Compiler 릴리즈가 되었습니다. TypeScript 7.0은 6.x에서 Deprecation Warning으로 예고된 Breaking Change들을 포함합니다. 지금 준비를 시작하지 않으면 업그레이드 시 상당한 부담이 발생합니다.
+
+## TypeScript 6.0에서 발생하는 경고들
+
+현재 `tsconfig.json`에 다음 Option들을 사용 중이라면 6.0에서 이미 경고가 발생합니다.
+
+```json
+{
+  "compilerOptions": {
+    "target": "es5",           // ⚠️ Deprecated
+    "baseUrl": "./src",        // ⚠️ Deprecated → paths 사용
+    "moduleResolution": "node" // ⚠️ Deprecated → bundler 사용
+  }
+}
+```
+
+이 경고들을 지금 해결하는 것이 7.0으로의 가장 부드러운 마이그레이션 경로입니다.
+
+## TypeScript 7.0 Breaking Change 상세
+
+### 1. --strict가 기본값으로 활성화됩니다
+
+TypeScript 7.0에서는 `--strict` 플래그가 기본 활성화됩니다. 현재 `strict: false`로 운영 중인 프로젝트는 7.0 업그레이드 전에 모든 Strict 위반 사항을 해결해야 합니다.
+
+자주 발생하는 패턴:
+
+```typescript
+// noImplicitAny — 타입 Annotation 필요
+function process(data) { // Error: Parameter 'data' implicitly has an 'any' type.
+  return data.value;
+}
+
+// strictNullChecks — null/undefined 처리 필요
+function getLabel(item: { label?: string }): string {
+  return item.label; // Error: 'string | undefined' is not assignable to 'string'
+}
+
+// 수정 후
+function getLabel(item: { label?: string }): string {
+  return item.label ?? '라벨 없음';
+}
+```
+
+지금 바로 `npx tsc --strict --noEmit`을 실행해 현재 Strict 위반 건수를 파악하세요.
+
+### 2. --target es5 제거
+
+TypeScript 7.0에서는 ES5 컴파일이 제거됩니다. 세 가지 선택지가 있습니다:
+
+1. IE11 지원 종료 — 2026년 현재 대부분의 프로젝트에서 현실적인 선택
+2. 타입 체크는 TypeScript, ES5 트랜스파일은 Babel 사용
+3. TypeScript 6.x에서 유지
+
+```json
+// Target 업데이트
+{
+  "compilerOptions": {
+    "target": "es2020"
+  }
+}
+```
+
+### 3. --baseUrl 제거
+
+`baseUrl` 기반 Module Resolution이 7.0에서 제거됩니다. `paths`로 대체하세요:
+
+```json
+// Before (6.x 이전)
+{
+  "compilerOptions": {
+    "baseUrl": "./src"
+  }
+}
+// import { api } from 'api'; → ./src/api.ts 해석
+
+// After (7.0 호환)
+{
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+// import { api } from '@/api'; → ./src/api.ts 해석
+```
+
+Vite의 `resolve.alias`나 Next.js의 `@/*` 컨벤션과 통일하면 Stack 전체의 일관성을 유지할 수 있습니다.
+
+### 4. --moduleResolution node10 제거
+
+Legacy `node` (또는 `node10`) Module Resolution이 제거됩니다:
+
+```json
+// 모던 Bundler 사용 시 (Vite, esbuild, webpack 등)
+{
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "bundler"
+  }
+}
+
+// Bundler 없는 Node.js 프로젝트
+{
+  "compilerOptions": {
+    "moduleResolution": "node16"
+  }
+}
+```
+
+## 마이그레이션 체크리스트
+
+**Phase 1 — 6.x Deprecation Warning 해결**
+- [ ] `baseUrl`을 명시적인 `paths` 매핑으로 교체
+- [ ] `moduleResolution`을 `bundler` 또는 `node16`으로 변경
+- [ ] `target`을 최소 `es2020`으로 업데이트
+
+**Phase 2 — Strict 위반 해결**
+- [ ] `npx tsc --strict --noEmit` 실행으로 건수 파악
+- [ ] `noImplicitAny`부터 우선 해결 — 영향 범위가 가장 큼
+- [ ] 대규모 프로젝트는 `ts-strict-plugin`으로 점진적 적용 검토
+
+**Phase 3 — 의존 라이브러리 확인**
+- [ ] 주요 라이브러리의 TypeScript 7.0 호환 여부 확인
+- [ ] 라이브러리별 tsconfig 권장 설정 변경 여부 확인
+
+## 정리
+
+TypeScript 7.0의 변경사항은 10년간 쌓인 하위 호환성 부채를 청산하는 방향으로 설계되었습니다. `tsconfig.json`의 기술 부채가 많을수록 마이그레이션 비용이 커집니다.
+
+`--strict` 마이그레이션은 대규모 프로젝트에서 가장 시간이 걸리는 작업입니다. 6.x의 Deprecation Warning을 Error로 처리하는 문화를 지금부터 만드는 것이 7.0 출시 전 가장 부담 없이 대비하는 방법입니다.

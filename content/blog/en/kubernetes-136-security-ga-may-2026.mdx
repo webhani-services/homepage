@@ -1,0 +1,103 @@
+---
+title: "Kubernetes v1.36: Security Defaults Tighten as AI Workload Support Matures"
+description: "What's actually changed in Kubernetes v1.36, why the Ingress NGINX retirement matters, and how to plan your migration."
+date: "2026-05-16"
+status: "published"
+tags: ["Kubernetes", "DevOps", "Security", "Cloud Infrastructure", "AI Workloads"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-136-security-ga-may-2026"
+---
+
+Kubernetes v1.36 landed in May 2026 with 70 enhancements. Three features graduated to General Availability — User Namespaces, Mutating Admission Policies, and Fine-Grained Kubelet API Authorization — and Ingress NGINX was officially retired back in March. Here's what matters for teams running production clusters.
+
+## User Namespaces: Stronger Container Isolation
+
+User Namespaces reached GA in v1.36. The feature allows container processes to run under UIDs/GIDs that are mapped to unprivileged host users, even if they appear as root inside the container.
+
+Without User Namespaces, a container escape that grants root access inside the container could grant the same effective access on the host. With it, the blast radius shrinks considerably.
+
+```yaml
+# Enable User Namespaces at the Pod level
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-workload
+spec:
+  hostUsers: false  # Enable User Namespaces
+  containers:
+  - name: app
+    image: my-app:latest
+    securityContext:
+      runAsUser: 0  # Root inside the container, but mapped to
+                    # an unprivileged UID on the host
+```
+
+For security-sensitive production workloads, this should be part of your baseline Pod spec. Check that your container images don't rely on host-level UID assumptions before enabling it.
+
+## Mutating Admission Policies: Webhooks Without the Overhead
+
+Mutating Admission Policies are now GA, enabling CEL-based resource mutation without a dedicated Webhook server. For common mutation use cases — adding default labels, injecting sidecar configs — this reduces both operational overhead and a potential failure point.
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1alpha1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: inject-team-label
+spec:
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE"]
+      resources: ["pods"]
+  mutations:
+  - patchType: "ApplyConfiguration"
+    applyConfiguration:
+      expression: |
+        Object{
+          metadata: Object.metadata{
+            labels: {"team": "platform"}
+          }
+        }
+```
+
+This doesn't replace all Webhook use cases — complex logic requiring external state or multi-step decisions still needs a Webhook. But for declarative mutations, the native approach is cleaner.
+
+## Fine-Grained Kubelet API Authorization
+
+Kubelet API access is now more granular. Previously, access was relatively coarse — you either had it or you didn't. The new authorization model allows scoping access to specific subresources, reducing the attack surface for lateral movement within a cluster.
+
+Review your existing RBAC policies for anything that grants broad Kubelet API access and tighten accordingly.
+
+## The Ingress NGINX Retirement
+
+Ingress NGINX was retired on March 24, 2026. This is the most impactful change for many clusters.
+
+Your migration options are:
+
+1. **Gateway API** — the Kubernetes-native successor, now stable and recommended for new deployments
+2. **Envoy Gateway** — a Gateway API implementation backed by Envoy, CNCF-graduated
+3. **NGINX Ingress Controller from NGINX Inc.** — a separate (non-community) NGINX-based implementation
+
+```bash
+# Check which Ingress controller version you're running
+kubectl get pods -n ingress-nginx \
+  -o jsonpath='{.items[*].spec.containers[*].image}'
+
+# Check if Gateway API CRDs are already installed
+kubectl get crd gateways.gateway.networking.k8s.io 2>/dev/null \
+  && echo "Gateway API present" || echo "Not installed"
+```
+
+The retirement means no new features and eventually no security patches. Start migration planning now rather than waiting for an incident to force the decision.
+
+## AI Workloads and What's Changing
+
+Kubernetes is increasingly the default orchestration substrate for GPU-based workloads. The traditional "golden signals" — CPU and memory — need to expand to include GPU utilization, memory bandwidth, and inference throughput.
+
+Platform Engineering teams are finding that abstractions like Ray or Kubeflow are necessary to prevent ML engineers from needing deep Kubernetes expertise just to run training jobs.
+
+## Summary
+
+v1.36 is a meaningful release for security posture. The GA graduation of User Namespaces and Fine-Grained Kubelet Auth gives teams concrete handles to tighten their baseline. The Ingress NGINX retirement is the immediate action item — audit your clusters and start evaluating Gateway API if you haven't already.

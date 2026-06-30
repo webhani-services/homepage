@@ -1,0 +1,210 @@
+---
+title: "Polyglot AI Systems in Practice: Python, Go, and Rust in the Same Stack"
+description: "Production AI systems increasingly use Python for ML pipelines, Go for API governance, and Rust for sandboxed code execution. Here's how to draw the right boundaries between them."
+date: "2026-05-26"
+status: "published"
+tags: ["Python", "Go", "Rust", "Architecture", "AI System"]
+thumbnail: ""
+author: "webhani"
+slug: "polyglot-ai-systems-python-go-rust-2026"
+---
+
+A pattern is solidifying in production AI systems: Python handles ML and LLM logic, Go manages API orchestration and governance, and Rust runs untrusted code in WebAssembly sandboxes. This isn't language preference — it reflects where each language's ecosystem and runtime characteristics are genuinely better suited to the problem.
+
+The senior engineers commanding a $25K–$30K premium over their Go counterparts aren't picking Rust for aesthetics. They're using it because nothing else gives the same guarantees when executing untrusted, LLM-generated code in production.
+
+## Why Single-Language AI Systems Break Down
+
+Each layer of an AI system has different requirements that tend to conflict when forced into one runtime.
+
+**ML layer** needs PyTorch, TensorFlow, Hugging Face, and the Anthropic SDK. These are Python-first. Trying to replicate that ecosystem in another language means rewriting tooling that already works.
+
+**API layer** needs to handle thousands of concurrent connections with predictable latency and low memory overhead. Python's GIL limits true concurrency, and asyncio helps but adds complexity. Go's goroutine model handles this cleanly.
+
+**Execution layer** (when users or LLMs submit code to run) needs memory safety guarantees that can't be patched on top of a general-purpose runtime. Rust's ownership model provides them at compile time.
+
+```
+         ┌─────────────────────────────────────┐
+         │         Clients / Frontend           │
+         └──────────────┬──────────────────────┘
+                        │
+         ┌──────────────▼──────────────────────┐
+         │          Go API Gateway              │
+         │  Auth · Rate Limiting · Routing      │
+         │  Fan-out to ML services              │
+         └──────┬───────────────────┬──────────┘
+                │                   │
+   ┌────────────▼──────┐  ┌─────────▼────────────┐
+   │  Python ML Layer  │  │  Rust WASM Sandbox   │
+   │  RAG · LLM Calls  │  │  Code Execution      │
+   │  Embeddings       │  │  Untrusted Input     │
+   └───────────────────┘  └──────────────────────┘
+```
+
+## Python: Keep It Focused on ML
+
+The Python service should do one thing: ML logic. Don't let it become a monolith that also handles auth, rate limiting, and routing. FastAPI with async handlers gives you good throughput for I/O-bound LLM calls.
+
+```python
+from fastapi import FastAPI, HTTPException
+from anthropic import AsyncAnthropic
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+app = FastAPI()
+client = AsyncAnthropic()
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+@app.post("/rag/query")
+async def rag_query(query: str, documents: list[str]) -> dict:
+    if not documents:
+        raise HTTPException(status_code=400, detail="No documents provided")
+
+    query_emb = embedder.encode(query)
+    doc_embs = embedder.encode(documents)
+
+    # Select top-3 by cosine similarity
+    scores = np.dot(doc_embs, query_emb) / (
+        np.linalg.norm(doc_embs, axis=1) * np.linalg.norm(query_emb) + 1e-10
+    )
+    top_k = np.argsort(scores)[-3:][::-1]
+    context = "\n\n".join(documents[i] for i in top_k)
+
+    response = await client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": f"Context:\n{context}\n\nQ: {query}"}]
+    )
+    return {"answer": response.content[0].text, "sources": top_k.tolist()}
+```
+
+Deploy this as an internal service. It should not be directly accessible from the internet — the Go gateway is the only entry point.
+
+## Go: Gateway and Orchestration
+
+Go coordinates requests between clients and the Python layer. The goroutine model makes fan-out patterns (querying multiple ML services in parallel) straightforward without callback complexity.
+
+```go
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "sync"
+    "time"
+)
+
+type MLResult struct {
+    ServiceID string
+    Answer    string
+    Error     error
+}
+
+// Fan out a single request to multiple ML service replicas
+func queryMLServices(ctx context.Context, query string, docs []string) []MLResult {
+    endpoints := []string{
+        "http://ml-service-1:8000/rag/query",
+        "http://ml-service-2:8000/rag/query",
+    }
+
+    results := make([]MLResult, len(endpoints))
+    var wg sync.WaitGroup
+
+    for i, ep := range endpoints {
+        wg.Add(1)
+        go func(idx int, url string) {
+            defer wg.Done()
+
+            reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+            defer cancel()
+
+            answer, err := callMLService(reqCtx, url, query, docs)
+            results[idx] = MLResult{
+                ServiceID: fmt.Sprintf("svc-%d", idx),
+                Answer:    answer,
+                Error:     err,
+            }
+        }(i, ep)
+    }
+
+    wg.Wait()
+    return results
+}
+
+func handleQuery(w http.ResponseWriter, r *http.Request) {
+    // Auth and rate limiting happen here, before forwarding to Python
+    if !authenticate(r) {
+        http.Error(w, "unauthorized", http.StatusUnauthorized)
+        return
+    }
+
+    results := queryMLServices(r.Context(), extractQuery(r), extractDocs(r))
+    json.NewEncoder(w).Encode(results)
+}
+```
+
+Go's context cancellation propagates through all goroutines automatically. When the HTTP request context is cancelled (client disconnect, gateway timeout), the downstream ML calls are cancelled too.
+
+## Rust: Sandboxed Execution
+
+If your system executes LLM-generated code — or any user-provided code — you need strict isolation. Rust with Wasmtime gives you a sandbox where the running code cannot access the host filesystem, network, or memory outside its allocated region.
+
+```rust
+use wasmtime::{Engine, Module, Store, Linker, Config};
+use std::time::Duration;
+use anyhow::Result;
+
+pub struct Sandbox {
+    engine: Engine,
+}
+
+impl Sandbox {
+    pub fn new() -> Result<Self> {
+        let mut config = Config::new();
+        // Enforce resource limits at the engine level
+        config.consume_fuel(true);
+        Ok(Sandbox {
+            engine: Engine::new(&config)?,
+        })
+    }
+
+    pub fn run(&self, wasm_bytes: &[u8], fuel_limit: u64) -> Result<String> {
+        let module = Module::new(&self.engine, wasm_bytes)?;
+        let mut store = Store::new(&self.engine, ());
+
+        // Fuel limits execution steps — prevents infinite loops
+        store.add_fuel(fuel_limit)?;
+
+        let linker = Linker::new(&self.engine);
+        let instance = linker.instantiate(&mut store, &module)?;
+
+        let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+        run.call(&mut store, ())?;
+
+        let fuel_consumed = fuel_limit - store.fuel_consumed().unwrap_or(0);
+        Ok(format!("completed, fuel consumed: {}", fuel_consumed))
+    }
+}
+```
+
+The fuel mechanism acts as a computational budget. An infinite loop runs out of fuel and terminates cleanly instead of hanging the service.
+
+## Service Boundaries
+
+The key to making this work is treating each language layer as a separate service with a well-defined interface — not as internal modules of one application.
+
+| Layer | Protocol | Reason |
+|-------|----------|--------|
+| Go → Python | HTTP/JSON (internal) | Simple, debuggable, Python-native |
+| Go → Rust | HTTP or stdin/stdout | WASM output is text/binary |
+| External → Go | HTTPS + Auth | Only entry point |
+
+Message queues (Kafka, RabbitMQ) fit well between Go and Python when ML tasks are long-running. Instead of blocking a Go goroutine for 30 seconds waiting for an LLM response, enqueue the task and receive the result via webhook when the Python service completes it.
+
+## Our Take
+
+Not every AI project needs this architecture. A single FastAPI service is the right starting point for most teams. The polyglot split makes sense when you hit specific problems: Python concurrency limits under high load, a need to execute untrusted code safely, or separate deployment cadences for ML models versus API logic.
+
+The value isn't in using three languages — it's in recognizing that these three concerns have different characteristics and designing for that explicitly. When you do need to split, drawing the boundaries early makes the eventual transition straightforward instead of a rewrite.

@@ -1,0 +1,166 @@
+---
+title: "React Compiler v1.0 安定版 — 手書き memoization の終焉"
+description: "React Compiler が安定版に達し、useMemo/useCallback を自動化。開発チームが得た恩恵と移行時の注意点を実例で解説します。"
+date: "2026-05-20"
+status: "published"
+tags: ["React", "frontend", "performance", "JavaScript", "TypeScript"]
+thumbnail: ""
+author: "webhani"
+slug: "react-compiler-stable-auto-memoization-2026"
+---
+
+## React Compiler とは
+
+React Compiler は、React コンポーネントを静的解析し、不要な再レンダリングを自動的に除去するビルドタイムのコンパイラです。2024年末に React 19 と同時に公開ベータに入り、2025年10月に v1.0 として安定版となりました。React 19.2（2026年3月）はその基盤の上にサーバーサイドレンダリングの改善を追加しています。
+
+開発者が `useMemo`、`useCallback`、`React.memo` を手動で記述することなく、コンパイラが同等のパフォーマンス最適化を自動的に適用します。
+
+## 手動 memoization の問題
+
+React コンポーネントのパフォーマンス最適化は、これまで開発者の手動作業に依存していました。
+
+```tsx
+// 従来のコード — 手動 memoization
+const OrderItem = React.memo(({ order, onCancel }: Props) => {
+  const formattedDate = useMemo(
+    () => new Intl.DateTimeFormat('ja-JP').format(new Date(order.createdAt)),
+    [order.createdAt]
+  );
+
+  const handleCancel = useCallback(() => {
+    onCancel(order.id, order.status);
+  }, [onCancel, order.id, order.status]);
+
+  return (
+    <div>
+      <span>{order.productName}</span>
+      <span>{formattedDate}</span>
+      <button onClick={handleCancel}>キャンセル</button>
+    </div>
+  );
+});
+```
+
+この手動アプローチには失敗モードがあります。`useCallback` の依存配列に `order.status` を含め忘れると、古い値を参照する stale closure バグが発生します。このバグは特定の操作シーケンスでのみ現れるため、発見が遅れがちです。コードベースが大きくなるにつれ、数百のコンポーネントで依存配列を正確に管理することは継続的な負担になります。
+
+## React Compiler 適用後
+
+```tsx
+// React Compiler 導入後 — クリーンなコード
+function OrderItem({ order, onCancel }: Props) {
+  const formattedDate = new Intl.DateTimeFormat('ja-JP')
+    .format(new Date(order.createdAt));
+
+  function handleCancel() {
+    onCancel(order.id, order.status);
+  }
+
+  return (
+    <div>
+      <span>{order.productName}</span>
+      <span>{formattedDate}</span>
+      <button onClick={handleCancel}>キャンセル</button>
+    </div>
+  );
+}
+```
+
+`React.memo`、`useMemo`、`useCallback` はすべて不要になります。コンパイラが静的解析によって「この値は前のレンダリングから変わっていない」と判断した箇所を自動的にメモ化します。
+
+コードが読みやすくなるだけでなく、コンパイラは人間より細かい粒度でメモ化を適用できます。手動では「どこまでメモ化するか」のコスト判断が必要ですが、コンパイラはすべての箇所を静的解析して最適な選択をします。
+
+## 導入手順
+
+### インストール
+
+```bash
+npm install babel-plugin-react-compiler@latest
+```
+
+### Next.js
+
+Next.js 15 以降では `next.config.mjs` で有効化できます：
+
+```js
+// next.config.mjs
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  experimental: {
+    reactCompiler: true
+  }
+};
+
+export default nextConfig;
+```
+
+### Vite
+
+```ts
+// vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [
+    react({
+      babel: {
+        plugins: ['babel-plugin-react-compiler']
+      }
+    })
+  ]
+});
+```
+
+## コンパイラが最適化できないケース
+
+React Compiler は静的解析に基づいています。React のルールに違反するコードや外部の可変参照を使うコードは最適化されません。
+
+```tsx
+// コンパイラが最適化をスキップする例
+function ProblematicComponent({ items }: { items: string[] }) {
+  // Rules of Hooks 違反 — 条件付き Hook 呼び出し
+  if (items.length > 0) {
+    const filtered = useMemo(
+      () => items.filter(Boolean),
+      [items]
+    ); // 最適化されない
+  }
+
+  return <List items={items} />;
+}
+```
+
+コンパイラが最適化をスキップした箇所はビルド出力に警告が含まれます。`eslint-plugin-react-compiler` を使うと、コード段階で事前に検出できます：
+
+```bash
+npm install eslint-plugin-react-compiler --save-dev
+```
+
+```json
+{
+  "plugins": ["react-compiler"],
+  "rules": {
+    "react-compiler/react-compiler": "warn"
+  }
+}
+```
+
+## 実際のチームの報告
+
+早期採用したチームの報告は「地味」なものが多いです。コードレビューで `useMemo` の依存配列ミスによる指摘が減った、再レンダリングに起因するバグのカテゴリが消えた、新しいコンポーネントを書くときの心理的負担が減った、という声が挙がっています。
+
+「革命的」な変化ではなく、長期にわたって蓄積するメリットです。特に大規模なコードベースで memoization の不整合がパフォーマンス問題として顕在化しやすいプロジェクトでの効果が顕著です。
+
+## 移行時の注意点
+
+**段階的な移行を推奨**: 全ファイルを一度に変換せず、新規コンポーネントから適用を開始し、問題がないことを確認してから既存コードへ展開します。
+
+**既存の `useMemo`/`useCallback` はそのまま**: コンパイラは既存の memoization フックと共存できます。削除は動作確認後に段階的に行えます。
+
+**Rules of Hooks を先に修正**: コンパイラは Rules of Hooks に厳密に従うコードを最適化します。`eslint-plugin-react-hooks` で既存の違反を先に修正してください。
+
+## まとめ
+
+React Compiler の安定化は、パフォーマンス最適化の責任をコンパイラに移譲する転換点です。`useMemo`、`useCallback`、`React.memo` のすべてを一度に排除できるわけではありませんが、日常的な最適化コストを大幅に削減します。
+
+新規プロジェクトでは最初からコンパイラを有効化することを推奨します。既存プロジェクトへの移行は段階的に行い、`eslint-plugin-react-compiler` で最適化できないパターンを事前に検出してください。

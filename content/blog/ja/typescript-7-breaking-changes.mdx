@@ -1,0 +1,155 @@
+---
+title: "TypeScript 7.0の破壊的変更に備える — 移行ガイドと実践チェックリスト"
+description: "TypeScript 6.0が最後のJSベースリリースとなり、7.0では--strict強制化、--target es5削除、--baseUrl削除、--moduleResolution node10削除などの破壊的変更が予定されています。今から準備を始めるための実践的なガイドです。"
+date: "2026-06-10"
+status: "published"
+tags: ["TypeScript", "Migration", "JavaScript", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-7-breaking-changes"
+---
+
+TypeScript 6.0が2026年初頭にリリースされ、7.0へのロードマップも明確になってきました。TypeScript 7.0はJSベースのビルドシステムからの脱却を含む大規模なアーキテクチャ変更を伴い、長年の後方互換性が整理されます。主な変更点と移行の優先順位を整理します。
+
+## TypeScript 6.0での現状
+
+TypeScript 6.0はJSで書かれた最後のTypeScriptコンパイラです。これはメタな変更ですが、パフォーマンスやツールチェーンに影響を与えます。6.0では以下のオプションが非推奨になり、使用すると警告が出力されます。
+
+```json
+// tsconfig.json — 6.0で警告が出るオプション
+{
+  "compilerOptions": {
+    "target": "es5",           // ⚠️ 非推奨
+    "baseUrl": "./src",        // ⚠️ 非推奨 → pathsを使う
+    "moduleResolution": "node" // ⚠️ 非推奨 → bundlerを使う
+  }
+}
+```
+
+これらの警告を今のうちに解消しておくことが、7.0への最もスムーズな移行パスです。
+
+## TypeScript 7.0での破壊的変更（予定）
+
+### 1. --strictがデフォルトで有効に
+
+7.0では`--strict`フラグがデフォルトで有効になります。現在`strict: false`で運用しているプロジェクトは、事前に`strict: true`での型エラーをすべて解消しておく必要があります。
+
+strictモードで頻出するエラーパターン：
+
+```typescript
+// noImplicitAny: 型注釈が必要になる
+function process(data) { // Error: Parameter 'data' implicitly has an 'any' type.
+  return data.value;
+}
+
+// strictNullChecks: nullチェックが必要になる
+function getName(user: { name?: string }): string {
+  return user.name; // Error: Type 'string | undefined' is not assignable to type 'string'.
+}
+
+// 修正後
+function getName(user: { name?: string }): string {
+  return user.name ?? 'Unknown';
+}
+```
+
+まず`npx tsc --strict --noEmit`を実行してエラー件数を把握することから始めましょう。
+
+### 2. --target es5の削除
+
+ES5へのダウンコンパイルが7.0で削除されます。選択肢は3つです。
+
+1. IE11サポートを終了する（2026年現在の大多数のプロジェクトで現実的な選択）
+2. TypeScriptは型チェックのみに使い、ES5トランスパイルはBabelに委ねる
+3. TypeScript 6.x系に留まる
+
+```json
+// 7.0対応: targetをes2020以降に更新
+{
+  "compilerOptions": {
+    "target": "es2020"
+  }
+}
+```
+
+### 3. --baseUrlの削除
+
+`baseUrl`によるモジュール解決が削除されます。`paths`と組み合わせた明示的なエイリアス設定に移行します。
+
+```json
+// Before (6.x以前)
+{
+  "compilerOptions": {
+    "baseUrl": "./src"
+  }
+}
+// import { api } from 'api'; → ./src/api.ts を解決
+
+// After (7.0対応)
+{
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+// import { api } from '@/api'; → ./src/api.ts を解決
+```
+
+Next.jsやViteのAlias設定（`@/*`コンベンション）との統一も意識して移行を進めましょう。
+
+### 4. --moduleResolution node10の削除
+
+`node10`（旧`node`）モジュール解決が削除されます。
+
+```json
+// Before
+{
+  "compilerOptions": {
+    "moduleResolution": "node"
+  }
+}
+
+// After — モダンバンドラー使用時
+{
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "bundler"
+  }
+}
+
+// After — バンドラーなしのNode.jsプロジェクト
+{
+  "compilerOptions": {
+    "moduleResolution": "node16"
+  }
+}
+```
+
+## 移行チェックリスト
+
+### フェーズ1: 6.0の非推奨警告を解消する
+
+- [ ] `baseUrl`を`paths`に置き換える
+- [ ] `moduleResolution`を`bundler`または`node16`に変更
+- [ ] `target`を最低でも`es2020`に更新
+
+### フェーズ2: strict違反を解消する
+
+```bash
+# strict違反の件数を確認
+npx tsc --strict --noEmit 2>&1 | grep "error TS" | wc -l
+```
+
+大規模プロジェクトでは`@ts-strict-plugin`などを活用して段階的に移行する方法も有効です。
+
+### フェーズ3: 依存ライブラリの確認
+
+- [ ] 主要ライブラリのTypeScript 7.0対応状況を確認
+- [ ] ライブラリ固有のtsconfig推奨設定変更がないか確認
+
+## まとめ
+
+TypeScript 7.0の変更は「10年分の後方互換性の整理」という方向性で設計されています。`tsconfig.json`の技術的負債が多いほど移行コストは大きくなります。6.0の非推奨警告をエラーとして扱う文化を作ることが、7.0への最もスムーズな移行パスです。
+
+特に`--strict`対応は大規模プロジェクトでは時間がかかるため、今からstrict: trueでの型エラーゼロを目標に取り組み始めることをお勧めします。

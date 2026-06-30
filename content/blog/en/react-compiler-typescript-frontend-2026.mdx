@@ -1,0 +1,108 @@
+---
+title: "React Compiler Is Stable: What Actually Changes for Your Next.js Project"
+description: "React Compiler reached stable status in React 19.2, eliminating the need for manual memoization. With TypeScript now used by 67% of developers, here's what these shifts mean in practice."
+date: "2026-05-01"
+status: "published"
+tags: ["React", "TypeScript", "Next.js", "Frontend", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "react-compiler-typescript-frontend-2026"
+---
+
+## React Compiler is stable — what actually changes
+
+React 19.2 shipped React Compiler as stable. The practical consequence: `useMemo`, `useCallback`, and `React.memo` are no longer the default tools for preventing unnecessary re-renders.
+
+The Compiler analyzes your components at build time, tracks dependencies automatically, and emits optimized code. You write plain logic; the Compiler handles the optimization.
+
+**Before (React 19.1 and earlier)**:
+
+```tsx
+import { useMemo, useCallback } from 'react'
+
+function ProductList({ products, onSelect }: Props) {
+  const sorted = useMemo(
+    () => [...products].sort((a, b) => a.price - b.price),
+    [products]
+  )
+  const handleSelect = useCallback(
+    (id: string) => onSelect(id),
+    [onSelect]
+  )
+  return sorted.map(p => (
+    <ProductCard key={p.id} product={p} onSelect={handleSelect} />
+  ))
+}
+```
+
+**After (React 19.2 + Compiler)**:
+
+```tsx
+function ProductList({ products, onSelect }: Props) {
+  const sorted = [...products].sort((a, b) => a.price - b.price)
+  return sorted.map(p => (
+    <ProductCard key={p.id} product={p} onSelect={id => onSelect(id)} />
+  ))
+}
+```
+
+The Compiler produces equivalent or better optimization than manual memoization in the majority of cases.
+
+### Enabling it in Next.js
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next'
+
+const config: NextConfig = {
+  experimental: {
+    reactCompiler: true,
+  },
+}
+
+export default config
+```
+
+Most existing code works without modification. For cases where the Compiler cannot safely optimize — direct DOM mutations, certain ref patterns — you can opt out with `'use no memo'` at the component level.
+
+## TypeScript is now the default, not the exception
+
+67% of developers write more TypeScript than JavaScript as of 2026. The shift happened because the cost of TypeScript dropped (better tooling, AI assistants that understand types) while the benefit stayed constant.
+
+A few `tsconfig.json` flags worth enabling in new projects:
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "moduleResolution": "bundler"
+  }
+}
+```
+
+`noUncheckedIndexedAccess` flags `arr[0]` as potentially `undefined`, which catches a whole class of runtime errors at compile time. It was previously considered too noisy for most projects, but with AI assistants fixing type errors in real time, it's now practical to keep on.
+
+## Turbopack replaced Webpack
+
+Next.js 15 made Turbopack the default bundler. The developer experience improvement is most visible in two areas:
+
+- **Dev server start**: Near-instant on most projects
+- **HMR**: Changes reflect in hundreds of milliseconds, not seconds
+
+If you have Webpack plugins in your current config, check compatibility before migrating. Not all Webpack plugins have Turbopack equivalents yet. `next dev --turbopack` will report unsupported plugins on startup.
+
+## How this changes our default project setup
+
+At webhani, these are the concrete adjustments to our new project baseline:
+
+**React Compiler enabled by default** — we removed `useMemo` and `useCallback` from our component templates. We add them back only when profiling shows the Compiler isn't handling a specific case well.
+
+**`noUncheckedIndexedAccess` on** — added to our `tsconfig.json` base. The initial type errors on legacy code are worth fixing once rather than encountering runtime bugs repeatedly.
+
+**Turbopack default** — new projects start with Turbopack. Projects with custom Webpack plugins stay on Webpack until compatible alternatives exist.
+
+## Summary
+
+React Compiler stable, 67% TypeScript adoption, and Turbopack as default are all changes in the same direction: less boilerplate, faster feedback loops. If you're starting a Next.js project today, these are reasonable defaults rather than experimental choices.

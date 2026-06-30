@@ -1,0 +1,129 @@
+---
+title: "Kubernetes v1.36 User Namespaces GA: 컨테이너 보안 강화의 실제"
+description: "Kubernetes v1.36 'Haru'에서 User Namespaces와 Mutating Admission Policies가 GA로 승격됐습니다. 컨테이너 UID 격리의 의미와 실제 구현 방법을 설명합니다."
+date: "2026-05-30"
+status: "published"
+tags: ["Kubernetes", "보안", "컨테이너", "DevOps", "클라우드 인프라"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-v136-user-namespaces-security-2026"
+---
+
+InfoQ가 2026년 5월에 보도한 바에 따르면, Kubernetes v1.36(코드명: Haru)에서 **User Namespaces**와 **Mutating Admission Policies**가 General Availability(GA)로 승격됐습니다. 70개의 enhancement 중 18개가 Stable이 된 이번 릴리스에서, 컨테이너 보안을 실질적으로 강화하는 기능이 안정적으로 제공됩니다.
+
+## User Namespaces가 해결하는 문제
+
+많은 컨테이너 이미지가 기본적으로 root(UID 0)로 실행됩니다. `runAsNonRoot: true` SecurityContext 설정이 있지만, 권한 포트 바인딩이나 특정 경로 쓰기 등 정당한 이유로 root 권한을 필요로 하는 레거시 이미지가 많아 적용률이 낮았습니다.
+
+**기존 위험**: 컨테이너 탈출 취약점이 악용될 경우, 컨테이너 내부에서 root로 실행 중인 프로세스가 호스트 OS에서도 root 권한을 갖게 됩니다. 이는 시스템 전체 장악으로 이어질 수 있습니다.
+
+**User Namespaces의 해결책**: 컨테이너 내부의 UID 0이 호스트 OS의 65536 이상의 비특권 UID로 매핑됩니다. 컨테이너는 여전히 root로 동작한다고 인식하지만, 호스트는 일반 사용자로 처리합니다. 이미지 수정 없이 호스트 레벨 격리를 얻을 수 있습니다.
+
+## User Namespaces 활성화 방법
+
+Pod spec에서 `hostUsers: false`로 활성화합니다.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-app
+spec:
+  hostUsers: false  # User Namespaces 활성화
+  containers:
+    - name: app
+      image: myapp:latest
+      securityContext:
+        runAsUser: 0  # 컨테이너 내부에서는 root
+        # 호스트에서는 비특권 UID로 자동 매핑
+```
+
+**커널 요건**: Linux 6.3 이상이 필요합니다. 적용 전 노드 커널 버전을 확인합니다.
+
+```bash
+kubectl get nodes -o custom-columns='NAME:.metadata.name,KERNEL:.status.nodeInfo.kernelVersion'
+```
+
+EKS의 경우 Amazon Linux 2023 또는 Ubuntu 22.04 이상의 노드 그룹에서 사용 가능합니다. 구버전 커널에서는 `hostUsers: false`를 설정해도 User Namespaces가 활성화되지 않고 Pod만 정상 실행됩니다.
+
+## Mutating Admission Policies로 자동화
+
+v1.36에서 함께 GA로 승격된 Mutating Admission Policies를 활용하면 Admission Webhook 서버 없이 Namespace 전체에 `hostUsers: false`를 자동 적용할 수 있습니다. 정책은 CEL(Common Expression Language)로 작성하며 클러스터 내부에서 실행됩니다.
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: enable-user-namespaces
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        operations: ["CREATE"]
+  mutations:
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: |
+          Object{
+            spec: Object.spec{
+              hostUsers: false
+            }
+          }
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: enable-user-namespaces-binding
+spec:
+  policyName: enable-user-namespaces
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        user-namespaces: "enabled"
+```
+
+Namespace에 `user-namespaces: "enabled"` 레이블을 추가하면 해당 Namespace에 생성되는 모든 Pod에 `hostUsers: false`가 자동으로 설정됩니다. 별도의 Webhook 서버를 배포하거나 관리할 필요가 없습니다.
+
+## 다층 보안 프로파일
+
+User Namespaces는 다른 보안 설정과 함께 사용할 때 효과가 극대화됩니다.
+
+```yaml
+spec:
+  hostUsers: false
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+          add: ["NET_BIND_SERVICE"]
+```
+
+User Namespaces(UID 격리) + seccomp(시스템 콜 필터링) + capabilities 최소화 조합으로, 이미지 수정 없이 실용적인 다층 방어를 구성할 수 있습니다.
+
+## 마이그레이션 시 주의사항
+
+**볼륨 소유권 문제**: HostPath 볼륨이나 NFS 마운트를 사용하는 경우, UID 매핑으로 인해 파일 권한 문제가 발생할 수 있습니다. 프로덕션 적용 전 스테이징에서 반드시 검증하세요.
+
+**이미지 호환성**: 대부분의 이미지는 수정 없이 동작합니다. 특정 UID를 전제로 한 시작 스크립트가 있는 이미지는 별도 테스트가 필요합니다.
+
+**단계적 롤아웃**: Mutating Admission Policy의 Namespace 선택자를 활용해 개발 환경이나 중요도가 낮은 Namespace부터 순차적으로 적용하세요.
+
+## v1.36의 다른 주요 기능
+
+- **Fine-Grained Kubelet API Authorization(GA)**: 멀티테넌트 클러스터에서 유용한 kubelet API 세밀한 권한 제어
+- **25개 Beta 기능**: GPU 워크로드 스케줄링을 위한 DRA(Dynamic Resource Allocation) 개선 포함
+- **25개 Alpha 기능**: Sidecar Container 기능 강화 및 추가 네트워크 정책 제어 포함
+
+## 정리
+
+Kubernetes v1.36의 User Namespaces GA는 이미지 재빌드나 애플리케이션 팀과의 협의 없이 호스트 레벨 격리 혜택을 얻을 수 있게 합니다. PCI DSS, SOC 2, ISO 27001 같은 컴플라이언스 요건이 있는 환경에서 도입을 검토할 가치가 있습니다.
+
+노드 커널 버전 확인 → Mutating Admission Policies로 자동화 설정 → 스테이징에서 볼륨 호환성 검증 → 프로덕션 Namespace 순차 적용의 순서로 진행하세요.

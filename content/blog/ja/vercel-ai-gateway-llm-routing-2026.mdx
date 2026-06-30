@@ -1,0 +1,92 @@
+---
+title: "Vercel AI Gateway：Next.js アプリの LLM アクセスを一元管理する"
+description: "Vercel AI Gateway は複数の AI プロバイダを単一エンドポイントで統合し、モデル切り替え・コスト追跡・フォールバックを透過的に扱います。Next.js アプリへの導入方法と設計上の考慮点を整理します。"
+date: "2026-05-02"
+status: "published"
+tags: ["Vercel", "AI", "LLM", "Next.js", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "vercel-ai-gateway-llm-routing-2026"
+---
+
+AI 機能を持つ Web アプリを構築する際、複数の LLM プロバイダを使い分ける必要が増えています。コスト・レイテンシ・モデル能力のバランスを取りながら、各プロバイダの SDK をそれぞれ組み込むと複雑さが増します。
+
+Vercel AI Gateway は、このアクセス層を単一エンドポイントに集約する GA サービスです。100 以上のモデルを統一インターフェースで呼び出せ、観測性・フォールバック・コスト管理が標準で備わっています。
+
+## アーキテクチャの概要
+
+Vercel AI Gateway は AI SDK v6 と統合しており、プロバイダ文字列 (`"provider/model"`) を指定するだけでルーティングが機能します。アプリケーションコードからプロバイダ固有の SDK 依存を除去できるのが主な利点です。
+
+```typescript
+// app/api/chat/route.ts
+import { streamText } from "ai";
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+
+  const result = await streamText({
+    model: "anthropic/claude-sonnet-4-6",  // プロバイダ/モデル文字列
+    messages,
+  });
+
+  return result.toDataStreamResponse();
+}
+```
+
+モデルを切り替える場合は文字列を変えるだけで、ライブラリのインポートや認証ロジックの変更は不要です。
+
+## フォールバックと信頼性
+
+本番環境では特定プロバイダの障害や高レイテンシが起きた際の代替ルートが必要です。AI Gateway は `fallback` 設定でこれを宣言的に扱えます。
+
+```typescript
+import { streamText } from "ai";
+
+const result = await streamText({
+  model: "anthropic/claude-opus-4-7",
+  fallback: [
+    "openai/gpt-5.5",            // 第一フォールバック
+    "google/gemini-3-1-flash",   // 第二フォールバック
+  ],
+  messages,
+});
+```
+
+プライマリモデルが応答しない場合、ゲートウェイが透過的にフォールバックを試みます。アプリケーション層でのエラーハンドリングを大幅に簡素化できます。
+
+## 観測性とコスト管理
+
+Vercel ダッシュボードでは、リクエストログ・トークン使用量・モデル別コストを標準で確認できます。個別の API 呼び出しにインストルメンテーションを追加することなく、プロジェクト全体の消費を可視化できます。
+
+これは特に複数モデルを並行して試している段階で有効です。どのモデルがコストの大部分を占めているかを、コードを変えずに把握できます。
+
+## バジェット制限
+
+使い過ぎを防ぐために、モデルごとの月次予算を設定できます。
+
+```json
+{
+  "ai": {
+    "gateway": {
+      "budgets": [
+        { "model": "anthropic/claude-opus-4-7", "monthly": 500 },
+        { "model": "openai/gpt-5.5", "monthly": 200 }
+      ]
+    }
+  }
+}
+```
+
+予算上限に達したモデルへのリクエストは自動的にフォールバックにルーティングされるため、予期しないコスト超過を防止できます。
+
+## 設計上の考慮点
+
+Vercel AI Gateway は Vercel プラットフォームと密結合しています。利点はインフラ設定がゼロで使い始められること、欠点はプラットフォームへの依存度が高まることです。
+
+複数のクラウドプロバイダで動かす可能性があるサービス、またはレイテンシベースルーティングやセマンティックルーティングなど細かい制御が必要な場合は、LiteLLM や独自ゲートウェイの構築も選択肢になります。ただし Vercel + Next.js スタックで完結するプロジェクトであれば、AI Gateway の導入コストは非常に低く、得られるメリットは大きいです。
+
+## まとめ
+
+Vercel AI Gateway は、LLM アクセス層の標準化を Next.js エコシステムに持ち込む実用的なソリューションです。複数プロバイダの切り替えをコードレベルで管理する手間をなくし、観測性とコスト制御を標準で提供します。
+
+新規プロジェクトで AI 機能を追加する場合、プロバイダ固有の SDK を直接組み込む前に、AI Gateway を経由する構成を検討する価値があります。

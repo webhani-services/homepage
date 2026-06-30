@@ -1,0 +1,157 @@
+---
+title: "Redis 8.x Native Vector Search: Rethinking Your AI Application Cache Layer"
+description: "Redis 8.x ships native vector similarity search, making semantic caching viable without external services. What this means for AI application backends and how to implement it."
+date: "2026-05-26"
+status: "published"
+tags: ["Redis", "Vector Search", "AI", "Caching", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "redis-8-vector-search-ai-cache-2026"
+---
+
+Redis 8.x now includes native vector similarity search. Previously, adding semantic search to a system meant bringing in a dedicated vector database — Pinecone, Weaviate, or pgvector. For systems already running Redis, this is meaningful: you can implement semantic caching without adding infrastructure.
+
+Redis holds roughly 82% market share in in-memory data stores. The majority of production web services already have Redis in their stack. Native vector search turns an existing component into something more capable.
+
+## What Semantic Caching Solves
+
+Traditional caching matches on exact keys. Two requests that mean the same thing but are phrased differently will produce two cache misses:
+
+```python
+cache.get("What's the weather in Tokyo?")          # hit
+cache.get("Current temperature in Tokyo?")          # miss — different key, same intent
+cache.get("Tell me Tokyo's weather conditions")     # miss — same again
+```
+
+With an LLM-backed application, this matters. Users ask the same questions in different ways constantly. If every unique phrasing triggers an LLM API call, your inference costs grow faster than your user base.
+
+Semantic caching computes vector embeddings for incoming queries and finds the nearest cached result above a similarity threshold. Phrasing variations that share the same intent return a cached response:
+
+```python
+cache.semantic_get("What's the weather in Tokyo?")         # computes embedding, checks index
+cache.semantic_get("Current temperature in Tokyo?")        # cosine similarity > threshold → hit
+cache.semantic_get("What's the forecast for Osaka?")       # different intent → miss
+```
+
+## Redis 8.x Implementation
+
+Redis 8.x uses HNSW (Hierarchical Navigable Small World) as its vector indexing algorithm. Here's a working implementation:
+
+```python
+import redis
+import numpy as np
+from openai import OpenAI
+
+r = redis.Redis(host="localhost", port=6379, decode_responses=False)
+openai_client = OpenAI()
+
+# Create the vector index
+r.execute_command(
+    "FT.CREATE", "llm_cache_idx",
+    "ON", "HASH",
+    "PREFIX", "1", "cache:",
+    "SCHEMA",
+    "embedding", "VECTOR", "HNSW", "6",
+    "TYPE", "FLOAT32",
+    "DIM", "1536",
+    "DISTANCE_METRIC", "COSINE",
+    "response", "TEXT",
+    "model", "TEXT",
+    "created_at", "NUMERIC"
+)
+
+def get_embedding(text: str) -> np.ndarray:
+    response = openai_client.embeddings.create(
+        input=text,
+        model="text-embedding-3-small"
+    )
+    return np.array(response.data[0].embedding, dtype=np.float32)
+
+def cache_store(query: str, response: str, model: str, ttl: int = 3600) -> None:
+    embedding = get_embedding(query)
+    key = f"cache:{hash(query)}"
+    pipe = r.pipeline()
+    pipe.hset(key, mapping={
+        "embedding": embedding.tobytes(),
+        "response": response,
+        "model": model,
+        "created_at": int(__import__("time").time())
+    })
+    pipe.expire(key, ttl)
+    pipe.execute()
+
+def cache_lookup(query: str, threshold: float = 0.92) -> str | None:
+    embedding = get_embedding(query)
+
+    results = r.execute_command(
+        "FT.SEARCH", "llm_cache_idx",
+        "*=>[KNN 1 @embedding $vec AS dist]",
+        "PARAMS", "2", "vec", embedding.tobytes(),
+        "RETURN", "2", "response", "dist",
+        "DIALECT", "2"
+    )
+
+    if results[0] == 0:
+        return None
+
+    items = results[2]
+    dist = float(items[items.index(b"dist") + 1])
+    similarity = 1 - dist  # convert cosine distance to similarity
+
+    if similarity >= threshold:
+        return items[items.index(b"response") + 1].decode()
+
+    return None
+```
+
+The `threshold` parameter controls how strict the match needs to be. A value of `0.92` works well as a starting point — adjust based on your domain. For highly specialized vocabulary (medical, legal), you may want to raise it slightly to avoid false hits.
+
+## Memory Footprint
+
+Redis keeps vector indexes in RAM. A 1536-dimension Float32 vector takes about 6KB. Plan accordingly:
+
+| Entries | Memory (1536-dim, Float32) |
+|---------|---------------------------|
+| 100K    | ~600MB                    |
+| 1M      | ~6GB                      |
+| 10M     | ~60GB                     |
+
+For most LLM application semantic caches, the entry count stays manageable. User queries tend to cluster around common intents, and a cache of 50K–200K entries can cover a surprisingly large fraction of traffic patterns. This is different from a knowledge base search index, which might need millions of entries.
+
+## Setting the Right TTL
+
+TTL strategy depends on how quickly your domain's ground truth changes:
+
+```python
+TTL_CONFIGS = {
+    "news_summary": 900,          # 15 minutes — information expires fast
+    "product_faq": 86400,         # 24 hours — relatively stable
+    "documentation": 604800,      # 7 days — changes infrequently
+    "user_preference": 2592000,   # 30 days — long-lived
+}
+
+def cache_with_domain_ttl(query: str, response: str, domain: str) -> None:
+    ttl = TTL_CONFIGS.get(domain, 3600)
+    cache_store(query, response, model="claude-sonnet-4-6", ttl=ttl)
+```
+
+Mixing TTLs per domain, rather than applying a blanket value, improves cache accuracy without much additional complexity.
+
+## When to Use Redis vs. a Dedicated Vector DB
+
+Redis 8.x vector search is a good fit for caching scenarios. It's not a replacement for dedicated vector databases in all cases:
+
+| Use case | Recommendation |
+|----------|---------------|
+| Semantic cache (< 1M entries) | Redis 8.x |
+| RAG knowledge base (millions of documents) | Pinecone / Weaviate / pgvector |
+| Complex metadata filtering | Dedicated vector DB |
+| Already running Redis | Redis 8.x |
+
+The operational advantage of Redis is real: one fewer service to deploy, monitor, and manage. For teams running lean infrastructure, that tradeoff often justifies the feature limitations.
+
+## Our Take
+
+LLM inference cost is the budget item that catches teams by surprise. Semantic caching is among the most straightforward ways to reduce it — you're avoiding redundant API calls for queries that have equivalent answers already cached.
+
+Redis 8.x removing the need for a separate vector database lowers the adoption barrier significantly. If your stack already includes Redis, the effort to add semantic caching is now closer to a few hours than a few days. Start with a high threshold (0.92–0.95) to keep false hit rates low, measure your cache hit rate in the first week, and tune from there.

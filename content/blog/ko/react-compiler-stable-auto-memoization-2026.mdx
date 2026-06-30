@@ -1,0 +1,160 @@
+---
+title: "React Compiler v1.0 안정화 — 수동 memoization의 종말"
+description: "React Compiler가 안정 버전으로 출시되어 useMemo/useCallback을 자동화합니다. 팀이 실제로 경험한 효과와 마이그레이션 시 주의사항을 알아봅니다."
+date: "2026-05-20"
+status: "published"
+tags: ["React", "frontend", "performance", "JavaScript", "TypeScript"]
+thumbnail: ""
+author: "webhani"
+slug: "react-compiler-stable-auto-memoization-2026"
+---
+
+## React Compiler란
+
+React Compiler는 빌드 타임에 React 컴포넌트를 정적 분석하여 불필요한 재렌더링을 자동으로 제거하는 컴파일러입니다. 2024년 말 React 19와 함께 공개 베타로 출시되었고, 2025년 10월에 v1.0 안정 버전이 되었습니다. React 19.2(2026년 3월)는 이 기반 위에 SSR 개선 사항을 추가했습니다.
+
+개발자가 `useMemo`, `useCallback`, `React.memo`를 수동으로 작성하지 않아도 컴파일러가 동등한 성능 최적화를 자동으로 적용합니다.
+
+## 수동 Memoization의 문제점
+
+React Compiler 이전에는 성능 최적화가 개발자의 수동 작업에 의존했습니다.
+
+```tsx
+// 이전 방식 — 수동 memoization
+const OrderItem = React.memo(({ order, onCancel }: Props) => {
+  const formattedDate = useMemo(
+    () => new Intl.DateTimeFormat('ko-KR').format(new Date(order.createdAt)),
+    [order.createdAt]
+  );
+
+  const handleCancel = useCallback(() => {
+    onCancel(order.id, order.status);
+  }, [onCancel, order.id, order.status]);
+
+  return (
+    <div>
+      <span>{order.productName}</span>
+      <span>{formattedDate}</span>
+      <button onClick={handleCancel}>취소</button>
+    </div>
+  );
+});
+```
+
+이 방식에는 문제가 있습니다. `useCallback` 의존성 배열에서 `order.status`가 누락되면 오래된 값을 참조하는 stale closure 버그가 발생합니다. 이 버그는 특정 상호작용 시퀀스에서만 나타나기 때문에 발견이 늦어집니다. 코드베이스가 커질수록 수백 개의 컴포넌트에서 의존성 배열을 올바르게 유지하는 것이 지속적인 부담이 됩니다.
+
+## React Compiler 적용 후
+
+```tsx
+// React Compiler 도입 후 — 깔끔한 코드
+function OrderItem({ order, onCancel }: Props) {
+  const formattedDate = new Intl.DateTimeFormat('ko-KR')
+    .format(new Date(order.createdAt));
+
+  function handleCancel() {
+    onCancel(order.id, order.status);
+  }
+
+  return (
+    <div>
+      <span>{order.productName}</span>
+      <span>{formattedDate}</span>
+      <button onClick={handleCancel}>취소</button>
+    </div>
+  );
+}
+```
+
+`React.memo`, `useMemo`, `useCallback`이 모두 필요 없게 됩니다. 컴파일러가 정적 분석을 통해 "이 값은 이전 렌더링에서 변경되지 않았다"고 판단한 부분을 자동으로 메모이제이션합니다.
+
+코드가 읽기 쉬워질 뿐 아니라, 컴파일러는 사람보다 더 세밀한 단위로 메모이제이션을 적용할 수 있습니다.
+
+## 설치 방법
+
+### Next.js
+
+Next.js 15 이상에서는 `next.config.mjs`에서 활성화합니다:
+
+```js
+// next.config.mjs
+const nextConfig = {
+  experimental: {
+    reactCompiler: true
+  }
+};
+
+export default nextConfig;
+```
+
+### Vite
+
+```bash
+npm install babel-plugin-react-compiler@latest
+```
+
+```ts
+// vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [
+    react({
+      babel: {
+        plugins: ['babel-plugin-react-compiler']
+      }
+    })
+  ]
+});
+```
+
+## 컴파일러가 최적화할 수 없는 경우
+
+컴파일러는 정적 분석 기반으로 작동합니다. React 규칙을 위반하거나 외부 가변 참조를 사용하는 코드는 최적화되지 않습니다.
+
+```tsx
+// 컴파일러가 최적화를 건너뛰는 예
+function BadComponent({ items }: Props) {
+  // Rules of Hooks 위반 — 조건부 Hook 호출
+  if (items.length > 0) {
+    const filtered = useMemo(() => items.filter(Boolean), [items]); // 최적화 안 됨
+  }
+
+  return <List items={items} />;
+}
+```
+
+컴파일러가 최적화를 건너뛰면 빌드 출력에 경고가 포함됩니다. `eslint-plugin-react-compiler`를 사용하면 빌드 전에 이런 패턴을 감지할 수 있습니다:
+
+```bash
+npm install eslint-plugin-react-compiler --save-dev
+```
+
+```json
+{
+  "plugins": ["react-compiler"],
+  "rules": {
+    "react-compiler/react-compiler": "warn"
+  }
+}
+```
+
+## 실제 팀의 경험
+
+초기 도입 팀들의 보고는 대부분 "지루한" 것들입니다. 의존성 배열 누락으로 인한 코드 리뷰 지적이 줄었고, 재렌더링으로 인한 버그 카테고리가 사라졌으며, 새 컴포넌트를 작성할 때의 심리적 부담이 줄었습니다.
+
+이런 개선은 장기적으로 누적되어 큰 차이를 만들어냅니다. 특히 대규모 코드베이스에서 memoization 불일치가 성능 문제로 나타나기 쉬운 프로젝트에서 효과가 두드러집니다.
+
+## 마이그레이션 방법
+
+**신규 프로젝트**: 처음부터 컴파일러를 활성화하세요. 하지 않을 이유가 없습니다.
+
+**기존 프로젝트**: 전체 코드베이스를 한 번에 변환하지 마세요. 새 파일에 먼저 적용하고 회귀가 없음을 확인한 뒤 점진적으로 확장하세요. 기존 `useMemo`와 `useCallback`은 컴파일러와 공존 가능합니다.
+
+**먼저 Rules of Hooks 위반을 수정하세요**: 컴파일러는 올바른 코드를 최적화합니다. `eslint-plugin-react-hooks`로 위반 사항을 먼저 수정하세요.
+
+## 정리
+
+React Compiler 안정화는 메모이제이션의 책임을 개발자 규율에서 빌드 도구로 이전하는 전환점입니다. 의존성 배열 버그라는 버그 카테고리 자체를 없애고, 컴포넌트 코드를 더 읽기 쉽게 만듭니다.
+
+신규 프로젝트에는 즉시 활성화하세요. 기존 코드베이스에는 점진적으로 적용하고, lint 도구로 컴파일러가 도움이 안 되는 부분을 미리 식별하세요.

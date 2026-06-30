@@ -1,0 +1,238 @@
+---
+title: "Clean Architecture in Next.js with TypeScript and TanStack Query"
+description: "A practical look at layering Next.js App Router, TypeScript, and TanStack Query for maintainable frontend architecture. Includes concrete patterns for data fetching, cache management, and testing strategy."
+date: "2026-05-23"
+status: "published"
+tags: ["Next.js", "TypeScript", "TanStack Query", "Architecture", "React"]
+thumbnail: ""
+author: "webhani"
+slug: "clean-architecture-nextjs-typescript-2026"
+---
+
+As Next.js App Router has become the default starting point for new projects, the question of how to structure a codebase for long-term maintainability has become more urgent. Server Components, Client Components, API Routes, and TanStack Query's cache layer all need to fit together coherently — and the decisions you make early tend to compound over time.
+
+This post covers the layered architecture we use at webhani for Next.js + TypeScript + TanStack Query projects, with concrete code patterns for each layer.
+
+## The Problem with Unstructured Components
+
+Stuffing data fetching, business logic, and rendering into the same component works fine on day one. Over time it produces:
+
+- Components that can't be unit tested because API calls and UI are entangled
+- Duplicated fetch logic scattered across components, making API changes expensive
+- Type definitions that drift between components and the server, allowing runtime errors that TypeScript should have caught
+
+Clean architecture in this context means one thing: **controlling the direction of dependencies**. Each layer knows about the layers below it, not above.
+
+## Directory Structure
+
+```
+src/
+├── app/                    # Next.js App Router — routing only
+│   ├── (routes)/
+│   │   └── users/
+│   │       ├── page.tsx    # Server Component
+│   │       └── [id]/
+│   │           └── page.tsx
+│   └── api/
+│       └── users/
+│           └── route.ts
+├── features/               # Feature-scoped modules
+│   └── users/
+│       ├── api.ts          # Raw fetch functions
+│       ├── queries.ts      # TanStack Query definitions
+│       ├── types.ts        # Type definitions
+│       └── components/     # Feature-specific UI
+├── lib/
+│   └── api-client.ts       # HTTP client (fetch wrapper)
+└── components/             # Shared UI components
+```
+
+The key principle is co-locating everything a feature needs under `features/<name>/`. Cross-feature imports are a signal that you need a shared abstraction rather than a direct dependency.
+
+## Layer by Layer
+
+### Types (`types.ts`)
+
+```typescript
+// features/users/types.ts
+export interface User {
+  id: string;
+  name: string;
+  email: string;
+  role: 'admin' | 'member';
+  createdAt: string;
+}
+
+export interface CreateUserInput {
+  name: string;
+  email: string;
+  role: 'admin' | 'member';
+}
+
+export interface UpdateUserInput extends Partial<CreateUserInput> {
+  id: string;
+}
+```
+
+Types are defined once and imported everywhere. When the API changes shape, the type error propagates through every consumer — catching mistakes at compile time rather than production.
+
+### API Functions (`api.ts`)
+
+```typescript
+// features/users/api.ts
+import { apiClient } from '@/lib/api-client';
+import type { User, CreateUserInput, UpdateUserInput } from './types';
+
+export async function fetchUsers(): Promise<User[]> {
+  return apiClient.get('/api/users');
+}
+
+export async function fetchUserById(id: string): Promise<User> {
+  return apiClient.get(`/api/users/${id}`);
+}
+
+export async function createUser(input: CreateUserInput): Promise<User> {
+  return apiClient.post('/api/users', input);
+}
+
+export async function updateUser({ id, ...input }: UpdateUserInput): Promise<User> {
+  return apiClient.patch(`/api/users/${id}`, input);
+}
+```
+
+These are plain async functions with no React dependencies. They work in Node.js (server) and browser environments equally. Testing them is straightforward: mock `apiClient` and assert on the call arguments.
+
+### TanStack Query Layer (`queries.ts`)
+
+```typescript
+// features/users/queries.ts
+import {
+  useQuery,
+  useMutation,
+  useQueryClient,
+  queryOptions,
+} from '@tanstack/react-query';
+import { fetchUsers, fetchUserById, createUser, updateUser } from './api';
+import type { CreateUserInput, UpdateUserInput } from './types';
+
+// Centralized query keys — prevents typos and cache key mismatches
+export const userKeys = {
+  all: ['users'] as const,
+  detail: (id: string) => ['users', id] as const,
+};
+
+// queryOptions makes this definition reusable in both Server and Client contexts
+export const usersQueryOptions = queryOptions({
+  queryKey: userKeys.all,
+  queryFn: fetchUsers,
+  staleTime: 1000 * 60 * 5,
+});
+
+export function useUser(id: string) {
+  return useQuery({
+    queryKey: userKeys.detail(id),
+    queryFn: () => fetchUserById(id),
+  });
+}
+
+export function useCreateUser() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: createUser,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: userKeys.all });
+    },
+  });
+}
+
+export function useUpdateUser() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: updateUser,
+    onSuccess: (updated) => {
+      queryClient.setQueryData(userKeys.detail(updated.id), updated);
+      queryClient.invalidateQueries({ queryKey: userKeys.all });
+    },
+  });
+}
+```
+
+Centralizing query keys in `userKeys` is the single most impactful pattern here. When query keys are inline string literals scattered across files, cache invalidation bugs are almost guaranteed as the codebase grows.
+
+### Server Component with Prefetch
+
+```typescript
+// app/(routes)/users/page.tsx
+import { HydrationBoundary, dehydrate } from '@tanstack/react-query';
+import { getQueryClient } from '@/lib/query-client';
+import { usersQueryOptions } from '@/features/users/queries';
+import { UserList } from '@/features/users/components/UserList';
+
+export default async function UsersPage() {
+  const queryClient = getQueryClient();
+
+  // Prefetch on the server — data arrives with the HTML
+  await queryClient.prefetchQuery(usersQueryOptions);
+
+  return (
+    <HydrationBoundary state={dehydrate(queryClient)}>
+      <UserList />
+    </HydrationBoundary>
+  );
+}
+```
+
+The `queryOptions` helper defined in `queries.ts` is reused here without duplication. The server-fetched cache is serialized and handed to the client, eliminating the loading waterfall that would otherwise appear on first render.
+
+### Client Component
+
+```typescript
+// features/users/components/UserList.tsx
+'use client';
+
+import { useSuspenseQuery } from '@tanstack/react-query';
+import { usersQueryOptions } from '../queries';
+
+export function UserList() {
+  // useSuspenseQuery guarantees data is defined — no optional chaining needed
+  const { data: users } = useSuspenseQuery(usersQueryOptions);
+
+  return (
+    <ul>
+      {users.map((user) => (
+        <li key={user.id}>
+          <span>{user.name}</span>
+          <span>{user.email}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+`useSuspenseQuery` removes the need to handle loading and error states inline — those are handled by Suspense and Error Boundary wrappers higher in the tree, which is where they belong architecturally.
+
+## Testing by Layer
+
+| Layer | Approach |
+|-------|---------|
+| `api.ts` | Unit test — mock `apiClient`, assert call arguments |
+| `queries.ts` | Hook test — `@testing-library/react` with `QueryClientProvider` |
+| Components | Integration test — MSW to intercept network requests |
+| `app/` pages | E2E — Playwright |
+
+Each layer is independently testable because dependencies only flow downward. A component test doesn't need to know about the HTTP client.
+
+## Our Take
+
+The common failure mode in Next.js projects isn't a lack of conventions — it's conventions that aren't enforced. A `features/` directory structure and centralized query keys cost nothing to set up on day one and pay dividends when you're refactoring a data model six months later.
+
+The patterns here aren't novel. They're an application of standard layered architecture principles to the specific constraints of Next.js App Router + TanStack Query. The goal is to make the right thing the easy thing: fetching data through a query hook should be less work than writing a raw `useEffect`, and it should be.
+
+## Summary
+
+- `features/<name>/` co-location minimizes cross-feature coupling
+- Separate `types.ts`, `api.ts`, and `queries.ts` files give each layer a clear, single responsibility
+- `queryOptions` shares cache configuration between Server and Client components without duplication
+- Centralized `queryKeys` objects prevent cache invalidation bugs
+- Each layer has an independent, appropriate testing strategy

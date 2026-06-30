@@ -1,0 +1,142 @@
+---
+title: "Docker Kanvas：Compose から Kubernetes への自動変換で開発と本番の橋渡し"
+description: "Docker が Kanvas をリリース。Docker Compose ファイルを Kubernetes マニフェストに自動変換し、ローカル開発と本番クラスタの乖離を縮めます。Helm との違いと実際の使いどころを解説します。"
+date: "2026-05-11"
+status: "published"
+tags: ["Docker", "Kubernetes", "DevOps", "cloud-infrastructure", "container"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-compose-kubernetes"
+---
+
+## Docker Kanvas とは
+
+Docker が Kanvas をリリースしました。ローカル開発で使い慣れた Docker Compose ファイルを Kubernetes のマニフェストに自動変換するプラットフォームです。Helm や Kustomize が担ってきた領域に Docker が参入した形です。
+
+従来の課題として、ローカルは `docker-compose up` で動くが、本番は Kubernetes マニフェストで管理するという二重管理の問題がありました。Kanvas はこの乖離を減らすことを目指しています。
+
+## 動作の仕組み
+
+Kanvas は Docker Compose ファイルを読み込み、Service・Volume・Network の定義から Kubernetes の Deployment・Service・PersistentVolumeClaim などのリソースを生成します。
+
+```yaml
+# docker-compose.yml（入力例）
+version: "3.9"
+services:
+  web:
+    image: my-app:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgres://db:5432/mydb
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=mydb
+      - POSTGRES_PASSWORD=secret
+
+volumes:
+  pg_data:
+```
+
+上記の Compose ファイルから、Kanvas は概ね以下のリソースを生成します。
+
+```yaml
+# 生成される Kubernetes Deployment（web サービス）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: my-app:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: DATABASE_URL
+              value: "postgres://db:5432/mydb"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  ports:
+    - port: 3000
+  selector:
+    app: web
+```
+
+## Helm・Kustomize との違い
+
+| ツール | 特徴 | 向いているケース |
+|---|---|---|
+| **Helm** | テンプレートエンジン。値の差し替えで複数環境に対応 | 複雑な設定の再利用・配布 |
+| **Kustomize** | パッチベース。ベース定義をオーバーレイで環境別に変更 | 環境ごとの差分管理 |
+| **Kanvas** | Compose からの自動変換。開発との一貫性を重視 | Compose ベースのチームの Kubernetes 移行 |
+
+Kanvas は Helm や Kustomize の代替というより、「Compose で作ったものを Kubernetes に持っていく」出発点として機能します。生成されたマニフェストを Kustomize で環境別に管理するといった組み合わせも有効です。
+
+## 実際の使いどころ
+
+**Kanvas が有効なケース**
+
+- Docker Compose ベースのプロジェクトを Kubernetes に初めて移行するとき
+- 開発チームが Kubernetes に不慣れで、Compose との対応関係を学びながら移行したい場合
+- プロトタイプや小規模サービスの迅速な Kubernetes デプロイ
+
+**Kanvas だけでは不足するケース**
+
+- Horizontal Pod Autoscaler (HPA) の設定
+- Ingress Controller の細かい設定
+- 本番環境向けの Resource Requests/Limits の最適化
+- Secret Management (External Secrets Operator 等との連携)
+
+Compose から自動生成されるマニフェストはあくまで出発点です。本番運用には追加の設定が必要になります。
+
+## 移行時の注意点
+
+Compose の `depends_on` は Kubernetes では直接サポートされていません。`readinessProbe` か `initContainer` で対応する必要があります。
+
+```yaml
+# Kubernetes での depends_on 相当の実装（readinessProbe）
+readinessProbe:
+  exec:
+    command:
+      - pg_isready
+      - -h
+      - db
+  initialDelaySeconds: 5
+  periodSeconds: 5
+```
+
+また、Compose の `ports` は NodePort または Ingress に変換が必要で、Kanvas が生成するデフォルト設定をそのまま本番で使うには追加の検討が必要です。セキュリティ設定（Security Context、Non-root ユーザー等）は自動生成では不十分なことが多い点も注意してください。
+
+## webhani の見解
+
+Kubernetes への移行は、Helm や Kustomize の習得コストが参入障壁になることがありました。Kanvas は Compose ユーザーが Kubernetes の世界に入るときの学習コストを下げる点で価値があります。
+
+生成されたマニフェストを読んで、Compose の設定がどのように Kubernetes に変換されるかを理解することで、Kubernetes の学習ツールとしても機能します。ただし、本番環境で使う場合は生成物のレビューを怠らないことが重要です。
+
+## まとめ
+
+- Docker Kanvas は Compose → Kubernetes の自動変換ツール
+- Helm・Kustomize の代替ではなく、移行の出発点として機能
+- 小規模プロジェクトや学習目的での Kubernetes 入門に適している
+- 本番環境への適用には、生成されたマニフェストの精査と追加設定が必須
+- `depends_on` は `readinessProbe` か `initContainer` で代替する

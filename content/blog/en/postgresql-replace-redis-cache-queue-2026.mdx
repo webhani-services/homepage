@@ -1,0 +1,176 @@
+---
+title: "Do You Still Need Redis in 2026? PostgreSQL as Cache, Queue, and Pub/Sub"
+description: "A practical look at when a single PostgreSQL instance can absorb caching, job queues, and pub/sub workloads that teams reflexively reach for Redis to handle, with original SQL and a decision checklist."
+date: "2026-06-12"
+status: "published"
+tags: ["PostgreSQL", "Redis", "Architecture", "Caching", "Database"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-replace-redis-cache-queue-2026"
+---
+
+When a client asks us to design a new backend, a Redis box almost always appears in the first whiteboard sketch. It is muscle memory. We needed a cache, so Redis. We needed a job queue, so Redis. We needed to push an event to a few connected clients, so Redis pub/sub. None of those decisions are wrong on their own. Stacked together on a small or medium application, though, they buy a second datastore that has to be provisioned, monitored, backed up, patched, and reasoned about during every incident — often to serve traffic a single PostgreSQL instance would barely notice.
+
+This post is the argument we actually make to clients in 2026: before adding Redis, check whether the PostgreSQL you are already running can do the job. For caching, lightweight pub/sub, and job queues, modern Postgres has features built specifically for these patterns. We will walk through all three with working SQL, and — just as importantly — be honest about where this approach breaks down.
+
+## The "default to Redis" reflex costs more than it looks
+
+The cost of an extra datastore is rarely the licence or the instance bill. It is the operational surface. A second system means a second failure mode, a second set of metrics on the dashboard, a second connection pool to size, a second thing that can fall out of sync with your primary data. For a team running one database well, adding Redis can quietly double the on-call cognitive load.
+
+There is also a correctness angle that gets overlooked. When your cache, your queue, and your source of truth live in three different places, you inherit dual-write problems. You write a business row to Postgres and enqueue a job in Redis; if the second call fails or the process dies between them, you have an order with no fulfilment job, or a job pointing at a row that was rolled back. People paper over this with retries and reconciliation scripts. Keeping the queue inside the same database removes the race entirely, because the enqueue and the business write happen in one transaction.
+
+Let me be clear about the trade. Postgres is meaningfully slower per operation than Redis. Redis routinely serves reads in the sub-millisecond range from memory; a Postgres round trip is more like a fraction of a millisecond up to a few milliseconds depending on the query, indexes, and connection overhead. Redis also ships data structures Postgres simply does not have natively — sorted sets, HyperLogLog, bitmaps. If your design genuinely depends on those, this article is not for you. For everyone else, read on.
+
+## Caching with UNLOGGED tables
+
+Postgres writes every change to the write-ahead log (WAL) so it can recover after a crash. For durable business data that is exactly what you want. For cache data it is wasted work — if the cache is lost on restart, you simply repopulate it.
+
+An `UNLOGGED` table skips the WAL. Writes are faster because there is less to persist, and the data is not replicated or crash-safe — on a crash or restart the table is truncated. That is the correct trade-off for a cache, where losing the contents costs you a few cache misses, not data integrity. In informal community benchmarks the write speedup is typically in the low double-digit percentages over a regular logged table; treat that as a direction, not a guarantee, and measure your own workload.
+
+```sql
+CREATE UNLOGGED TABLE cache_entries (
+    cache_key   text PRIMARY KEY,
+    payload     jsonb NOT NULL,
+    expires_at  timestamptz NOT NULL
+);
+
+CREATE INDEX idx_cache_entries_expires_at
+    ON cache_entries (expires_at);
+```
+
+Reading a value means ignoring anything already past its expiry:
+
+```sql
+SELECT payload
+FROM cache_entries
+WHERE cache_key = $1
+  AND expires_at > now();
+```
+
+Writing or refreshing an entry is a single upsert with a TTL expressed as an interval:
+
+```sql
+INSERT INTO cache_entries (cache_key, payload, expires_at)
+VALUES ($1, $2, now() + interval '5 minutes')
+ON CONFLICT (cache_key)
+DO UPDATE SET payload    = EXCLUDED.payload,
+              expires_at = EXCLUDED.expires_at;
+```
+
+The query already filters out expired rows, so correctness never depends on cleanup. But dead rows still occupy space and bloat the index, so run a periodic sweep — a scheduled job every few minutes is fine:
+
+```sql
+DELETE FROM cache_entries
+WHERE expires_at <= now();
+```
+
+You can drive that delete from `pg_cron`, an application scheduler, or a plain cron entry. The point is that expiry is enforced at read time and cleanup is a background concern, not a correctness requirement.
+
+## Job queues with SELECT ... FOR UPDATE SKIP LOCKED
+
+This is the pattern that converts the most skeptics. The classic objection to a database-backed queue is that workers polling the same table will contend on the same rows and trip over each other. `SKIP LOCKED` removes that objection. When a worker selects a row `FOR UPDATE`, Postgres locks it; `SKIP LOCKED` tells any other worker to skip rows that are already locked rather than wait. Every worker grabs a different job, with no double-processing and no lock contention.
+
+```sql
+CREATE TABLE job_queue (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    job_type     text NOT NULL,
+    payload      jsonb NOT NULL,
+    status       text NOT NULL DEFAULT 'pending',
+    attempts     int  NOT NULL DEFAULT 0,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_job_queue_pending
+    ON job_queue (created_at)
+    WHERE status = 'pending';
+```
+
+A worker dequeues one job inside a transaction. It selects the oldest pending row, skips anything another worker already holds, and flips the status to `processing` in the same statement using a CTE:
+
+```sql
+BEGIN;
+
+WITH next_job AS (
+    SELECT id
+    FROM job_queue
+    WHERE status = 'pending'
+    ORDER BY created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+UPDATE job_queue AS j
+SET status = 'processing',
+    attempts = j.attempts + 1
+FROM next_job
+WHERE j.id = next_job.id
+RETURNING j.id, j.job_type, j.payload;
+
+COMMIT;
+```
+
+The worker processes the returned job, then marks it `done` (or back to `pending`/`failed` on error). The transaction is what makes this safe: the row is locked the moment it is selected, so two workers can never claim the same job.
+
+Now the payoff mentioned earlier. Because the queue is just a table, you can enqueue inside the same transaction that writes the business row:
+
+```sql
+BEGIN;
+INSERT INTO orders (customer_id, total) VALUES ($1, $2);
+INSERT INTO job_queue (job_type, payload)
+VALUES ('send_receipt', jsonb_build_object('customer_id', $1));
+COMMIT;
+```
+
+Either both rows commit or neither does. There is no window where the order exists without its job, and no reconciliation script to maintain. That guarantee is genuinely hard to reproduce with a separate Redis queue.
+
+## Pub/sub with LISTEN / NOTIFY
+
+For real-time fan-out, Postgres has `LISTEN` and `NOTIFY`. A connection subscribes to a channel; any session that calls `NOTIFY` on that channel pushes a message to every listener.
+
+```sql
+LISTEN job_events;
+
+NOTIFY job_events, 'job:4821:ready';
+```
+
+You can fire the notification from a trigger so it rides along with a data change, or call it directly from application code. On the consumer side, with `pg` (node-postgres) in TypeScript, you hold a dedicated connection and react to incoming events:
+
+```typescript
+import { Client } from "pg";
+
+const client = new Client({ connectionString: process.env.DATABASE_URL });
+await client.connect();
+await client.query("LISTEN job_events");
+
+client.on("notification", (msg) => {
+  console.log(`channel=${msg.channel} payload=${msg.payload}`);
+  // wake a worker, invalidate a cache key, push to a websocket, etc.
+});
+```
+
+Now the honest limitations, because this is where teams get burned. The payload is capped at roughly 8000 bytes, so send an identifier and let the consumer fetch the detail, never the full object. `LISTEN`/`NOTIFY` needs a dedicated, persistent connection, which makes it incompatible with PgBouncer in transaction-pooling mode — the listening session must stay pinned. And it is not a partition-tolerant broker: if a listener is disconnected when a notification fires, that message is gone, with no replay. Treat it as a best-effort wake-up signal, not a durable event log. If you need delivery guarantees, combine it with the job table — `NOTIFY` to wake the worker, the table for the actual durable state.
+
+A version note worth attribution: PostgreSQL 18 is the current production line in 2026, and a scalability improvement to `LISTEN`/`NOTIFY` under high notification volume is landing in PostgreSQL 19, which is in beta as of June 2026 with general availability expected around September. Treat that as approximate; check the release notes before you depend on it.
+
+## A decision checklist
+
+Reach for Postgres-only when most of these hold:
+
+- Throughput is modest — comfortably under tens of thousands of operations per second.
+- Latency targets are in the low-millisecond range, not hard sub-millisecond SLAs.
+- You do not need Redis-native structures (sorted sets, HyperLogLog, bitmaps).
+- Transactional consistency between your data and your queue actually matters.
+- Operational simplicity and cost are real constraints — common for small-to-medium and cost-sensitive clients.
+
+Keep Redis when:
+
+- You are pushing very high throughput (100k+ ops/sec) or need true sub-millisecond latency.
+- Your design depends on Redis data structures or capabilities Postgres lacks.
+- A cache miss storm would overwhelm your primary database, and you need an isolated memory tier to protect it.
+
+## Takeaways
+
+- For many real applications, one PostgreSQL instance covers caching, job queues, and pub/sub without a second datastore.
+- `UNLOGGED` tables give fast, disposable cache storage; enforce TTL at read time and sweep expired rows in the background.
+- `SELECT ... FOR UPDATE SKIP LOCKED` gives a contention-free multi-worker queue, with the bonus of transactional enqueue alongside your business writes.
+- `LISTEN`/`NOTIFY` covers lightweight real-time fan-out, but it is best-effort: small payloads, a pinned connection, no replay. Pair it with a table when you need durability.
+- This is about removing premature infrastructure, not a claim that Postgres beats Redis everywhere. Start with one database, measure, and add Redis the day your numbers actually demand it.

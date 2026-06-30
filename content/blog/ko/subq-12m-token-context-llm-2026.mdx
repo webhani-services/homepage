@@ -1,0 +1,116 @@
+---
+title: "1,200만 토큰 컨텍스트 윈도우: SubQ가 엔지니어링 팀에 실제로 가져다주는 변화"
+description: "마이애미 스타트업 Subquadratic이 업계 최초의 1,200만 토큰 Context Window LLM 'SubQ'를 출시했습니다. 거대한 컨텍스트가 실제로 무엇을 바꾸는지, RAG가 여전히 필요한 상황은 어디인지 분석합니다."
+date: "2026-05-25"
+status: "published"
+tags: ["AI", "LLM", "context-window", "enterprise", "developer-tools"]
+thumbnail: ""
+author: "webhani"
+slug: "subq-12m-token-context-llm-2026"
+---
+
+## 컨텍스트 윈도우 제약의 현실
+
+LLM으로 코드베이스를 분석할 때 개발자들이 공통적으로 부딪히는 문제가 있습니다. 모델이 한 번에 볼 수 있는 코드의 양이 제한되어 있다는 것입니다. Claude 3.5 Sonnet의 200K 토큰, Gemini 1.5 Pro의 1M 토큰으로 점차 확장되어 왔지만, 대부분의 실제 프로덕션 코드베이스는 여전히 한 번에 담기지 않습니다.
+
+RAG 파이프라인, 청킹 전략, 요약 루프 — 우회책은 있지만 각각 복잡성과 유지보수 오버헤드를 추가합니다.
+
+마이애미 스타트업 Subquadratic이 이 한계를 정면으로 돌파합니다. 이번 주 출시된 SubQ는 업계 최초로 1,200만 토큰 컨텍스트 윈도우를 프로덕션에서 제공합니다.
+
+## 1,200만 토큰이 실제로 의미하는 것
+
+크기를 현실적으로 환산하면:
+- 영어로 약 1,000만 단어
+- 중형 SaaS 프로덕트 코드베이스 전체 (~100만 줄)
+- Academic Paper 수백 편
+- 대기업의 법률 문서 전부
+
+실제 코드로 보면 이렇습니다:
+
+```python
+# 기존 RAG 방식 — 청킹이 필수
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Chroma
+
+splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
+docs = splitter.split_documents(codebase_documents)
+vectorstore = Chroma.from_documents(docs, embeddings)
+retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+# 추론 시점에는 10개의 청크만 보임
+
+# SubQ 방식 — 전체를 그대로 전달
+import subq
+
+client = subq.Client(api_key="your-api-key")
+
+with open("entire_codebase.txt") as f:
+    full_context = f.read()
+
+result = client.complete(
+    context=full_context,
+    prompt="이 코드베이스의 상위 5개 보안 위험과 기술 부채 핫스팟을 찾아주세요."
+)
+```
+
+청킹을 없애면 정보 손실에 관한 실패 유형 자체를 제거할 수 있습니다.
+
+## 기술 아키텍처 배경
+
+SubQ라는 이름은 핵심 문제를 직접 가리킵니다. 기존 Transformer Attention은 시퀀스 길이의 제곱(O(n²))으로 스케일합니다. 1M 토큰에서도 이미 극한에 가깝고, 12M 토큰에서는 표준 아키텍처로는 사실상 불가능합니다.
+
+Subquadratic(사명 자체가 "제곱 미만"을 의미)은 Linear Attention과 SSM(State Space Models)을 결합해 이 확장 비용을 O(n²) 미만으로 낮췄습니다. 기술 논문이 공개되어 있으니, 이 분야에서 개발하고 있다면 읽어볼 만합니다.
+
+## 실제로 효과적인 사용 사례
+
+**레거시 코드베이스 일괄 분석**이 가장 명확한 활용처입니다:
+
+```bash
+# 전체 git 히스토리를 내보내 SubQ에 분석 요청
+git log --all --full-diff -p > full_history.txt
+
+curl -X POST https://api.subq.ai/v1/complete \
+  -H "Authorization: Bearer $SUBQ_API_KEY" \
+  -d '{
+    "context": "<전체 git 히스토리>",
+    "prompt": "이 코드베이스의 아키텍처 변천사를 요약하고 가장 큰 기술 부채 영역을 찾아주세요."
+  }'
+```
+
+**마이크로서비스 간 의존성 매핑** — 서비스 하나의 변경이 전체 시스템에 미치는 영향을 한 번에 파악합니다.
+
+**문서-코드 정합성 검증** — 스펙, API 문서, 구현체를 함께 넣고 불일치를 찾습니다.
+
+## 한계와 주의사항
+
+**레이턴시**: 1,200만 토큰 처리는 느립니다. 실시간 코딩 보조가 아닌, 주간 보안 감사나 마이그레이션 계획 같은 배치 처리에 적합합니다.
+
+**"Lost in the Middle" 문제**: 연구에 따르면 LLM은 긴 컨텍스트 중간 부분의 정보를 놓치는 경향이 있습니다. 12M 토큰에서는 이 효과가 더 강하게 나타날 수 있습니다.
+
+**검증된 벤치마크 부족**: SubQ는 새로운 모델입니다. GPT-4나 Claude 3.5 Sonnet만큼의 프로덕션 실적이 없습니다. 비즈니스 크리티컬한 작업에는 도메인 특화 검증이 선행되어야 합니다.
+
+**비용**: 토큰이 많을수록 API 비용이 증가합니다. 전량 인젝션이 항상 경제적으로 최적은 아닙니다.
+
+## RAG가 필요 없어지는가?
+
+아닙니다. 올바른 관점은 대규모 컨텍스트 윈도우와 RAG가 서로 다른 문제를 해결한다는 것입니다.
+
+| 시나리오 | 권장 접근법 |
+|---------|-----------|
+| 코드베이스 전체 보안 감사 | 대용량 컨텍스트 (전량 인젝션) |
+| 실시간 코딩 어시스턴트 | 소용량 컨텍스트 + RAG |
+| 고빈도 문서 검색 | RAG |
+| 비용 효율 우선 배치 처리 | RAG (청크) |
+
+RAG 인프라에는 실질적인 유지보수 비용이 있습니다. 임베딩 모델, 벡터 DB, 청킹 전략 — 이 복잡성을 없앨 수 있다면 아키텍처 단순화 자체가 큰 가치입니다.
+
+## webhani의 시각
+
+SubQ의 등장이 흥미로운 이유는 RAG 파이프라인의 총소유비용(TCO)과의 비교가 실용적으로 중요해졌기 때문입니다.
+
+권장 접근법:
+1. 레이턴시가 허용되는 배치 작업(보안 스캔, 코드베이스 분석)으로 먼저 검증
+2. 기존 RAG 파이프라인과 비용·정확도 기준으로 비교
+3. "Lost in the Middle" 문제를 실제 코드베이스 크기로 확인
+4. 비즈니스 크리티컬한 작업은 충분한 검증 후 도입 결정
+
+컨텍스트 윈도우 경쟁은 계속됩니다. 중요한 건 아키텍처 선택지를 넓게 유지하고, 실제 정확도와 비용으로 판단하는 것입니다.

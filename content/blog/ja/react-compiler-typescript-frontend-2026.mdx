@@ -1,0 +1,120 @@
+---
+title: "React Compiler の安定版と TypeScript 主流化——2026年のフロントエンド開発の現在地"
+description: "React 19.2でCompilerが安定版になり、手動のuseMemo/useCallbackが不要になりました。TypeScriptの採用率が67%に達した今、フロントエンド開発のベストプラクティスはどう変わったのかを整理します。"
+date: "2026-05-01"
+status: "published"
+tags: ["React", "TypeScript", "Next.js", "Frontend", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "react-compiler-typescript-frontend-2026"
+---
+
+## React Compilerが安定版になった意味
+
+React 19.2でReact Compilerが安定版（Stable）になりました。これは、手動でのメモ化管理——`useMemo`、`useCallback`、`React.memo`——が原則として不要になることを意味します。
+
+Compilerは、コンポーネントを分析して依存関係を自動的に追跡し、再レンダリングが必要なコンポーネントだけを効率的に更新します。開発者が考えるべきことが一つ減った、実感できる変化です。
+
+### 変化の前後を確認する
+
+**Before（React 19.1まで）**:
+
+```tsx
+import { useMemo, useCallback } from 'react'
+
+function ProductList({ products, onSelect }: Props) {
+  const sorted = useMemo(
+    () => [...products].sort((a, b) => a.price - b.price),
+    [products]
+  )
+
+  const handleSelect = useCallback(
+    (id: string) => onSelect(id),
+    [onSelect]
+  )
+
+  return sorted.map(p => (
+    <ProductCard key={p.id} product={p} onSelect={handleSelect} />
+  ))
+}
+```
+
+**After（React 19.2 + Compiler）**:
+
+```tsx
+function ProductList({ products, onSelect }: Props) {
+  const sorted = [...products].sort((a, b) => a.price - b.price)
+
+  return sorted.map(p => (
+    <ProductCard key={p.id} product={p} onSelect={id => onSelect(id)} />
+  ))
+}
+```
+
+Compilerがコンパイル時に最適化を適用するため、手動の最適化と同等かそれ以上の効果が得られます。
+
+### 既存プロジェクトへの適用
+
+Compilerはオプトイン方式で導入できます。`next.config.ts`での設定例：
+
+```typescript
+import type { NextConfig } from 'next'
+
+const config: NextConfig = {
+  experimental: {
+    reactCompiler: true,
+  },
+}
+
+export default config
+```
+
+既存コードのほとんどはそのまま動作します。直接DOM操作やライブラリ依存の`ref`操作など、Compilerが最適化できないパターンには`'use no memo'`ディレクティブで除外できます。
+
+## TypeScriptが標準になった
+
+開発者の67%が現在、JavaScriptよりTypeScriptを多く書いているというデータがあります（2026年調査）。数年前まで「大規模プロジェクト向け」だったTypeScriptは、今や規模を問わず採用されるデフォルトの選択肢です。
+
+この変化の背景には主に2つの要因があります。TypeScriptを使うコストが下がった（IDEの補完精度向上、AI Assistantとの相性の良さ）一方、型安全性の恩恵はそのまま維持されています。
+
+### 2026年の推奨`tsconfig.json`設定
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true
+  }
+}
+```
+
+`noUncheckedIndexedAccess`は`arr[0]`を潜在的に`undefined`として扱い、ランタイムエラーの一類型を事前に防ぎます。以前は「厳しすぎる」と敬遠されることもありましたが、AI AssistantがType エラーの修正を支援できる現在では、有効にしておく方が早期にバグを発見できます。
+
+## TurbopackがWebpackを置き換えた
+
+Next.js 15でTurbopack（Rustベースのバンドラー）がデフォルトに移行しました。体感として最も大きな変化は以下の2点です。
+
+- **Dev Server起動**: ほとんどのプロジェクトでほぼ即時起動
+- **HMR（Hot Module Replacement）**: 保存から数百ミリ秒以内に反映
+
+移行の注意点として、カスタムWebpackプラグインを使っている場合は互換性の確認が必要です。すべてのWebpack PluginにTurbopack相当が存在するわけではありません。`next dev --turbopack`を実行すると、起動時に対応していないPluginが報告されます。
+
+## webhaniとして何を変えたか
+
+これらの変化を受けて、webhaniでのフロントエンド開発の標準構成も更新しました。
+
+**React Compiler有効化をデフォルト化**——コンポーネントテンプレートから`useMemo`と`useCallback`を削除しました。Profilingで特定のケースをCompilerが処理できていないことが確認されたときのみ追加します。
+
+**`noUncheckedIndexedAccess`を標準有効化**——`tsconfig.json`のベースに追加しました。レガシーコードの初期型エラーは一度修正する価値があります。
+
+**Turbopackへの移行**——新規プロジェクトはTurbopackで開始します。カスタムWebpack Pluginがあるプロジェクトは、互換性のある代替が出るまでWebpackを維持します。
+
+## まとめ
+
+React Compilerの安定化とTypeScriptの主流化は、どちらも「手間が減った」という方向の変化です。最適化のための定型コードが減り、型安全性が当然の前提になることで、開発者はロジックそのものに集中できるようになります。
+
+TurbopackによるDX改善と合わせて、2026年のNext.jsプロジェクトは以前より少ない摩擦でスタートできます。これらは実験的な選択肢ではなく、新規プロジェクトの合理的なデフォルトです。

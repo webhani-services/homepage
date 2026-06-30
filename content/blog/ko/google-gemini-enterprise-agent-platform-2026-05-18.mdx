@@ -1,0 +1,119 @@
+---
+title: "Google Gemini Enterprise Agent Platform — AI 에이전트 ID 관리와 Governance 중앙화"
+description: "Google Cloud Next 2026에서 발표된 Gemini Enterprise Agent Platform의 Agent Identity와 Agent Gateway가 엔터프라이즈 AI 에이전트 운영에 가져다주는 변화를 알아봅니다."
+date: "2026-05-18"
+status: "published"
+tags: ["Google Cloud", "AI-agents", "enterprise", "security", "governance"]
+thumbnail: ""
+author: "webhani"
+slug: "google-gemini-enterprise-agent-platform-2026-05-18"
+---
+
+## 아직 아무도 해결하지 않은 문제
+
+AI 에이전트를 도입한 대부분의 조직은 "이 에이전트가 무엇을 할 수 있는가?"라는 질문에는 답했지만, "이 에이전트가 무엇을 하도록 승인되었고, 나중에 어떻게 증명할 수 있는가?"라는 질문에는 답하지 못했습니다.
+
+단일 에이전트 배포에서는 이 공백이 관리 가능합니다. 데이터 조회 에이전트, 변환 에이전트, 외부 시스템 쓰기 에이전트가 협력하는 멀티 에이전트 워크플로우로 확장되면, 인증·감사·보안 정책 적용의 복잡성이 급격히 증가합니다.
+
+Google Gemini Enterprise Agent Platform은 2026년 4월 Google Cloud Next에서 발표된, 이 문제에 대한 직접적인 해답입니다.
+
+## 플랫폼 개요
+
+Gemini Enterprise Agent Platform은 Vertex AI의 후계자로, Google의 엔터프라이즈 AI 중앙 플랫폼입니다. 모델 선택, 에이전트 빌드·배포·거버넌스를 여러 서비스에 분산하지 않고 하나로 통합합니다.
+
+거버넌스 레이어가 아키텍처적으로 가장 주목할 만한 부분입니다. 세 가지 컴포넌트로 구성됩니다: Agent Identity, Agent Gateway, Agent Registry.
+
+## Agent Identity: AI 에이전트를 위한 SPIFFE
+
+플랫폼에 등록된 모든 에이전트는 SPIFFE(Secure Production Identity Framework for Everyone) 표준을 따르는 암호화 신원을 부여받습니다.
+
+```
+SPIFFE ID 형식:
+spiffe://trust-domain/path/identifying/the/agent
+
+예시:
+spiffe://acme.corp/agents/invoice-processor/v2/prod
+```
+
+SPIFFE는 이미 Kubernetes와 서비스 메시 환경(Istio 등)에서 워크로드 신원 표준으로 자리잡았습니다. AI 에이전트에 이를 확장 적용하는 것은 새로운 신원 체계를 발명하는 대신 기존 인프라와의 통합을 선택한 실용적 결정입니다.
+
+Agent Identity가 제공하는 것:
+
+- **라이프사이클 바인딩**: 에이전트 배포 시 발급, 폐기 시 만료. 수동으로 교체해야 할 영구 자격증명 없음
+- **감사 추적**: 에이전트의 모든 행동이 SPIFFE ID와 허용 정책에 매핑되어 로그에 기록됨
+- **증명(Attestation)**: 암호화로 증명되는 신원 — 다른 프로세스가 해당 에이전트인 척 위조 불가
+
+실용적 효과: 멀티 에이전트 워크플로우에서 문제가 발생했을 때, "어느 에이전트가, 어떤 권한으로, 언제 이 작업을 했는가?"를 답할 수 있습니다.
+
+## Agent Gateway: 중앙 집중식 정책 집행
+
+Agent Gateway는 에이전트와 그들이 상호작용하는 모든 것 — API, 데이터베이스, 도구, 다른 에이전트 — 사이에 위치합니다. 모든 트래픽이 이를 경유합니다.
+
+```
+에이전트 A ────┐
+에이전트 B ────┼──→ [ Agent Gateway ] ──→ 외부 서비스
+에이전트 C ────┘           │
+                    적용되는 정책:
+                    - IAM 인가
+                    - Semantic Governance
+                    - Model Armor
+```
+
+**IAM 인가**는 표준적입니다. 게이트웨이가 에이전트의 신원에 요청된 리소스 접근 권한이 있는지 확인합니다.
+
+**Model Armor**는 프롬프트 인젝션과 데이터 유출 위험을 처리합니다. 통신 경로에 위치해 에이전트 동작을 조작하려는 악의적 입력을 탐지하거나, 민감 데이터가 에이전트 출력을 통해 유출되는 것을 방지합니다.
+
+**Semantic Governance**가 가장 혁신적인 부분입니다. 리소스 이름이나 권한 범위 기반 규칙 대신, 에이전트가 수행하려는 작업의 의미에 기반해 정책을 적용합니다. "외부 서비스에 PII를 전송하지 않는다"와 같은 정책을, 특정 API 엔드포인트에 관계없이 내용의 의미를 평가해 적용할 수 있습니다.
+
+## Agent Registry
+
+Agent Registry는 조직 내 모든 AI 에이전트의 카탈로그입니다. 내부 구축 에이전트와 파트너 에코시스템에서 조달한 에이전트 모두를 포함하며, Agent Identity와 연결됩니다.
+
+거버넌스 관점에서 두 가지 통제를 제공합니다.
+
+1. **인벤토리**: 환경에서 실행 중인 모든 에이전트를 파악
+2. **허용 목록**: 등록된 에이전트만 운영 가능 — 비승인 배포 차단
+
+## 실제 운영 시나리오
+
+**재무 보고서 자동화 에이전트 예시:**
+
+```
+1. 에이전트 시작
+   → Agent Identity가 SPIFFE ID 발급
+
+2. 재무 DB 접근 요청
+   → Agent Gateway가 IAM 정책 확인
+   → 승인된 범위의 데이터만 접근 허용
+
+3. 보고서 생성
+   → Semantic Governance가 출력 내용 검사
+   → 기밀 정보의 부적절한 외부 전송 방지
+
+4. 감사 로그 기록
+   → SPIFFE ID 포함, 언제 무엇을 했는지 완전 기록
+```
+
+이 추적 가능성은 컴플라이언스와 감사 대응의 핵심 요건을 충족합니다.
+
+## 이 수준의 거버넌스가 필요한 때
+
+읽기 전용 문서 접근 권한을 가진 단일 내부 챗봇에 Agent Identity와 Agent Gateway는 과도한 설계입니다. 프로덕션 데이터, 외부 시스템, 규제 대상 정보를 다루는 경우라면, 진지하게 보안을 고려한다면 선택이 아닙니다.
+
+특히 빠른 도입 효과가 기대되는 상황:
+
+- **규제 산업(금융·의료·법률)**: 에이전트 행동의 완전한 감사 추적이 법적·규제적 요건
+- **멀티 에이전트 오케스트레이션**: 에이전트 A가 에이전트 B를 호출하고 DB에 쓰는 경우, 전통적 접근 로그는 인과 관계를 잃음
+- **분산된 AI 도입이 진행 중인 대규모 조직**: 20개 팀이 각자 에이전트를 배포한다면, 레지스트리와 신원 집행만이 가시성과 통제를 유지하는 현실적 방법
+
+## OpenAI Daybreak, Anthropic Mythos와의 차이
+
+OpenAI Daybreak와 Anthropic Mythos는 AI를 활용해 소프트웨어의 보안 취약점을 찾고 수정하는 도구입니다. Gemini Enterprise Agent Platform은 다른 문제를 해결합니다: AI 에이전트 자체를 인프라 컴포넌트로서 거버닝하는 것입니다.
+
+이는 경쟁하는 접근법이 아니라, 프로덕션 시스템에 AI가 깊이 통합될수록 필요해지는 서로 다른 보안 레이어를 다루고 있습니다.
+
+## 정리
+
+Agent Identity(SPIFFE 기반), Agent Gateway(중앙 정책 집행), Agent Registry(인벤토리 및 허용 목록)는 AI 에이전트를 1급 인프라 컴포넌트로 취급하는 거버넌스 레이어입니다. 잘 운영되는 시스템의 다른 서비스와 동일한 책임 기준을 적용합니다.
+
+AI 에이전트가 실험에서 프로덕션 워크플로우의 일부로 전환되는 시점에, 특히 외부 시스템이나 규제 대상 데이터를 다루는 에이전트라면, 에이전트가 확산되기 전에 거버넌스 아키텍처를 설계해야 합니다. 이미 배포된 멀티 에이전트 시스템에 신원과 인가 통제를 나중에 추가하는 것은 처음부터 구축하는 것보다 훨씬 어렵습니다.

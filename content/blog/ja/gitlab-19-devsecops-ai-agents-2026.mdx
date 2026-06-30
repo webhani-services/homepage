@@ -1,0 +1,173 @@
+---
+title: "GitLab 19.0：DevSecOpsの完全統合とAI Agentの安全な認証管理"
+description: "2026年5月22日にリリースされたGitLab 19.0は、DevSecOpsの各フェーズを統合するOrchestration機能を強化し、Coding AgentがSecretに触れないCredential管理の仕組みを導入しました。主な変更点と移行ポイントを整理します。"
+date: "2026-05-28"
+status: "published"
+tags: ["GitLab", "DevSecOps", "CI/CD", "AI Agent", "Security"]
+thumbnail: ""
+author: "webhani"
+slug: "gitlab-19-devsecops-ai-agents-2026"
+---
+
+2026年5月22日、GitLab 19.0がリリースされました。今回のリリースの核心は「DevSecOpsの完全な統合」です。セキュリティスキャン、コンプライアンスチェック、AI Codingを1つのPlatformに束ね、それぞれのフェーズが分断されずに連携して動作するOrchestration機能が大幅に強化されています。
+
+また、AI Codingが普及する中で避けられなくなった課題——Coding AgentへのSecret露出問題——への実用的な解答が含まれているのも注目点です。
+
+## 19.0の主な変更点
+
+### DevSecOps Orchestration
+
+GitLab 19.0では、CI/CDパイプラインにセキュリティフェーズが組み込まれる方式が整理されました。従来は開発者がSASTやDASTのJobを個別にpipeline.ymlに定義する必要がありましたが、19.0からは`security:`セクションで宣言的に管理できるようになっています。
+
+```yaml
+# .gitlab-ci.yml（GitLab 19.0の新しい記法）
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+
+security:
+  policy:
+    require_sast: true
+    block_on_critical: true       # Criticalが検出されたらMergeをブロック
+    auto_fix_minor: true          # Minorは自動Patchを提案
+  scan_on:
+    - merge_request
+    - default_branch
+
+stages:
+  - build
+  - test
+  - security   # SecurityフェーズはGitLabが自動挿入
+  - deploy
+```
+
+`block_on_critical: true`を設定すると、Critical脆弱性が検出されたMRはMerge不可になります。従来は設定ファイルとPolicy設定を別々に管理する必要がありましたが、19.0では宣言的に一箇所にまとめられます。
+
+### AI Agentのための安全なCredential管理
+
+AI Coding Agentが普及したことで、AgentがRepository全体を読み書きするためにAPI KeyやSecretへのアクセスが必要になるケースが増えています。問題は、AgentにSecretをそのまま渡すとLLMのContextに平文で入ってしまう点です。
+
+GitLab 19.0では、**Agent Vault**という機能が導入されました。これはCI/CDのSecret変数管理をAgent向けに拡張したもので、AgentはSecretの実際の値を受け取らずに認証済みのAPIコールだけを行えます。
+
+```yaml
+# .gitlab-ci.yml - Agent Vault設定
+coding_agent:
+  stage: implement
+  image: registry.gitlab.com/gitlab-org/coding-agent:latest
+  variables:
+    # AgentはSECRET_APIKEYの値を直接参照しない
+    # VaultがAgent代わりに認証を処理する
+    GITLAB_AGENT_VAULT_ENABLED: "true"
+    GITLAB_AGENT_PERMISSIONS: "read_repository,create_mr"
+  secrets:
+    AWS_CREDENTIALS:
+      vault: aws/creds/deploy-role  # HashiCorp Vault経由
+      token: $VAULT_TOKEN
+  script:
+    - gitlab-agent run --task="$TASK_DESCRIPTION"
+```
+
+この仕組みでは、Agentは`AWS_CREDENTIALS`の実際のAccess KeyやSecret Keyの値をEnvironment Variableとして受け取りません。代わりにVaultがAgentの操作を代理認証します。LLMのContextにSecretが混入するリスクを構造的に排除しています。
+
+## Pipeline Security Policyの実用例
+
+19.0で追加されたSecurity Policy as CodeをProjectに適用する例です。
+
+```yaml
+# security-policy.yml（Projectルートに配置）
+version: "2"
+scan_execution_policy:
+  - name: "Production Branch Protection"
+    description: "mainブランチへのMerge前にフルスキャンを実行"
+    enabled: true
+    rules:
+      - type: pipeline
+        branches:
+          - main
+          - release/*
+    actions:
+      - scan: sast
+        variables:
+          SAST_EXCLUDED_PATHS: "spec,test,docs"
+      - scan: container_scanning
+      - scan: dependency_scanning
+        variables:
+          DS_MAX_DEPTH: "5"
+
+  - name: "AI Generated Code Review"
+    description: "AI Agentが生成したコードへの追加スキャン"
+    enabled: true
+    rules:
+      - type: merge_request
+        branch_type: protected
+        commits:
+          author_email_regex: ".*agent.*@gitlab\\.com"
+    actions:
+      - scan: sast
+        severity_levels:
+          - critical
+          - high
+```
+
+AI Agentが作成したCommitに対しては追加のスキャンが走る設定を`author_email_regex`で実現できます。これによりAgent生成コードへのセキュリティ要件を人間のコードと分けて管理できます。
+
+## GitLab 19.0への移行時の注意点
+
+### 非推奨になった設定
+
+GitLab 19.0では以下のCI/CD設定が非推奨になっています。
+
+```yaml
+# ❌ 非推奨（19.0以降は動作しない可能性あり）
+include:
+  - template: SAST.gitlab-ci.yml  # パスが変更された
+
+# ✅ 新しいパス
+include:
+  - template: Security/SAST.gitlab-ci.yml
+```
+
+`rules`と`only/except`を混在させているPipelineも19.0から警告が出ます。`only/except`は`rules`に統一することを推奨します。
+
+```yaml
+# ❌ 19.0で警告
+deploy:
+  script: ./deploy.sh
+  only:
+    - main
+
+# ✅ rulesに統一
+deploy:
+  script: ./deploy.sh
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+```
+
+### Runnerのバージョン要件
+
+GitLab 19.0のAgent Vault機能を使うには、GitLab Runner 17.5以降が必要です。Self-hostedのRunnerを使っている場合は事前にバージョンを確認してください。
+
+```bash
+# Runnerのバージョン確認
+gitlab-runner --version
+
+# Docker経由のRunner更新
+docker pull gitlab/gitlab-runner:latest
+docker stop gitlab-runner
+docker rm gitlab-runner
+docker run -d --name gitlab-runner \
+  --restart always \
+  -v /srv/gitlab-runner/config:/etc/gitlab-runner \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  gitlab/gitlab-runner:latest
+```
+
+## webhaniが注目するポイント
+
+GitLab 19.0の変更の中で、実際のProjectに即効性があるのは2つです。
+
+**1. Security Policy as Code**：セキュリティ要件をコードで管理できるようになったことで、チーム間でのセキュリティ基準の標準化が容易になります。特にMRのAuthorがAI Agentかどうかによってスキャン内容を変える設定は、AI Codingが増えている現在のチームに直接役立ちます。
+
+**2. Agent Vault**：AI AgentにSecretを渡さずに操作させる仕組みは、今後AI Codingを本格採用するチームには必須の設計パターンになっていくと見ています。GitLabが Platform側でこれを解決したことは重要です。
+
+GitLab 14.0や15.0に比べると、19.0はメジャーバージョンアップとしては機能追加より「統合の洗練」に注力したリリースです。既存のDevSecOps設定が整理されているチームにとっては、スムーズにアップグレードできるはずです。

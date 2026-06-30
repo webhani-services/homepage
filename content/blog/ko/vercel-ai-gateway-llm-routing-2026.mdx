@@ -1,0 +1,90 @@
+---
+title: "Vercel AI Gateway: Next.js 앱에서 LLM 접근을 통합 관리하기"
+description: "Vercel AI Gateway는 100개 이상의 AI 모델을 단일 엔드포인트로 통합하여 Fallback, 비용 추적, 관찰성을 기본 제공합니다. Next.js 앱에 적용하는 실용적인 가이드입니다."
+date: "2026-05-02"
+status: "published"
+tags: ["Vercel", "AI", "LLM", "Next.js", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "vercel-ai-gateway-llm-routing-2026"
+---
+
+AI 기능을 갖춘 웹 앱을 구축할 때 다양한 LLM 프로바이더를 사용해야 하는 경우가 늘고 있습니다. 각 프로바이더별 SDK 의존성과 인증 패턴을 별도로 관리하면 코드가 복잡해집니다.
+
+Vercel AI Gateway는 이 접근 계층을 단일 엔드포인트로 통합합니다. 100개 이상의 모델을 20ms 이하의 라우팅 레이턴시로 지원하며, Fallback, 비용 관리, 관찰성이 기본으로 포함됩니다.
+
+## 기본 연동
+
+AI SDK v6의 프로바이더 문자열 패턴을 통해 동작합니다. 애플리케이션 코드에서 프로바이더별 Import가 필요 없습니다.
+
+```typescript
+// app/api/chat/route.ts
+import { streamText } from "ai";
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+
+  const result = await streamText({
+    model: "anthropic/claude-sonnet-4-6",
+    messages,
+  });
+
+  return result.toDataStreamResponse();
+}
+```
+
+모델 변경은 문자열 하나만 바꾸면 됩니다. 인증, 스트리밍 처리, SDK 통합 코드는 그대로입니다.
+
+## Fallback 설정
+
+프로덕션 환경에서는 특정 프로바이더에 장애가 발생했을 때 자동 전환이 필요합니다. Gateway에서 선언적으로 설정할 수 있습니다.
+
+```typescript
+const result = await streamText({
+  model: "anthropic/claude-opus-4-7",
+  fallback: [
+    "openai/gpt-5.5",
+    "google/gemini-3-1-pro",
+  ],
+  messages,
+});
+```
+
+기본 모델이 응답하지 않으면 Gateway가 순서대로 Fallback을 시도합니다. 애플리케이션 코드에서는 단일 결과만 받습니다.
+
+## 추가 계측 없는 관찰성
+
+Vercel 대시보드에서 모델별 요청 수, 토큰 사용량, 첫 번째 토큰까지의 시간, 비용을 확인할 수 있습니다. 모든 요청이 Gateway를 통과하므로 별도의 로깅 코드가 필요 없습니다.
+
+여러 모델을 실험하는 단계에서 특히 유용합니다. API 호출에 로깅을 추가하지 않고도 실제 비용과 레이턴시를 프로덕션에서 비교할 수 있습니다.
+
+## 예산 제한
+
+모델별 월간 지출 한도를 설정하여 예기치 않은 비용 초과를 방지할 수 있습니다.
+
+```json
+{
+  "ai": {
+    "gateway": {
+      "budgets": [
+        { "model": "anthropic/claude-opus-4-7", "monthly": 500 },
+        { "model": "openai/gpt-5.5", "monthly": 200 }
+      ]
+    }
+  }
+}
+```
+
+모델이 예산 한도에 도달하면 요청이 자동으로 Fallback으로 라우팅됩니다. 실패 없이 서비스를 유지할 수 있습니다.
+
+## 트레이드오프
+
+Vercel AI Gateway는 Vercel 플랫폼과 강하게 결합되어 있습니다. 인프라 설정 없이 바로 사용할 수 있다는 장점이 있지만, 플랫폼 종속성이 높아진다는 단점도 있습니다.
+
+여러 클라우드에서 실행해야 하거나 레이턴시 기반 라우팅, 시맨틱 라우팅 등 세밀한 라우팅 로직이 필요한 경우에는 LiteLLM 같은 자체 호스팅 솔루션이 더 유연합니다. 하지만 Vercel 스택으로 완결되는 프로젝트라면 Gateway의 편의성 대비 복잡도 비율은 매우 우수합니다.
+
+## 정리
+
+Vercel AI Gateway는 프로덕션 Next.js 앱에서 LLM 프로바이더 다양성을 관리하는 실용적인 솔루션입니다. 접근을 표준화하고, 프로바이더별 SDK 코드를 제거하고, 별도 계측 없이 관찰성을 제공합니다.
+
+Vercel에 호스팅된 앱에 AI 기능을 추가할 때, 프로바이더 SDK를 직접 연동하기 전에 Gateway를 경유하는 구성을 기본 옵션으로 고려해볼 가치가 있습니다.

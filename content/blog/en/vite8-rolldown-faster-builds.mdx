@@ -1,0 +1,81 @@
+---
+title: "Vite 8 with Rolldown: Rust-Powered Builds 10–30x Faster"
+description: "Vite 8, released in March 2026, ships Rolldown — a Rust-based Rollup replacement that cuts production build times by 10–30x. Here's what changed, why it matters, and how to migrate."
+date: "2026-05-04"
+status: "published"
+tags: ["Vite", "Rolldown", "Frontend", "Build Tools", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "vite8-rolldown-faster-builds"
+---
+
+Vite 8, released in March 2026, integrates Rolldown — a Rust rewrite of Rollup — as its default production bundler. With 65 million weekly downloads, Vite is one of the most-used build tools in frontend development. A 10–30x improvement in build speed isn't just a benchmark number; it's a meaningful change for large codebases and CI pipelines.
+
+## What Rolldown Is
+
+Rolldown is a Rollup-compatible bundler written in Rust. It slots into the existing Vite pipeline, replacing the JavaScript-based Rollup for production builds while preserving API compatibility with Rollup plugins.
+
+The pattern follows what SWC, OXC, and Biome already established — rewriting JavaScript toolchain components in Rust to bypass the performance limits inherent to single-threaded JS execution and garbage collection overhead. Rolldown is that approach applied to the bundler step.
+
+## Measured Build Times
+
+Published benchmarks for mid-size React projects (1,000–5,000 modules):
+
+| Modules | Rollup (Vite 7) | Rolldown (Vite 8) | Speedup |
+|---------|----------------|-------------------|---------|
+| 1,000 | ~4.2s | ~0.4s | ~10x |
+| 3,000 | ~18s | ~0.8s | ~22x |
+| 5,000 | ~45s | ~1.5s | ~30x |
+
+The gains compound in monorepo setups where multiple packages build in sequence.
+
+## Migrating to Vite 8
+
+For most projects, the migration is a single command:
+
+```bash
+npm install vite@8 --save-dev
+```
+
+Rolldown is the default bundler in Vite 8 — no configuration change needed. Your existing `vite.config.ts` works as-is in most cases:
+
+```typescript
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  build: {
+    rollupOptions: {
+      // Rollup options remain valid under Rolldown
+      output: {
+        manualChunks: {
+          vendor: ["react", "react-dom"],
+        },
+      },
+    },
+  },
+});
+```
+
+### Potential Issues to Check
+
+**Custom Rollup plugins**: Most Rollup plugins work with Rolldown, but plugins using low-level hooks need verification. Check the Rolldown compatibility table before migrating production workloads.
+
+**CommonJS interop**: Rolldown enforces stricter ESM semantics. Legacy CJS packages that rely on Node.js module resolution quirks may need a compatibility wrapper (`@rollup/plugin-commonjs` or equivalent).
+
+**Source map format**: If your debugging setup depends on specific source map output, test this explicitly post-migration before rolling out to all environments.
+
+## Impact Beyond CI
+
+Build speed improvements affect the development loop too:
+
+- **Vite dev server startup**: Faster initial dependency pre-bundling on cold starts
+- **vitest runs**: When using vitest alongside Vite, the test transform pipeline benefits from the faster bundler
+- **`vite build && vite preview` cycles**: Local production previews become near-instant for most projects
+
+## Takeaway
+
+Rolldown is not experimental — it's the default in Vite 8. For new projects, Vite 8 is the obvious choice. For existing Vite 7 projects, the migration path is low-risk for standard configurations, and the payoff is substantial for any codebase above a few hundred modules.
+
+If you're running CI builds that spend more than 30 seconds on the bundle step, this upgrade alone should significantly cut that time. For teams running large monorepos, the impact is even more pronounced.

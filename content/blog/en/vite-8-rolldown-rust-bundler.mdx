@@ -1,0 +1,90 @@
+---
+title: "Vite 8 and Rolldown: Why One Bundler Is Better Than Two"
+description: "Vite 8 replaces esbuild and Rollup with Rolldown, a single Rust-based bundler that delivers 10–30x faster builds and eliminates the dev/prod environment gap. Here's what changed and what you need to do."
+date: "2026-06-01"
+status: "published"
+tags: ["Vite", "Rolldown", "Rust", "Build Tools", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "vite-8-rolldown-rust-bundler"
+---
+
+Vite 8.0 shipped stable on March 12, 2026. The biggest change since Vite 2: the dual-bundler architecture is gone. esbuild (used in dev) and Rollup (used in production) are replaced by a single Rust-based bundler called Rolldown.
+
+## The Problem Rolldown Solves
+
+Vite's split-bundler setup introduced a class of bugs that were hard to reproduce: tree-shaking differences, plugin side-effects, and chunk-splitting behavior that worked in dev but failed in production. The root cause was simple — two bundlers with subtly different semantics handling the same code.
+
+Rolldown eliminates this by being the single bundler for both environments. It's written in Rust, runs at native speed comparable to esbuild, and implements the same plugin API as Rollup. Most existing Vite plugins work without modification.
+
+## Performance Numbers
+
+Real-world results reported at the Vite 8 launch:
+
+| Metric | Improvement |
+|--------|-------------|
+| Production build | 10–30x faster |
+| Dev server cold start | 3x faster |
+| Full reload | 40% faster |
+| Network requests (dev) | 10x fewer |
+
+Specific case studies: Linear cut build times from 46s to 6s. Ramp reported 57% reduction, Beehiiv 64%.
+
+## Migrating from Vite 7
+
+The migration path is straightforward for most projects:
+
+```bash
+npm install vite@8 --save-dev
+```
+
+That's it in most cases. Your `vite.config.ts` should continue working without changes:
+
+```typescript
+// vite.config.ts — typically unchanged
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ['react', 'react-dom'],
+        }
+      }
+    }
+  }
+});
+```
+
+Rolldown maintains Rollup's plugin API, so official framework plugins (`@vitejs/plugin-react`, `@vitejs/plugin-vue`, etc.) are already updated for compatibility.
+
+## Where You Might Hit Issues
+
+Cases that warrant extra testing:
+
+- **Custom Rollup plugins** that use internal hooks (`renderChunk`, `generateBundle`) — verify they work under Rolldown
+- **Complex CSS Modules** — the processing path changed; run your full test suite
+- **Dynamic import chunk splitting** — Rolldown's chunking heuristics differ slightly from Rollup's in edge cases
+- **Terser-specific minification options** — Rolldown ships its own minifier; some `terserOptions` entries won't apply
+
+```bash
+# Check for warnings on your first Vite 8 build
+npx vite build --debug 2>&1 | grep -E "(warn|error)"
+```
+
+## The Oxc Foundation
+
+Rolldown is built on Oxc, a Rust-based JavaScript toolchain that includes a parser, linter, transformer, and minifier. Vite 8 is the first version to run entirely on this Rust-native pipeline, fully dropping the Node.js esbuild dependency.
+
+As Oxc's minifier and transformer reach maturity (both under active development), future Vite 8.x releases should deliver additional speed gains without requiring any migration on your end.
+
+## Should You Upgrade Now?
+
+**New projects**: Yes, immediately. There's no reason to start on the older architecture.
+
+**Existing projects**: Check your custom plugins for Rolldown compatibility, run your test suite against a Vite 8 build, and upgrade. The migration cost is low for most projects, and the payoff — especially for larger codebases — is measurable from day one.
+
+The dev/prod parity improvement alone is worth it for teams that have spent time chasing environment-specific build bugs. Fewer "works on my machine" incidents is a meaningful quality-of-life improvement.

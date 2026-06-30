@@ -1,0 +1,148 @@
+---
+title: "Cloudflare Dynamic Workers — AI Agent のコード実行基盤として Docker を置き換える"
+description: "Cloudflare Dynamic Workers は、V8 Isolate を使って実行時に Worker を動的生成するサンドボックス技術です。Docker コンテナの 100 倍速い起動と大幅な低メモリで、AI が生成したコードの安全な実行環境として注目されています。"
+date: "2026-05-10"
+status: "published"
+tags: ["Cloudflare", "AI", "Edge Computing", "Serverless", "Agents"]
+thumbnail: ""
+author: "webhani"
+slug: "cloudflare-dynamic-workers-ai-sandbox-2026"
+---
+
+AI Agent がコードを生成・実行するシステムを構築するとき、実行環境の分離は避けられない課題です。これまで多くのチームが Docker コンテナや E2B、Modal などのマネージドサービスを使ってきましたが、Cloudflare が Beta 公開した Dynamic Workers は、この問題へのアプローチを根本から変える可能性があります。
+
+## Dynamic Workers とは何か
+
+Dynamic Workers は、実行中の Worker が別の Worker をランタイムで動的に生成する仕組みです。生成された Worker はそれ自体の V8 Isolate で動作し、呼び出し元とは完全に隔離されたサンドボックスになります。
+
+従来の Cloudflare Workers では、デプロイされた Worker のコードは事前に決まっていました。Dynamic Workers では、Worker に渡した文字列をそのままコードとして Isolate 内で実行できます。AI が生成したコードをそのまま受け取って安全に実行する、という用途に直接対応します。
+
+```typescript
+// Worker A: AI が生成したコードを受け取って実行する
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const { code, input } = await request.json() as {
+      code: string;
+      input: unknown;
+    };
+
+    // 動的に Worker を生成してコードを実行
+    const worker = await createDynamicWorker(code);
+    const result = await worker.run(input);
+
+    return Response.json({ result });
+  },
+};
+
+async function createDynamicWorker(code: string) {
+  // Dynamic Workers API でサンドボックス Worker を生成
+  return await DynamicWorker.create({
+    script: code,
+    // Isolate ごとの CPU とメモリ上限を設定
+    limits: {
+      cpuMs: 5000,
+      memoryMb: 128,
+    },
+  });
+}
+```
+
+実行される Worker は独立した Isolate のため、ホスト Worker のグローバルスコープや他のリクエストのデータには一切アクセスできません。
+
+## Docker コンテナとの性能差
+
+Dynamic Workers が Docker に対して持つ最大の優位性は起動レイテンシとメモリです。
+
+| 指標 | Docker コンテナ | Dynamic Workers |
+|------|----------------|-----------------|
+| コールドスタート | 500ms〜数秒 | 数ミリ秒〜数十ミリ秒 |
+| メモリ使用量 | コンテナあたり数十〜数百 MB | Isolate あたり数 MB |
+| スケールアウト | 数秒〜数十秒 | ほぼ即時 |
+
+「100 倍速い」という数字は誇張ではなく、Docker のコールドスタートが 1〜2 秒のとき、V8 Isolate の起動は数ミリ秒に収まることを指しています。AI Agent のように多数のコード実行リクエストを並列処理する場合、この差は累積してレイテンシとコストに直接影響します。
+
+ただし「ほぼゼロのコールドスタート」は完全なゼロではありません。Isolate の初期化には数ミリ秒かかり、Worker のスクリプトが大きくなれば JIT コンパイルの時間も増えます。ベンチマークの数字を鵜呑みにせず、実際のユースケースで計測することを勧めます。
+
+## `@cloudflare/dynamic-workflows` との組み合わせ
+
+Dynamic Workers 単体では、一回の実行が終われば状態は消えます。AI Agent のワークフローでは、「コードを実行して結果を待ち、次のステップに進む」という処理が連鎖します。`@cloudflare/dynamic-workflows` はこの問題を解決するための Durable Workflows 実装です。
+
+Cloudflare Workflows（`workflow-starter.ts`）と異なり、`@cloudflare/dynamic-workflows` は事前登録なしにワークフローを動的に定義・実行できます。
+
+```typescript
+import { DynamicWorkflow } from "@cloudflare/dynamic-workflows";
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const { taskId, steps } = await request.json() as {
+      taskId: string;
+      steps: Array<{ code: string; input: unknown }>;
+    };
+
+    // ワークフローを動的に生成して実行開始
+    const workflow = await DynamicWorkflow.create(env.WORKFLOWS, {
+      id: taskId,
+      steps: steps.map((step, index) => ({
+        name: `step-${index}`,
+        run: async (ctx) => {
+          // 各ステップで Dynamic Worker を生成してコードを実行
+          const worker = await ctx.createWorker(step.code);
+          return await worker.run(step.input);
+        },
+      })),
+    });
+
+    return Response.json({ workflowId: workflow.id });
+  },
+};
+```
+
+ワークフローは sleep、resume、retry を組み込みでサポートします。AI Agent が長時間タスクを実行しながら人間の承認を待つようなシナリオでも、Durable Object が状態を永続化するため中断・再開が可能です。
+
+## Cloudflare Sandboxes と Mesh
+
+Dynamic Workers と組み合わせて使える関連機能が 2 つあります。
+
+**Cloudflare Sandboxes** は、エージェント向けの永続的なシェル・ファイルシステム環境です。Dynamic Workers が「コードの実行」に特化しているのに対し、Sandboxes はファイルの読み書きや複数コマンドにまたがる状態保持が必要な場合に補完的な役割を担います。長時間稼働するファイル処理ジョブや、ビルドツールを使う処理は Dynamic Workers より Sandboxes が適しています。
+
+**Cloudflare Mesh** は Agent ごとのネットワークアクセス制御です。どの External Endpoint に接続できるかをホワイトリストで設定できるため、AI Agent が意図しない外部 API を呼び出すリスクを減らせます。
+
+```typescript
+// Mesh でエージェントのネットワークアクセスを制限
+const worker = await DynamicWorker.create({
+  script: agentCode,
+  network: {
+    // このエージェントが接続できる Endpoint のみ許可
+    allowedOrigins: [
+      "https://api.example.com",
+      "https://storage.example.com",
+    ],
+    // 外部へのアウトバウンド接続をデフォルト拒否
+    defaultPolicy: "deny",
+  },
+});
+```
+
+## 制限事項
+
+Dynamic Workers の制約を把握しておくことは重要です。
+
+**言語サポート**: JavaScript、TypeScript、WASM のみです。Python は現時点でサポートされていません。AI Agent が Python コードを生成・実行するユースケースには適用できません。Python が必要な場合は E2B や Modal のような専用サービスを検討してください。
+
+**実行モデル**: Cloudflare Workers 全般の制約を受けます。1 リクエストあたりの CPU 時間上限（デフォルト 50ms、Unbound では最大 30 秒）、外部ネットワークアクセスの制限などが該当します。長時間のファイル処理や大規模なデータ変換は向きません。
+
+**Beta 段階**: 現在 Beta のため、API の変更や仕様変更が起こりえます。プロダクション導入する場合は早期から Cloudflare のアップデートを追いかけることを勧めます。
+
+## どれを選ぶか
+
+| ユースケース | 推奨 |
+|-------------|------|
+| JS/TS コードを大量・並列に実行したい | Dynamic Workers |
+| Python など多言語サポートが必要 | E2B / Modal |
+| ファイルシステムや永続シェルが必要 | Cloudflare Sandboxes |
+| ステップ間で状態保持が必要なワークフロー | dynamic-workflows |
+| エージェントの外部接続を制御したい | Cloudflare Mesh |
+
+Dynamic Workers は「AI が生成した JS/TS コードを安全・高速・低コストで実行したい」という要件に対して現時点でもっとも筋の良い選択肢です。Docker に比べてオーバーヘッドが大幅に減り、Cloudflare のグローバルネットワーク上で動作するためレイテンシも低い。
+
+Beta 段階のため本番投入には慎重な判断が必要ですが、JS/TS 実行に限定できるなら、今すぐ試す価値は十分あります。

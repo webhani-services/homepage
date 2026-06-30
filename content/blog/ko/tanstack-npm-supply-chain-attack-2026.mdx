@@ -1,0 +1,138 @@
+---
+title: "TanStack·Mistral npm 공급망 공격: CI/CD 자격증명 유출 대응 가이드"
+description: "'mini Shai-Hulud' 캠페인이 주간 수천만 다운로드의 TanStack Router와 Mistral AI npm 패키지를 표적으로 삼았습니다. 유출 가능성이 있는 자격증명 확인 방법과 구조적 방어책을 설명합니다."
+date: "2026-05-21"
+status: "published"
+tags: ["Security", "npm", "Supply-Chain", "CI/CD", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "tanstack-npm-supply-chain-attack-2026"
+---
+
+'mini Shai-Hulud'로 명명된 npm 공급망 공격이 `@tanstack/react-router`, `@tanstack/history`, `@tanstack/router-core`를 포함한 TanStack 생태계와 Mistral AI의 npm 패키지를 침해했습니다. 영향을 받은 패키지들의 합산 주간 다운로드 수는 수천만 건에 달합니다.
+
+별도로 Trend Micro가 공개한 TeamPCP 캠페인은 Docker Hub 이미지, VS Code/OpenVSX 확장, GitHub Actions 워크플로우도 유사한 자격증명 수집을 목적으로 공격했습니다.
+
+## 무슨 일이 일어났나
+
+공격자는 정상적인 npm 패키지에 악성 코드를 삽입했습니다. 이 코드는 실행 환경에서 다음 정보를 수집해 외부 서버로 전송합니다:
+
+- 환경 변수에 포함된 GitHub 토큰
+- AWS, GCP, Azure 액세스 키
+- CI/CD 플랫폼 시크릿 (GitHub Actions, CircleCI 등)
+- 컨테이너 레지스트리 자격증명
+
+CI 파이프라인은 `npm install` 실행 시 클라우드 자격증명과 레포지토리 토큰을 환경 변수로 로드하는 경우가 많아 공격 표면이 넓습니다.
+
+## 즉시 확인해야 할 사항
+
+### Lock File 이력 확인
+
+`package-lock.json` 또는 `yarn.lock`의 Git 이력에서 영향받은 패키지의 버전이 예상치 않게 변경된 시점이 있는지 확인합니다:
+
+```bash
+# Lock file 변경 이력 확인
+git log --oneline --follow -- package-lock.json | head -20
+
+# 특정 패키지 버전 이력 확인
+git log -p -- package-lock.json | grep -A 3 '"@tanstack/react-router"'
+```
+
+예상치 못한 시점에 lock file이 변경되었다면 해당 환경의 시크릿이 유출되었을 가능성이 있습니다.
+
+### CI/CD 시크릿 교체
+
+영향 노출 기간에 `npm install`(npm ci가 아닌)로 해당 패키지를 설치한 환경의 시크릿을 교체하세요:
+
+- GitHub Personal Access Token 및 Fine-grained token
+- 클라우드 제공자 액세스 키 (AWS IAM, GCP 서비스 계정, Azure 서비스 주체)
+- CI/CD 플랫폼 API 키
+- 컨테이너 레지스트리 Push 자격증명
+
+```bash
+# GitHub Actions 시크릿 목록 확인
+gh secret list --repo org/repo
+
+# 시크릿 업데이트
+gh secret set AWS_ACCESS_KEY_ID --repo org/repo
+```
+
+### 의존성 감사
+
+```bash
+npm audit
+
+# 영향받은 패키지의 현재 버전 확인
+npm list @tanstack/react-router @tanstack/history @tanstack/router-core
+```
+
+## 구조적 방어책
+
+### CI에서 `npm ci` 사용 철저화
+
+`npm ci`는 설치 전 `package-lock.json`의 SHA512 해시를 검증합니다. `npm install`은 그렇지 않습니다. 공급망 방어에서 가장 즉효성 있는 단일 변경입니다:
+
+```yaml
+# GitHub Actions
+- name: Install dependencies
+  run: npm ci  # npm install 대신 npm ci 사용
+```
+
+### CI 권한 명시적 제한
+
+GitHub Actions는 명시적으로 제한하지 않으면 넓은 권한을 부여합니다. 각 워크플로우에 필요한 권한만 선언합니다:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write  # OIDC 클라우드 인증이 필요한 경우만
+```
+
+### 시크릿 범위를 Step 단위로 제한
+
+CI 작업 전체에 모든 자격증명을 노출하지 말고, 필요한 Step에만 전달합니다:
+
+```yaml
+- name: Deploy
+  env:
+    AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  run: ./deploy.sh
+  # 이 Job의 다른 Step은 해당 환경 변수에 접근 불가
+```
+
+### 정적 키 대신 OIDC 인증 전환
+
+AWS, GCP, Azure의 경우 정적 액세스 키를 OIDC 페더레이션으로 교체하면 실행마다 단기 토큰이 생성되어 공급망 공격이 수집할 정적 시크릿이 존재하지 않습니다:
+
+```yaml
+- name: Configure AWS credentials
+  uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: arn:aws:iam::123456789:role/github-actions-role
+    aws-region: ap-northeast-1
+    # 정적 키 없음 — 이 실행에서만 유효한 토큰 생성
+```
+
+### 의존성 자동 모니터링
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 10
+```
+
+## 공급망 공격이 효과적인 이유
+
+npm 레지스트리는 개방적으로 설계되어 패키지 게시에 강한 제약이 없습니다. 공격자가 관리자 계정을 장악하거나 인기 패키지의 의존성에 침투하면, 단 하나의 커밋으로 수시간 내에 수백만 개의 환경에 도달할 수 있습니다.
+
+핵심은 "내가 작성한 취약한 코드"가 아니라 "신뢰했던 서드파티"가 공격 경로가 된다는 것입니다.
+
+## 정리
+
+TanStack Router 또는 Mistral AI npm 패키지를 사용 중이라면: lock file 이력 확인, 유출 가능성이 있는 시크릿 교체, 최신 안전 버전으로 업데이트를 우선순위로 진행하세요. 그리고 이번 사건을 계기로 CI에서 `npm ci` 강제화, OIDC 인증 전환, 시크릿 범위 최소화를 구조적으로 정비하는 것을 권장합니다.

@@ -1,0 +1,162 @@
+---
+title: "Next.js 16 Cache Components와 Partial Pre-Rendering 실전 가이드"
+description: "Next.js 16에서 정식 도입된 Cache Components와 Partial Pre-Rendering(PPR)의 동작 원리와 실전 적용 방법을 설명합니다."
+date: "2026-06-04"
+status: "published"
+tags: ["Next.js", "React", "Web Development", "Performance", "Caching"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-cache-components-partial-prerendering"
+---
+
+Next.js 16에서 Partial Pre-Rendering(PPR)과 Cache Components가 안정 버전으로 제공되기 시작했습니다. 두 기능을 함께 사용하면 "빠른 정적 페이지"와 "유연한 동적 페이지" 사이의 선택 문제를 해결할 수 있습니다.
+
+## PPR이 해결하는 문제
+
+기존 Next.js에서 페이지 내에 동적 컴포넌트가 하나라도 있으면 페이지 전체가 동적으로 처리되었습니다. 정적 생성은 페이지 단위의 전부 아니면 전무(all-or-nothing) 방식이었습니다.
+
+PPR은 하나의 페이지를 두 부분으로 분리합니다. 빌드 시 생성되는 정적 Shell과, `<Suspense>` 경계로 감싸진 동적 영역입니다. 브라우저는 정적 Shell을 즉시 받고, 동적 콘텐츠는 해결되는 대로 스트리밍으로 채워집니다.
+
+```
+빌드 시:     [정적 Shell] + [Suspense Fallback] → CDN 배포
+요청 시:     [정적 Shell] + [동적 콘텐츠]       → 클라이언트에 스트리밍
+```
+
+TTFB는 정적 Shell이 CDN에서 즉시 제공되므로 빠르게 유지되고, 동적 콘텐츠는 초기 렌더링을 차단하지 않고 나중에 스트리밍됩니다.
+
+## Cache Components
+
+React의 `cache` 함수가 Next.js 16에서 안정 버전으로 제공됩니다. 비동기 함수 결과를 요청 내에서, 그리고 렌더 트리 전체에서 메모이제이션합니다.
+
+```tsx
+// app/components/ProductList.tsx
+import { cache } from "react";
+
+const getProducts = cache(async (categoryId: string) => {
+  const res = await fetch(`/api/products?category=${categoryId}`, {
+    next: { revalidate: 300 }, // 5분마다 재검증
+  });
+  return res.json();
+});
+
+export async function ProductList({ categoryId }: { categoryId: string }) {
+  const products = await getProducts(categoryId);
+
+  return (
+    <ul>
+      {products.map((p) => (
+        <li key={p.id}>
+          {p.name} — {p.price.toLocaleString()}원
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+`cache`로 감싼 함수는 같은 요청 내에서 동일한 인수로 여러 번 호출되어도 한 번만 실행됩니다. `next: { revalidate: 300 }`을 조합하면 5분 후 백그라운드에서 데이터를 재생성하는 ISR 동작을 컴포넌트 수준에서 구현할 수 있습니다.
+
+## PPR 설정 및 구현
+
+`next.config.mjs`에서 PPR을 활성화합니다.
+
+```js
+// next.config.mjs
+const nextConfig = {
+  experimental: {
+    ppr: true,
+  },
+};
+
+export default nextConfig;
+```
+
+페이지 컴포넌트에서는 동적 컴포넌트를 `<Suspense>`로 감싸면 됩니다.
+
+```tsx
+// app/products/[id]/page.tsx
+import { Suspense } from "react";
+import { ProductDetail } from "@/components/ProductDetail";
+import { UserRecommendations } from "@/components/UserRecommendations";
+import { RelatedProducts } from "@/components/RelatedProducts";
+
+export const experimental_ppr = true;
+
+export default function ProductPage({ params }: { params: { id: string } }) {
+  return (
+    <div className="product-page">
+      {/* 정적: 빌드 시 생성 */}
+      <nav aria-label="breadcrumb">...</nav>
+
+      {/* 동적: 특정 상품에 따라 달라짐 */}
+      <Suspense fallback={<ProductSkeleton />}>
+        <ProductDetail id={params.id} />
+      </Suspense>
+
+      {/* 동적: 사용자 세션에 따라 달라짐 */}
+      <Suspense fallback={<RecommendationSkeleton />}>
+        <UserRecommendations productId={params.id} />
+      </Suspense>
+
+      {/* 캐시된 동적: 5분마다 갱신 */}
+      <Suspense fallback={<div>관련 상품 로딩 중...</div>}>
+        <RelatedProducts categoryId="electronics" />
+      </Suspense>
+    </div>
+  );
+}
+```
+
+`<Suspense>` 경계 밖에 있는 것은 정적 Shell의 일부가 됩니다.
+
+## 컴포넌트별 캐시 정책 구성
+
+Cache Components는 중첩이 가능하므로 컴포넌트 트리의 각 레벨에서 다른 TTL을 설정할 수 있습니다.
+
+```tsx
+// 사이트 헤더 — 1시간 캐시
+async function SiteHeader() {
+  const config = await getSiteConfig(); // cache + revalidate: 3600
+  return <header style={{ background: config.brandColor }}>{config.siteName}</header>;
+}
+
+// 상품 상세 — 5분 캐시
+async function ProductDetail({ id }: { id: string }) {
+  const product = await getProduct(id); // cache + revalidate: 300
+  return (
+    <section>
+      <h1>{product.name}</h1>
+      <p>{product.description}</p>
+    </section>
+  );
+}
+
+// 재고 현황 — 캐시 없음 (실시간)
+async function InventoryBadge({ productId }: { productId: string }) {
+  const stock = await getStockLevel(productId);
+  return <span>{stock > 0 ? "재고 있음" : "품절"}</span>;
+}
+```
+
+이 수준의 세밀함은 이전에는 실용적으로 구현하기 어려웠습니다.
+
+## 기존 ISR과의 비교
+
+| 항목 | 기존 ISR | PPR + Cache Components |
+|------|----------|----------------------|
+| 캐시 단위 | 페이지 전체 | 컴포넌트 단위 |
+| 정적/동적 혼합 | 불가 | 가능 |
+| 사용자 세션 콘텐츠 | 불가 | `<Suspense>`로 처리 |
+| 재검증 제어 | 페이지 단위 | 컴포넌트 단위 |
+
+## 주의사항
+
+**Suspense 경계 설계가 핵심입니다.** 사용자 세션이나 실시간 데이터가 필요한 것은 `<Suspense>`로 감싸고, 그 외는 Shell이나 캐시로 처리합니다.
+
+**Skeleton 크기를 맞춰야 합니다.** Fallback과 실제 콘텐츠의 크기가 다르면 레이아웃 시프트가 발생합니다. 높이를 맞추거나 `min-height`를 설정하세요.
+
+**정적 Shell을 독립적으로 테스트하세요.** 브라우저에서 JavaScript를 비활성화하고 페이지 구조가 의미 있고 탐색 가능한지 확인하는 것이 좋습니다.
+
+## 정리
+
+PPR과 Cache Components는 Next.js의 렌더링 결정 단위를 페이지에서 컴포넌트로 이동시킵니다. 실용적인 시작점은 트래픽이 많은 페이지에서 가장 느린 동적 컴포넌트를 찾아, 5~10분 재검증 기간의 Cache Components를 먼저 적용해 보는 것입니다. 그런 다음 사용자별로 달라지는 콘텐츠를 `<Suspense>`로 감싸면 PPR이 나머지를 처리합니다.

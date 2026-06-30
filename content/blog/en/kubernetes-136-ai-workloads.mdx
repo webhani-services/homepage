@@ -1,0 +1,173 @@
+---
+title: "Kubernetes v1.36 and AI Workloads: Running MLOps at Scale"
+description: "Kubernetes v1.36 introduces Pod-Level Resource Managers as alpha, improving flexible GPU resource management for ML workloads. A practical guide to running MLOps on Kubernetes in 2026."
+date: "2026-05-04"
+status: "published"
+tags: ["Kubernetes", "MLOps", "AI", "Cloud Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-136-ai-workloads"
+---
+
+Kubernetes v1.36 shipped Pod-Level Resource Managers as an alpha feature. The addition targets GPU and hardware-accelerator scheduling — problems that have become increasingly relevant as ML training and inference workloads move to Kubernetes as their primary orchestration layer.
+
+In 2026, the heaviest Kubernetes workloads are no longer traditional microservices — they're MLOps pipelines, model inference services, and large-scale data processing jobs. That shift changes how clusters need to be designed and operated.
+
+## What's Different About ML Workloads
+
+Standard web applications and ML workloads have fundamentally different infrastructure requirements:
+
+| Aspect | Web App | ML Workload |
+|--------|---------|-------------|
+| Resource pattern | Steady CPU/memory | Bursty GPU usage |
+| Execution | Continuous | Batch / intermittent |
+| Scaling | Horizontal pod scaling | GPU node pool management |
+| Data | Stateless | Large persistent datasets |
+| Failure recovery | Restart from scratch | Checkpoint required |
+
+## Pod-Level Resource Managers
+
+Traditional Kubernetes resource management — CPU/memory requests and limits — wasn't designed for GPUs. The Device Plugin framework handled GPU scheduling, but fine-grained allocation across multiple GPUs and dynamic reconfiguration remained difficult.
+
+Pod-Level Resource Managers provides a more expressive model:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ml-training-job
+spec:
+  containers:
+    - name: trainer
+      image: my-ml-trainer:latest
+      resources:
+        requests:
+          cpu: "4"
+          memory: "16Gi"
+          nvidia.com/gpu: "2"
+        limits:
+          cpu: "8"
+          memory: "32Gi"
+          nvidia.com/gpu: "2"
+  resourceClaims:
+    - name: gpu-resource
+      resourceClaimTemplateName: gpu-claim-template
+```
+
+## Training Jobs in Practice
+
+For distributed training, the Kubernetes `Job` resource manages parallel execution across GPU nodes:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-training
+spec:
+  completions: 4
+  parallelism: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: trainer
+          image: pytorch/pytorch:2.5-cuda12.1
+          command: ["python", "train.py"]
+          args:
+            - "--epochs=100"
+            - "--checkpoint-dir=/checkpoints"
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: checkpoints
+              mountPath: /checkpoints
+      volumes:
+        - name: checkpoints
+          persistentVolumeClaim:
+            claimName: model-checkpoints-pvc
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+```
+
+Setting `restartPolicy: OnFailure` combined with checkpoint volumes means a failed pod resumes from its last checkpoint rather than restarting training from scratch — critical for multi-hour training jobs.
+
+## Inference Service Deployment
+
+Serving a trained model has different priorities: lower latency, horizontal scaling, and graceful rollout for model version updates:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: inference
+  template:
+    metadata:
+      labels:
+        app: inference
+    spec:
+      containers:
+        - name: inference
+          image: my-inference-server:latest
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: inference-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: inference-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+GPU nodes are expensive. Pairing HPA with `cluster-autoscaler` and scale-down stabilization policies prevents idle GPU nodes from running unnecessarily between inference bursts.
+
+## Internal Developer Platforms for MLOps
+
+The 2026 platform engineering trend extends into ML workflows. Teams are building self-service platforms where ML engineers can deploy training jobs and inference services without managing Kubernetes YAML directly.
+
+Common stack: Backstage (developer portal) + ArgoCD (GitOps) + Kubeflow (ML pipeline orchestration). This abstraction layer lets data scientists iterate faster while infrastructure teams maintain standards for security, cost, and observability.
+
+## Practical Next Steps
+
+If you're moving ML workloads to Kubernetes:
+
+1. Start with `Job` resources for training before investing in Kubeflow
+2. Use node taints and tolerations to isolate GPU nodes from general workloads
+3. Mount datasets from PVCs rather than baking them into container images
+4. Add checkpointing to training scripts before running long jobs
+5. Set GPU resource limits equal to requests — GPU scheduling doesn't work reliably with burstable resources
+
+Pod-Level Resource Managers in v1.36 is still alpha, so it's not production-ready yet. But the trajectory is clear: Kubernetes is building first-class support for the hardware and scheduling patterns that AI workloads require, and the operational patterns for MLOps on K8s are maturing rapidly.

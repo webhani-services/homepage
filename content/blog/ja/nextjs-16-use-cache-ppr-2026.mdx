@@ -1,0 +1,287 @@
+---
+title: "Next.js 16 の `use cache` ディレクティブと Partial Pre-Rendering：キャッシュの新しい考え方"
+description: "`use cache` ディレクティブと Partial Pre-Rendering (PPR) は、Next.js 16 が持ち込んだキャッシュの新しいパラダイムです。fetch ベースの複雑なキャッシュ設定から脱却し、コンポーネント単位の宣言的キャッシュへ移行するための実践ガイドです。"
+date: "2026-05-24"
+status: "published"
+tags: ["nextjs", "react", "performance", "caching", "ppr"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-use-cache-ppr-2026"
+---
+
+Next.js 16 がリリースされて以来、最も開発者の関心を集めている変更の一つが `use cache` ディレクティブと Partial Pre-Rendering (PPR) の組み合わせです。これらは単なる API の追加ではなく、Next.js のキャッシュモデル全体を再設計するものです。
+
+## なぜ今、キャッシュを再考する必要があったのか
+
+### 従来の fetch キャッシュの問題点
+
+Next.js 13〜15 の fetch ベースキャッシュは、多くの開発者を混乱させてきました。`fetch` に `cache: "force-cache"` を渡すか、`revalidate` オプションを設定するか。Router Cache、Full Route Cache、Request Memoization の三層構造を正確に理解していなければ、意図しないキャッシュの挙動に悩まされることになります。
+
+```typescript
+// Next.js 14 時代の典型的なパターン（わかりにくい）
+async function getData() {
+  const res = await fetch("https://api.example.com/data", {
+    next: { revalidate: 3600 },
+  });
+  return res.json();
+}
+
+// または unstable_cache を使う場合
+import { unstable_cache } from "next/cache";
+
+const getCachedData = unstable_cache(
+  async () => {
+    const res = await fetch("https://api.example.com/data");
+    return res.json();
+  },
+  ["data-key"],
+  { revalidate: 3600 }
+);
+```
+
+`unstable_cache` という名前が示す通り、これは「安定していない」APIでした。実際、Next.js チームは長い間この API を改善しようとしていましたが、fetch のセマンティクスと混在する設計上の制約から抜け出せずにいました。
+
+### `use cache` が解決すること
+
+`use cache` は React の `"use client"` や `"use server"` と同様の宣言的アプローチです。ファイル先頭またはコンポーネント・関数の先頭に配置することで、そのスコープ全体をキャッシュ対象として明示します。fetch の有無に関わらず動作し、任意の非同期処理をキャッシュできます。
+
+## `use cache` の基本的な使い方
+
+### ファイルレベルのキャッシュ
+
+```typescript
+// app/components/ProductList.tsx
+"use cache";
+
+import { getProducts } from "@/lib/api";
+
+export async function ProductList() {
+  const products = await getProducts();
+
+  return (
+    <ul>
+      {products.map((product) => (
+        <li key={product.id}>{product.name}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+ファイル先頭に `"use cache"` を置くと、そのファイルから export されるすべての関数がキャッシュされます。これは Server Component 全体をキャッシュしたい場合に有効です。
+
+### 関数レベルのキャッシュ
+
+```typescript
+// app/lib/data.ts
+import { unstable_cacheTag as cacheTag, unstable_cacheLife as cacheLife } from "next/cache";
+
+export async function getProductById(id: string) {
+  "use cache";
+  cacheLife("hours");
+  cacheTag(`product-${id}`);
+
+  const res = await fetch(`https://api.example.com/products/${id}`);
+  return res.json();
+}
+```
+
+関数の中に `"use cache"` を配置することで、特定の関数だけをキャッシュ対象にできます。`cacheLife()` でキャッシュの有効期間を、`cacheTag()` でオンデマンド再検証のためのタグを指定します。
+
+### `cacheLife()` の設定
+
+```typescript
+// app/lib/product-data.ts
+import { unstable_cacheLife as cacheLife } from "next/cache";
+
+export async function getPopularProducts() {
+  "use cache";
+  // プリセット名で指定（"seconds", "minutes", "hours", "days", "weeks", "max"）
+  cacheLife("hours");
+
+  return fetch("https://api.example.com/popular").then((r) => r.json());
+}
+
+export async function getStaticContent() {
+  "use cache";
+  // カスタム設定: stale(クライアントキャッシュ), revalidate(バックグラウンド更新), expire(強制失効)
+  cacheLife({
+    stale: 300,      // 5分間はキャッシュを新鮮とみなす
+    revalidate: 900, // 15分後にバックグラウンドで再検証
+    expire: 86400,   // 24時間後に強制失効
+  });
+
+  return fetch("https://cms.example.com/content").then((r) => r.json());
+}
+```
+
+### `cacheTag()` とオンデマンド再検証
+
+```typescript
+// app/lib/user-data.ts
+import { unstable_cacheTag as cacheTag } from "next/cache";
+
+export async function getUserProfile(userId: string) {
+  "use cache";
+  cacheTag(`user-${userId}`, "user-profiles");
+
+  const res = await fetch(`https://api.example.com/users/${userId}`);
+  return res.json();
+}
+
+// app/api/revalidate/route.ts（Webhook などから呼ばれる）
+import { revalidateTag } from "next/cache";
+
+export async function POST(request: Request) {
+  const { userId } = await request.json();
+
+  // 特定ユーザーのキャッシュだけを無効化
+  revalidateTag(`user-${userId}`);
+
+  return Response.json({ revalidated: true });
+}
+```
+
+## Partial Pre-Rendering (PPR) との組み合わせ
+
+### PPR の基本概念
+
+PPR は、1つのページ内で静的コンテンツと動的コンテンツを混在させる仕組みです。従来の選択肢は「完全静的（SSG）」か「完全動的（SSR）」でしたが、PPR はページの静的なシェルを即座に配信し、動的な部分だけを後からストリーミングします。
+
+```typescript
+// next.config.ts
+const nextConfig = {
+  experimental: {
+    ppr: "incremental", // または true でアプリ全体に適用
+  },
+};
+```
+
+### ページレベルでの PPR 有効化
+
+```typescript
+// app/products/[id]/page.tsx
+export const experimental_ppr = true;
+
+import { Suspense } from "react";
+import { ProductDetails } from "@/components/ProductDetails";
+import { PersonalizedRecommendations } from "@/components/PersonalizedRecommendations";
+import { ReviewSection } from "@/components/ReviewSection";
+
+export default async function ProductPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = await params;
+
+  return (
+    <main>
+      {/* use cache でキャッシュ済み → 静的シェルの一部として即座に配信 */}
+      <ProductDetails productId={id} />
+
+      {/* Suspense で囲まれた動的コンテンツ → ストリーミング */}
+      <Suspense fallback={<div>レコメンドを読み込み中...</div>}>
+        <PersonalizedRecommendations userId={/* cookie から */} />
+      </Suspense>
+
+      <Suspense fallback={<div>レビューを読み込み中...</div>}>
+        <ReviewSection productId={id} />
+      </Suspense>
+    </main>
+  );
+}
+```
+
+```typescript
+// app/components/ProductDetails.tsx
+"use cache";
+
+import { unstable_cacheTag as cacheTag, unstable_cacheLife as cacheLife } from "next/cache";
+
+export async function ProductDetails({ productId }: { productId: string }) {
+  cacheTag(`product-${productId}`);
+  cacheLife("hours");
+
+  const product = await fetch(
+    `https://api.example.com/products/${productId}`
+  ).then((r) => r.json());
+
+  return (
+    <section>
+      <h1>{product.name}</h1>
+      <p>{product.description}</p>
+      <span>¥{product.price.toLocaleString()}</span>
+    </section>
+  );
+}
+```
+
+`ProductDetails` は `use cache` でキャッシュされているため、PPR においてページの静的シェルに組み込まれます。一方、ユーザー固有の `PersonalizedRecommendations` は Suspense バウンダリで囲まれた動的コンテンツとしてストリーミングされます。
+
+### パフォーマンスの変化
+
+この構成により、ユーザーは以下のような体験を得ます：
+
+1. **即座のキャッシュヒット**：商品詳細とページ構造が CDN キャッシュから即座に配信
+2. **段階的なハイドレーション**：静的シェルが表示された後、パーソナライズされたコンテンツが流れ込む
+3. **実質的なゼロ TTFB**：全ページ SSR と比較して、最初のバイトが届くまでの時間が劇的に短縮
+
+## Turbopack デフォルト化による開発体験の変化
+
+Next.js 16 では Turbopack が標準 bundler になりました。`next dev` を実行すると、明示的な設定なしに Turbopack が使用されます。
+
+実務上の影響として最も大きいのは、コールドスタートの短縮です。特に `use cache` を多用するアプリケーションでは、Turbopack のモジュールグラフ解析がキャッシュのコンパイル境界を正確に把握し、HMR の精度が上がります。Server Component を含む複数ファイルを変更した際のリロードが、従来より細粒度になっています。
+
+webpack プラグインを多用している既存プロジェクトでは、互換性の確認が必要です。`next.config.ts` で `bundler: "webpack"` を指定すれば従来通り動作しますが、長期的には Turbopack への移行を計画することをお勧めします。
+
+## 既存プロジェクトからの移行アドバイス
+
+### ステップ 1：`unstable_cache` の置き換え
+
+```typescript
+// 移行前
+import { unstable_cache } from "next/cache";
+
+const getUser = unstable_cache(
+  async (id: string) => {
+    return db.user.findUnique({ where: { id } });
+  },
+  ["user"],
+  { revalidate: 3600 }
+);
+
+// 移行後
+async function getUser(id: string) {
+  "use cache";
+  cacheLife("hours");
+  cacheTag(`user-${id}`);
+
+  return db.user.findUnique({ where: { id } });
+}
+```
+
+### ステップ 2：fetch の cache オプションを削除
+
+`use cache` を使う場合、fetch に `cache` や `next.revalidate` オプションを渡す必要はありません。`use cache` のスコープ全体がキャッシュされるためです。
+
+### ステップ 3：PPR の段階的導入
+
+```typescript
+// next.config.ts
+const nextConfig = {
+  experimental: {
+    ppr: "incremental", // ページごとに opt-in できる
+  },
+};
+```
+
+`incremental` モードでは、各ページファイルで `export const experimental_ppr = true` を追加したページのみ PPR が有効になります。一度にすべてを移行せず、トラフィックの多いページから試すのが安全です。
+
+## webhani の見解
+
+`use cache` と PPR の組み合わせは、「静的か動的か」という二択を終わらせる重要な設計です。コンポーネントの単位でキャッシュ戦略を決められるため、ページ全体のキャッシュ方針を一つに統一する必要がなくなります。
+
+特に EC サイトや情報サービスのように、「商品情報は変わりにくいが、在庫・価格・レコメンドはリアルタイム性が必要」といった混在ページに威力を発揮します。`use cache` でプロダクト情報を数時間キャッシュしつつ、Suspense で囲んだ在庫表示は動的にストリーミングする構成が、コードレベルで自然に表現できます。
+
+`unstable_cache` から `use cache` への移行は機械的で簡単です。新規プロジェクトなら迷わず `use cache` を採用し、PPR を `incremental` で試しながら徐々に広げていくアプローチをお勧めします。

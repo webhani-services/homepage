@@ -1,0 +1,233 @@
+---
+title: "Hexagonal Architecture and DDD in 2026: Keeping Business Logic Testable"
+description: "A practical look at Ports and Adapters with DDD bounded contexts, with a concrete TypeScript example showing how port interfaces make business logic fast to test and easy to replace."
+date: "2026-06-12"
+status: "published"
+tags: ["Architecture", "DDD", "Hexagonal Architecture", "Testing", "TypeScript"]
+thumbnail: ""
+author: "webhani"
+slug: "hexagonal-architecture-ddd-testability-2026"
+---
+
+Most of the pain we see in long-lived backends comes from one root cause: business logic that knows too much about infrastructure. A pricing rule reaches directly into a SQL client. A subscription state machine imports an HTTP SDK to call a billing provider. A few months later, the database is fine, the billing provider is fine, but you cannot write a fast test for any of it because every test path drags a network connection or a container behind it.
+
+Hexagonal architecture, also called Ports and Adapters, exists to cut that knot. The idea is old, but in 2026 it earns its keep for a reason that was less obvious a decade ago: the infrastructure around us has become unusually volatile. LLM providers ship breaking changes and new models every few weeks. Vendor APIs get deprecated. You evaluate three model providers in a quarter and keep none of them permanently. When the things on the edge of your system change this fast, you want the core to be insulated from them by an explicit, narrow boundary you control.
+
+## The core idea, stated plainly
+
+A hexagonal system has three layers of responsibility.
+
+The **domain core** holds your business rules and use cases. It is plain code with no imports from any framework, database driver, HTTP client, or message queue. It does not know whether data lives in Postgres or in memory, whether a request arrived over REST or gRPC.
+
+A **port** is an interface, owned by the core, that describes a capability the core needs from the outside world: "save an order," "send a notification," "ask a model to summarize text." The core depends on the interface, never on a concrete implementation.
+
+An **adapter** is a concrete implementation of a port that talks to a real technology. `PostgresOrderRepository` implements the `OrderRepository` port. A different adapter implements the same port using an in-memory map for tests. The core does not change when you swap adapters.
+
+The shape matters because it inverts the direction of dependency. Infrastructure depends on the domain, not the other way around. The domain stays at the center, ignorant and stable.
+
+## A concrete example
+
+Let us model a small slice of an ordering system. The use case is "place an order," and it needs to persist orders somewhere. We start with the domain, which has no idea what "somewhere" means.
+
+```typescript
+// domain/order.ts — pure business types, no infrastructure
+export type OrderId = string;
+
+export interface OrderLine {
+  sku: string;
+  quantity: number;
+  unitPriceCents: number;
+}
+
+export class Order {
+  constructor(
+    readonly id: OrderId,
+    readonly customerId: string,
+    readonly lines: OrderLine[],
+    readonly placedAt: Date,
+  ) {}
+
+  totalCents(): number {
+    return this.lines.reduce(
+      (sum, line) => sum + line.quantity * line.unitPriceCents,
+      0,
+    );
+  }
+}
+```
+
+Next, the port. This is the only thing the use case is allowed to know about persistence. It is an interface, owned by the domain, expressed in domain terms.
+
+```typescript
+// domain/ports.ts — the contract the core depends on
+import { Order, OrderId } from "./order";
+
+export interface OrderRepository {
+  save(order: Order): Promise<void>;
+  findById(id: OrderId): Promise<Order | null>;
+}
+
+export interface IdGenerator {
+  next(): OrderId;
+}
+```
+
+Now the use case. It depends only on the ports above. There is no SQL, no client library, no environment variable. The business rule here is small but real: an order must have at least one line, and a customer cannot place two identical orders within the same second is not enforced here, but you can see where it would go.
+
+```typescript
+// domain/place-order.ts — the use case
+import { Order, OrderLine } from "./order";
+import { OrderRepository, IdGenerator } from "./ports";
+
+export class EmptyOrderError extends Error {}
+
+export class PlaceOrder {
+  constructor(
+    private readonly repo: OrderRepository,
+    private readonly ids: IdGenerator,
+    private readonly clock: () => Date,
+  ) {}
+
+  async execute(input: {
+    customerId: string;
+    lines: OrderLine[];
+  }): Promise<Order> {
+    if (input.lines.length === 0) {
+      throw new EmptyOrderError("an order needs at least one line");
+    }
+    const order = new Order(
+      this.ids.next(),
+      input.customerId,
+      input.lines,
+      this.clock(),
+    );
+    await this.repo.save(order);
+    return order;
+  }
+}
+```
+
+Notice the clock is injected too. Time is also infrastructure. Injecting it means the test controls "now" instead of fighting it.
+
+Now the adapters. The real one sketches how it would talk to Postgres. You would never run this in a unit test.
+
+```typescript
+// adapters/postgres-order-repository.ts
+import { Pool } from "pg";
+import { Order, OrderId } from "../domain/order";
+import { OrderRepository } from "../domain/ports";
+
+export class PostgresOrderRepository implements OrderRepository {
+  constructor(private readonly pool: Pool) {}
+
+  async save(order: Order): Promise<void> {
+    await this.pool.query(
+      "INSERT INTO orders (id, customer_id, lines, placed_at) VALUES ($1, $2, $3, $4)",
+      [order.id, order.customerId, JSON.stringify(order.lines), order.placedAt],
+    );
+  }
+
+  async findById(id: OrderId): Promise<Order | null> {
+    const res = await this.pool.query(
+      "SELECT id, customer_id, lines, placed_at FROM orders WHERE id = $1",
+      [id],
+    );
+    if (res.rows.length === 0) return null;
+    const row = res.rows[0];
+    return new Order(row.id, row.customer_id, row.lines, row.placed_at);
+  }
+}
+```
+
+And the in-memory adapter, which is the whole point. It implements the same interface with a plain `Map`.
+
+```typescript
+// adapters/in-memory-order-repository.ts
+import { Order, OrderId } from "../domain/order";
+import { OrderRepository } from "../domain/ports";
+
+export class InMemoryOrderRepository implements OrderRepository {
+  private store = new Map<OrderId, Order>();
+
+  async save(order: Order): Promise<void> {
+    this.store.set(order.id, order);
+  }
+
+  async findById(id: OrderId): Promise<Order | null> {
+    return this.store.get(id) ?? null;
+  }
+}
+```
+
+## Why this makes testing cheap
+
+Because the use case depends on `OrderRepository` and not on Postgres, the test wires up the in-memory adapter and a couple of trivial fakes. No container, no migration, no network.
+
+```typescript
+// place-order.test.ts
+import { describe, it, expect } from "vitest";
+import { PlaceOrder, EmptyOrderError } from "../domain/place-order";
+import { InMemoryOrderRepository } from "../adapters/in-memory-order-repository";
+
+describe("PlaceOrder", () => {
+  const setup = () => {
+    const repo = new InMemoryOrderRepository();
+    let counter = 0;
+    const ids = { next: () => `order-${++counter}` };
+    const clock = () => new Date("2026-06-12T09:00:00Z");
+    return { repo, useCase: new PlaceOrder(repo, ids, clock) };
+  };
+
+  it("persists a valid order and computes the total", async () => {
+    const { repo, useCase } = setup();
+    const order = await useCase.execute({
+      customerId: "cust-1",
+      lines: [{ sku: "A", quantity: 2, unitPriceCents: 500 }],
+    });
+
+    expect(order.totalCents()).toBe(1000);
+    expect(await repo.findById(order.id)).not.toBeNull();
+  });
+
+  it("rejects an order with no lines", async () => {
+    const { useCase } = setup();
+    await expect(
+      useCase.execute({ customerId: "cust-1", lines: [] }),
+    ).rejects.toBeInstanceOf(EmptyOrderError);
+  });
+});
+```
+
+These tests run in milliseconds and are deterministic. The clock is fixed, the IDs are predictable, the store is fresh per test. There is nothing flaky to retry. When you later add the real `PostgresOrderRepository`, you cover it with a small set of integration tests that genuinely hit a database, and you keep those separate and few. The bulk of your behavior is verified without infrastructure at all.
+
+The same shape pays off directly with fast-moving AI vendors. Put a `SummarizationPort` in your core, implement it once with provider A, again with provider B, and a third time as a deterministic fake that returns a canned summary. Your domain logic and its tests never change when you switch providers, and your integration suite is the only place that touches a real model endpoint.
+
+## The failure mode: ports for everything
+
+The honest risk with this style is over-engineering. Teams discover the pattern and start wrapping every class behind an interface, producing a forest of one-implementation "ports" that exist only to satisfy a doctrine. Each one adds a file, an indirection, and a moment of "where is this actually implemented" for every reader. That is ceremony, not design.
+
+A port earns its keep when at least one of these is true:
+
+- **There is, or will plausibly be, more than one real implementation.** Two payment providers, two storage backends, an on-prem and a cloud variant.
+- **It crosses an external boundary** you do not control: a database, a third-party API, the file system, the clock, randomness, a queue.
+- **You need to fake it in tests** to keep them fast and deterministic.
+
+If none of those hold, a port is dead weight. A pure function that formats a string does not need an interface. A small internal helper that will only ever have one implementation does not need one either. Use the pattern where the boundary is real, and use a plain function or class where it is not.
+
+## Bounded contexts: do not share one giant model
+
+DDD's contribution here is knowing where to draw the hexagons. The trap is a single `Order` type shared across billing, fulfillment, and analytics, accreting fields until it serves all of them and none of them well. The word "order" means different things in each context, and forcing one model to carry every meaning is what produces brittle, tangled code.
+
+Align module boundaries to language boundaries. If the billing team and the fulfillment team use the same word with different meanings, that is a strong signal to split the model. Each bounded context gets its own domain types, its own ports, and translates at the seams. The ubiquitous language inside one context stays consistent; you do not try to make it consistent across the whole company.
+
+A note on restraint for 2026: hexagonal architecture and clean bounded contexts are worth applying widely, but the heavier patterns are not. Event sourcing and CQRS solve real problems in genuinely complex, high-transaction domains with auditing or temporal-query needs. They are a poor default for a CRUD product. Start with the simplest thing that works, often a clean modular monolith, and evolve toward microservices or event-driven designs only when concrete business pressure demands it. Patterns applied for fashion add cost without buying anything.
+
+## Takeaways
+
+- Keep the domain core free of infrastructure imports. Depend on ports, not on drivers and SDKs.
+- Inject time, randomness, and IDs as ports too. They are infrastructure in disguise.
+- Use in-memory adapters to make the bulk of your tests fast and deterministic; reserve integration tests for the real adapters and keep them few.
+- Behind a port, fast-moving AI and vendor APIs become replaceable without touching domain logic or its tests.
+- A port earns its keep only with multiple implementations, an external boundary, or a test fake. Otherwise prefer a plain function.
+- Draw bounded contexts along language boundaries. Do not force one model to mean everything.
+- Reach for event sourcing and CQRS only when the domain's complexity genuinely calls for them. Start simple and let pressure, not fashion, drive the evolution.

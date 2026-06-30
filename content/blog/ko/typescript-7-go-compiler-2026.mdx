@@ -1,0 +1,102 @@
+---
+title: "TypeScript v7 Go 기반 컴파일러 전환 — 개발자가 준비해야 할 것들"
+description: "TypeScript 팀이 v7에서 컴파일러를 Go로 재작성합니다. 왜 Go인지, 무엇이 바뀌는지, 지금부터 준비할 내용을 정리합니다."
+date: "2026-05-07"
+status: "published"
+tags: ["TypeScript", "Go", "Developer Tools", "Frontend", "Compiler"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-7-go-compiler-2026"
+---
+
+Microsoft TypeScript 팀이 v7에서 컴파일러 전체를 Go로 재작성하는 계획을 진행 중입니다. TypeScript 6.0이 "현행 JavaScript 사양 기반 마지막 메이저 버전"으로 자리매김했다면, v7은 아키텍처의 근본적인 전환입니다.
+
+## 왜 Go인가
+
+TypeScript 컴파일러(`tsc`)는 오랫동안 TypeScript 자체로 작성되어 왔습니다. 이 구조는 컴파일러와 언어 서비스를 같은 코드베이스에서 공유하는 장점이 있었지만, 대규모 프로젝트에서 성능 한계가 문제가 되었습니다.
+
+Go를 선택한 주된 이유는 성능입니다. Go는 GC를 유지하면서도 C에 가까운 실행 속도를 내며, goroutine 기반 병렬 처리가 타입 체크 병렬화에 적합합니다.
+
+Rust도 검토되었지만, TypeScript 타입 체커가 의존하는 복잡한 공유 가변 상태 관리가 Rust의 소유권 모델과 맞지 않았습니다. Go의 GC 모델은 기존 컴파일러 로직을 더 직접적으로 이식할 수 있습니다.
+
+## 무엇이 빨라지는가
+
+공개된 벤치마크에서는 타입 체크 처리량이 5~10배 향상되는 케이스가 보고되고 있습니다.
+
+```bash
+# 현재 (tsc v6.0, 50만 줄 규모 모노레포)
+$ time npx tsc --noEmit
+real    0m12.4s
+
+# TypeScript v7 Go 기반 (예측치)
+real    0m1.8s
+```
+
+LSP 응답 속도도 개선됩니다. 에디터에서 자동완성이나 타입 에러 표시가 느린 프로젝트라면 체감할 수 있는 차이가 생깁니다.
+
+## 개발자 관점에서의 변화
+
+### 안정적인 인터페이스는 그대로
+
+`tsconfig.json` 구성, 타입 문법, `tsc` CLI 인터페이스는 변경되지 않습니다. TypeScript 코드를 작성하고 `tsc`로 빌드하는 일반적인 사용 방식에서 v7은 사실상 드롭인 교체입니다.
+
+### Compiler API가 주요 마찰 지점
+
+`"typescript"` 패키지를 직접 import하여 컴파일러 내부 API를 사용하는 코드는 확인이 필요합니다.
+
+```typescript
+import * as ts from "typescript";
+
+const transformer: ts.TransformerFactory<ts.SourceFile> = (context) => {
+  return (sourceFile) => {
+    const visitor: ts.Visitor = (node) => {
+      if (ts.isCallExpression(node)) {
+        // 이런 저수준 Compiler API 사용 코드는
+        // v7에서 호환성 확인이 필요할 수 있습니다
+      }
+      return ts.visitEachChild(node, visitor, context);
+    };
+    return ts.visitNode(sourceFile, visitor) as ts.SourceFile;
+  };
+};
+```
+
+Go 버전 컴파일러는 Node.js 바인딩 레이어를 제공할 예정이지만, API 호환성 범위는 아직 확정 중입니다.
+
+### 영향받는 도구들
+
+TypeScript Compiler API에 의존하는 주요 도구들:
+
+- **ts-morph** — AST 조작 라이브러리
+- **ts-node / tsx** — TypeScript 직접 실행
+- **@typescript-eslint** — 이미 v7 대응 추적 중
+- TypeScript AST를 사용하는 커스텀 Babel/SWC 플러그인
+
+대부분의 팀에서 가장 영향이 큰 의존성은 `@typescript-eslint`입니다. 해당 팀은 이미 마이그레이션 계획에 참여하고 있습니다.
+
+### Type Stripping과의 관계
+
+Node.js 22+에서 지원하는 `--experimental-strip-types`는 전체 컴파일러를 호출하지 않고 런타임에서 TypeScript 타입 어노테이션을 제거합니다. Go 기반 컴파일러와 네이티브 타입 스트리핑은 같은 방향을 향하고 있습니다. ts-node의 역할이 점차 줄어들고 Node.js 네이티브 TypeScript 실행이 주류가 될 것으로 예상됩니다.
+
+## 지금 준비할 것들
+
+TypeScript v7은 2026년 하반기 출시를 목표로 하고 있습니다.
+
+**Compiler API 사용 현황 파악:**
+
+```bash
+grep -r "from 'typescript'" --include="*.ts" --include="*.js" .
+grep -r "require('typescript')" --include="*.ts" --include="*.js" .
+```
+
+검색 결과가 있다면, 어떤 API를 사용하는지 파악하고 v7 마이그레이션 가이드 공개를 대기하세요.
+
+**TypeScript 6.0 마이그레이션 먼저 완료하기.** `strict` 기본 활성화와 `using` 키워드 지원 등 6.0 변경사항이 v7의 기반이 됩니다. 6.0으로 먼저 이동하면 총 마이그레이션 범위가 줄어듭니다.
+
+**타입 시스템 우회 코드 정리하기.** 비표준 타입 트릭이나 `as unknown as X` 같은 과도한 캐스팅을 줄이고 타입 정의를 단순하게 유지하면 마이그레이션 비용이 낮아집니다.
+
+## webhani의 판단
+
+Go 기반 컴파일러는 특히 대규모 코드베이스를 다루는 팀에게 실질적인 생산성 향상을 가져옵니다. 일반 TypeScript 사용자에게는 마이그레이션 경로가 매끄럽지만, 복잡성은 도구 생태계에 집중되어 있습니다.
+
+Compiler API 의존성을 파악하고, TypeScript 버전을 6.0까지 최신으로 유지하며, `@typescript-eslint`와 TypeScript 공식 블로그를 주시하는 것이 현시점의 최선입니다. 언어 자체는 변하지 않습니다 — 코드를 체크하는 속도만 빨라질 뿐입니다.

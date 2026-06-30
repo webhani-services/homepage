@@ -1,0 +1,123 @@
+---
+title: "Chrome に組み込まれた Gemini Nano — Browser-Native AI API が Web 開発を変える"
+description: "Google が Chrome にデフォルトインストールした Gemini Nano と、JavaScript から呼び出せる Prompt API、Translation API の実際の使い方を解説します。"
+date: "2026-05-07"
+status: "published"
+tags: ["AI", "Chrome", "JavaScript", "Browser API", "LLM"]
+thumbnail: ""
+author: "webhani"
+slug: "chrome-gemini-nano-browser-ai-2026"
+---
+
+Google は Chrome に Gemini Nano（約 4GB の軽量 LLM）をデフォルトでインストールし、Web ページの JavaScript から直接呼び出せる API セットを段階的に公開しています。サーバーへのリクエストなしにブラウザ上で自然言語処理ができるという仕組みは、Web アプリケーションの設計に新しい選択肢をもたらします。
+
+## 何ができるのか
+
+現在提供されているか、近日提供予定の API は以下のとおりです。
+
+- **Prompt API**: テキストプロンプトを送り、LLM の応答を受け取る汎用 API
+- **Translation API**: テキストの翻訳をオンデバイスで実行
+- **Summarization API**: 長文の要約
+- **Rewrite API**: テキストのトーン変更・言い換え
+
+これらはすべてクライアントサイドで完結するため、ユーザーの入力がサーバーに送信されません。
+
+## Prompt API の基本
+
+```javascript
+// Origin Trial への登録が必要（2026年現在）
+const session = await window.ai.languageModel.create({
+  systemPrompt: "You are a helpful assistant for a Japanese e-commerce site.",
+});
+
+const response = await session.prompt("この商品の返品ポリシーを教えてください");
+console.log(response);
+
+// ストリーミングも可能
+const stream = await session.promptStreaming("長い質問...");
+for await (const chunk of stream) {
+  process.stdout.write(chunk);
+}
+```
+
+API の設計は OpenAI SDK に近く、既存の AI 統合コードを持つ開発者にとって学習コストは低いです。
+
+## Translation API の実用例
+
+```javascript
+const translator = await window.translation.createTranslator({
+  sourceLanguage: "en",
+  targetLanguage: "ja",
+});
+
+// ユーザーが入力した英語テキストをリアルタイムで翻訳
+document.getElementById("input").addEventListener("input", async (e) => {
+  const translated = await translator.translate(e.target.value);
+  document.getElementById("output").textContent = translated;
+});
+```
+
+従来は翻訳 API（DeepL、Google Translate API）への HTTP リクエストが必要でしたが、これがブラウザ内で完結します。試用した範囲では応答は 50〜200ms 程度で、軽量な UX 向上には十分な速度です。
+
+## パフォーマンスの現実
+
+Gemini Nano はデスクトップ向けに最適化された 4GB のモデルです。いくつかの制約を把握しておく必要があります。
+
+**初回ロード**: モデルのダウンロードが完了するまで API は使えません。Chrome はバックグラウンドで段階的にダウンロードしますが、低速回線の環境では時間がかかります。
+
+**ハードウェア要件**: GPU または NPU のある環境でないと推論速度が著しく低下します。`window.ai.languageModel.capabilities()` で事前確認できます。
+
+```javascript
+const capabilities = await window.ai.languageModel.capabilities();
+
+if (capabilities.available === "readily") {
+  // モデルが使用可能
+} else if (capabilities.available === "after-download") {
+  // ダウンロード後に使用可能
+} else {
+  // このデバイスでは利用不可 → サーバーサイド API にフォールバック
+  return callServerSideAPI(input);
+}
+```
+
+**コンテキスト長**: Gemini Nano のコンテキストウィンドウは比較的小さく、長文処理には向きません。
+
+## プライバシーとオフライン動作
+
+Browser-native AI の最大の利点はプライバシーです。ユーザーが入力したテキストがサーバーに送信されないため、機密情報を含むテキスト処理（例：社内文書の要約、個人情報を含むフォームの補完）でも外部 API と比べてリスクが低くなります。
+
+また、オフライン環境でも動作するため、ネットワーク接続が不安定な環境（現場作業、地下など）を対象にしたアプリケーションで価値を発揮します。
+
+## 実際の適用場面を考える
+
+webhani がよく関わる Web アプリケーションの文脈で、現実的な活用場面を整理します。
+
+**有効な場面:**
+- UI 上のリアルタイム入力補完（オートコレクト、文章改善の提案）
+- フォーム入力内容の軽量な要約・ラベリング
+- 多言語サイトでの簡易翻訳プレビュー
+
+**サーバーサイド API を維持すべき場面:**
+- 精度が重要なプロダクション向け翻訳
+- 長文文書の処理
+- iOS / Safari ユーザーが多い環境（Chrome 限定のため）
+- モバイル中心のトラフィック（ハードウェア要件を満たさないケースが多い）
+
+## Origin Trial の現状と展開
+
+2026 年 5 月時点では、多くの API が Chrome Origin Trial の段階にあります。本番投入には事前登録と一定のフィードバック義務が伴います。
+
+```html
+<!-- Origin Trial トークンをメタタグで指定 -->
+<meta http-equiv="origin-trial" content="YOUR_TOKEN_HERE">
+```
+
+W3C での標準化プロセスも進行中で、他のブラウザへの拡張も議論されています。現時点では Chrome 限定の機能として扱い、必ず能力チェックとフォールバックを実装するのが適切な設計です。
+
+## まとめ
+
+Browser-native AI は「すべてをサーバーレスにする」銀の弾丸ではありません。しかし、UX 向上のための軽量な AI 機能（入力補助、翻訳、要約）を、インフラコストなしに提供できる選択肢として十分な実用性があります。
+
+プロジェクト要件を整理する際に「この機能はデバイス側で完結できるか？」という問いを加えることで、設計の選択肢が広がります。まずは能力チェックを含む段階的な導入から始め、対象ユーザーのデバイス環境に合わせた判断をすることをお勧めします。
+
+現状では Chrome Desktop ユーザーに限定した機能強化として位置付け、Safari / Firefox ユーザーには既存の API フローを継続するハイブリッドアーキテクチャが最も堅実です。

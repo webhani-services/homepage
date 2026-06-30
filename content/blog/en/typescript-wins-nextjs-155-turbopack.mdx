@@ -1,0 +1,176 @@
+---
+title: "TypeScript Has Won — What Next.js 15.5 and Turbopack Mean for Web Development in 2026"
+description: "With 40% of developers writing TypeScript-only code and Next.js 15.5 shipping Turbopack production builds in beta, here's what matters for your stack."
+date: "2026-05-22"
+status: "published"
+tags: ["TypeScript", "Next.js", "Turbopack", "web-development", "frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-wins-nextjs-155-turbopack"
+---
+
+## The TypeScript Default
+
+A phrase from the JavaScript ecosystem survey has been making the rounds: "TypeScript has won. Not as a bundler, but as a language." It comes from a Nuxt core team lead, and it's not wrong.
+
+Survey data backs it up: 40% of respondents now write TypeScript exclusively. More practically: major libraries are designed TypeScript-first, AI coding tools default to TypeScript output, and starting a new project in plain JavaScript requires consciously opting out of the standard toolchain.
+
+This isn't a trend anymore — it's the baseline. The interesting question now is how you configure TypeScript, not whether to use it.
+
+## Next.js 15.5: The Changes That Matter
+
+### Turbopack Production Builds (Beta)
+
+Turbopack has been available for the dev server for a while. Next.js 15.5 extends it to production builds in beta:
+
+```bash
+next build --turbopack
+```
+
+The claim: 700x faster on large codebases compared to Webpack. Whether that number holds for your project depends on size and configuration, but the directional improvement is real. Dev server startup and HMR speed improvements have already proven out in practice.
+
+What to check before switching production builds:
+
+- Run your full test suite against the Turbopack output — chunk splitting behavior differs from Webpack
+- Compare bundle sizes; Turbopack may produce different output shapes
+- Verify any custom Webpack plugins you're using: not all have Turbopack equivalents yet
+
+```javascript
+// next.config.ts — no extra config needed with --turbopack flag
+// For custom alias resolution:
+const nextConfig = {
+  experimental: {
+    turbo: {
+      resolveAlias: {
+        underscore: "lodash",
+      },
+    },
+  },
+};
+
+export default nextConfig;
+```
+
+Turbopack production builds are beta, not stable. Use them in staging and on non-critical workloads before rolling to production. The dev server is production-ready; the builder is not yet.
+
+### Node.js Middleware (Now Stable)
+
+Middleware in Next.js used to run in the Edge Runtime, which means a constrained environment: no native Node.js APIs, limited package compatibility. That was a meaningful constraint for anything beyond basic request manipulation.
+
+Next.js 15.5 makes Node.js Runtime stable for Middleware:
+
+```typescript
+// middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+import { verifyToken } from "@/lib/auth"; // full Node.js crypto available
+
+export async function middleware(request: NextRequest) {
+  const token = request.cookies.get("session")?.value;
+
+  if (!token) {
+    return NextResponse.redirect(new URL("/login", request.url));
+  }
+
+  // no need for edge-compatible crypto workarounds
+  const payload = await verifyToken(token);
+
+  const response = NextResponse.next();
+  response.headers.set("x-user-id", payload.userId);
+  return response;
+}
+
+export const config = {
+  matcher: ["/((?!_next|api/public).*)"],
+};
+```
+
+This is the change with the most immediate practical impact. Authentication middleware that required workarounds or separate route handlers for Node.js-specific operations can now be written directly, without mental overhead about runtime constraints.
+
+### `next lint` Deprecation
+
+The `next lint` command is deprecated in 15.5. The recommendation: run ESLint or Biome directly.
+
+```json
+{
+  "scripts": {
+    "lint": "eslint . --ext .ts,.tsx,.js",
+    "lint:fix": "eslint . --ext .ts,.tsx,.js --fix"
+  }
+}
+```
+
+If your CI pipeline calls `next lint`, update it. If you were already using ESLint directly, nothing changes.
+
+## Biome as an ESLint/Prettier Alternative
+
+Biome (formerly Rome) is gaining real traction as a unified formatter and linter written in Rust. Single tool, fast execution, consistent configuration.
+
+```bash
+npm install --save-dev @biomejs/biome
+npx @biomejs/biome init
+```
+
+```json
+// biome.json
+{
+  "$schema": "https://biomejs.dev/schemas/1.x.x/schema.json",
+  "formatter": {
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": {
+    "rules": {
+      "recommended": true,
+      "correctness": {
+        "noUnusedVariables": "error"
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "semicolons": "always"
+    }
+  }
+}
+```
+
+The trade-off: Biome's rule set doesn't match the ESLint plugin ecosystem yet. If your setup relies on `eslint-plugin-react-hooks`, `@typescript-eslint/strict`, or project-specific ESLint plugins, migration cost can be significant. Biome makes sense for greenfield projects or teams willing to invest in migration.
+
+## TypeScript Configuration That Actually Matters
+
+With TypeScript as the default, configuration quality matters. A `tsconfig.json` that doesn't enable strict mode is providing false confidence.
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true
+  }
+}
+```
+
+`noUncheckedIndexedAccess` is the one most teams skip. It makes array and object index access return `T | undefined` instead of `T`, which forces you to handle the case where the index doesn't exist. It catches real bugs, and the extra `?.` and null checks it requires are worth it.
+
+Enable `strict: true` at project start — enabling it later means resolving potentially hundreds of type errors across the codebase. The earlier the better.
+
+## The 2026 Stack
+
+| Category | Choice | Notes |
+|----------|--------|-------|
+| Framework | Next.js 15.x | App Router + RSC are stable |
+| Language | TypeScript (strict) | Start strict, stay strict |
+| Bundler | Turbopack (new) / Webpack (existing) | Turbopack prod builds are beta |
+| Linter/Formatter | ESLint + Prettier or Biome | Biome for new projects |
+| CSS | Tailwind CSS 4 | Performance + dev speed |
+
+## Summary
+
+TypeScript is the default. The question has shifted from adoption to configuration quality. Next.js 15.5's Node.js Middleware stability is the most practically useful change — auth middleware without Edge Runtime constraints is simply less painful to write and maintain. Turbopack production builds are worth watching but not yet at the "switch production" stage.
+
+Concrete next step: open your `tsconfig.json` and check whether `strict: true` and `noUncheckedIndexedAccess: true` are enabled. If not, enable them now and work through the errors. The longer you wait, the more expensive that fix becomes.

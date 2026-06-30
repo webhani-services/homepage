@@ -1,0 +1,148 @@
+---
+title: "Astral's `ty` Reaches Stable: A Rust-Powered Python Type Checker Worth Evaluating"
+description: "Astral, the team behind uv, has released `ty` — a Rust-based Python type checker — as stable. Here's how it compares to mypy and pyright, and how to evaluate it for your projects."
+date: "2026-05-21"
+status: "published"
+tags: ["Python", "Type-Checking", "Developer-Tools", "Astral", "uv"]
+thumbnail: ""
+author: "webhani"
+slug: "astral-ty-python-type-checker-2026"
+---
+
+Astral — the team that built `uv` and `ruff` — has released `ty`, a Rust-based Python type checker, as stable. The pattern is familiar: take a slow Python toolchain component, rewrite it in Rust, and deliver an order-of-magnitude speedup. `uv` did this for package management. `ty` targets type checking.
+
+For teams where mypy runtime is a CI bottleneck, or for new projects that want a fast, modern type checker from day one, this release is worth evaluating.
+
+## The State of Python Type Checking
+
+Before diving into `ty`, a quick picture of where the existing tools stand:
+
+**mypy** is the reference implementation, has the most mature plugin ecosystem (django-stubs, sqlalchemy-stubs, etc.), and handles the most edge cases. The downside is speed: on large codebases, even with daemon mode (`dmypy`), CI cold starts are slow.
+
+**pyright** (Microsoft) is faster than mypy, has excellent VS Code integration via Pylance, and generally produces good inference. It requires Node.js, which is a minor friction point in Python-only environments.
+
+**ty** aims to be faster than both, staying within the Python toolchain (no Node.js runtime), and benefits from Astral's track record of prioritizing developer experience.
+
+## Installation and Basic Usage
+
+```bash
+# Install via uv (recommended)
+uv tool install ty
+
+# Or via pip
+pip install ty
+
+# Verify installation
+ty --version
+```
+
+Running a check:
+
+```bash
+# Check current directory
+ty check
+
+# Check specific paths
+ty check src/ tests/
+
+# JSON output for CI integration
+ty check --output-format json src/
+```
+
+## Configuration
+
+`ty` reads from `ty.toml` at the project root, or from the `[tool.ty]` section in `pyproject.toml`:
+
+```toml
+# pyproject.toml
+[tool.ty]
+src = ["src", "tests"]
+exclude = ["**/migrations/**", "**/__pycache__/**"]
+python-version = "3.12"
+strict = false
+```
+
+## Migrating from mypy
+
+The configuration structure maps reasonably well:
+
+```toml
+# mypy.ini (before)
+[mypy]
+python_version = 3.12
+strict = True
+ignore_missing_imports = False
+files = src/
+
+# ty.toml (after)
+[tool.ty]
+python-version = "3.12"
+strict = true
+src = ["src"]
+```
+
+Not every mypy option has a direct equivalent. A parallel-run strategy works well: run both tools for a sprint, compare the output, and migrate once you've validated that `ty`'s findings match (or improve on) mypy's.
+
+```bash
+# Compare outputs on the same codebase
+mypy src/ 2>&1 | tee mypy-output.txt
+ty check src/ 2>&1 | tee ty-output.txt
+diff mypy-output.txt ty-output.txt
+```
+
+## CI Integration
+
+```yaml
+# .github/workflows/type-check.yml
+name: Type Check
+
+on: [push, pull_request]
+
+jobs:
+  type-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run type check
+        run: uv run ty check src/
+```
+
+## What to Watch For
+
+### Plugin Ecosystem Maturity
+
+mypy's plugin ecosystem (django-stubs, SQLAlchemy stubs, etc.) took years to develop. `ty`'s compatibility with these stubs and plugins isn't yet at parity. If your project relies heavily on third-party type stubs, verify compatibility before committing to a migration.
+
+### Incremental Adoption Path
+
+Rather than a full-codebase migration, a staged approach reduces risk:
+
+1. Start new projects with `ty` from the beginning
+2. Run `ty` alongside mypy on existing projects to compare outputs
+3. Migrate CI to `ty` once confidence is established
+
+### Measuring Real Impact
+
+Performance gains are most visible at scale. For a 10K-line codebase, the difference may not be meaningful. For 100K+ lines, the CI time reduction can be substantial:
+
+```bash
+# Benchmark both tools on your actual codebase
+time mypy src/
+time ty check src/
+```
+
+## Takeaway
+
+`ty` stable means Astral's approach is production-ready, not just experimental. The combination of `uv` + `ruff` + `ty` is shaping up to be a cohesive, fast Python toolchain. For new projects, adopting `ty` from the start is a reasonable default. For existing projects, the evaluation path is clear: run it in parallel, measure the difference, migrate if the results hold up.

@@ -1,0 +1,140 @@
+---
+title: "12Mトークンの壁を超えたLLM：SubQが変えるコードベース分析の常識"
+description: "Subquadratic社が業界初の1,200万トークンContext WindowのLLM「SubQ」をリリース。コードベース全体をプロンプトに収めることが現実になった今、エンタープライズ開発の何が変わるかを考察します。"
+date: "2026-05-25"
+status: "published"
+tags: ["AI", "LLM", "context-window", "enterprise", "developer-tools"]
+thumbnail: ""
+author: "webhani"
+slug: "subq-12m-token-context-llm-2026"
+---
+
+## Context Windowの制約と現在地
+
+LLMを実務のコード補助に使う上で、長年の課題がContext Windowの制約でした。Claude 3.5 Sonnetが200Kトークン、Gemini 1.5 Proが1Mトークンと段階的に拡大されてきましたが、実際の大規模プロジェクトでは依然として「一度に読み込めない」問題が残っていました。
+
+200万行を超えるコードベース、複数ドキュメントにまたがる法律レビュー、数百ページの技術仕様——これらの分析には、チャンク分割やRAG（Retrieval-Augmented Generation）、要約といった回避策が必要でした。
+
+マイアミを拠点とするスタートアップSubquadraticが、この壁を取り除こうとしています。同社が発表した「SubQ」は、業界初となる12Mトークンのコンテキストウィンドウを持つ本番LLMです。
+
+## 12Mトークンとは実際何を意味するか
+
+数字を現実のサイズ感に置き換えると：
+
+- 英語で約1,000万単語
+- 中規模SaaSプロダクトのコードベース全体（〜100万行相当）
+- Academic Paper数百本
+- 大企業の法務契約書すべて
+
+実際の活用コードで見てみましょう：
+
+```python
+# 従来のRAGアプローチ
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.embeddings import OpenAIEmbeddings
+
+# チャンク分割が必要
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=2000,
+    chunk_overlap=200
+)
+docs = splitter.split_documents(codebase_documents)
+vectorstore = Chroma.from_documents(docs, OpenAIEmbeddings())
+
+# 関連チャンクのみ取得（全体は見えない）
+retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+```
+
+```python
+# SubQでの新しいアプローチ（全体を一度に渡す）
+import subq
+
+client = subq.Client(api_key="your-api-key")
+
+# コードベース全体を直接渡す
+with open("full_codebase_dump.txt") as f:
+    entire_codebase = f.read()
+
+response = client.complete(
+    context=entire_codebase,
+    prompt="""
+    このコードベース全体を分析して以下を教えてください：
+    1. セキュリティ上の懸念点（SQLインジェクション、XSSリスクなど）
+    2. 技術的負債のホットスポット（循環依存、重複ロジック）
+    3. テストカバレッジが薄い領域
+    """
+)
+print(response.text)
+```
+
+チャンク分割なしで全体像を把握できることが、精度面での最大の違いです。
+
+## 技術的背景：なぜ今まで12Mが難しかったか
+
+従来のTransformerアーキテクチャでは、Attentionの計算コストがシーケンス長の二乗（O(n²)）でスケールします。1Mトークンでも計算量は膨大で、メモリ使用量も現実的ではありませんでした。
+
+Subquadratic（「二乗未満」という意味の社名）は、Linear AttentionやSSM（State Space Models）などのアプローチを組み合わせた独自アーキテクチャを採用しています。公開されている論文によると、O(n²)の計算複雑性を大幅に削減することに成功しています。
+
+## 実際の活用ケースと制約
+
+### 有効なユースケース
+
+**レガシーシステムの一括分析**
+
+```bash
+# リポジトリ全体をエクスポートしてSubQに送る例
+git log --all --full-diff -p > full_git_history.txt
+
+# SubQ APIで分析
+curl -X POST https://api.subq.ai/v1/complete \
+  -H "Authorization: Bearer $SUBQ_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "context": "<full_git_history内容>",
+    "prompt": "このプロジェクトの変遷とアーキテクチャ上の問題点を教えてください"
+  }'
+```
+
+**ドキュメントとコードの整合性検証**
+
+仕様書・API設計書・実装コードを同時に与えて、乖離を自動検出する使い方は実務で効果が高いです。
+
+**マルチリポジトリの依存関係分析**
+
+マイクロサービス構成で、複数リポジトリ間の影響範囲を一度に把握できます。
+
+### 注意すべき制約
+
+**レイテンシ**：12Mトークンの処理はリアルタイムには不向きです。セキュリティ監査や週次レポートなど、バッチ処理として位置づけるべきです。
+
+**"Lost in the Middle"問題**：研究によると、LLMは長いコンテキストの中間部分を見落としやすい傾向があります。12Mトークンではこの問題が強調される可能性があります。
+
+**新モデルのリスク**：既存の主要モデルほどベンチマークや本番実績がなく、精度の検証が必要です。
+
+**コスト**：トークン量が増えるほどAPIコストも増加します。全量インジェクションが常にROIで優れるわけではありません。
+
+## RAGは不要になるか
+
+答えはノーです。大Context Windowは、RAGを置き換えるものではなく、ツールの選択肢を広げるものです。
+
+| ユースケース | 推奨アプローチ |
+|------------|--------------|
+| セキュリティ監査・レガシー分析 | 大Context Window（全量インジェクション）|
+| リアルタイムコード補助 | 小Context + RAG |
+| 更新頻度の高いドキュメント検索 | RAG |
+| コスト効率優先の定常処理 | RAG（チャンク処理）|
+
+## webhaniの見解
+
+SubQの登場で私たちが注目しているのは、RAGパイプラインのメンテナンスコストとの比較です。埋め込みモデルの選定、ベクターDBの管理、チャンク戦略の調整——これらのインフラコストは無視できません。
+
+もし全量インジェクションで同等の精度が得られるなら、アーキテクチャの簡素さは大きな価値になります。特に、分析頻度が低く精度が重要な用途（セキュリティ監査、コードレビュー自動化）では試す価値があります。
+
+現時点での推奨アクション：
+1. バッチ型分析タスク（セキュリティスキャン、コードベース分析）で検証する
+2. RAGパイプラインの総所有コスト（TCO）を測定し比較する
+3. "Lost in the Middle"問題の実態を自社のコードベースサイズで確認する
+4. 本番クリティカルなタスクへの採用は十分なベンチマーク後に判断する
+
+Context Windowの拡大競争はまだ続きます。重要なのはアーキテクチャの選択肢を広く保ち、実際の精度とコストで判断することです。
