@@ -1,0 +1,133 @@
+---
+title: "Claude Opus 4.8 in GitHub Copilot: What Terminal-Bench 2.1 Actually Tells You"
+description: "Claude Opus 4.8 is now available in GitHub Copilot Pro+, Business, and Enterprise. Terminal-Bench 2.1 results are out. Here's what the numbers mean for teams choosing AI coding tools."
+date: "2026-06-11"
+status: "published"
+tags: ["Claude", "GitHub Copilot", "AI Coding", "LLM", "Benchmark"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-opus-48-github-copilot-benchmark-2026-06"
+---
+
+GitHub Copilot added Claude Opus 4.8 as a selectable model for Pro+, Business, and Enterprise subscribers. At the same time, Terminal-Bench 2.1 results published rankings for the current generation of AI coding tools. Both are worth looking at together.
+
+## Terminal-Bench 2.1 Rankings
+
+| Tool | Model | Terminal-Bench 2.1 |
+|---|---|---|
+| Codex CLI | GPT-5.5 | 83.4% |
+| Claude Code | Claude Opus 4.8 | 78.9% |
+| Gemini CLI | Gemini 3.1 Pro | 70.7% |
+
+GPT-5.5 held its lead from Terminal-Bench 2.0 (where it scored 82.7%), with a slight improvement. Claude Code with Opus 4.8 comes in at 78.9%, a meaningful step up from its predecessor. The gap between first and second is around 4.5 points — competitive, but consistent across both benchmark versions.
+
+On SWE-bench Verified, Claude Opus 4.8 scores **88.6%**. That benchmark measures autonomous resolution of real GitHub issues — repository comprehension, test execution, and iterative fixing in a loop. The combination of 88.6% on SWE-bench and 78.9% on Terminal-Bench reflects where Opus 4.8 is strong: understanding and modifying existing codebases.
+
+## What the Copilot Integration Changes
+
+Until now, getting full Claude capability in a coding workflow meant running Claude Code in a terminal or configuring a separate API integration. The Copilot integration puts Opus 4.8 directly in VS Code, JetBrains, and other supported IDEs through the familiar Chat interface.
+
+Switch the model in the Copilot Chat model selector and you're done. No additional configuration needed.
+
+The most practical benefit is combining the `@workspace` context with Opus 4.8's codebase reasoning. Where a smaller model might give a generic answer about your authentication flow, Opus 4.8 can trace the actual implementation across files and identify specific issues.
+
+## A Real-World Refactoring Example
+
+Here's a workflow that demonstrates where Opus 4.8 earns its place. Suppose you're migrating from `passport.js` to a custom JWT middleware implementation.
+
+Start with the existing code:
+
+```typescript
+// Existing passport.js authentication
+import passport from 'passport';
+import { Strategy as JwtStrategy, ExtractJwt } from 'passport-jwt';
+
+passport.use(new JwtStrategy({
+  jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+  secretOrKey: process.env.JWT_SECRET!,
+}, async (payload, done) => {
+  const user = await UserRepository.findById(payload.sub);
+  return user ? done(null, user) : done(null, false);
+}));
+
+export const authenticate = passport.authenticate('jwt', { session: false });
+```
+
+In Copilot Chat with Opus 4.8 selected:
+
+```
+@workspace Rewrite the JWT authentication currently using passport.js as
+a direct Express middleware. Requirements:
+- Match the existing UserRepository interface in the codebase
+- Follow the error handling conventions in src/middleware/errorHandler.ts
+- Existing tests in tests/auth/ should pass without modification
+```
+
+Opus 4.8 pulls in `errorHandler.ts`, checks how `AppError` is constructed, scans the test files to understand what shape the output needs to take, and produces something consistent with the rest of the project:
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+import jwt from 'jsonwebtoken';
+import { UserRepository } from '../repositories/UserRepository';
+import { AppError } from './errorHandler';
+
+export async function authenticate(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader?.startsWith('Bearer ')) {
+    return next(new AppError('Authentication token not found', 401));
+  }
+
+  const token = authHeader.slice(7);
+
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET!) as { sub: string };
+    const user = await UserRepository.findById(payload.sub);
+
+    if (!user) {
+      return next(new AppError('User not found', 401));
+    }
+
+    req.user = user;
+    next();
+  } catch {
+    next(new AppError('Invalid token', 401));
+  }
+}
+```
+
+The result follows the project's `AppError` pattern and uses `UserRepository` the same way the rest of the codebase does. That cross-file consistency is what distinguishes a strong codebase-aware model from one that produces syntactically correct but contextually isolated output.
+
+## Choosing Between the Tools
+
+The Copilot integration doesn't replace the case for Claude Code or Codex CLI — it adds a third option with a different tradeoff profile.
+
+**GitHub Copilot + Opus 4.8 makes sense if:**
+- Your team already uses Copilot Business or Enterprise and wants better model capability without adding another tool
+- You need organization-level controls — audit logs, policy enforcement, seat management
+- The inline completion + chat combination in the IDE is where your workflow lives
+
+**Claude Code is the better fit if:**
+- You want to run long, autonomous multi-step coding tasks from the terminal
+- You're building custom MCP tool integrations
+- The full 78.9% Terminal-Bench capability is something you need outside the IDE context
+
+**Codex CLI makes sense if:**
+- Terminal-based automation is the primary use case and GPT-5.5's 83.4% matters for your specific workloads
+- You're already deep in the OpenAI ecosystem
+
+## Multiple Frontier Models Under One Roof
+
+GitHub Copilot now gives teams access to both GPT-5.5 and Claude Opus 4.8 under a single subscription. The practical implication is that you can run the same prompt against both models for a given task type, observe which produces better output for your actual code, and lock in that choice for your team — without spinning up separate API integrations.
+
+This matters more as the benchmark gaps narrow. When GPT-5.5 leads Terminal-Bench by 4.5 points but Opus 4.8 leads SWE-bench by a significant margin, the "right" model genuinely depends on what your team does most.
+
+## The Takeaway
+
+Terminal-Bench 2.1: Codex CLI at 83.4%, Claude Code at 78.9%, Gemini CLI at 70.7%. SWE-bench Verified: Claude Opus 4.8 at 88.6%.
+
+The GitHub Copilot integration puts Opus 4.8 in the IDE without requiring a separate setup. For teams already on Copilot Business or Enterprise, it's worth switching the model selector and running your usual workflows against it for a week. The benchmark numbers give you a starting hypothesis; your own codebase gives you the answer.

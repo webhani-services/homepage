@@ -1,0 +1,131 @@
+---
+title: "Diffusion LLM 실전 활용 — Mercury 2를 에이전트 구성에 끼워 넣는 관점"
+description: "Inception Labs의 Mercury 2는 토큰을 하나씩 만드는 대신 병렬 리파인먼트로 텍스트를 생성합니다. 빠른 Diffusion 모델과 프론티어 Autoregressive 모델을 어떻게 함께 쓸지 정리합니다."
+date: "2026-06-12"
+status: "published"
+tags: ["LLM", "Diffusion Models", "AI Agents", "Performance", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "mercury-2-diffusion-llm-agentic-2026"
+---
+
+프로덕션에서 돌리는 대부분의 언어 모델은 구조적으로 같은 특징을 공유합니다. 왼쪽에서 오른쪽으로, 토큰을 하나씩 써 내려가는 방식입니다. 각 토큰은 바로 앞 토큰이 확정될 때까지 기다립니다. 이 순서성이 우리가 의존하는 자연스러운 문장 생성의 원천이면서, 동시에 우리가 계속 싸우는 레이턴시의 원천이기도 합니다. Inception Labs의 Mercury 2는 다른 길을 택합니다. 다음 토큰을 순서대로 예측하는 대신, 문장 전체를 먼저 초안으로 깔아 놓고 소수의 디노이징 스텝으로 다듬어 갑니다. 이미지 생성용 Diffusion 모델이 쓰는 반복적 클린업 발상을 텍스트에 적용한 것입니다. 공개된 처리량은 초당 1,000토큰 이상으로, 속도에 최적화된 Autoregressive 시스템 중에서도 가장 빠른 축과 비교해 대략 5배이며, 추론 품질은 유지된다고 합니다.
+
+이 숫자 자체도 흥미롭지만, 처리량만이 본론은 아닙니다. 본론은 그것이 시스템 설계에 무엇을 가져오느냐입니다. 아래에서는 webhani가 이런 모델을 클라이언트 아키텍처용으로 실제 어떻게 평가하는지, 에이전트의 안쪽 루프에 무엇을 맡기는지, 그리고 어디에서 프론티어 모델로 에스컬레이션하는지를 정리합니다.
+
+## 병렬 리파인먼트와 다음 토큰 예측의 차이
+
+표준 Transformer 디코더는 구조상 순차적입니다. N번째 토큰을 만들려면 1부터 N-1까지가 이미 확정되어 있어야 합니다. 요청을 배치로 묶을 수도, speculative decoding을 쓸 수도, 양자화할 수도 있지만, 하나의 응답 내부에 있는 의존 체인 자체에서는 벗어날 수 없습니다. 한 번의 생성에 드는 실제 시간은 그 길이와 본질적으로 묶여 있습니다.
+
+Diffusion 텍스트 모델, 이른바 dLLM은 이 체인을 끊습니다. 출력 전체의 노이즈가 낀, 혹은 마스킹된 초안에서 시작해 고정된 횟수의 리파인먼트 스텝으로 모든 포지션을 거의 병렬로 선명하게 만들어 갑니다. 비용을 지배하는 것은 토큰 수가 아니라 스텝 수입니다. 긴 출력이 훨씬 빨리 돌아오는 이유가 여기에 있습니다. Mercury 2는 현대적인 모델에 기대하는 실용적인 인터페이스를 그대로 갖추고 있습니다. tool calling, JSON schema로 제약한 구조화 출력, 그리고 멀티모달 확장입니다. Inception Labs가 공개한 가격에 따르면 입력이 100만 토큰당 약 $0.25, 출력이 약 $0.75이며, 집필 시점 기준으로 early access를 통해 사용할 수 있습니다.
+
+트레이드오프는 정직하게 봐 두어야 합니다. Autoregressive 모델의 생태계는 성숙해 있고, 수년에 걸쳐 쌓인 도구들, 프롬프트 패턴, 파인튜닝 레시피가 그 주위에 갖춰져 있습니다. Diffusion 방식의 텍스트 생성은 순차 디코딩이 가진 결정성과 단계별 제어 가능성을 어느 정도 내주는 대신 병렬성을 얻습니다. 그리고 가장 어려운 추론 과제에서는 프론티어 Autoregressive 모델이 여전히 우위에 있습니다. 이것들은 dLLM을 탈락시키는 이유가 아닙니다. 어디를 향해 써야 하는지를 알려 줄 뿐입니다.
+
+## 레이턴시는 보여주기용 지표가 아니라 설계상의 관심사
+
+챗봇 한 턴이라면 수백 밀리초의 추가 레이턴시는 UX의 세부 사항일 뿐입니다. 그런데 에이전트 시스템에서는 누적됩니다. 전형적인 에이전트 루프는 계획하고, 도구를 부르고, 결과를 관찰하고, 다시 반복하는 흐름이며, 그 각 회전에는 최소 한 번의 모델 생성이 들어갑니다. 엔드 투 엔드 레이턴시는 모든 스텝의 합입니다.
+
+```
+total_latency ≈ Σ (스텝 i의 생성 토큰 수 / 처리량) + 도구·네트워크 오버헤드
+```
+
+에이전트가 하나의 태스크를 끝내는 데 8번이나 12번의 스텝을 밟을 때, 스텝당 생성 속도는 스텝 수만큼 곱해집니다. 바로 이 지점에서 5배의 처리량 개선은 벤치마크 한 줄이 아니라 2초 응답과 10초 응답을 가르는 차이가 됩니다. 같은 논리가 실시간 음성 같은 인터랙티브 UX에도 적용됩니다. 사용자 입력에서 음성 출력까지의 예산은 가차 없기 때문입니다.
+
+그러니 어떤 빠른 모델에 손을 뻗기 전에, 자신의 워크로드가 정말 레이턴시 바운드인지부터 측정하세요. 간단한 어림 계산입니다. 각 에이전트 스텝이 약 400토큰을 생성하고 태스크 평균이 10스텝이라고 합시다. 초당 200토큰이면 대략 20초가 순수 생성 시간입니다. 초당 1,000토큰이면 약 4초입니다. 도구 호출과 네트워크 오버헤드가 어느 쪽이든 합쳐서 3초를 더한다면, 23초에서 7초로 줄어듭니다. 반대로 각 스텝이 30토큰만 생성하는 짧은 경우라면 생성 부분이 이미 작아서, 속도 개선이 실제 시간을 거의 움직이지 못합니다. 무언가를 바꾸기 전에 자신의 실제 트래픽으로 이 계산을 해 보세요.
+
+## 2단 라우터 — 루프에는 빠른 모델, 어려운 판단에는 프론티어 모델
+
+우리가 가장 자주 권하는 패턴은 "모델을 교체하라"가 아니라 "모델을 계층화하라"입니다. 루프 안쪽의 고빈도이면서 상대적으로 저위험인 작업, 예컨대 라우팅, 분류, 초안 생성, 도구 인자 조립에는 빠른 dLLM을 씁니다. 정말로 깊이가 필요한 스텝, 예컨대 최종 종합이나 까다로운 다중 제약 판단에는 프론티어 Autoregressive 모델을 남겨 둡니다. 라우터가 턴마다 어느 계층을 쓸지 정합니다.
+
+다음은 프로바이더에 종속되지 않은 스케치입니다. `generate` 인터페이스는 의도적으로 범용으로 두어, 실제로 쓰는 SDK에 매핑할 수 있게 했습니다.
+
+```typescript
+type Role = "system" | "user" | "assistant" | "tool";
+
+interface Message {
+  role: Role;
+  content: string;
+}
+
+interface ToolSpec {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+interface GenerateRequest {
+  model: string;
+  messages: Message[];
+  tools?: ToolSpec[];
+}
+
+interface GenerateResult {
+  text: string;
+  usage: { inputTokens: number; outputTokens: number };
+}
+
+// 프로바이더 비종속 클라이언트가 generate(req)를 제공한다고 가정한다.
+declare function generate(req: GenerateRequest): Promise<GenerateResult>;
+
+const FAST_MODEL = "mercury-2";        // Diffusion, 처리량 최적화
+const FRONTIER_MODEL = "frontier-ar";  // Autoregressive, 추론 깊이 최적화
+
+interface Turn {
+  messages: Message[];
+  tools?: ToolSpec[];
+  // 오케스트레이터가 이 턴에 대해 이미 알고 있는 시그널.
+  isFinalAnswer: boolean;
+  estimatedComplexity: number; // 0..1, 가벼운 휴리스틱이나 분류기에서
+}
+
+function pickModel(turn: Turn): string {
+  // 최종 종합과 명백히 어려운 턴은 프론티어 모델로.
+  if (turn.isFinalAnswer || turn.estimatedComplexity > 0.7) {
+    return FRONTIER_MODEL;
+  }
+  // 그 외(라우팅, 분류, 초안)는 빠른 경로를 탄다.
+  return FAST_MODEL;
+}
+
+async function runTurn(turn: Turn): Promise<GenerateResult> {
+  const model = pickModel(turn);
+  const result = await generate({
+    model,
+    messages: turn.messages,
+    tools: turn.tools,
+  });
+
+  // 에스컬레이션: 빠른 모델의 초안이 가벼운 품질 체크를 통과하지
+  // 못하면, 포기하기 전에 한 번만 프론티어 모델로 재시도한다.
+  if (model === FAST_MODEL && !passesQualityGate(result.text)) {
+    return generate({
+      model: FRONTIER_MODEL,
+      messages: turn.messages,
+      tools: turn.tools,
+    });
+  }
+
+  return result;
+}
+
+function passesQualityGate(text: string): boolean {
+  // 도메인 특화: schema 검증, 필수 필드 존재 여부,
+  // 명백한 거부나 잘림이 없는지. 가볍고 결정적으로 유지한다.
+  return text.trim().length > 0;
+}
+```
+
+핵심은 `pickModel`의 형태입니다. 대부분의 프로덕션 에이전트에는 명백히 가벼운 턴 몇 개와 정말로 어려운 턴 몇 개가 있습니다. 단순한 시그널로 라우팅하는 것만으로 이득의 대부분을 챙길 수 있습니다. `runTurn`의 에스컬레이션 폴백은 안전밸브입니다. 빠른 모델이 결정적 게이트를 통과하지 못하는 결과를 내놓으면, 나쁜 결과를 그대로 내보내는 대신 프론티어 모델에 한 번만 추가 비용을 씁니다. 이렇게 하면 흔한 케이스는 빠르게, 드문 어려운 케이스는 정확하게 유지됩니다.
+
+`estimatedComplexity`가 정교할 필요는 없습니다. 입력 길이, 특정 키워드의 유무, 현재 추론 체인의 깊이, 또는 작은 전용 분류기 어느 것이든 동작합니다. 거친 휴리스틱에서 시작해 에스컬레이션 비율을 측정하고, 거기서부터 튜닝해 가세요.
+
+## 아직 dLLM을 쓰지 않을 상황
+
+속도에는 맥락이 따라붙습니다. 태스크가 엣지 케이스의 정확성이 지배하는 짧은 단발 요청이고 레이턴시가 이미 허용 범위라면, 계층화는 필요 없는 복잡성만 더합니다. 특정 Autoregressive 프로바이더에 단단히 결합된 도구들, 평가 하네스, 파인튜닝 파이프라인에 의존하고 있다면 마이그레이션 비용이 처리량 이득을 넘어설 수 있습니다. 그리고 가장 어려운 프론티어 추론, 오답의 비용이 크고 분해가 잘 되지 않는 부류의 문제에는 우리는 여전히 최상위 Autoregressive 모델을 기본값으로 둡니다. 계층화의 요점은 바로 전체에서 하나를 고를 필요가 없다는 데 있습니다. 고르는 단위는 턴입니다.
+
+## 핵심 정리
+
+- Mercury 2 같은 Diffusion LLM은 Autoregressive 모델이 벗어날 수 없는 단 하나의 비용, 즉 한 응답 내부의 순차 의존을 공략합니다. 효과가 드러나는 곳은 멀티 스텝 에이전트와 인터랙티브 UX이며, 레이턴시가 다수 생성의 합이 되는 영역입니다.
+- 마이그레이션 전에 측정하세요. 스텝당 토큰 수와 태스크당 스텝 수를 곱해 보세요. 그 곱이 작다면 빠른 모델이라도 실제 시간은 거의 변하지 않습니다.
+- 교체가 아니라 계층화하세요. 가볍고 고빈도인 턴은 빠른 dLLM으로, 어려운 턴이나 최종 턴은 프론티어 모델로 라우팅하고, 결정적 품질 게이트를 폴백으로 두세요.
+- 트레이드오프는 정직하게. 생태계 성숙도, 제어 가능성, 최상위 추론은 가장 어려운 작업에서 여전히 프론티어 Autoregressive 모델 쪽에 손을 들어 줍니다. dLLM이 자리를 얻는 곳은 루프 안이지, 반드시 정점은 아닙니다.

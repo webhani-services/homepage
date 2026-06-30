@@ -1,0 +1,159 @@
+---
+title: "Platform Engineering が DevOps を置き換える — 開発者の認知負荷を下げる IDP の実践"
+description: "2026年に組織の 80% が採用すると予測される Platform Engineering の実態を解説。Internal Developer Platform の構築が開発速度にどう直結するか、具体的なアーキテクチャと実践パターンを紹介します。"
+date: "2026-06-09"
+status: "published"
+tags: ["Platform Engineering", "DevOps", "Kubernetes", "IDP", "DevEx"]
+thumbnail: ""
+author: "webhani"
+slug: "platform-engineering-cognitive-load-2026"
+---
+
+2026年、Platform Engineering は「先進的なチームの取り組み」から「標準的な組織設計」へと移行しつつあります。業界調査によると、2026年末までに約 80% の組織が何らかの形で Platform Engineering を採用すると見込まれています（2020年代初頭の採用率は 45% 程度でした）。
+
+この変化の背景には、Kubernetes と Cloud Native スタックの複雑化により、開発者が本来注力すべきプロダクト開発以外のことに費やす時間が増加しているという現実があります。
+
+## Platform Engineering とは何か
+
+Platform Engineering は、開発者がインフラや運用の詳細を意識せずにプロダクト開発に集中できるようにするための、**Internal Developer Platform (IDP)** を構築・運用する専門チームを設置する組織設計です。
+
+従来の DevOps とのアプローチの違いを整理すると:
+
+| | 従来の DevOps | Platform Engineering |
+|---|---|---|
+| 目的 | 開発・運用の壁を取り除く | 開発者の生産性を最大化する |
+| 手段 | チームの文化・プロセス変革 | セルフサービス可能なプラットフォーム提供 |
+| 対象 | Dev と Ops の協働 | 開発者のユーザー体験（DevEx）|
+| インターフェース | ツールチェーン | Developer Portal |
+
+Platform Engineering は DevOps を否定するものではなく、DevOps の思想を実装形態として具体化したものと考えるのが正確です。
+
+## Internal Developer Platform の構成要素
+
+典型的な IDP は以下のレイヤーで構成されます。
+
+### 1. Developer Portal（Backstage）
+
+Spotify が開発した OSS の [Backstage](https://backstage.io/) は、IDP のフロントエンドとして広く採用されています。
+
+```yaml
+# catalog-info.yaml — Backstage にサービスを登録する例
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: payment-service
+  description: Stripe webhook handling and payment processing
+  annotations:
+    github.com/project-slug: webhani/payment-service
+    backstage.io/techdocs-ref: dir:.
+spec:
+  type: service
+  lifecycle: production
+  owner: team-payments
+  system: e-commerce-platform
+  dependsOn:
+    - resource:default/postgres-payments
+    - component:default/notification-service
+```
+
+このファイルをリポジトリに置くことで、Backstage がサービスの依存関係、オーナー、ドキュメントを自動で管理します。「このサービスは誰が管理しているか」「どのデータベースに依存しているか」といった情報を、Backstage の UI から一元的に参照できるようになります。
+
+### 2. セルフサービス型インフラプロビジョニング（Crossplane）
+
+CNCF のプロジェクトである Crossplane は、Kubernetes のカスタムリソースとしてクラウドリソースを定義・プロビジョニングする仕組みを提供します。
+
+```yaml
+# XRD — 開発者向けの「PostgreSQL データベース」抽象化
+apiVersion: apiextensions.crossplane.io/v1
+kind: CompositeResourceDefinition
+metadata:
+  name: xpostgresqlinstances.platform.webhani.io
+spec:
+  group: platform.webhani.io
+  names:
+    kind: XPostgreSQLInstance
+    plural: xpostgresqlinstances
+  versions:
+    - name: v1alpha1
+      served: true
+      referenceable: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                parameters:
+                  type: object
+                  properties:
+                    size:
+                      type: string
+                      enum: ["small", "medium", "large"]
+                    region:
+                      type: string
+```
+
+開発者はこの抽象化を通じて、AWS RDS の細かい設定を知らなくても PostgreSQL インスタンスを払い出せます。プラットフォームチームが裏側の実装（マルチ AZ、バックアップポリシー、セキュリティグループなど）を一元管理します。
+
+### 3. Golden Path テンプレート
+
+IDP の中核は「推奨される実装パターン」を提供することです。新しいサービスを作る際に、セキュリティ・可観測性・CI/CD が最初から設定された状態でスタートできる仕組みです。
+
+```bash
+# Backstage の Software Template を使った新サービス生成
+# 開発者が入力するのは: サービス名、チーム名、言語（Node.js/Python/Go）のみ
+
+# 生成されるもの:
+# - リポジトリ (GitHub)
+# - Kubernetes Deployment / Service / HPA
+# - Prometheus メトリクス設定
+# - OpenTelemetry トレーシング設定
+# - GitHub Actions CI/CD パイプライン
+# - Backstage カタログ登録
+# - PagerDuty アラート設定
+```
+
+この「Golden Path」により、新しいサービスが本番対応の状態で5分以内に立ち上がる環境を実現しているチームがあります。
+
+## 認知負荷の削減という本質
+
+Platform Engineering が解決しようとしている問題は、突き詰めると**認知負荷 (Cognitive Load)** の削減です。
+
+Kubernetes のマニフェスト、Terraform の設定、CI/CD パイプライン、監視設定、セキュリティポリシー — これらを一人の開発者が全て理解・管理することは、チームが大きくなるにつれて非現実的になります。
+
+Matthew Skelton と Manuel Pais の著書「Team Topologies」では、チームが扱うべき認知負荷には上限があり、それを超えると品質低下とバーンアウトが発生すると指摘しています。Platform Engineering は、プラットフォームチームがインフラ複雑性の認知負荷を吸収することで、プロダクトチームが本来の責務に集中できるようにする組織設計です。
+
+## 導入のアンチパターン
+
+Platform Engineering を導入する際によく見られる失敗パターンを紹介します。
+
+**アンチパターン1: 開発者を顧客として扱わない**
+
+IDP はプロダクトです。開発者が使いたくなるように設計する必要があります。「使わなければならない」ではなく「使った方が圧倒的に楽」という体験を作ることが重要です。使われない Portal は技術的負債になります。
+
+**アンチパターン2: 一度に全てを構築しようとする**
+
+最初からフル装備の IDP を作ろうとして頓挫するケースが多くあります。まず最も摩擦が大きい1〜2のユースケース（例: 新サービスの立ち上げ、本番環境へのデプロイ）に集中し、価値を示してから拡張する方が現実的です。
+
+**アンチパターン3: プラットフォームチームがボトルネックになる**
+
+Platform Engineering の目的はセルフサービスの実現です。開発者が何かをするたびにプラットフォームチームへの申請が必要な状態は、旧来の Ops チームの問題を再現しているに過ぎません。
+
+## webhani の見解
+
+Platform Engineering の採用率が上昇している背景には、Kubernetes の学習コストと運用複雑性が、多くのチームの実力を超えてしまったという現実があります。
+
+webhani では、クライアントの Platform Engineering 導入支援において以下の段階的アプローチを推奨しています。
+
+1. **Phase 1: 現状の痛点マッピング** — 開発者が最も時間を無駄にしているプロセスをヒアリングで特定（新環境のセットアップ？デプロイの複雑さ？本番トラブルの調査手順？）
+
+2. **Phase 2: 小さな Golden Path から始める** — 一つのユースケースのみをカバーする薄い IDP から始め、使われることを確認してから拡張する
+
+3. **Phase 3: Developer Portal の導入** — Backstage によるサービスカタログを整備し、「誰が何を管理しているか」の透明性を確保する
+
+Platform Engineering は技術的な取り組みですが、本質的には組織設計の問題です。プラットフォームチームと開発チームの境界をどこに引くか、どのレベルの抽象化を提供するかは、チームの規模・技術力・ビジネスの変化速度によって異なります。正解は一つではありませんが、「開発者の体験を改善する」という目的からブレない設計が、長期的に機能するプラットフォームを作る上で最も重要な判断軸になります。
+
+---
+
+*参考: [Beyond Kubernetes: Platform Engineering Trends for 2026](https://medium.com/@orlando1409/beyond-kubernetes-platform-engineering-trends-for-2026-8f82e09e27e0), [2026 Kubernetes Playbook](https://www.fairwinds.com/blog/2026-kubernetes-playbook-ai-self-healing-clusters-growth)*

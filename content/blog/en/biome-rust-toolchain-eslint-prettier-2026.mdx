@@ -1,0 +1,88 @@
+---
+title: "Biome in 2026: When to Replace ESLint and Prettier — and When Not To"
+description: "Biome's Rust toolchain lints and formats 10,000 files in under a second where ESLint and Prettier take nearly a minute. But raw speed isn't the whole decision. Here's a practical migration framework."
+date: "2026-06-13"
+status: "published"
+tags: ["Biome", "ESLint", "Prettier", "TypeScript", "Developer Tooling"]
+thumbnail: ""
+author: "webhani"
+slug: "biome-rust-toolchain-eslint-prettier-2026"
+---
+
+The JavaScript toolchain is quietly migrating from JavaScript to Rust, and Biome is the clearest example. It bundles linting and formatting into a single Rust binary — replacing both ESLint and Prettier — and the performance gap is not subtle. Published benchmarks put Biome at linting 10,000 files in roughly 0.8 seconds against ESLint's 45.2 seconds, and formatting in 0.3 seconds against Prettier's 12.1 seconds.
+
+Speed is the headline. Whether to migrate is a more nuanced question, and that nuance is what actually matters for a team.
+
+## Why a single Rust binary changes the math
+
+ESLint and Prettier are two tools with overlapping responsibilities, separate configs, and a long history of fighting each other over formatting rules. The standard fix — `eslint-config-prettier` to disable conflicting rules — is a patch over an architectural seam. Biome removes the seam by doing both jobs in one pass over a shared parser.
+
+For a single file the difference is imperceptible. The gap compounds where it hurts: pre-commit hooks, CI lint jobs, and editor save-on-format across a large monorepo. A lint step that drops from 45 seconds to under one second changes developer behavior — fast feedback gets run; slow feedback gets skipped or pushed to CI where it blocks merges.
+
+```bash
+# Install and initialize
+npm install --save-dev --save-exact @biomejs/biome
+npx biome init
+
+# Replaces an eslint + prettier invocation pair
+npx biome check --write ./src
+```
+
+A minimal `biome.json` covers what previously took two config files:
+
+```json
+{
+  "$schema": "https://biomejs.dev/schemas/2.3.0/schema.json",
+  "formatter": { "enabled": true, "indentStyle": "space" },
+  "linter": {
+    "enabled": true,
+    "rules": { "recommended": true }
+  }
+}
+```
+
+## The honest limits
+
+This is where we slow our clients down before they rip out ESLint. As of its 2.x line, Biome ships 400+ lint rules and added type-aware linting — meaning it handles many TypeScript-aware checks without a separate `tsc` pass. But three gaps remain real:
+
+1. **The plugin ecosystem.** Framework-specific rule sets — `eslint-plugin-react-hooks`, `eslint-plugin-next`, accessibility plugins — have no full Biome equivalent yet. If the hooks-rules linter is load-bearing for your React codebase, you cannot drop ESLint entirely.
+2. **Custom rules.** Any in-house ESLint rules your team wrote don't port over.
+3. **Type-checking itself.** Type-aware *linting* is not the same as type-checking. Biome still relies on `tsc` for full type verification — it complements the compiler, it doesn't replace it.
+
+The practical consequence: for many teams the honest move in 2026 is not "replace ESLint" but "scope Biome to formatting and core linting, keep ESLint for the rules Biome doesn't cover, and disable overlapping rules to avoid double-fixes."
+
+## A decision framework
+
+We use a simple test with clients deciding whether to migrate.
+
+**Adopt Biome fully** if: your project is JavaScript/TypeScript without heavy reliance on framework-specific lint plugins, your team has no custom ESLint rules, and CI/editor lint latency is a felt pain point. Greenfield projects especially have little reason to start with the slower stack.
+
+**Adopt Biome partially** if: you depend on `eslint-plugin-react-hooks`, Next.js lint rules, or a11y plugins. Use Biome as the formatter and base linter for its speed, keep a slim ESLint config for the specialized rules, and turn off ESLint's formatting rules so the two don't fight.
+
+**Stay on ESLint + Prettier** if: you have a large investment in custom rules, a mature plugin-heavy config that works, and lint speed isn't causing real friction. Migrating a working setup for its own sake is rarely worth the churn.
+
+## Migrating without a flag day
+
+If you decide to move, do it incrementally:
+
+```bash
+# 1. Let Biome import your existing config as a starting point
+npx biome migrate eslint --write
+npx biome migrate prettier --write
+
+# 2. Run formatting first — it's the lowest-risk, highest-value win
+npx biome format --write ./src
+
+# 3. Enable linting rule groups gradually, fixing as you go
+npx biome lint --write ./src
+```
+
+Format first. Formatting changes are mechanical and easy to review in a single large diff. Then turn on lint rule groups one at a time so the team isn't drowned in violations on day one.
+
+## Takeaway
+
+Biome is part of a broader shift — the toolchain moving to compiled languages for speed — and for the right project it removes real friction: one binary, one config, sub-second feedback. But "faster" is not automatically "better fit." The teams that migrate well are the ones that scope honestly: take the speed where Biome is ready, keep ESLint where its ecosystem is still irreplaceable, and avoid the trap of rewriting a working setup just because a faster tool exists.
+
+---
+
+*Sources: [Biome](https://biomejs.dev/), [Biome migration guide for 2026 — DEV Community](https://dev.to/pockit_tools/biome-the-eslint-and-prettier-killer-complete-migration-guide-for-2026-27m), [OXC vs ESLint vs Biome — PkgPulse](https://www.pkgpulse.com/guides/oxc-vs-eslint-vs-biome-javascript-linting-2026)*

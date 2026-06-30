@@ -1,0 +1,233 @@
+---
+title: "2026년의 Hexagonal Architecture와 DDD: 비즈니스 로직을 테스트 가능하게 유지하기"
+description: "Ports and Adapters와 DDD bounded context를 실무 관점에서 정리하고, Port 인터페이스가 비즈니스 로직을 빠르게 테스트하고 쉽게 교체하게 만드는 과정을 구체적인 TypeScript 예제로 보여줍니다."
+date: "2026-06-12"
+status: "published"
+tags: ["Architecture", "DDD", "Hexagonal Architecture", "Testing", "TypeScript"]
+thumbnail: ""
+author: "webhani"
+slug: "hexagonal-architecture-ddd-testability-2026"
+---
+
+오래 운영되는 Backend에서 겪는 고통의 상당수는 하나의 근본 원인으로 수렴합니다. 비즈니스 로직이 Infrastructure를 너무 많이 알고 있다는 것입니다. 가격 계산 규칙이 SQL Client를 직접 만집니다. Subscription 상태 전이가 결제 Provider를 호출하려고 HTTP SDK를 import합니다. 몇 달 뒤, Database도 멀쩡하고 결제 Provider도 멀쩡한데, 모든 테스트 경로가 Network 연결이나 Container를 끌고 다니는 탓에 빠른 테스트를 단 한 줄도 쓸 수 없게 됩니다.
+
+Hexagonal Architecture, 다른 이름으로 Ports and Adapters는 이 매듭을 끊기 위해 존재합니다. 발상 자체는 오래되었지만 2026년에는 10년 전만큼 자명하지 않았던 이유로 값을 합니다. 우리를 둘러싼 Infrastructure가 유난히 변동성이 커졌기 때문입니다. LLM Provider는 몇 주마다 Breaking Change와 새 모델을 내놓습니다. Vendor API는 Deprecated됩니다. 한 분기에 모델 Provider 셋을 평가하고 결국 아무것도 영구 채택하지 않는 일이 흔하게 벌어집니다. 시스템의 바깥 가장자리가 이렇게 빠르게 변한다면, Core는 그것들로부터 내가 통제하는 명시적이고 좁은 경계로 격리해 두고 싶어집니다.
+
+## 핵심 발상을 그대로 말하면
+
+Hexagonal 시스템에는 책임의 층이 세 개 있습니다.
+
+**Domain Core**는 비즈니스 규칙과 Use Case를 담습니다. Framework, Database Driver, HTTP Client, Message Queue 그 무엇도 import하지 않는 순수 코드입니다. 데이터가 Postgres에 있는지 메모리에 있는지, 요청이 REST로 왔는지 gRPC로 왔는지 알지 못합니다.
+
+**Port**는 Core가 바깥 세계에 대해 필요로 하는 능력을 기술한 인터페이스이며, Core가 소유합니다. "주문을 저장한다", "알림을 보낸다", "모델에게 텍스트를 요약시킨다" 같은 것입니다. Core는 이 인터페이스에 의존하고, 구체적인 구현에는 절대 의존하지 않습니다.
+
+**Adapter**는 Port의 구체적인 구현으로, 실재하는 기술과 대화합니다. `PostgresOrderRepository`는 `OrderRepository` Port를 구현합니다. 또 다른 Adapter는 테스트용으로 메모리상의 map을 써서 같은 Port를 구현합니다. Adapter를 교체해도 Core는 바뀌지 않습니다.
+
+이 형태가 중요한 이유는 의존성의 방향을 뒤집기 때문입니다. Infrastructure가 Domain에 의존하지, 그 반대가 아닙니다. Domain은 중심에 머물며 바깥을 모른 채 안정적으로 남습니다.
+
+## 구체적인 예제
+
+주문 시스템의 작은 한 조각을 모델링해 봅니다. Use Case는 "주문하기"이고, 주문을 어딘가에 영속화해야 합니다. 먼저 Domain부터 시작하는데, Domain은 그 "어딘가"가 무엇을 뜻하는지 알지 못합니다.
+
+```typescript
+// domain/order.ts — 순수 비즈니스 타입, Infrastructure 없음
+export type OrderId = string;
+
+export interface OrderLine {
+  sku: string;
+  quantity: number;
+  unitPriceCents: number;
+}
+
+export class Order {
+  constructor(
+    readonly id: OrderId,
+    readonly customerId: string,
+    readonly lines: OrderLine[],
+    readonly placedAt: Date,
+  ) {}
+
+  totalCents(): number {
+    return this.lines.reduce(
+      (sum, line) => sum + line.quantity * line.unitPriceCents,
+      0,
+    );
+  }
+}
+```
+
+다음은 Port입니다. Use Case가 영속화에 대해 알아도 되는 것은 이것뿐입니다. Domain이 소유하고, Domain의 언어로 표현된 인터페이스입니다.
+
+```typescript
+// domain/ports.ts — Core가 의존하는 계약
+import { Order, OrderId } from "./order";
+
+export interface OrderRepository {
+  save(order: Order): Promise<void>;
+  findById(id: OrderId): Promise<Order | null>;
+}
+
+export interface IdGenerator {
+  next(): OrderId;
+}
+```
+
+이제 Use Case 본체입니다. 위의 Port에만 의존합니다. SQL도, Client Library도, 환경 변수도 없습니다. 여기서의 비즈니스 규칙은 작지만 진짜입니다. 주문에는 최소 한 줄(line)이 있어야 한다는 것입니다.
+
+```typescript
+// domain/place-order.ts — Use Case
+import { Order, OrderLine } from "./order";
+import { OrderRepository, IdGenerator } from "./ports";
+
+export class EmptyOrderError extends Error {}
+
+export class PlaceOrder {
+  constructor(
+    private readonly repo: OrderRepository,
+    private readonly ids: IdGenerator,
+    private readonly clock: () => Date,
+  ) {}
+
+  async execute(input: {
+    customerId: string;
+    lines: OrderLine[];
+  }): Promise<Order> {
+    if (input.lines.length === 0) {
+      throw new EmptyOrderError("an order needs at least one line");
+    }
+    const order = new Order(
+      this.ids.next(),
+      input.customerId,
+      input.lines,
+      this.clock(),
+    );
+    await this.repo.save(order);
+    return order;
+  }
+}
+```
+
+clock도 주입된다는 점에 주목하세요. 시각 역시 Infrastructure입니다. 주입함으로써 테스트는 "지금"과 싸우는 대신 그것을 통제할 수 있게 됩니다.
+
+이어서 Adapter입니다. 실제 운영용은 Postgres와 어떻게 대화할지를 스케치합니다. 이것을 Unit Test에서 돌릴 일은 없습니다.
+
+```typescript
+// adapters/postgres-order-repository.ts
+import { Pool } from "pg";
+import { Order, OrderId } from "../domain/order";
+import { OrderRepository } from "../domain/ports";
+
+export class PostgresOrderRepository implements OrderRepository {
+  constructor(private readonly pool: Pool) {}
+
+  async save(order: Order): Promise<void> {
+    await this.pool.query(
+      "INSERT INTO orders (id, customer_id, lines, placed_at) VALUES ($1, $2, $3, $4)",
+      [order.id, order.customerId, JSON.stringify(order.lines), order.placedAt],
+    );
+  }
+
+  async findById(id: OrderId): Promise<Order | null> {
+    const res = await this.pool.query(
+      "SELECT id, customer_id, lines, placed_at FROM orders WHERE id = $1",
+      [id],
+    );
+    if (res.rows.length === 0) return null;
+    const row = res.rows[0];
+    return new Order(row.id, row.customer_id, row.lines, row.placed_at);
+  }
+}
+```
+
+그리고 메모리 Adapter, 바로 이것이 핵심입니다. 같은 인터페이스를 순수 `Map`으로 구현합니다.
+
+```typescript
+// adapters/in-memory-order-repository.ts
+import { Order, OrderId } from "../domain/order";
+import { OrderRepository } from "../domain/ports";
+
+export class InMemoryOrderRepository implements OrderRepository {
+  private store = new Map<OrderId, Order>();
+
+  async save(order: Order): Promise<void> {
+    this.store.set(order.id, order);
+  }
+
+  async findById(id: OrderId): Promise<Order | null> {
+    return this.store.get(id) ?? null;
+  }
+}
+```
+
+## 왜 테스트가 싸지는가
+
+Use Case가 Postgres가 아니라 `OrderRepository`에 의존하므로, 테스트는 In-Memory Adapter와 사소한 fake 두어 개만 배선하면 됩니다. Container도, Migration도, Network도 없습니다.
+
+```typescript
+// place-order.test.ts
+import { describe, it, expect } from "vitest";
+import { PlaceOrder, EmptyOrderError } from "../domain/place-order";
+import { InMemoryOrderRepository } from "../adapters/in-memory-order-repository";
+
+describe("PlaceOrder", () => {
+  const setup = () => {
+    const repo = new InMemoryOrderRepository();
+    let counter = 0;
+    const ids = { next: () => `order-${++counter}` };
+    const clock = () => new Date("2026-06-12T09:00:00Z");
+    return { repo, useCase: new PlaceOrder(repo, ids, clock) };
+  };
+
+  it("유효한 주문을 저장하고 합계를 계산한다", async () => {
+    const { repo, useCase } = setup();
+    const order = await useCase.execute({
+      customerId: "cust-1",
+      lines: [{ sku: "A", quantity: 2, unitPriceCents: 500 }],
+    });
+
+    expect(order.totalCents()).toBe(1000);
+    expect(await repo.findById(order.id)).not.toBeNull();
+  });
+
+  it("line이 없는 주문을 거부한다", async () => {
+    const { useCase } = setup();
+    await expect(
+      useCase.execute({ customerId: "cust-1", lines: [] }),
+    ).rejects.toBeInstanceOf(EmptyOrderError);
+  });
+});
+```
+
+이 테스트들은 밀리초 단위로 돌고 결정적입니다. clock은 고정, ID는 예측 가능, store는 테스트마다 새것입니다. 재시도하고 싶어지는 flaky함이 없습니다. 나중에 운영용 `PostgresOrderRepository`를 추가할 때는, 실제로 Database를 때리는 소수의 Integration Test로 그것을 커버하고, 그것들은 분리해 적게 유지합니다. 동작의 대부분은 Infrastructure에 전혀 손대지 않고 검증되는 셈입니다.
+
+같은 형태는 변화가 빠른 AI Vendor에도 직접 효과를 냅니다. Core에 `SummarizationPort`를 두고, Provider A로 한 번, Provider B로 다시 한 번, 그리고 정해진 요약을 돌려주는 결정적 fake로 세 번째를 구현합니다. Provider를 바꿔도 Domain 로직과 그 테스트는 전혀 바뀌지 않고, 실제 모델 Endpoint에 닿는 곳은 Integration Suite 하나뿐입니다.
+
+## 실패 양상: 모든 것에 Port
+
+이 방식의 정직한 위험은 Over-Engineering입니다. 패턴을 익힌 팀이 모든 클래스를 인터페이스로 감싸기 시작하면서, 교리를 만족시키려고만 존재하는 "구현이 하나뿐인 Port"의 숲을 만들어냅니다. 하나하나가 파일을 늘리고, 간접 참조를 늘리며, 읽는 사람마다 "이거 실제로 어디서 구현돼 있지" 하는 순간을 만듭니다. 그것은 설계가 아니라 의례입니다.
+
+Port가 값을 하는 것은 다음 중 적어도 하나가 참일 때입니다.
+
+- **구현이 둘 이상이거나, 현실적으로 둘 이상이 될 법하다.** 결제 Provider 두 개, Storage 두 계통, On-Prem 판과 Cloud 판 등.
+- **내가 통제하지 않는 외부 경계를 넘는다.** Database, 서드파티 API, File System, 시각, 난수, Queue.
+- **테스트에서 fake로 만들어야 한다.** 빠르고 결정적으로 유지하기 위해.
+
+이 중 어느 것도 해당하지 않으면 Port는 그저 짐입니다. 문자열을 포매팅하는 순수 함수에 인터페이스는 필요 없습니다. 구현이 영원히 하나뿐일 작은 내부 Helper에도 필요 없습니다. 경계가 진짜인 곳에서 패턴을 쓰고, 그렇지 않은 곳에서는 순수 함수나 클래스를 쓰면 됩니다.
+
+## Bounded Context: 거대한 공유 모델을 만들지 않기
+
+여기서 DDD의 기여는 Hexagon을 어디에 그을지를 아는 것입니다. 함정은 결제, 배송, 분석에 걸쳐 공유된 단일 `Order` 타입이 모두를 섬기려고 필드를 쌓다가 결국 누구에게도 잘 맞지 않게 되는 것입니다. "order"라는 단어는 Context마다 다른 의미를 가지며, 한 모델에 모든 의미를 짊어지게 하는 것이 깨지기 쉽고 엉킨 코드를 낳습니다.
+
+Module의 경계를 언어의 경계에 맞추세요. 결제 팀과 배송 팀이 같은 단어를 다른 의미로 쓴다면, 그것은 모델을 쪼개야 한다는 강한 신호입니다. 각 Bounded Context는 자기만의 Domain 타입과 자기만의 Port를 가지고, 이음매에서 번역합니다. 한 Context 안에서는 Ubiquitous Language를 일관되게 유지하되, 회사 전체에서 일관되게 만들려 들지는 않습니다.
+
+2026년의 절제에 관한 한마디. Hexagonal Architecture와 깔끔한 Bounded Context는 널리 적용할 가치가 있지만, 더 무거운 패턴은 그렇지 않습니다. Event Sourcing과 CQRS는 감사나 시계열 질의 요구가 있는, 진정으로 복잡하고 트랜잭션이 많은 Domain에서 실재하는 문제를 풉니다. CRUD 제품의 기본값으로는 부적합합니다. 동작하는 것 중 가장 단순한 것, 많은 경우 깔끔한 Modular Monolith에서 시작하고, 구체적인 비즈니스 압력이 요구할 때에만 Microservice나 Event-Driven으로 진화시키세요. 유행으로 적용한 패턴은 아무것도 사지 못한 채 비용만 더합니다.
+
+## 정리
+
+- Domain Core를 Infrastructure import로부터 자유롭게 유지합니다. Driver나 SDK가 아니라 Port에 의존합니다.
+- 시각, 난수, ID도 Port로 주입합니다. 이것들은 모습을 바꾼 Infrastructure입니다.
+- In-Memory Adapter로 테스트의 대부분을 빠르고 결정적으로 만듭니다. Integration Test는 운영 Adapter용으로 남겨 두고 적게 유지합니다.
+- Port 뒤에서는 변화가 빠른 AI와 Vendor API가 Domain 로직과 그 테스트에 손대지 않고 교체 가능해집니다.
+- Port가 값을 하는 것은 복수 구현, 외부 경계, 테스트 fake 중 하나가 있을 때뿐입니다. 그 외에는 순수 함수를 택합니다.
+- Bounded Context는 언어의 경계를 따라 긋습니다. 한 모델에 모든 의미를 짊어지게 하지 않습니다.
+- Event Sourcing과 CQRS는 Domain의 복잡함이 정말로 요구할 때에만 손을 뻗습니다. 단순하게 시작하고, 유행이 아니라 압력이 진화를 이끌게 합니다.

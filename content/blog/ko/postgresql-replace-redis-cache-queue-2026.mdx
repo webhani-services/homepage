@@ -1,0 +1,176 @@
+---
+title: "2026년에도 Redis가 필요할까? PostgreSQL을 Cache, Queue, Pub/Sub로 쓰기"
+description: "중소 규모 애플리케이션에서 Cache, Job Queue, Pub/Sub를 위해 반사적으로 Redis를 추가하기 전에, 이미 돌아가는 PostgreSQL 한 대로 흡수할 수 있는지 동작하는 SQL과 판단 Checklist로 정리합니다."
+date: "2026-06-12"
+status: "published"
+tags: ["PostgreSQL", "Redis", "Architecture", "Caching", "Database"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-replace-redis-cache-queue-2026"
+---
+
+Client가 새 Backend 설계를 의뢰하면 첫 화이트보드 스케치에는 거의 항상 Redis가 등장합니다. 일종의 반사 신경입니다. Cache가 필요하니 Redis, Job Queue가 필요하니 Redis, 접속 중인 몇몇 Client에 Event를 밀어내야 하니 Redis Pub/Sub. 각각의 결정만 놓고 보면 틀리지 않았습니다. 그런데 중소 규모 애플리케이션에서 이것들이 쌓이면, Provisioning하고 Monitoring하고 Backup하고 Patch하고 장애 때마다 머리를 싸매야 하는 대상이 하나 더 늘어납니다. 정작 그 Traffic은 이미 돌아가는 PostgreSQL 한 대가 거의 알아차리지도 못할 수준인 경우가 많습니다.
+
+이 글은 2026년에 우리가 실제로 Client에게 하는 주장입니다. Redis를 추가하기 전에, 지금 운영 중인 PostgreSQL이 그 일을 처리할 수 있는지 먼저 확인하라는 것입니다. Cache, 가벼운 Pub/Sub, Job Queue에 대해서는 현대 Postgres에 이 Pattern들을 위한 전용 기능이 갖춰져 있습니다. 세 가지를 모두 동작하는 SQL로 살펴보고, 그만큼 중요한 것으로서 이 접근이 무너지는 경계도 솔직하게 짚겠습니다.
+
+## "일단 Redis" 반사는 보이는 것보다 비싸다
+
+Datastore를 하나 더 두는 비용은 License나 Instance 요금이 아닙니다. 진짜 비용은 운영 표면입니다. System이 하나 늘면 장애 Mode가 하나 늘고, Dashboard에 올릴 지표 한 세트가 늘고, 크기를 조정해야 할 Connection Pool이 하나 늘고, 주 데이터와 어긋날 수 있는 대상이 하나 늘어납니다. Database 한 대를 잘 운영하는 Team에게 Redis 추가는 On-call 인지 부하를 조용히 두 배로 만들 수 있습니다.
+
+자주 간과되는 정합성 측면도 있습니다. Cache, Queue, 진실의 원천이 서로 다른 세 곳에 흩어져 있으면 Dual-write 문제를 떠안게 됩니다. 업무 Row를 Postgres에 쓰고 Job을 Redis에 Enqueue하는데, 두 번째 호출이 실패하거나 그 사이에 Process가 죽으면 처리 Job 없는 주문, 혹은 Rollback된 Row를 가리키는 Job이 남습니다. 많은 현장이 이를 Retry와 대사(reconciliation) Script로 덮습니다. Queue를 같은 Database 안에 두면 Enqueue와 업무 쓰기가 하나의 Transaction에서 일어나므로 이 경쟁 조건이 통째로 사라집니다.
+
+Trade-off는 분명히 해두겠습니다. Postgres는 연산 하나당으로 보면 Redis보다 확실히 느립니다. Redis는 Memory에서 Read를 sub-millisecond로 돌려주는 것이 보통이지만, Postgres의 왕복은 Query, Index, Connection Overhead에 따라 0.x 밀리초에서 수 밀리초 사이입니다. 또한 Redis에는 Postgres가 Native로 갖지 못한 자료 구조가 있습니다. Sorted Set, HyperLogLog, Bitmap 같은 것들입니다. 설계가 이것들에 진짜로 의존한다면 이 글은 맞지 않습니다. 그 외라면 계속 읽으시길 권합니다.
+
+## UNLOGGED 테이블을 사용한 Cache
+
+Postgres는 Crash 후 복구할 수 있도록 모든 변경을 WAL(write-ahead log)에 기록합니다. 영속적인 업무 데이터에는 이것이 정답입니다. 하지만 Cache 데이터에는 낭비입니다. 재시작으로 Cache가 사라져도 그냥 다시 채우면 그만이기 때문입니다.
+
+`UNLOGGED` 테이블은 WAL을 건너뜁니다. 영속화할 양이 줄어드는 만큼 쓰기가 빠르고, 데이터는 Replication도 Crash 안전성도 없습니다. Crash나 재시작 시 테이블은 Truncate됩니다. 내용을 잃어도 아픈 것은 데이터 무결성이 아니라 Cache Miss 몇 번뿐이므로, Cache에는 이것이 올바른 Trade-off입니다. 비공식 Community Benchmark에서 일반 logged 테이블 대비 쓰기 속도 향상은 대체로 십몇 퍼센트대지만, 이는 방향성으로만 받아들이고 자신의 Workload에서 직접 측정하시기 바랍니다.
+
+```sql
+CREATE UNLOGGED TABLE cache_entries (
+    cache_key   text PRIMARY KEY,
+    payload     jsonb NOT NULL,
+    expires_at  timestamptz NOT NULL
+);
+
+CREATE INDEX idx_cache_entries_expires_at
+    ON cache_entries (expires_at);
+```
+
+값을 읽을 때는 이미 만료된 Row를 무시합니다.
+
+```sql
+SELECT payload
+FROM cache_entries
+WHERE cache_key = $1
+  AND expires_at > now();
+```
+
+쓰기나 갱신은 TTL을 interval로 표현한 단일 Upsert로 끝납니다.
+
+```sql
+INSERT INTO cache_entries (cache_key, payload, expires_at)
+VALUES ($1, $2, now() + interval '5 minutes')
+ON CONFLICT (cache_key)
+DO UPDATE SET payload    = EXCLUDED.payload,
+              expires_at = EXCLUDED.expires_at;
+```
+
+Query 쪽에서 이미 만료 Row를 걸러내므로 정합성은 Cleanup에 의존하지 않습니다. 다만 죽은 Row는 여전히 공간을 차지하고 Index를 비대하게 만들므로, 몇 분 간격으로 도는 주기적 청소를 넣습니다.
+
+```sql
+DELETE FROM cache_entries
+WHERE expires_at <= now();
+```
+
+이 DELETE는 `pg_cron`으로도, 애플리케이션 Scheduler로도, 평범한 cron으로도 돌릴 수 있습니다. 핵심은 만료 판정이 Read 시점에 강제되고, Cleanup은 정합성 요건이 아니라 Background 관심사라는 점입니다.
+
+## SELECT ... FOR UPDATE SKIP LOCKED를 사용한 Job Queue
+
+이 Pattern이 가장 많은 회의론자를 돌려세웁니다. Database를 Queue로 쓸 때의 전형적인 반론은, 같은 테이블을 Polling하는 Worker들이 같은 Row를 두고 경쟁하며 서로 부딪힌다는 것입니다. `SKIP LOCKED`가 이 반론을 없앱니다. Worker가 Row를 `FOR UPDATE`로 선택하면 Postgres는 그 Row를 Lock하고, `SKIP LOCKED`는 다른 Worker에게 이미 Lock된 Row는 기다리지 말고 건너뛰라고 지시합니다. 각 Worker는 서로 다른 Job을 잡으므로 이중 처리도 Lock 경쟁도 없습니다.
+
+```sql
+CREATE TABLE job_queue (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    job_type     text NOT NULL,
+    payload      jsonb NOT NULL,
+    status       text NOT NULL DEFAULT 'pending',
+    attempts     int  NOT NULL DEFAULT 0,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_job_queue_pending
+    ON job_queue (created_at)
+    WHERE status = 'pending';
+```
+
+Worker는 Transaction 안에서 한 건을 Dequeue합니다. 가장 오래된 pending Row를 고르고, 다른 Worker가 잡고 있는 Row는 건너뛰며, CTE를 써서 같은 문장 안에서 status를 `processing`으로 바꿉니다.
+
+```sql
+BEGIN;
+
+WITH next_job AS (
+    SELECT id
+    FROM job_queue
+    WHERE status = 'pending'
+    ORDER BY created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+UPDATE job_queue AS j
+SET status = 'processing',
+    attempts = j.attempts + 1
+FROM next_job
+WHERE j.id = next_job.id
+RETURNING j.id, j.job_type, j.payload;
+
+COMMIT;
+```
+
+Worker는 반환된 Job을 처리한 뒤 `done`으로(에러 시 `pending`/`failed`로 되돌림) 표시합니다. 이를 안전하게 만드는 것은 Transaction입니다. Row는 선택되는 순간 Lock되므로 두 Worker가 같은 Job을 가져가는 일은 결코 없습니다.
+
+그리고 앞서 언급한 이점입니다. Queue가 그냥 테이블이므로, 업무 Row를 쓰는 바로 그 Transaction에서 Enqueue할 수 있습니다.
+
+```sql
+BEGIN;
+INSERT INTO orders (customer_id, total) VALUES ($1, $2);
+INSERT INTO job_queue (job_type, payload)
+VALUES ('send_receipt', jsonb_build_object('customer_id', $1));
+COMMIT;
+```
+
+두 Row가 함께 Commit되거나 둘 다 안 되거나입니다. 주문이 Job 없이 존재하는 틈은 없고, 유지보수할 대사 Script도 없습니다. 이 보장을 별도 Redis Queue로 재현하기란 실제로 꽤 어렵습니다.
+
+## LISTEN / NOTIFY를 사용한 Pub/Sub
+
+Real-time Fan-out에는 Postgres의 `LISTEN`과 `NOTIFY`가 있습니다. Connection이 Channel을 구독하고, 그 Channel에 `NOTIFY`를 호출한 임의의 Session이 모든 Listener에게 Message를 밀어냅니다.
+
+```sql
+LISTEN job_events;
+
+NOTIFY job_events, 'job:4821:ready';
+```
+
+알림은 Trigger에서 발화시켜 데이터 변경에 함께 태워도 되고, 애플리케이션 Code에서 직접 호출해도 됩니다. Consumer 쪽에서는 TypeScript의 `pg`(node-postgres)로 전용 Connection을 유지하며 들어오는 Event에 반응합니다.
+
+```typescript
+import { Client } from "pg";
+
+const client = new Client({ connectionString: process.env.DATABASE_URL });
+await client.connect();
+await client.query("LISTEN job_events");
+
+client.on("notification", (msg) => {
+  console.log(`channel=${msg.channel} payload=${msg.payload}`);
+  // Worker를 깨우거나, Cache Key를 무효화하거나, WebSocket으로 밀어내는 등
+});
+```
+
+이제 솔직한 한계입니다. 여기서 데는 Team이 많기 때문입니다. Payload는 약 8000 Byte가 상한이므로, 식별자만 보내고 상세는 Consumer가 가져오게 하며 Object 전체는 절대 보내지 마십시오. `LISTEN`/`NOTIFY`는 전용의 지속 Connection을 필요로 하며, 그래서 PgBouncer의 transaction pooling Mode와 호환되지 않습니다. Listen 중인 Session은 계속 Pin되어 있어야 합니다. 그리고 이것은 Partition 내성을 갖춘 Broker가 아닙니다. 알림이 발화한 순간 Listener가 끊겨 있었다면 그 Message는 사라지고 재전송도 없습니다. 내구성 있는 Event Log가 아니라 Best-effort 기상 Signal로 다루십시오. 전달 보장이 필요하면 Job 테이블과 결합합니다. `NOTIFY`로 Worker를 깨우고, 실제 영속 상태는 테이블에 둡니다.
+
+귀속을 밝혀둘 Version 이야기 하나. 2026년 현재 Production Line은 PostgreSQL 18이며, 높은 알림량 아래에서의 `LISTEN`/`NOTIFY` Scalability 개선이 PostgreSQL 19에 들어올 예정입니다. 19는 2026년 6월 기준 Beta이고, GA는 9월경으로 예상됩니다. 이는 근사치로 다루고, 의존하기 전에 Release Note를 확인하십시오.
+
+## 판단 Checklist
+
+다음 대부분이 들어맞으면 Postgres 단독으로 진행하십시오.
+
+- Throughput이 적당함 — 초당 수만 연산을 여유 있게 밑돎.
+- Latency 목표가 낮은 밀리초대이고, 엄격한 sub-millisecond SLA가 아님.
+- Redis Native 구조(Sorted Set, HyperLogLog, Bitmap)가 불필요.
+- 데이터와 Queue 사이의 Transaction 정합성이 실제로 중요함.
+- 운영 단순함과 비용이 현실적 제약 — 중소 규모나 비용에 민감한 Client에서 흔함.
+
+다음 경우에는 Redis를 유지하십시오.
+
+- 매우 높은 Throughput(초당 10만 연산 이상)을 밀어내거나, 진짜 sub-millisecond Latency가 필요함.
+- 설계가 Redis의 자료 구조나 Postgres에 없는 기능에 의존함.
+- Cache Miss 폭풍이 Primary Database를 압도할 수 있어, 그것을 보호할 독립된 Memory 계층이 필요함.
+
+## 핵심 정리
+
+- 많은 실제 애플리케이션에서 PostgreSQL 한 대가 Cache, Job Queue, Pub/Sub를 모두 커버하며, 두 번째 Datastore는 필요 없습니다.
+- `UNLOGGED` 테이블은 빠르고 버려도 되는 Cache 저장소를 제공합니다. TTL은 Read 시점에 강제하고, 만료 Row는 Background에서 청소합니다.
+- `SELECT ... FOR UPDATE SKIP LOCKED`는 경쟁 없는 다중 Worker Queue를 구현하며, 업무 쓰기와 같은 Transaction에서 Enqueue하는 보너스가 따라옵니다.
+- `LISTEN`/`NOTIFY`는 가벼운 Real-time Fan-out을 커버하지만 Best-effort입니다. 작은 Payload, Pin된 Connection, 재전송 없음. 내구성이 필요하면 테이블과 결합하십시오.
+- 이것은 이른 Infra를 걷어내는 이야기이지, Postgres가 어디서나 Redis를 이긴다는 주장이 아닙니다. Database 한 대로 시작하고, 측정하고, 숫자가 정말로 요구하는 날에 Redis를 추가하십시오.

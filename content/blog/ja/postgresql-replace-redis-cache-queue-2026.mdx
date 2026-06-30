@@ -1,0 +1,176 @@
+---
+title: "2026年、まだRedisは必要か？PostgreSQLをキャッシュ・キュー・Pub/Subとして使う"
+description: "小〜中規模アプリでキャッシュ、ジョブキュー、Pub/Subのために反射的にRedisを足す前に、すでに動いているPostgreSQL一台で吸収できないか。動くSQLと判断チェックリストで整理します。"
+date: "2026-06-12"
+status: "published"
+tags: ["PostgreSQL", "Redis", "Architecture", "Caching", "Database"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-replace-redis-cache-queue-2026"
+---
+
+クライアントから新しいバックエンドの設計を依頼されると、最初のホワイトボードにはほぼ必ずRedisが登場します。これは反射神経のようなものです。キャッシュが要るからRedis、ジョブキューが要るからRedis、接続中の数クライアントにイベントを流したいからRedis Pub/Sub。一つひとつの判断は間違っていません。ただ、小〜中規模のアプリでこれらを積み重ねると、プロビジョニング・監視・バックアップ・パッチ適用、そして障害のたびに頭を悩ませる対象がもう一つ増えます。そのトラフィックは、すでに動いているPostgreSQL一台がほとんど気づかない程度のものだったりします。
+
+この記事は、2026年に私たちが実際にクライアントへ伝えている主張です。Redisを足す前に、いま運用しているPostgreSQLでその仕事がこなせないか確認しましょう。キャッシュ、軽量なPub/Sub、ジョブキューに関しては、モダンなPostgresにこれらのパターン専用の機能が揃っています。三つすべてを動くSQLで見ていき、同じくらい大事なこととして、このやり方が破綻する境界も正直に示します。
+
+## 「とりあえずRedis」の反射はコストが見えにくい
+
+データストアを一つ増やすコストは、ライセンス料やインスタンス代ではありません。本当のコストは運用面です。システムが一つ増えれば障害モードが一つ増え、ダッシュボードに載せる指標が一セット増え、サイズ調整すべきコネクションプールが一つ増え、主データとずれうる対象が一つ増えます。データベース一台をきちんと運用しているチームにとって、Redisの追加はオンコールの認知負荷を静かに倍増させかねません。
+
+見落とされがちな正しさの観点もあります。キャッシュ・キュー・正となるデータが三つの別々の場所にあると、二重書き込み（dual-write）問題を抱え込みます。業務行をPostgresに書き、ジョブをRedisにエンキューする。もし二つ目の呼び出しが失敗したり、その間にプロセスが落ちたりすれば、処理ジョブのない注文や、ロールバックされた行を指すジョブが残ります。多くの現場はこれをリトライや突合スクリプトで誤魔化します。キューを同じデータベース内に置けば、エンキューと業務書き込みが一つのトランザクションで起きるため、この競合は丸ごと消えます。
+
+トレードオフははっきりさせておきます。Postgresは一操作あたりではRedisより明確に遅いです。Redisはメモリから読み取りをサブミリ秒で返すのが普通ですが、Postgresの往復はクエリ・インデックス・接続オーバーヘッド次第で、コンマ数ミリ秒から数ミリ秒といったところです。さらにRedisにはPostgresがネイティブに持たないデータ構造があります。Sorted Set、HyperLogLog、Bitmapなどです。設計がこれらに本当に依存しているなら、この記事は向きません。それ以外の方は続きをどうぞ。
+
+## UNLOGGEDテーブルによるキャッシュ
+
+Postgresはクラッシュ後に復旧できるよう、すべての変更をWAL（write-ahead log）に書き込みます。永続的な業務データにはこれが正解です。しかしキャッシュデータにとっては無駄な仕事です。再起動でキャッシュが消えても、単に再生成すればよいだけだからです。
+
+`UNLOGGED`テーブルはWALをスキップします。永続化する量が減るぶん書き込みが速く、データはレプリケーションもクラッシュ耐性もありません。クラッシュや再起動でテーブルはtruncateされます。中身を失っても痛むのはデータ整合性ではなくキャッシュミス数回ぶんなので、キャッシュにはこれが正しいトレードオフです。コミュニティの非公式なベンチマークでは、通常のloggedテーブルに対する書き込み高速化はおおむね十数パーセント台ですが、これは方向性として捉え、自分のワークロードで計測してください。
+
+```sql
+CREATE UNLOGGED TABLE cache_entries (
+    cache_key   text PRIMARY KEY,
+    payload     jsonb NOT NULL,
+    expires_at  timestamptz NOT NULL
+);
+
+CREATE INDEX idx_cache_entries_expires_at
+    ON cache_entries (expires_at);
+```
+
+値の読み取りでは、すでに期限切れの行を無視します。
+
+```sql
+SELECT payload
+FROM cache_entries
+WHERE cache_key = $1
+  AND expires_at > now();
+```
+
+書き込みや更新は、TTLをintervalで表現した単一のupsertで済みます。
+
+```sql
+INSERT INTO cache_entries (cache_key, payload, expires_at)
+VALUES ($1, $2, now() + interval '5 minutes')
+ON CONFLICT (cache_key)
+DO UPDATE SET payload    = EXCLUDED.payload,
+              expires_at = EXCLUDED.expires_at;
+```
+
+クエリ側ですでに期限切れ行を弾いているので、正しさはクリーンアップに依存しません。ただし不要行は領域を占有しインデックスを肥大化させるため、数分おきに走らせる定期的な掃除を入れます。
+
+```sql
+DELETE FROM cache_entries
+WHERE expires_at <= now();
+```
+
+このDELETEは`pg_cron`でも、アプリのスケジューラでも、素のcronでも駆動できます。要点は、期限切れの判定は読み取り時に行われ、クリーンアップは正しさの要件ではなくバックグラウンドの関心事だということです。
+
+## SELECT ... FOR UPDATE SKIP LOCKEDによるジョブキュー
+
+このパターンが最も多くの懐疑派を翻意させます。データベースをキューにする際の典型的な反論は、同じテーブルをポーリングするワーカー同士が同じ行を奪い合い、衝突するというものです。`SKIP LOCKED`がこの反論を消します。ワーカーが行を`FOR UPDATE`で選択するとPostgresはその行をロックし、`SKIP LOCKED`は他のワーカーに対して、すでにロックされた行は待たずにスキップせよと指示します。各ワーカーは別々のジョブを掴むので、二重処理もロック競合も起きません。
+
+```sql
+CREATE TABLE job_queue (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    job_type     text NOT NULL,
+    payload      jsonb NOT NULL,
+    status       text NOT NULL DEFAULT 'pending',
+    attempts     int  NOT NULL DEFAULT 0,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_job_queue_pending
+    ON job_queue (created_at)
+    WHERE status = 'pending';
+```
+
+ワーカーはトランザクション内で一件をデキューします。最古のpending行を選び、他のワーカーが保持している行はスキップし、CTEを使って同じ文の中でstatusを`processing`に切り替えます。
+
+```sql
+BEGIN;
+
+WITH next_job AS (
+    SELECT id
+    FROM job_queue
+    WHERE status = 'pending'
+    ORDER BY created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+UPDATE job_queue AS j
+SET status = 'processing',
+    attempts = j.attempts + 1
+FROM next_job
+WHERE j.id = next_job.id
+RETURNING j.id, j.job_type, j.payload;
+
+COMMIT;
+```
+
+ワーカーは返ってきたジョブを処理し、その後`done`に（エラー時は`pending`/`failed`に戻す）マークします。これを安全にしているのはトランザクションです。行は選択された瞬間にロックされるため、二つのワーカーが同じジョブを取ることは決してありません。
+
+そして冒頭で触れた利点です。キューがただのテーブルなので、業務行を書くのと同じトランザクションでエンキューできます。
+
+```sql
+BEGIN;
+INSERT INTO orders (customer_id, total) VALUES ($1, $2);
+INSERT INTO job_queue (job_type, payload)
+VALUES ('send_receipt', jsonb_build_object('customer_id', $1));
+COMMIT;
+```
+
+両方の行がコミットされるか、どちらもされないかのどちらかです。注文がジョブなしで存在する隙間はなく、保守すべき突合スクリプトもありません。この保証を別建てのRedisキューで再現するのは、実際にはかなり困難です。
+
+## LISTEN / NOTIFYによるPub/Sub
+
+リアルタイムなファンアウトには、Postgresの`LISTEN`と`NOTIFY`があります。コネクションがチャンネルを購読し、そのチャンネルに対して`NOTIFY`を呼んだ任意のセッションが、すべてのリスナーへメッセージを押し出します。
+
+```sql
+LISTEN job_events;
+
+NOTIFY job_events, 'job:4821:ready';
+```
+
+通知はトリガーから発火させてデータ変更に同乗させてもよいですし、アプリコードから直接呼んでも構いません。コンシューマ側では、TypeScriptの`pg`（node-postgres）で専用コネクションを保持し、届いたイベントに反応します。
+
+```typescript
+import { Client } from "pg";
+
+const client = new Client({ connectionString: process.env.DATABASE_URL });
+await client.connect();
+await client.query("LISTEN job_events");
+
+client.on("notification", (msg) => {
+  console.log(`channel=${msg.channel} payload=${msg.payload}`);
+  // ワーカーを起こす、キャッシュキーを無効化する、WebSocketへ流す、など
+});
+```
+
+ここからは正直な制約です。ここで火傷するチームが多いからです。ペイロードは約8000バイトが上限なので、識別子だけを送って詳細はコンシューマ側で取得させ、オブジェクト全体は決して送らないこと。`LISTEN`/`NOTIFY`は専用の永続コネクションを必要とし、そのためPgBouncerのtransaction poolingモードとは相性が悪いです。リッスン中のセッションはpinし続ける必要があります。そしてこれはパーティション耐性のあるブローカーではありません。通知が発火した瞬間にリスナーが切断されていれば、そのメッセージは消え、再送はありません。耐久性のあるイベントログではなく、ベストエフォートの起動シグナルとして扱ってください。配信保証が要るなら、ジョブテーブルと組み合わせます。`NOTIFY`でワーカーを起こし、永続的な状態はテーブルに持たせるのです。
+
+帰属を明記すべきバージョンの話を一つ。2026年時点の本番ラインはPostgreSQL 18で、高い通知量下での`LISTEN`/`NOTIFY`のスケーラビリティ改善がPostgreSQL 19で入る予定です。19は2026年6月時点でベータ、GAは9月ごろの見込みです。これは概算として扱い、依存する前にリリースノートを確認してください。
+
+## 判断チェックリスト
+
+次の多くが当てはまるなら、Postgresのみで進めましょう。
+
+- スループットが控えめ — 毎秒数万操作を余裕で下回る。
+- レイテンシ目標が低ミリ秒台で、厳格なサブミリ秒のSLAではない。
+- Redisネイティブの構造（Sorted Set、HyperLogLog、Bitmap）が不要。
+- データとキューの間のトランザクション整合性が実際に重要。
+- 運用のシンプルさとコストが現実的な制約 — 小〜中規模やコストに敏感なクライアントでよくあります。
+
+次の場合はRedisを残します。
+
+- 非常に高いスループット（毎秒10万操作以上）を捌く、または真のサブミリ秒レイテンシが要る。
+- 設計がRedisのデータ構造やPostgresにない機能に依存している。
+- キャッシュミスの嵐がプライマリDBを圧倒しうるため、それを守る独立したメモリ層が要る。
+
+## まとめ
+
+- 多くの実アプリでは、PostgreSQL一台でキャッシュ・ジョブキュー・Pub/Subをまかなえ、二つ目のデータストアは要りません。
+- `UNLOGGED`テーブルは高速で使い捨てのキャッシュ領域を提供します。TTLは読み取り時に効かせ、期限切れ行はバックグラウンドで掃除します。
+- `SELECT ... FOR UPDATE SKIP LOCKED`は競合のないマルチワーカーキューを実現し、業務書き込みと同じトランザクションでエンキューできるおまけ付きです。
+- `LISTEN`/`NOTIFY`は軽量なリアルタイムファンアウトをまかないますが、ベストエフォートです。小さなペイロード、pinされたコネクション、再送なし。耐久性が要るならテーブルと組み合わせます。
+- これは早すぎるインフラを取り除く話であって、Postgresがあらゆる場面でRedisに勝るという主張ではありません。まずデータベース一台で始め、計測し、数字が本当に求めた日にRedisを足しましょう。

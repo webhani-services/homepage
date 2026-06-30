@@ -1,0 +1,147 @@
+---
+title: "Next.js 16 Partial Prerendering과 Cache Components — Server-First 설계 실전 가이드"
+description: "Next.js 16이 정식화하는 Partial Prerendering과 Cache Components의 구조를 설명합니다. 정적 Shell과 동적 영역을 하나의 Route에 공존시키는 아키텍처와 구체적인 구현 패턴을 소개합니다."
+date: "2026-06-09"
+status: "published"
+tags: ["Next.js", "React", "Web Development", "Vercel", "TypeScript"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-partial-prerendering-2026"
+---
+
+Next.js 16은 Partial Prerendering(PPR)과 Cache Components를 핵심으로 하는 'Server-First' 아키텍처를 정식화합니다. 이는 정적 생성과 동적 렌더링을 하나의 Route 안에 공존시키는 구조로, 지금까지 "전부 SSG"냐 "전부 SSR"이냐는 이분법적 선택을 강요받던 설계상의 제약을 해소합니다.
+
+## Partial Prerendering이 해결하는 문제
+
+PPR 이전에는 Route가 완전히 정적(빌드 시 생성)이거나 완전히 동적(요청마다 평가)이었습니다. 페이지의 어느 한 부분이라도 실시간 데이터가 필요하면, 내비게이션이나 레이아웃처럼 전혀 바뀌지 않는 부분도 포함해 Route 전체가 SSR로 처리됐습니다.
+
+PPR은 Route를 두 레이어로 분리합니다:
+
+- **정적 Shell**: 빌드 시 생성되어 CDN 엣지에서 거의 즉시 제공되는 부분(내비게이션, 레이아웃, 정적 콘텐츠)
+- **동적 영역**: 요청 시 평가되어 Suspense를 통해 스트리밍되는 부분(사용자 고유 데이터, 실시간 재고 정보 등)
+
+설계의 판단 기준이 "이 Route는 SSG인가 SSR인가?"에서 "이 데이터의 신선도 요건은 무엇인가?"로 바뀝니다.
+
+## 구현 패턴
+
+### 기본 PPR 구조
+
+```tsx
+// app/products/[id]/page.tsx
+
+import { Suspense } from "react";
+import { ProductShell } from "./components/ProductShell";
+import { DynamicInventory } from "./components/DynamicInventory";
+import { DynamicReviews } from "./components/DynamicReviews";
+
+// 이 Route는 정적 Shell로 prerender됩니다
+export default function ProductPage({ params }: { params: { id: string } }) {
+  return (
+    <ProductShell id={params.id}>
+      {/* 동적 영역은 Suspense로 감쌉니다 */}
+      <Suspense fallback={<InventorySkeleton />}>
+        <DynamicInventory productId={params.id} />
+      </Suspense>
+      <Suspense fallback={<ReviewsSkeleton />}>
+        <DynamicReviews productId={params.id} />
+      </Suspense>
+    </ProductShell>
+  );
+}
+```
+
+`ProductShell`은 빌드 시 HTML로 생성되어 CDN에서 제공됩니다. `DynamicInventory`와 `DynamicReviews`는 요청 시 Server Component로 스트리밍됩니다. 사용자는 Shell을 즉시 보면서 동적 영역이 로딩되는 것을 기다립니다.
+
+### Cache Components
+
+Cache Components는 동적 Route 안에서도 특정 Component의 출력을 캐시할 수 있는 기능입니다. 요청마다 바뀌는 것이 아니라 일정 주기로 업데이트되는 콘텐츠(프로모션 배너, 추천 아이템 등)에 유용합니다.
+
+```tsx
+// components/FeaturedBanners.tsx
+import { unstable_cache as cache } from "next/cache";
+
+// 1시간마다 재평가되는 캐시된 Component
+const getCachedBanners = cache(
+  async () => {
+    const banners = await db.banners.findMany({ where: { active: true } });
+    return banners;
+  },
+  ["featured-banners"],
+  { revalidate: 3600, tags: ["banners"] }
+);
+
+export async function FeaturedBanners() {
+  const banners = await getCachedBanners();
+  return (
+    <ul>
+      {banners.map((banner) => (
+        <li key={banner.id}>{banner.title}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+`revalidate: 3600`으로 시간 기반 재검증을 설정하고, `tags`로 On-Demand Revalidation 트리거를 지정합니다.
+
+### On-Demand Revalidation
+
+```typescript
+// app/api/revalidate/route.ts
+import { revalidateTag } from "next/cache";
+import { NextRequest, NextResponse } from "next/server";
+
+export async function POST(request: NextRequest) {
+  const { tag, secret } = await request.json();
+
+  if (secret !== process.env.REVALIDATION_SECRET) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  revalidateTag(tag);
+  return NextResponse.json({ revalidated: true, tag });
+}
+```
+
+CMS의 Webhook을 이 엔드포인트에 연결하면, 편집자가 콘텐츠를 게시할 때 `/api/revalidate`가 호출되어 해당 태그를 가진 모든 캐시 항목이 다음 요청 시 새로 패치됩니다.
+
+## Next.js 15에서의 마이그레이션
+
+Next.js 15에서 PPR을 실험적으로 활성화했다면, Next.js 16에서의 주요 변경점은 `experimental.ppr` 플래그가 더 이상 필요하지 않다는 것입니다 — PPR이 기본값이 됩니다.
+
+```javascript
+// next.config.mjs — Next.js 16
+const nextConfig = {
+  // experimental.ppr 제거됨 — PPR은 이제 기본 동작
+  // 명시적으로 비활성화할 경우에만 설정 필요
+};
+
+export default nextConfig;
+```
+
+더 중요한 마이그레이션 고려 사항은 Next.js 16에서 Turbopack이 기본 번들러가 된다는 점입니다. 커스텀 Webpack 로더나 플러그인을 사용하는 프로젝트는 업그레이드 전 호환성 확인이 필요합니다.
+
+## PPR이 효과를 발휘하는 상황과 그렇지 않은 상황
+
+| 페이지 유형 | 정적 영역 | 동적 영역 | PPR 효과 |
+|---|---|---|---|
+| 이커머스 상품 페이지 | 설명, 이미지, 스펙 | 재고, 가격, 리뷰 | 높음 — 초기 렌더링 대폭 개선 |
+| 대시보드 | 내비게이션, 레이아웃 | KPI, 실시간 데이터 | 중간 — Layout Shift 감소 |
+| 블로그 게시물 | 본문, 메타데이터 | 개인화 추천 | 중간 — TTFB가 정적 수준으로 개선 |
+| 인증 후 앱 | 공통 UI Shell | 사용자 고유 데이터 | 중간 — Shell 사전 로딩 |
+
+페이지의 상당 부분이 정적이지만 일부 영역에 동적 데이터가 필요한 경우에 PPR이 가장 큰 효과를 냅니다. 모든 것이 사용자별로 다른 완전 동적 대시보드나, 반대로 완전히 정적인 마케팅 페이지에는 효과가 제한적입니다.
+
+## 실전 고려 사항
+
+**먼저 데이터 신선도 요건을 정리합니다.** PPR 도입 전에 각 Component가 필요로 하는 데이터의 업데이트 빈도를 분류하세요. "빌드 시", "시간 단위(1시간, 1일)", "요청마다"의 세 단계로 나누는 것만으로도 정적 Shell, Cache Component, 동적 Server Component 중 어느 것을 사용할지 판단이 명확해집니다.
+
+**Turbopack 마이그레이션을 별도 작업으로 분리합니다.** 커스텀 Webpack 설정이 있는 경우, Turbopack 마이그레이션을 Next.js 16 기능 업그레이드와 분리해 진행하기를 권장합니다. 번들러 문제와 PPR 문제가 혼재하면 원인 파악이 어려워집니다.
+
+**Suspense 경계를 의도적으로 설계합니다.** PPR에서 Suspense 배치는 사용자 경험에 직결됩니다. Skeleton의 범위가 너무 넓으면 Layout Shift가 늘고, 너무 세밀하면 구현 비용이 올라갑니다. 디자인 시스템에 Skeleton Component를 포함시키면 일관된 Fallback UI를 유지하기 쉬워집니다.
+
+Next.js 16이 정식화하는 Server-First 방향성은 SvelteKit, Nuxt에서도 동일하게 나타납니다. 2026년 프론트엔드 아키텍처는 클라이언트 사이드 JavaScript를 얼마나 줄일 수 있는지를 설계의 중심에 두는 경향이 강해지고 있습니다.
+
+---
+
+*참고: [Next.js Updates by Vercel - June 2026](https://releasebot.io/updates/vercel/next-js), [Next.js 15 and Beyond](https://medium.com/@beenakumawat003/next-js-15-and-beyond-the-future-of-full-stack-react-in-2026-advanced-guide-with-deep-insights-d7253dc46205)*

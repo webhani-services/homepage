@@ -1,0 +1,92 @@
+---
+title: "Docker Kanvas: Bridging Docker Compose and Kubernetes"
+description: "Docker and Layer5 launched Kanvas to automatically convert Docker Compose files to Kubernetes manifests with visual infrastructure representation. Here's where it fits alongside Helm and Kustomize."
+date: "2026-06-10"
+status: "published"
+tags: ["Docker", "Kubernetes", "DevOps", "Cloud Infrastructure", "Kanvas"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-helm-kustomize-comparison"
+---
+
+Docker and Layer5 recently released Docker Kanvas, a tool that converts Docker Compose files to Kubernetes resources and renders the resulting infrastructure as a visual graph. Here's a practical look at where it fits in your toolchain.
+
+## What Docker Kanvas Does
+
+Kanvas takes a Docker Compose file as input and generates the corresponding Kubernetes resources: Deployments, Services, PersistentVolumeClaims, ConfigMaps, and Secrets. The generated resources are rendered as a dependency graph, showing how services relate to one another.
+
+The tool is built on Layer5's Meshery platform and supports multi-cluster management alongside the conversion workflow.
+
+## How It Compares to Helm and Kustomize
+
+Both Helm and Kustomize solve real problems and neither is going away. Kanvas occupies a different niche.
+
+**Helm** excels at packaging Kubernetes applications for distribution. Its templating system handles complex parameterization, and Helm Charts provide dependency management. The trade-off is debugging complexity — Go templates become unwieldy in large charts.
+
+```yaml
+# Helm template — powerful but verbose
+containers:
+  - name: {{ .Values.app.name }}
+    image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+    {{- if .Values.resources }}
+    resources:
+      {{- toYaml .Values.resources | nindent 12 }}
+    {{- end }}
+```
+
+**Kustomize** solves environment management with a base + overlays model. It's built into kubectl, requires no additional installation, and works with plain YAML. Complex parameterization is where it falls short compared to Helm.
+
+**Kanvas** targets a different entry point. It uses Docker Compose — a format most developers already know — as the starting point, reducing the barrier to Kubernetes adoption rather than competing with existing tools for teams already using them.
+
+## A Typical Conversion Example
+
+```yaml
+# docker-compose.yml
+services:
+  api:
+    image: myapi:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - DB_URL=postgresql://db:5432/appdb
+    depends_on:
+      - db
+  db:
+    image: postgres:16
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
+```
+
+Kanvas generates from this:
+- `Deployment` + `Service` for `api`
+- `Deployment` + `Service` for `db`
+- `PersistentVolumeClaim` for `pgdata`
+- `Secret` or `ConfigMap` for `DB_URL`
+
+The visual editor lets you review the dependency graph, layer in HPAs, NetworkPolicies, and resource limits, then export the final manifests.
+
+## When Kanvas Makes Sense
+
+Kanvas fits well when:
+- Your team uses Docker Compose for local development and is moving to Kubernetes
+- Services are relatively simple — fewer than 15 microservices
+- Kubernetes expertise on the team is limited
+- You need infrastructure diagrams for documentation or onboarding
+
+Stick with Helm or Kustomize when:
+- You're distributing a packaged application that others will install and configure
+- You need fine-grained environment management across multiple clusters
+- You're integrating into an existing Kubernetes CI/CD pipeline with established tooling
+
+## Practical Assessment
+
+The honest read on Docker Kanvas: it's a useful onramp, not a replacement for mature Kubernetes tooling. For production environments, a sensible approach is using Kanvas to generate a baseline manifest set, then wrapping it in Helm or managing environment-specific configuration with Kustomize.
+
+The visual infrastructure diagram is genuinely valuable for onboarding and documentation. Seeing the dependency graph without reading through YAML helps new team members get oriented quickly, and it serves as living documentation for infrastructure that otherwise lives only in files.
+
+## Takeaway
+
+Docker Kanvas reduces friction for Docker Compose users moving to Kubernetes. If your team is at that transition point, it's worth evaluating. For teams already running Kubernetes with Helm or Kustomize in place, it adds less value as a primary deployment tool but could work well as a visualization layer on top of existing infrastructure.
