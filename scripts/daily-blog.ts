@@ -1,68 +1,42 @@
 /**
  * Daily Blog Generator
  *
- * 最新の技術ニュースを取得し、Top 3 を選定して会社ブログ記事を自動生成する。
- * 3件のうち少なくとも1件は LLM/AI 関連のニュースが含まれる。
+ * LLM Gateway を使用して技術ブログ記事を自動生成する。
  *
  * Usage:
  *   npx tsx scripts/daily-blog.ts
- *   npx tsx scripts/daily-blog.ts --provider openai
  *   npx tsx scripts/daily-blog.ts --count 5
  *   npx tsx scripts/daily-blog.ts --dry-run
  *
  * Options:
  *   --count, -c     Number of articles to generate (default: 3)
  *   --locales, -l   Target locales (default: "ja,en,ko")
- *   --provider, -p  LLM provider (default: env LLM_PROVIDER or "anthropic")
- *   --model, -m     Model name (default: env LLM_MODEL or provider default)
  *   --dry-run       Print selected topics without generating articles
  *
  * Environment Variables:
- *   LLM_PROVIDER       Default LLM provider (anthropic | openai | gemini)
- *   LLM_MODEL          Default model name
- *   ANTHROPIC_API_KEY   Anthropic API key (default)
- *   OPENAI_API_KEY      OpenAI API key
- *   GEMINI_API_KEY      Google Gemini API key
- *
- * News Sources:
- *   - Hacker News API (free, no auth)
- *   - Dev.to API (free, no auth)
- *
- * Workflow:
- *   1. Fetch latest tech news from multiple sources
- *   2. LLM selects top N articles (at least 1 LLM/AI related)
- *   3. For each selected article, generate blog post in all locales
- *   4. Save as draft MDX files
+ *   LLM_GATEWAY_BASE_URL  LLM Gateway base URL (required)
+ *   LLM_GATEWAY_TOKEN     LLM Gateway API token (required)
  */
 
-import fs from "fs";
-import path from "path";
-import { createProvider } from "./lib/registry.js";
-import { fetchTechNews, formatNewsForLLM } from "./lib/news-fetcher.js";
+import {
+  LOCALE_NAMES,
+  getGatewayConfig,
+  toSlug,
+  buildMdx,
+  saveMdx,
+  runGatewayJob,
+} from "./lib/blog-gateway.js";
 
-const CONTENT_DIR = path.join(process.cwd(), "content/blog");
-
-const LOCALE_NAMES: Record<string, string> = {
-  ja: "Japanese",
-  en: "English",
-  ko: "Korean",
-};
-
-interface SelectedTopic {
-  index: number;
+interface GatewayTopic {
   title: string;
-  url: string;
-  reason: string;
-  slug: string;
-  isLLMRelated: boolean;
+  category: string;
+  rationale: string;
 }
 
 function parseArgs(args: string[]) {
   const parsed = {
     count: 3,
     locales: ["ja", "en", "ko"],
-    provider: undefined as string | undefined,
-    model: undefined as string | undefined,
     dryRun: false,
   };
 
@@ -77,14 +51,6 @@ function parseArgs(args: string[]) {
       case "-l":
         parsed.locales = (args[++i] ?? "").split(",").map((s) => s.trim());
         break;
-      case "--provider":
-      case "-p":
-        parsed.provider = args[++i];
-        break;
-      case "--model":
-      case "-m":
-        parsed.model = args[++i];
-        break;
       case "--dry-run":
         parsed.dryRun = true;
         break;
@@ -94,154 +60,43 @@ function parseArgs(args: string[]) {
   return parsed;
 }
 
-function buildSelectionPrompt(
-  newsText: string,
-  count: number
-): string {
-  return `You are a technical content curator for webhani Inc., an IT consulting and development company specializing in web development, cloud infrastructure, and AI/LLM solutions.
-
-Below is a list of recent tech news articles. Select the top ${count} articles that would be most interesting and valuable for our company blog.
-
-IMPORTANT CONSTRAINT: At least 1 of the ${count} selected articles MUST be related to LLM, AI, or machine learning (e.g., Claude, GPT, AI tools, prompt engineering, AI coding assistants, etc.).
-
-Selection criteria:
-- Relevance to web development, cloud, DevOps, or AI/LLM
-- Practical value for developers and IT professionals
-- Trending or high-impact topics
-- Freshness and novelty
-
-Respond in valid JSON only. No explanation before or after.
-
-Format:
-[
-  {
-    "index": <article number from the list>,
-    "title": "<original title>",
-    "url": "<url>",
-    "reason": "<why this is a good topic for our blog>",
-    "slug": "<url-safe-slug>",
-    "isLLMRelated": <true if LLM/AI related, false otherwise>
-  }
-]
-
---- NEWS LIST ---
-${newsText}
---- END LIST ---`;
-}
-
-function buildArticlePrompt(
-  topic: SelectedTopic,
-  locale: string
-): string {
-  const langName = LOCALE_NAMES[locale] ?? locale;
-  const today = new Date().toISOString().split("T")[0];
-
-  return `You are a technical blog writer for webhani Inc., an IT consulting and development company.
-
-Write an original blog post in ${langName} inspired by the following news article:
-
-Title: ${topic.title}
-URL: ${topic.url}
-Why we chose this: ${topic.reason}
-
-IMPORTANT RULES:
-- Do NOT simply translate or copy the original article
-- Write an ORIGINAL article from webhani's perspective
-- Add your own analysis, practical insights, and code examples
-- All content MUST be 100% original — never copy or closely paraphrase the source article
-- Code examples must be original or use only officially documented public APIs/patterns
-- Do not reproduce proprietary code, copyrighted text, or trademarked content without attribution
-- If citing statistics or research, mention the source inline (e.g., "according to [source]")
-- Relate the topic to web development, cloud, or AI consulting
-- Write 800-1500 words
-- Use proper markdown headings (##, ###), code blocks, and lists
-- Write in a professional but approachable tone — as a senior engineer sharing knowledge with peers, not as a marketer
-- Avoid hype, buzzwords ("revolutionary", "game-changing"), excessive exclamation marks, or clickbait
-- Keep introductions brief and get to practical content quickly
-- For Japanese: use です/ます style, keep technical terms in English/katakana
-- For Korean: use 합니다 style, mix Korean and English technical terms naturally
-- For English: use clear, direct technical writing — no filler phrases
-
-Output ONLY the complete MDX file content. No explanation before or after.
-
-Frontmatter:
----
-title: "<compelling title in ${langName}>"
-description: "<1-2 sentence summary in ${langName}>"
-date: "${today}"
-status: "draft"
-tags: [<3-5 relevant tags>]
-thumbnail: ""
-author: "webhani"
-slug: "${topic.slug}"
----
-
-(blog content in ${langName})`;
-}
-
-function saveMdx(locale: string, slug: string, content: string): string {
-  const dir = path.join(CONTENT_DIR, locale);
-  fs.mkdirSync(dir, { recursive: true });
-  const filePath = path.join(dir, `${slug}.mdx`);
-  fs.writeFileSync(filePath, content, "utf-8");
-  return filePath;
-}
-
 async function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const provider = createProvider(args.provider, undefined, args.model);
+  const { baseUrl, token } = getGatewayConfig();
 
-  console.log(`Provider: ${provider.name}`);
+  const args = parseArgs(process.argv.slice(2));
+  const today = new Date().toISOString().split("T")[0] as string;
+
   console.log(`Articles to generate: ${args.count}`);
   console.log(`Locales: ${args.locales.join(", ")}`);
   console.log("===\n");
 
-  // Step 1: Fetch news
-  const news = await fetchTechNews();
+  // Step 1: Select topics via gateway (sync task run)
+  console.log(`Selecting top ${args.count} topics...`);
 
-  if (news.length === 0) {
-    console.error("Error: No news articles fetched. Check network connection.");
-    process.exit(1);
-  }
-
-  const newsText = formatNewsForLLM(news);
-
-  // Step 2: LLM selects top articles
-  console.log(`\nSelecting top ${args.count} articles with LLM...`);
-
-  const selectionResponse = await provider.generate({
-    messages: [{ role: "user", content: buildSelectionPrompt(newsText, args.count) }],
-    maxTokens: 2048,
-    temperature: 0.3,
-  });
-
-  let selectedTopics: SelectedTopic[];
-  try {
-    // Extract JSON from response (handle potential markdown code blocks)
-    const jsonMatch = selectionResponse.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) throw new Error("No JSON array found in response");
-    selectedTopics = JSON.parse(jsonMatch[0]);
-  } catch {
-    console.error("Error: Failed to parse LLM selection response");
-    console.error("Response:", selectionResponse);
-    process.exit(1);
-  }
-
-  // Validate at least 1 LLM-related topic
-  const llmCount = selectedTopics.filter((t) => t.isLLMRelated).length;
-  if (llmCount === 0) {
-    console.warn(
-      "Warning: No LLM/AI related topic was selected. The constraint was not met."
-    );
-  }
+  const topicRes = await fetch(
+    `${baseUrl}/v1/tasks/daily-tech-topic-selection/run`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        input: { date: today, count: args.count, language: "ja" },
+      }),
+    },
+  );
+  if (!topicRes.ok)
+    throw new Error(`topic-selection failed: ${topicRes.status}`);
+  const { output } = (await topicRes.json()) as {
+    output: { topics: GatewayTopic[] };
+  };
+  const topics = output.topics;
 
   console.log("\nSelected topics:");
-  selectedTopics.forEach((topic, i) => {
-    console.log(
-      `  ${i + 1}. ${topic.title}${topic.isLLMRelated ? " [LLM/AI]" : ""}`
-    );
-    console.log(`     Slug: ${topic.slug}`);
-    console.log(`     Reason: ${topic.reason}`);
+  topics.forEach((topic, i) => {
+    console.log(`  ${i + 1}. ${topic.title} [${topic.category}]`);
+    console.log(`     Rationale: ${topic.rationale}`);
   });
 
   if (args.dryRun) {
@@ -249,32 +104,34 @@ async function main() {
     return;
   }
 
-  // Step 3: Generate articles for each topic
+  // Step 2: Generate articles for each topic and locale via async jobs
   console.log("\n===\nGenerating articles...\n");
 
-  for (const topic of selectedTopics) {
+  for (const topic of topics) {
     console.log(`\n--- ${topic.title} ---`);
+    const slug = toSlug(topic.title);
 
     for (const locale of args.locales) {
-      console.log(
-        `  Generating ${LOCALE_NAMES[locale] ?? locale} version...`
+      console.log(`  Generating ${LOCALE_NAMES[locale] ?? locale} version...`);
+
+      const article = await runGatewayJob(
+        "daily-tech-article",
+        {
+          date: today,
+          topic: topic.title,
+          language: locale,
+          target_length: 2000,
+        },
+        `daily-article:${today}:${topic.title}:${locale}`,
       );
 
-      const content = await provider.generate({
-        messages: [
-          { role: "user", content: buildArticlePrompt(topic, locale) },
-        ],
-        maxTokens: 4096,
-        temperature: 0.7,
-      });
-
-      const filePath = saveMdx(locale, topic.slug, content);
+      const filePath = saveMdx(locale, slug, buildMdx(article, today, slug));
       console.log(`  Saved: ${filePath}`);
     }
   }
 
   console.log(
-    `\nDone! Generated ${selectedTopics.length * args.locales.length} draft posts.`
+    `\nDone! Generated ${topics.length * args.locales.length} draft posts.`,
   );
   console.log('Review and change status to "published" when ready.');
 }

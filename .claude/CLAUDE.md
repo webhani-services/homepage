@@ -85,9 +85,12 @@ scripts/           # Blog generation scripts
 
 - **Content**: `content/blog/{locale}/{slug}.mdx` (MDX + frontmatter)
 - **Status**: `draft` | `published` | `private` (frontmatter `status` field)
-- **Auto-generation**: `npm run generate-blog -- -t "topic"` (default: Anthropic)
-  - Switch provider: `--provider openai` or `LLM_PROVIDER=gemini`
+- **Auto-generation**: `npm run generate-blog -- -t "topic"`
+  - 生성은 모두 **LLM Gateway** (async Job API)를 통해 처리됩니다. Local provider 라이브러리는 제거되었습니다.
+  - 필수 Environment Variables: `LLM_GATEWAY_BASE_URL`, `LLM_GATEWAY_TOKEN` (per-provider API key/switch 불필요)
+  - Gateway에 `blog-article-by-topic` / `blog-polish` / `daily-tech-article` Task가 등록되어 있어야 합니다.
   - Generated posts are saved with `status: draft`
+- **Scripts**: `generate-blog` (topic 기반), `polish-blog` (user draft 校正/翻訳), `daily-blog` (최신 tech topic 자동 선정)
 - **Claude Code commands** (no API key required, Claude Code generates directly):
   - `/project:generate-blog [topic]` — Generate blog post by topic
   - `/project:polish-blog [file path]` — Polish and translate user draft
