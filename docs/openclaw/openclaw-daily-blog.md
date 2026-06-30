@@ -171,7 +171,51 @@ find logs/ -name "daily-blog-*.log" -mtime +30 -delete
 | 예약 시각에 실행 안 됨      | plist 미적용 / 미등록         | `launchctl list \| grep webhani`로 확인, 없으면 `bootstrap` 재실행          |
 | plist 수정이 반영 안 됨     | 재적용 누락                   | `bootout` → `bootstrap` 순서로 재적용                                        |
 | git push 실패               | 인증 문제                     | `gh auth status` 확인, SSH Key / Token 설정 확인                            |
+| `gh` PR 단계 401 (`Bad credentials` / `Requires authentication`) | `gh` Token 만료/무효 | 아래 [gh 인증 (PAT) 관리](#gh-인증-pat-관리) 참조하여 재인증 |
 | Branch가 이미 존재함        | 같은 날 2회 실행됨            | Script가 `origin/blog/daily-${DATE}` 존재 시 자동 Skip                       |
 | Topic에 LLM/AI 미포함       | Prompt 제약이 약함            | "반드시 1건 이상" 문구 강조                                                  |
 | Timeout으로 중단됨          | 생성 시간이 김                | Script 내 `TIMEOUT_SECONDS`(기본 1800s) 조정                                |
 | 글 품질이 낮음              | Prompt 지시가 부족함          | `.claude/commands/daily-blog.md` 가이드라인 참조를 명시                      |
+
+## gh 인증 (PAT) 관리
+
+Script의 PR 생성·CI 확인·Merge는 전부 `gh`(GitHub API)에 의존합니다. `gh` Token이 만료되면 PR 단계에서 `HTTP 401: Bad credentials`로 자동화가 멈춥니다 (`git push`는 SSH라 영향 없음).
+
+Bot 계정(`yongwoon-moltbot`)은 **만료 없는 classic PAT**로 설정하는 것을 권장합니다. OAuth Token이나 fine-grained PAT(최대 1년)는 주기적으로 만료되어 자동화가 중단됩니다.
+
+### 증상 확인
+
+```bash
+gh auth status          # "token is invalid" 가 보이면 만료됨
+gh api user --jq .login # 401 이 나면 재인증 필요
+```
+
+### classic PAT 발급 (Bot 계정으로 로그인 상태)
+
+1. https://github.com/settings/tokens → **Generate new token → Tokens (classic)**
+2. 설정:
+   - **Expiration**: **No expiration** (무기한 — 만료로 인한 중단 방지)
+   - **Scopes**: `repo`, `workflow`, `read:org`
+3. 생성된 `ghp_...` Token 복사 (화면 이탈 시 재확인 불가)
+4. org가 SAML SSO를 강제하면, Token 목록에서 **Configure SSO → Authorize**로 `webhani-services` 인가 (안 하면 401 지속)
+
+### gh에 주입 (Secret이 Shell History에 안 남도록)
+
+```bash
+# 1번에서 복사한 Token이 클립보드에 있는 상태
+umask 077 && pbpaste > /tmp/ghpat \
+  && gh auth login -h github.com --with-token < /tmp/ghpat \
+  && rm -f /tmp/ghpat
+```
+
+또는 직접 붙여넣기: `gh auth login -h github.com --with-token` 실행 후 Token 붙여넣고 `Ctrl-D`.
+
+### 검증
+
+```bash
+gh auth status                                              # Token scopes: repo, workflow, read:org
+gh api user --jq .login                                    # yongwoon-moltbot (401 없음)
+gh api repos/webhani-services/homepage --jq .permissions.push  # true (PR Merge 권한)
+```
+
+> **참고**: `gh`는 Token을 `~/.config/gh/hosts.yml`에 **평문 저장**합니다 (`saved in plain text` 경고는 정상). 머신의 물리/계정 보안을 유지하세요. 주입한 Token은 기존 Token을 덮어쓰므로 별도 logout이 불필요합니다.
