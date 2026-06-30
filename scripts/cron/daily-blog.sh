@@ -16,12 +16,14 @@ DATE=$(date +%Y-%m-%d)
 LOG_FILE="${LOG_DIR}/daily-blog-${DATE}.log"
 LOCK_FILE="${LOG_DIR}/.daily-blog.lock"
 BRANCH_NAME="blog/daily-${DATE}"
-MAX_TURNS=30
+MAX_TURNS=80         # 9 ファイル生成 + git/PR まで完了するには 30 では不足 (生成だけで使い切る)
 TIMEOUT_SECONDS=1800  # 30 分
 LOG_RETENTION_DAYS=30
 
-# === PATH 設定 (claude コマンドが見つからない場合に備える) ===
-export PATH="$HOME/.claude/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+# === PATH 設定 (claude/gh/gtimeout コマンドが見つからない場合に備える) ===
+# launchd/cron は PATH を最小限 (/usr/bin:/bin) で起動するため、
+# claude (~/.local/bin), gh・gtimeout (/opt/homebrew/bin) を明示的に追加する
+export PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 # === Log Directory 作成 ===
 mkdir -p "${LOG_DIR}"
