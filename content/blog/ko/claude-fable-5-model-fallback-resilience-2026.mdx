@@ -1,0 +1,126 @@
+---
+title: "모델이 하루아침에 사라진다면: Fable 5 공급 중단에서 배우는 Fallback 설계"
+description: "Anthropic의 Claude Fable 5가 출시 며칠 만에 수출 규제로 공급 중단되었습니다. 특정 모델 의존을 피하고 Service를 멈추지 않게 하는 모델 추상화와 Fallback 설계를 구현 예제와 함께 정리합니다."
+date: "2026-07-01"
+status: "published"
+tags: ["Claude", "LLM", "Architecture", "Resilience", "AI"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-fable-5-model-fallback-resilience-2026"
+---
+
+2026년 6월, AI 업계에서 짧은 기간에 두 사건이 연달아 일어났습니다. 6월 9일 Anthropic이 최상위 모델 Claude Fable 5를 정식 출시했고, 며칠 뒤인 6월 12일에는 미국 정부의 수출 규제 지시에 따라 Fable 5와 Mythos 5에 대한 접근을 일시 중단한다고 발표했습니다([Anthropic](https://www.anthropic.com/news/claude-opus-4-8) 및 관련 보도). Opus, Sonnet, Haiku 등 다른 모델은 영향을 받지 않았지만, 최상위 모델 하나만을 전제로 만든 Product는 곧바로 대응에 쫓겼을 것입니다.
+
+이 사건은 특정 모델 ID에 직접 의존하는 설계가 얼마나 취약한지를 잘 보여 줍니다. 이 글에서는 모델이 공급 중단·폐기·가격 변경되어도 운영 Service를 멈추지 않게 하는 추상화와 Fallback을 구현 예제와 함께 정리합니다.
+
+## 무엇이 문제인가
+
+많은 Application이 코드 곳곳에 모델 이름을 Hardcoding합니다.
+
+```python
+# 여기저기 흩어진 모델 지정
+response = client.messages.create(
+    model="claude-fable-5",
+    max_tokens=4096,
+    messages=messages,
+)
+```
+
+이렇게 작성하면 모델이 사용 불가능해지는 순간 모든 호출 지점이 한꺼번에 깨집니다. 장애 대응 도중에 grep으로 호출부를 하나씩 찾아 바꾸는 작업이 발생합니다. 모델 Deprecation은 AI를 다루는 이상 피할 수 없는 이벤트이고, 이번처럼 규제에서 비롯된 중단은 예고 없이 오기도 합니다.
+
+## 추상화 Layer를 한 겹 둔다
+
+첫걸음은 모델 선택을 Business Logic에서 분리하는 것입니다. "용도"를 나타내는 논리적 이름을 정의하고, 실제 모델 ID로의 매핑을 한곳에 모읍니다.
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class ModelTier:
+    """용도별로 우선순위가 매겨진 후보 목록을 가진다"""
+    primary: str
+    fallbacks: list[str] = field(default_factory=list)
+
+# 설정으로 한곳에서 관리한다
+MODEL_TIERS = {
+    "reasoning": ModelTier(
+        primary="claude-opus-4-8",
+        fallbacks=["claude-sonnet-4-6"],
+    ),
+    "fast": ModelTier(
+        primary="claude-haiku-4-5",
+        fallbacks=["claude-sonnet-4-6"],
+    ),
+}
+```
+
+호출하는 쪽은 `model="claude-fable-5"`가 아니라 `tier="reasoning"`처럼 용도로 지정합니다. 이것만으로 모델 교체가 설정 파일 한 줄로 끝납니다. 이번 Fable 5 중단 같은 경우에도 `primary`를 Opus 4.8로 바꾸기만 하면 전사 Service가 복구됩니다.
+
+## 런타임 Fallback을 구현한다
+
+설정을 모으는 것에 더해, 런타임에 후보를 순서대로 시도하는 로직을 둡니다. 최상위 모델이 응답하지 않으면 다음 후보로 강등하고, 그래도 안 되면 마지막 후보까지 내려갑니다.
+
+```python
+import anthropic
+from anthropic import APIStatusError
+
+client = anthropic.Anthropic()
+
+# 일시적 실패로 간주하는 상태 코드
+RETRYABLE = {404, 429, 500, 503, 529}
+
+def create_with_fallback(tier: str, **kwargs):
+    spec = MODEL_TIERS[tier]
+    candidates = [spec.primary, *spec.fallbacks]
+    last_error = None
+
+    for model in candidates:
+        try:
+            return client.messages.create(model=model, **kwargs)
+        except APIStatusError as e:
+            if e.status_code in RETRYABLE:
+                log_fallback(tier, model, e.status_code)
+                last_error = e
+                continue
+            raise  # 잘못된 Request 등 회복 불가능한 것은 즉시 던진다
+
+    raise RuntimeError(f"tier={tier}의 모든 후보 실패") from last_error
+```
+
+여기서 핵심은 `404`(모델이 존재하지 않음)도 "일시적"으로 보고 다음 후보로 넘기는 점입니다. 이번 Fable 5처럼 어제까지 있던 모델이 갑자기 `404`를 반환하는 경우를 상정해 두면, 설정 변경이 미처 반영되기 전이라도 Service가 자동으로 대체 모델로 전환됩니다.
+
+## 출력 차이를 어떻게 흡수하는가
+
+모델을 바꾸면 당연히 출력의 품질과 형식이 달라집니다. Fallback이 단순히 "동작은 한다"를 넘어 안전하게 기능하려면, 출력을 "계약"으로 고정해 두는 것이 필수입니다. 실무에서는 다음 두 가지가 효과적입니다.
+
+첫째, 구조화된 출력을 강제합니다. Tool use(function calling)로 JSON Schema를 정의해 두면 어떤 모델이 응답하든 동일한 형태로 Parsing할 수 있습니다. 자유 서술 텍스트를 정규식으로 잘라내는 구현은 모델이 바뀌면 쉽게 깨집니다.
+
+```python
+# 어떤 모델이든 같은 Schema를 반환하도록 강제한다
+extract_tool = {
+    "name": "extract_summary",
+    "description": "기사에서 요약과 태그를 추출한다",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["summary", "tags"],
+    },
+}
+```
+
+둘째, 평가 Set을 준비합니다. 대표적인 입력 20~50건에 대한 기대 출력을 마련해 두고, Fallback 대상 모델에서도 허용 범위의 품질이 나오는지 정기적으로 검증합니다. 이것이 없으면 막상 강등되었을 때 "동작은 하지만 품질이 떨어진" 상태를 알아차리지 못합니다.
+
+## webhani의 관점
+
+저희가 고객의 AI 기능을 설계할 때 가장 먼저 확인하는 것은 "이 Product가 특정 모델 하나에 얼마나 강하게 묶여 있는가"입니다. 이번 Fable 5 건은 규제가 원인이었지만, 모델 폐기·가격 인상·Rate Limit 강화는 일상적으로 일어납니다. 공급 측 사정으로 Service가 멈출 위험은 AI를 넣는 이상 늘 존재합니다.
+
+실무상의 우선순위는 단순합니다. 먼저 모델 ID를 코드에서 빼내 설정으로 모읍니다. 다음으로 런타임 Fallback을 넣습니다. 그리고 구조화된 출력과 평가 Set으로 품질을 보장합니다. 이 셋을 먼저 갖춰 두면, 다음에 "최상위 모델이 갑자기 사용 불가능해진" 날이 와도 대응은 설정 파일 한 줄과 몇 분짜리 Deploy로 끝납니다.
+
+최신·최상위 모델을 쓰는 것 자체는 옳은 판단입니다. 다만 그 하나에 전체 무게를 싣지 않는 설계를 세트로 갖춰 두는 것. 그것이 변화가 빠른 AI를 운영 환경에서 다루기 위한 현실적인 보험입니다.
+
+---
+
+참고: [Introducing Claude Opus 4.8 — Anthropic](https://www.anthropic.com/news/claude-opus-4-8), [Models overview — Claude Platform Docs](https://platform.claude.com/docs/en/about-claude/models/overview)

@@ -1,0 +1,71 @@
+---
+title: "GitHub Actions セルフホストランナーのバージョン強制 (7/31) と CI/CD 可観測性"
+description: "2026 年 7 月 31 日に始まるセルフホストランナーの最低バージョン強制と、Actions Data Stream による CI/CD の可観測化。期限までに何を確認すべきか、運用目線で整理します。"
+date: "2026-07-01"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "DevOps", "Security", "Observability"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-runner-enforcement-observability-2026"
+---
+
+GitHub が 2026 年に進めている Actions のセキュリティ強化が、セルフホストランナーを使うチームにとって無視できない期限を伴って動き始めています。GitHub Enterprise Cloud（データレジデンシー利用）では、ランナーバージョン強制の brownout が 6 月 29 日から始まり、7 月 31 日に完全強制へ移行します（[The GitHub Blog](https://github.blog/news-insights/product-news/whats-coming-to-our-github-actions-2026-security-roadmap/)）。本記事では、この期限の意味と、あわせて押さえておきたい可観測性の新機能を運用目線で整理します。
+
+## 何が強制されるのか
+
+完全強制以降、最低必要バージョンを下回るセルフホストランナーは新規登録・再登録ができなくなり、ジョブ実行に必要な最低バージョンを下回る既存ランナーはジョブを受け付けなくなります。つまり、放置していた古いランナーが「ある日突然ジョブを拾わなくなる」状態が起こり得ます。
+
+サプライチェーン保護の観点では妥当な変更です。古いランナーはパッチ未適用の脆弱性を抱えがちで、CI はソースコードと認証情報に触れる最も機密性の高い経路の一つだからです。とはいえ運用側としては、期限前に棚卸しをしておかないと CI が止まるリスクを抱えます。
+
+## 期限までにやるべきこと
+
+まず、自社のランナーのバージョンを把握します。ラベルや登録状況は API でも確認できますが、現場で効くのは各ランナーホスト上でのバージョン確認です。
+
+```bash
+# 各ランナーホストでバージョンを確認
+cat /opt/actions-runner/.runner | grep -i version 2>/dev/null \
+  || ./run.sh --version
+```
+
+自動更新を有効にしているランナーは基本的に追従しますが、ファイアウォールやプロキシで外向き通信を絞っている環境では自動更新が失敗していることがあります。次のような棚卸しスクリプトで、管理対象ホストを一覧化して更新状況を確認しておくと安全です。
+
+```bash
+#!/usr/bin/env bash
+# 管理下のランナーホストを巡回してバージョンを集計
+set -euo pipefail
+
+HOSTS=(runner-a runner-b runner-c)
+for host in "${HOSTS[@]}"; do
+  version=$(ssh "$host" 'cd /opt/actions-runner && ./run.sh --version' 2>/dev/null || echo "UNREACHABLE")
+  printf '%-12s %s\n' "$host" "$version"
+done
+```
+
+自動更新が止まっている場合は、ランナーパッケージを最新版で再取得して入れ替えます。コンテナや IaC でランナーを管理しているなら、ベースイメージのバージョンを上げて再デプロイするのが筋の良いやり方です。
+
+## あわせて入る可観測性: Actions Data Stream
+
+今回のロードマップでは、強制だけでなく CI/CD を「本番システムと同じように観測する」ための仕組みも進んでいます。Actions Data Stream は、ワークフローの実行データを外部に流して分析できるようにするもので、これまでブラックボックスになりがちだった CI の状態を、他の本番系と同じ可観測性の土俵に乗せます。
+
+実務での使いどころは明確です。たとえばジョブの所要時間やキュー待ち時間を時系列で集計すれば、「最近 CI が遅い」という体感を数値で裏取りできます。ランナーの稼働率や失敗率を継続的に追えば、今回のバージョン強制のような変更がジョブ成功率に与えた影響も、推測ではなくデータで確認できます。
+
+```yaml
+# 可観測性の前段として、ジョブにタイミング情報を残す例
+- name: Mark job timing
+  if: always()
+  run: |
+    echo "job=${{ github.job }} status=${{ job.status }} \
+      run_id=${{ github.run_id }} ts=$(date -u +%FT%TZ)" >> "$GITHUB_STEP_SUMMARY"
+```
+
+外部ストリームの導入を待たずとも、まずはステップサマリやアーティファクトに実行メタデータを残しておくと、後から傾向を追いやすくなります。
+
+## webhani の視点
+
+CI/CD は「動いているうちは誰も見ない」インフラの典型です。今回のバージョン強制は、その放置されがちな領域に外から期限を切ってくる変更であり、対応そのものは難しくありませんが、対象の棚卸しを後回しにすると 7 月末に CI が止まるという形で表面化します。
+
+私たちが顧客の CI 環境を見るときに勧めているのは、二段構えの整理です。短期的には、期限前にセルフホストランナーのバージョンを棚卸しし、自動更新が実際に機能しているかを確認すること。中期的には、Actions Data Stream のような仕組みで CI のメトリクスを継続的に観測し、「壊れてから気づく」運用から「兆候の段階で気づく」運用へ移すことです。セキュリティ強化の波は今後も続く前提で、観測できる CI を先に作っておくことが、こうした期限つきの変更に振り回されないための一番の備えになります。
+
+---
+
+参考: [What's coming to our GitHub Actions 2026 security roadmap — The GitHub Blog](https://github.blog/news-insights/product-news/whats-coming-to-our-github-actions-2026-security-roadmap/)
