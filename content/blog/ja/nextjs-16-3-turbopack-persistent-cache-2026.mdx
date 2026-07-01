@@ -1,0 +1,99 @@
+---
+title: "Next.js 16.3 の Turbopack Persistent Cache と Rust React Compiler でビルドを速くする"
+description: "Next.js 16.3 が導入した Turbopack の Filesystem Cache、メモリ Eviction、Rust 版 React Compiler の実務での使いどころを整理します。開発サーバーと本番ビルドそれぞれで効く設定と、CI での注意点を解説します。"
+date: "2026-07-02"
+status: "published"
+tags: ["Next.js", "Turbopack", "ビルド最適化", "React", "CI"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-3-turbopack-persistent-cache-2026"
+---
+
+Next.js 16.3 では、Turbopack の Persistent Build Cache、開発中のメモリ Eviction、React Compiler の Rust 移植版が追加されました。いずれも派手な新機能ではありませんが、ビルド時間と開発中のメモリ消費という「日々効いてくる」部分の改善です。本記事では、それぞれの設定と実務での使いどころを整理します。
+
+## Turbopack の Filesystem Cache
+
+Turbopack は Rust で書かれたインクリメンタル Bundler で、処理をコア間で並列化し、関数単位まで結果を Cache します。Next.js 16 以降では、この Cache を Filesystem に永続化できるようになりました。挙動は開発時と本番ビルド時で分かれています。
+
+- `experimental.turbopackFileSystemCacheForDev`: 開発サーバー向け。既定で有効
+- `experimental.turbopackFileSystemCacheForBuild`: 本番ビルド向け。現状は Opt-in
+
+これまで Turbopack の Cache はプロセス内に留まっていたため、開発サーバーを再起動すると再計算が発生していました。Filesystem Cache により、再起動後や連続したビルドでも前回の結果を再利用でき、二回目以降の立ち上がりが速くなります。
+
+本番ビルド向けの Cache は Opt-in なので、`next.config` で明示的に有効化します。
+
+```javascript
+// next.config.mjs
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  experimental: {
+    // 本番ビルドの Filesystem Cache を有効化（現状は Opt-in）
+    turbopackFileSystemCacheForBuild: true,
+  },
+};
+
+export default nextConfig;
+```
+
+Experimental フラグである点には注意が必要です。プロダクションで採用する場合は、まず検証環境でビルド成果物が意図通りかを確認し、Cache に起因する不整合が出た場合の切り戻し手順を用意しておくべきです。
+
+## メモリ Eviction — 長時間の開発セッション向け
+
+Turbopack は関数単位で結果を Cache するため、開発を続けるほどメモリ使用量が積み上がりやすいという課題がありました。16.3 のメモリ Eviction は、長時間稼働している開発セッション中に Compiler が抱えているメモリを回収する仕組みです。
+
+実務では、一日中開発サーバーを立ち上げっぱなしにするケースは珍しくありません。これまでは「なんとなく重くなってきたので再起動する」という運用でしのいでいた部分が、Eviction によって緩和されます。特に大規模なコードベースや、モジュール数の多いプロジェクトで効果を感じやすいはずです。
+
+## Rust 版 React Compiler
+
+React Compiler は、コンポーネントの再レンダリングを自動で最適化する仕組みで、手動の `useMemo` / `useCallback` を減らせる点が利点です。16.3 では、この Compiler の Rust 移植版が Turbopack に統合されました。
+
+ポイントは「機能が変わった」のではなく「速くなった」ことです。従来 JavaScript で実装されていた Compiler の処理を Rust に置き換えることで、ビルドパイプライン全体に占める Compiler のオーバーヘッドが下がります。Turbopack 自体が Rust で書かれているため、同じランタイム上で動くことによる恩恵も見込めます。
+
+有効化の考え方自体は従来の React Compiler と同じで、`next.config` で Compiler を有効にします。
+
+```javascript
+// next.config.mjs
+const nextConfig = {
+  // React Compiler を有効化。16.3 では Rust 版が使われる
+  reactCompiler: true,
+};
+
+export default nextConfig;
+```
+
+React Compiler を初めて導入する場合は、既存コードで Rules of React に反する箇所（レンダー中の副作用など）があると最適化が効かない、あるいは想定外の挙動になることがあります。段階的に有効化し、ESLint プラグインで違反箇所を洗い出しておくと移行がスムーズです。
+
+## CI での使いどころ
+
+これらの改善は、ローカル開発だけでなく CI でこそ効きます。Persistent Cache を CI で活かすには、ビルド間で Cache ディレクトリを保持する必要があります。GitHub Actions であれば、Turbopack の Cache ディレクトリを `actions/cache` の対象に加える発想です。
+
+```yaml
+# .github/workflows の一部（概念例）
+- name: Restore build cache
+  uses: actions/cache@v4
+  with:
+    # Turbopack / Next.js のキャッシュを対象にする
+    path: |
+      .next/cache
+    key: nextjs-${{ hashFiles('package-lock.json') }}-${{ github.sha }}
+    restore-keys: |
+      nextjs-${{ hashFiles('package-lock.json') }}-
+```
+
+ここで重要なのは、Cache Key の設計です。依存関係やソースが変わったときに確実に Cache が更新されるよう、`restore-keys` でフォールバックを用意しつつ、完全一致は SHA など変化する値を含めておきます。Cache が古いまま再利用されると、原因の分かりにくいビルド不整合につながります。
+
+## webhani の視点 — どこから手を付けるか
+
+すべてを一度に有効化する必要はありません。webhani では次の順序を勧めています。
+
+1. **開発時の Filesystem Cache とメモリ Eviction** から始める。既定で有効なものが多く、リスクが小さいわりに開発体験の改善が分かりやすい。
+2. 次に **CI での Persistent Cache**。ビルド時間の短縮はチーム全体の生産性に直結する。Cache Key の検証を丁寧に行う。
+3. **React Compiler** は、Rules of React への準拠状況を確認してから段階導入する。
+
+Experimental フラグに依存する部分は、Next.js のバージョン更新で挙動が変わる可能性があります。導入時点の挙動を検証し、アップグレード時には Release Note を確認する運用を前提にしておくと安全です。
+
+## まとめ
+
+Next.js 16.3 の目玉は、新しい書き方ではなく「ビルドと開発の下回りを速く・軽くする」改善です。Filesystem Cache による再ビルドの高速化、メモリ Eviction による長時間セッションの安定化、Rust 版 React Compiler によるオーバーヘッド削減——いずれも日々の開発で積み上がる時間を削ります。まずはリスクの低い開発時の設定から始め、CI の Cache 設計へ広げていくのが現実的です。
+
+webhani では Next.js を用いたフロントエンド開発と、ビルドパイプラインや CI の最適化を支援しています。ビルドが遅い、CI が詰まるといった課題があればご相談ください。

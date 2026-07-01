@@ -1,0 +1,90 @@
+---
+title: "Claude Sonnet 5 で Agent のコストを下げる — Opus との使い分けと実装戦略"
+description: "2026 年 6 月に登場した Claude Sonnet 5 は、Opus 4.8 に近い Agent 性能を大幅に低いコストで提供します。本記事では Sonnet 5 と Opus の使い分け、Prompt Caching と Batch による費用最適化、実務での Agent 設計パターンを整理します。"
+date: "2026-07-02"
+status: "published"
+tags: ["Claude", "LLM", "AI Agent", "コスト最適化", "Anthropic"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-sonnet-5-agentic-coding-cost-2026"
+---
+
+2026 年 6 月 30 日に Anthropic が公開した Claude Sonnet 5 は、「安く Agent を回す」ことに主眼を置いたモデルです。数か月前までは上位モデルでしか実現できなかった自律的なタスク遂行を、Sonnet 価格帯で扱えるようにした点が実務上の意味を持ちます。本記事では、Sonnet 5 の位置づけを整理したうえで、Opus との使い分けとコストを抑える実装の勘所をまとめます。
+
+## Sonnet 5 は何が変わったのか
+
+公開情報によると、Sonnet 5 は Agent 用途を想定した設計になっており、計画立案、ブラウザやターミナルといった Tool の利用、複数ステップにわたる自律実行の精度が前世代の Sonnet 4.6 から改善しています。Anthropic が示した Agentic Coding のベンチマークでは Sonnet 5 が 63.2%、Opus 4.8 が 69.2%、Sonnet 4.6 が 58.1% とされており、Opus との差を詰めつつ Sonnet の価格帯を維持している点が特徴です。
+
+価格は 2026 年 8 月 31 日までの導入価格として Input 100 万トークンあたり $2、Output 100 万トークンあたり $10 で、その後は $3 / $15 に移行します（Anthropic 公表値）。同じ作業を Opus で回した場合と比べると、桁が一つ違うケースも珍しくありません。
+
+webhani の視点で重要なのは「性能が上がった」ことよりも、**Agent を常時稼働させる運用の採算が取りやすくなった**という点です。単発の高難度タスクではなく、社内自動化やカスタマーサポートの一次対応など、リクエスト数が積み上がるワークロードでこそ効いてきます。
+
+## Opus と Sonnet 5 の使い分け
+
+「常に最上位モデルを使う」のは、実務では最適解になりません。コストとレイテンシがそのまま運用負担になるためです。webhani では次の基準で振り分けることを勧めています。
+
+- **Sonnet 5 を既定にする**: CRUD 操作、定型的なコード生成、ログ調査、社内文書の要約、一次サポート応答など、量が出るタスク
+- **Opus に昇格させる**: 設計判断、複雑な障害の根本原因分析、失敗コストの大きい一発勝負のタスク
+
+実装上は、まず Sonnet 5 で処理し、信頼度が閾値を下回った場合や特定の条件に該当した場合のみ Opus へエスカレーションする二段構えが有効です。
+
+```typescript
+type Complexity = "routine" | "hard";
+
+function pickModel(task: { tokensEstimate: number; needsDesignJudgment: boolean }): string {
+  // 設計判断を伴う、または入力が大きく失敗コストが高いものだけ Opus へ
+  if (task.needsDesignJudgment || task.tokensEstimate > 40_000) {
+    return "claude-opus-4-8";
+  }
+  return "claude-sonnet-5";
+}
+
+async function runWithEscalation(prompt: string, task: Parameters<typeof pickModel>[0]) {
+  const first = await callClaude(pickModel(task), prompt);
+  // 自己申告の確信度が低ければ上位モデルで再実行
+  if (first.selfConfidence < 0.6 && pickModel(task) !== "claude-opus-4-8") {
+    return callClaude("claude-opus-4-8", prompt);
+  }
+  return first;
+}
+```
+
+上のコードは考え方を示す擬似実装です。`selfConfidence` の取り方はタスクによって異なりますが、構造化出力で確信度を返させる、あるいは検証ステップを別途挟むといった手段が現実的です。
+
+## Prompt Caching と Batch でコストを削る
+
+Sonnet 5 は Prompt Caching で最大 90%、Batch 処理で 50% のコスト削減が可能とされています。Agent を運用する場合、この 2 つを使うかどうかで請求額が大きく変わります。
+
+**Prompt Caching** は、System Prompt や Tool 定義、参照ドキュメントなど「毎回同じで長い前置き」をキャッシュする仕組みです。Agent は同じ System Prompt を何度も送るため、キャッシュヒット率が高くなりやすく、相性が良いです。
+
+```typescript
+// 長い System Prompt や Tool 定義を cache_control でマークする発想
+const system = [
+  {
+    type: "text",
+    text: LONG_SYSTEM_PROMPT_WITH_TOOL_SPECS, // 数千トークンの固定部分
+    cache_control: { type: "ephemeral" },
+  },
+];
+
+// 2 回目以降のリクエストでは、この固定部分がキャッシュから読まれる
+```
+
+**Batch 処理** は、即時応答が不要なワークロードに向きます。夜間のログ分類、大量ドキュメントの要約、テストケースの一括生成など、「数時間以内に返ればよい」処理を Batch にまとめると、リアルタイム API の半額で回せます。
+
+運用設計の順序としては、まず「本当にリアルタイムが必要か」を仕分け、不要なものを Batch へ寄せ、残るリアルタイム処理は Caching でヘッダー部分を圧縮する、という流れが分かりやすいです。
+
+## Agent 設計での実務的な注意点
+
+モデルが安くなっても、設計が雑だとコストは膨らみます。webhani が現場で重視しているのは次の点です。
+
+1. **ステップ数に上限を設ける**: 自律実行は便利ですが、無限ループや過剰なツール呼び出しは費用に直結します。`maxSteps` を明示し、超過時はフォールバックさせます。
+2. **Tool の粒度を揃える**: 一つの Tool に機能を詰め込みすぎると、モデルが誤った引数を渡しやすくなり、再試行が増えます。単機能で名前が自明な Tool に分割したほうが、結果的にトークン消費が減ります。
+3. **出力を構造化する**: 自由記述の出力は後段の処理でパースが必要になり、失敗時の再実行コストがかかります。最初から JSON Schema で縛るほうが安定します。
+4. **観測可能性を確保する**: どのステップで何トークン使ったかを記録しておかないと、コスト最適化の打ち手が見えません。トレーシングは Agent 運用の前提と考えるべきです。
+
+## まとめ
+
+Claude Sonnet 5 の意味は、「最上位モデルでしか回らなかった Agent を、日常の運用に載せられる価格帯に引き下げた」ことにあります。実務では、Sonnet 5 を既定として量の出るタスクを任せ、設計判断や失敗コストの高い場面だけ Opus に昇格させる二段構えが現実的です。そのうえで Prompt Caching と Batch を組み合わせれば、Agent の運用コストは無理なく管理できる範囲に収まります。
+
+webhani では AI/LLM を用いた業務自動化の設計から実装、コスト最適化までを支援しています。「Agent を導入したいがコストが読めない」という段階の相談も歓迎します。
