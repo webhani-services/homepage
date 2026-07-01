@@ -1,0 +1,99 @@
+---
+title: "Next.js 16.3의 Turbopack Persistent Cache와 Rust React Compiler로 Build 빠르게 하기"
+description: "Next.js 16.3이 도입한 Turbopack의 Filesystem Cache, Memory Eviction, Rust 판 React Compiler의 실무 활용처를 정리합니다. Dev Server와 Production Build 각각에 효과적인 설정과 CI에서의 주의점을 다룹니다."
+date: "2026-07-02"
+status: "published"
+tags: ["Next.js", "Turbopack", "Build 최적화", "React", "CI"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-3-turbopack-persistent-cache-2026"
+---
+
+Next.js 16.3에는 Turbopack의 Persistent Build Cache, 개발 중 Memory Eviction, React Compiler의 Rust 이식판이 추가됐습니다. 어느 것도 화려한 신기능은 아니지만, Build 시간과 개발 중 Memory 소비라는 "매일 쌓이는" 부분의 개선입니다. 이 글에서는 각 설정과 실무 활용처를 정리합니다.
+
+## Turbopack의 Filesystem Cache
+
+Turbopack은 Rust로 작성된 Incremental Bundler로, 작업을 Core 간에 병렬화하고 결과를 함수 단위까지 Cache합니다. Next.js 16부터는 이 Cache를 Filesystem에 영속화할 수 있게 됐습니다. 동작은 개발 시와 Production Build 시로 나뉩니다.
+
+- `experimental.turbopackFileSystemCacheForDev`: Dev Server용. 기본 활성화
+- `experimental.turbopackFileSystemCacheForBuild`: Production Build용. 현재는 Opt-in
+
+지금까지 Turbopack의 Cache는 Process 내부에만 머물렀기 때문에 Dev Server를 재시작하면 재계산이 발생했습니다. Filesystem Cache 덕분에 재시작 후나 연속된 Build에서도 이전 결과를 재사용할 수 있어, 두 번째 이후의 기동이 빨라집니다.
+
+Production Build용 Cache는 Opt-in이므로 `next.config`에서 명시적으로 활성화합니다.
+
+```javascript
+// next.config.mjs
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  experimental: {
+    // Production Build의 Filesystem Cache 활성화 (현재는 Opt-in)
+    turbopackFileSystemCacheForBuild: true,
+  },
+};
+
+export default nextConfig;
+```
+
+Experimental Flag라는 점에 주의해야 합니다. Production에 채택할 경우, 먼저 검증 환경에서 Build 산출물이 의도대로인지 확인하고, Cache에서 비롯된 불일치가 발생했을 때의 Rollback 절차를 준비해 둬야 합니다.
+
+## Memory Eviction — 장시간 개발 Session용
+
+Turbopack은 함수 단위로 결과를 Cache하기 때문에, 개발을 이어 갈수록 Memory 사용량이 쌓이기 쉽다는 과제가 있었습니다. 16.3의 Memory Eviction은 장시간 가동 중인 개발 Session에서 Compiler가 붙들고 있는 Memory를 회수하는 구조입니다.
+
+실무에서 하루 종일 Dev Server를 켜 두는 경우는 드물지 않습니다. 지금까지는 "왠지 무거워졌으니 재시작한다"로 버티던 부분이 Eviction으로 완화됩니다. 특히 대규모 Codebase나 Module 수가 많은 Project에서 효과를 체감하기 쉬울 것입니다.
+
+## Rust 판 React Compiler
+
+React Compiler는 Component의 재렌더링을 자동으로 최적화하는 구조로, 수동 `useMemo` / `useCallback`을 줄일 수 있는 점이 장점입니다. 16.3에서는 이 Compiler의 Rust 이식판이 Turbopack에 통합됐습니다.
+
+핵심은 "기능이 바뀐" 것이 아니라 "빨라진" 것입니다. 기존 JavaScript로 구현됐던 Compiler 처리를 Rust로 교체함으로써, Build Pipeline 전체에서 Compiler가 차지하는 Overhead가 줄어듭니다. Turbopack 자체가 Rust로 작성돼 있어 같은 Runtime에서 도는 이점도 기대할 수 있습니다.
+
+활성화 방식 자체는 기존 React Compiler와 동일하게 `next.config`에서 Compiler를 켭니다.
+
+```javascript
+// next.config.mjs
+const nextConfig = {
+  // React Compiler 활성화. 16.3에서는 Rust 판이 사용된다
+  reactCompiler: true,
+};
+
+export default nextConfig;
+```
+
+React Compiler를 처음 도입한다면, 기존 Code에 Rules of React를 위반하는 부분(Render 중 Side Effect 등)이 있을 때 최적화가 걸리지 않거나 예상 밖 동작이 될 수 있습니다. 단계적으로 활성화하고 ESLint Plugin으로 위반 지점을 미리 걸러 두면 Migration이 매끄럽습니다.
+
+## CI에서의 활용처
+
+이 개선들은 Local 개발뿐 아니라 CI에서 더 효과적입니다. Persistent Cache를 CI에서 살리려면 Build 간에 Cache Directory를 유지해야 합니다. GitHub Actions라면 Next.js의 Cache Directory를 `actions/cache` 대상에 넣는 발상입니다.
+
+```yaml
+# Workflow 일부 (개념 예)
+- name: Restore build cache
+  uses: actions/cache@v4
+  with:
+    # Turbopack / Next.js Cache를 대상으로 한다
+    path: |
+      .next/cache
+    key: nextjs-${{ hashFiles('package-lock.json') }}-${{ github.sha }}
+    restore-keys: |
+      nextjs-${{ hashFiles('package-lock.json') }}-
+```
+
+여기서 중요한 것은 Cache Key 설계입니다. 의존성이나 Source가 바뀌었을 때 Cache가 확실히 갱신되도록 `restore-keys`로 Fallback을 두면서, 완전 일치 Key에는 SHA처럼 변하는 값을 포함시킵니다. Cache가 낡은 채 재사용되면 원인 파악이 어려운 Build 불일치로 이어집니다.
+
+## webhani의 관점 — 어디부터 손댈까
+
+전부를 한 번에 활성화할 필요는 없습니다. webhani는 다음 순서를 권합니다.
+
+1. **개발 시 Filesystem Cache와 Memory Eviction**부터 시작합니다. 기본 활성화된 것이 많아 Risk가 작은 데 비해 개발 경험 개선이 뚜렷합니다.
+2. 다음은 **CI의 Persistent Cache**입니다. Build 시간 단축은 팀 전체 생산성으로 직결됩니다. Cache Key 검증을 꼼꼼히 합니다.
+3. **React Compiler**는 Rules of React 준수 상황을 확인한 뒤 단계 도입합니다.
+
+Experimental Flag에 의존하는 부분은 Next.js 버전 갱신으로 동작이 바뀔 수 있습니다. 도입 시점의 동작을 검증하고, Upgrade 시 Release Note를 확인하는 운영을 전제로 두면 안전합니다.
+
+## 정리
+
+Next.js 16.3의 핵심은 새로운 작성법이 아니라 "Build와 개발의 하부를 빠르고 가볍게" 하는 개선입니다. Filesystem Cache에 의한 재Build 고속화, Memory Eviction에 의한 장시간 Session 안정화, Rust 판 React Compiler에 의한 Overhead 절감 — 모두 매일의 개발에서 쌓이는 시간을 깎습니다. 우선 Risk가 낮은 개발 시 설정부터 시작해 CI의 Cache 설계로 넓혀 가는 것이 현실적입니다.
+
+webhani는 Next.js 기반 Frontend 개발과 Build Pipeline·CI 최적화를 지원합니다. Build가 느리다, CI가 막힌다 같은 과제가 있다면 상담해 주세요.

@@ -1,0 +1,105 @@
+---
+title: "Docker Compose から Kubernetes への移行 — 自動変換の限界と手当てすべき箇所"
+description: "Docker Compose を Kubernetes へ移行する際の変換ツール（Kompose、Compose Bridge）の使いどころと、自動変換では埋まらない Health Check・リソース制限・Secret 管理の手当てを整理します。Helm と Kustomize の役割分担も解説します。"
+date: "2026-07-02"
+status: "published"
+tags: ["Docker", "Kubernetes", "Compose", "DevOps", "移行"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-compose-to-kubernetes-migration-2026"
+---
+
+Docker Compose で運用してきたサービスを Kubernetes へ移す判断は、2026 年時点でも多くのチームが直面するテーマです。Compose は単一ファイルで完結する手軽さが魅力ですが、スケールや可用性、ロールアウト制御が必要になると Kubernetes の恩恵が大きくなります。本記事では、変換ツールの使いどころと、自動変換では埋まらない箇所の手当てを実務目線で整理します。
+
+## Compose と Kubernetes の構造的な違い
+
+まず押さえるべきは、両者の「粒度」の違いです。Docker Compose では、サービス定義もネットワークもボリュームも一つの YAML にまとまっています。一方 Kubernetes は、Deployment、Service、Volume、Secret といった役割ごとに別々の Manifest を必要とします。
+
+対応関係を大まかに示すと次の通りです。
+
+- Compose の `services` → Kubernetes の Deployment（状態を持つものは StatefulSet、ノード常駐なら DaemonSet）
+- Compose の `ports`（公開ポート）→ Service（サービス間通信・外部公開）
+- Compose の `volumes` → PersistentVolumeClaim
+- Compose の `environment` / Secret 相当 → ConfigMap / Secret
+
+この「1 対多」の展開が、手作業では手間になり、変換ツールが役立つ部分です。
+
+## 変換ツールの使いどころ
+
+代表的な選択肢として Kompose と Compose Bridge があります。
+
+**Kompose** は `kompose convert` で Compose ファイルから Kubernetes Manifest を自動生成します。ただし、公開情報でも 70〜80% 程度の自動変換にとどまるとされ、残りは手動で埋める前提で使うのが現実的です。生成された Manifest をたたき台とし、Health Check やリソース制限、Secret、NetworkPolicy を後から補います。
+
+**Compose Bridge** は、アプリケーションサービスに対して指定したインスタンス数を維持する Deployment、サービス間通信のための Service、公開ポート向けの Service などを生成します。
+
+どちらを使うにせよ、重要なのは「自動生成された Manifest をそのまま本番に載せない」ことです。変換はあくまで出発点で、本番に耐える構成にするのはその後の作業です。
+
+## 自動変換では埋まらない箇所
+
+webhani が移行支援で必ず確認するのは、次の 4 点です。ここが抜けたまま本番に載せると、障害やスケール不良の温床になります。
+
+### 1. Health Check（Probe）
+
+Compose の `healthcheck` は Kubernetes の Liveness / Readiness Probe に対応しますが、自動変換では十分に落とし込まれないことが多いです。Readiness Probe がないと、まだ準備できていない Pod にトラフィックが流れます。
+
+```yaml
+# Deployment の containers[] に追加する Probe の例
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8000
+  initialDelaySeconds: 10
+  periodSeconds: 10
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 5
+```
+
+### 2. リソース制限（requests / limits）
+
+Compose では省略しがちですが、Kubernetes では `requests` / `limits` を設定しないと、スケジューリングが不安定になり、他の Pod を巻き込む形でノードが逼迫します。
+
+```yaml
+resources:
+  requests:
+    cpu: "250m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+```
+
+### 3. Secret 管理
+
+Compose の `environment` に直接書いていた認証情報は、Kubernetes では Secret に分離します。自動変換は環境変数をそのまま ConfigMap に落とすことがあるため、機密情報が平文で残っていないかを必ず確認します。
+
+### 4. ネットワークポリシー
+
+Compose のネットワーク分離は、Kubernetes では NetworkPolicy として明示的に定義する必要があります。デフォルトでは Pod 間通信が全許可になるため、必要な経路だけを許可する設計に直します。
+
+## Helm と Kustomize の役割分担
+
+変換後の Manifest を環境ごとに運用するには、Helm か Kustomize を使います。両者は競合するというより、役割が違います。
+
+- **Helm**: パッケージ管理。複雑なアプリケーションを一つのチャートとして定義・インストール・アップグレードでき、値の差し替え（`values.yaml`）で再利用性が高い。
+- **Kustomize**: 構成管理。元の Manifest を書き換えずに、開発・ステージング・本番といった環境差分を上書きで表現できる。
+
+実務では、まず Compose から生成した Manifest を Base とし、環境差分を Kustomize の Overlay で管理する、あるいは Helm チャート化して `values` で切り替える、という二つのアプローチに落ち着くことが多いです。チームが Helm の運用に慣れているならチャート化、シンプルに保ちたいなら Kustomize、という選び方が分かりやすいでしょう。
+
+## 移行の進め方
+
+一気に全サービスを移すのは推奨しません。webhani では次の順序を勧めています。
+
+1. **ステートレスなサービスから移す**。Web アプリケーションや API のように状態を持たないものは、Deployment 化のリスクが小さい。
+2. **データストアは慎重に**。PersistentVolume の設計やバックアップ戦略を固めてから移す。安易な StatefulSet 化は避ける。
+3. **Probe・リソース制限・Secret を移行の必須項目にする**。変換ツールの出力をそのまま使わない。
+4. **本番切り替え前に負荷試験を行う**。スケール挙動と Probe の閾値は、実際の負荷をかけないと妥当性が判断できない。
+
+## まとめ
+
+Docker Compose から Kubernetes への移行は、変換ツールで 7〜8 割を機械的に進められますが、本番に耐える構成にするのは残りの手当て次第です。Health Check、リソース制限、Secret 管理、ネットワークポリシー——この 4 点を移行の必須項目として扱い、環境差分は Helm または Kustomize で整理する。この順序を踏めば、移行は着実に進みます。
+
+webhani では Docker / Kubernetes を用いたインフラ構築と、Compose からの移行支援を行っています。「Compose のままで限界を感じている」段階のご相談も歓迎します。

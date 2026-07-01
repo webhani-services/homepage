@@ -1,0 +1,105 @@
+---
+title: "Migrating from Docker Compose to Kubernetes: Where Auto-Conversion Falls Short"
+description: "A practical look at converting Docker Compose to Kubernetes — where tools like Kompose and Compose Bridge help, and the health checks, resource limits, and secret handling they leave for you to finish. Plus how Helm and Kustomize divide the work."
+date: "2026-07-02"
+status: "published"
+tags: ["Docker", "Kubernetes", "Compose", "DevOps", "Migration"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-compose-to-kubernetes-migration-2026"
+---
+
+Deciding to move services from Docker Compose to Kubernetes is still a common crossroads for teams in 2026. Compose is appealing for wrapping everything in a single file, but once you need scale, availability, and rollout control, Kubernetes starts to earn its complexity. This post lays out where conversion tools help and where you'll need to finish the job by hand.
+
+## The structural gap between Compose and Kubernetes
+
+The first thing to internalize is the difference in granularity. In Docker Compose, service definitions, networks, and volumes all live in one YAML file. Kubernetes, by contrast, wants separate manifests per role: Deployment, Service, Volume, Secret.
+
+The rough mapping looks like this:
+
+- Compose `services` → Kubernetes Deployment (StatefulSet for stateful workloads, DaemonSet for node-resident ones)
+- Compose `ports` (published) → Service (service-to-service communication and external exposure)
+- Compose `volumes` → PersistentVolumeClaim
+- Compose `environment` / secrets → ConfigMap / Secret
+
+This one-to-many expansion is the tedious part by hand — and exactly where conversion tools help.
+
+## Where the conversion tools fit
+
+The common options are Kompose and Compose Bridge.
+
+**Kompose** auto-generates Kubernetes manifests from a Compose file via `kompose convert`. Public guidance puts the auto-conversion at roughly 70–80%, so use it expecting to fill in the rest manually. Treat the generated manifests as a starting draft, then add health checks, resource limits, secrets, and network policies afterward.
+
+**Compose Bridge** generates Deployments that maintain the specified instance count for application services, Services for service-to-service communication, and Services for published ports.
+
+Either way, the key discipline is: **don't ship auto-generated manifests straight to production.** Conversion is only the starting point; making the config production-worthy is the work that follows.
+
+## What auto-conversion won't fill in
+
+These four things are what we always check on a migration. Skip them and you're seeding outages and scaling problems.
+
+### 1. Health checks (probes)
+
+Compose's `healthcheck` maps to Kubernetes liveness / readiness probes, but auto-conversion often doesn't translate them fully. Without a readiness probe, traffic flows to pods that aren't ready yet.
+
+```yaml
+# Probes to add under a Deployment's containers[]
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8000
+  initialDelaySeconds: 10
+  periodSeconds: 10
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 5
+```
+
+### 2. Resource limits (requests / limits)
+
+Easy to omit in Compose, but in Kubernetes, missing `requests` / `limits` makes scheduling unstable and lets one pod starve a node and drag others down with it.
+
+```yaml
+resources:
+  requests:
+    cpu: "250m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+```
+
+### 3. Secret handling
+
+Credentials you wrote directly into Compose's `environment` should be split out into Kubernetes Secrets. Auto-conversion sometimes dumps environment variables straight into a ConfigMap, so verify no sensitive values are left in plaintext.
+
+### 4. Network policy
+
+Compose's network isolation must be declared explicitly as a NetworkPolicy in Kubernetes. Pod-to-pod traffic is allowed by default, so redesign to permit only the paths you actually need.
+
+## How Helm and Kustomize divide the work
+
+To operate the converted manifests across environments, you'll reach for Helm or Kustomize. They aren't really competitors — they play different roles.
+
+- **Helm**: package management. It defines, installs, and upgrades a complex application as a single chart, with high reuse through value overrides (`values.yaml`).
+- **Kustomize**: configuration management. It expresses environment differences — dev, staging, prod — as overlays without altering the original manifests.
+
+In practice, teams settle into one of two approaches: keep the Compose-derived manifests as a base and manage environment deltas with Kustomize overlays, or package them as a Helm chart and switch via `values`. If your team is already comfortable operating Helm, charts make sense; if you want to stay simple, Kustomize is the easier pick.
+
+## How to sequence the migration
+
+Don't move every service at once. We recommend this order:
+
+1. **Start with stateless services.** Web apps and APIs without state carry low risk when moved to Deployments.
+2. **Handle datastores carefully.** Settle the PersistentVolume design and backup strategy before moving them. Avoid casually reaching for StatefulSets.
+3. **Make probes, resource limits, and secrets mandatory migration items.** Don't ship the conversion tool's raw output.
+4. **Run load tests before the production cutover.** Scaling behavior and probe thresholds can't be validated without real load.
+
+## Takeaways
+
+Migrating from Docker Compose to Kubernetes can be 70–80% mechanized with conversion tools, but making it production-worthy depends on the remaining work. Treat health checks, resource limits, secret handling, and network policy as mandatory items, and organize environment differences with Helm or Kustomize. Follow that sequence and the migration proceeds steadily.
+
+At webhani, we build infrastructure on Docker and Kubernetes and support migrations off Compose. If you're feeling the limits of staying on Compose, that's exactly the kind of conversation we welcome.
