@@ -1,0 +1,68 @@
+---
+title: "React2Shell(CVE-2025-55182) 대응 — RSC / Next.js RCE를 어떻게 막을 것인가"
+description: "React Server Components의 Deserialization에서 비롯된 CVSS 10.0 RCE, React2Shell의 영향 범위와 대응을 실무 관점에서 정리합니다. Patch 적용 절차, 영향 Version 확인, 그리고 다층 방어까지 다룹니다."
+date: "2026-07-03"
+status: "published"
+tags: ["Security", "Next.js", "React", "RSC", "취약점 대응"]
+thumbnail: ""
+author: "webhani"
+slug: "react2shell-rsc-nextjs-rce-2026"
+---
+
+React Server Components(RSC) Protocol에서 CVSS 10.0으로 평가되는 Remote Code Execution(RCE) 취약점이 발견되었습니다. 연구자들이 "React2Shell"이라 이름 붙였고, CVE-2025-55182(React 본체)와 CVE-2025-66478(Next.js)로 추적되고 있습니다. App Router를 사용하는 Next.js 15.x / 16.x와 React 19.x가 영향을 받으므로, 저희 표준 Stack인 Next.js 16을 포함해 많은 Project가 대상이 됩니다. 이 글에서는 당황하지 않고 대응하기 위한 확인 절차와 근본적인 사고방식을 정리합니다.
+
+## 무엇이 문제인가
+
+React2Shell은 RSC가 받아들이는 Request의 Deserialization 처리에서 비롯된 취약점입니다. RSC는 Client와 Server 사이에서 직렬화된 Payload를 주고받으며 Component 상태와 Action을 전달합니다. 이 처리 과정에서 공격자가 조작한 Request를 보내면, Server 측에서 의도하지 않은 Code가 실행될 수 있다는 것이 문제의 핵심입니다.
+
+심각한 점은 인증 이전(pre-authentication)에 단 하나의 HTTP Request만으로 성립할 수 있다는 것입니다. Login이나 특별한 권한 없이, 공개된 Endpoint에 도달할 수 있으면 공격 시도가 가능해집니다. CVSS 10.0이라는 최대치 평가는 이 "높은 도달성"과 "큰 영향"을 반영한 결과입니다.
+
+또한 공개 직후부터 실제 악용이 관측되었다는 점도 놓칠 수 없습니다. 여러 Security Vendor의 보고에 따르면, 공개로부터 수 시간 내에 복수의 공격 그룹이 Exploit을 시도했으며 대부분은 Coin Miner 설치를 노린 것이었습니다. "아직 공격받지 않았으니 괜찮다"는 전제는 이 취약점에는 통하지 않습니다.
+
+## 먼저 영향 범위를 확인한다
+
+대응의 첫걸음은 우리 Application이 영향 Version을 사용하는지 확인하는 것입니다. Next.js의 경우 공식에서 진단·업데이트용 Command를 제공합니다.
+
+```bash
+# 영향 여부를 확인하고 권장 Version으로 업데이트한다
+npx fix-react2shell-next
+```
+
+이 도구는 현재 Next.js Version을 감지해 지정된 대응 Version으로의 Bump를 제안·실행합니다. 수동으로 확인하려면 주요 대응 Version의 기준으로 아래를 참고하세요(Minor Version마다 Patch가 나뉘어 있습니다).
+
+- 15.0.x 계열 → 15.0.5
+- 15.1.x 계열 → 15.1.9
+- 15.5.x 계열 → 15.5.7
+- 16.0.x 계열 → 16.0.7
+
+React 단독으로는 19.0.1 / 19.1.2 / 19.2.1에서 수정이 반영되었습니다. Framework를 거치지 않고 React를 직접 사용하는 경우 이 계열에 맞춰 업데이트합니다.
+
+CI에 통합된 의존성 Audit이 있다면 해당 Alert도 함께 확인합니다. `package-lock.json`을 고정한 환경에서는 업데이트 후 Lockfile 재생성까지 확실히 수행하여, 실제 Deploy되는 산출물이 정말로 Patch된 것인지 확인하는 것이 중요합니다.
+
+## Patch로 끝내지 않는다 — 다층 방어
+
+Version 업데이트가 최우선이지만, 그것만을 대응의 전부로 삼아서는 안 됩니다. 이번처럼 "Request 하나로 RCE"라는 성질의 취약점은 Patch 적용까지의 공백 시간, 그리고 놓친 Subsystem에서 피해가 번집니다. 아래 관점을 함께 점검해 두면 안심할 수 있습니다.
+
+먼저 WAF나 Reverse Proxy 계층에서 RSC Endpoint로 향하는 수상한 Payload를 탐지·차단할 수 있는지 확인합니다. 긴급 완화책으로서 Patch 적용이 끝날 때까지의 시간을 벌 수 있습니다.
+
+다음은 Server Process의 권한 최소화입니다. Application을 실행하는 사용자의 권한을 좁히고, Container라면 읽기 전용 Filesystem과 불필요한 Capability 제거를 철저히 해 두면, 만에 하나 Exploit이 성립하더라도 이후의 확산을 어렵게 만들 수 있습니다.
+
+그리고 Egress(외부 통신) 모니터링입니다. 이번 실제 피해의 대부분은 Coin Miner 설치였습니다. Server에서 낯선 Mining Pool이나 외부 Host로의 통신이 발생하지 않는지 감시해 두면 침해 징후를 조기에 포착할 수 있습니다.
+
+```javascript
+// 예: 감시해야 할 "침해 후 행동"을 Checklist로 만들어 둔다
+const postExploitSignals = [
+  "낯선 외부 Host로의 Egress 통신",
+  "예상치 못한 Process 실행(Mining Binary 등)",
+  "App 실행 사용자에 의한 예기치 않은 File 쓰기",
+  "지속적으로 높게 유지되는 CPU 사용률",
+];
+```
+
+## webhani의 관점
+
+이런 Critical 취약점 대응에서 차이가 나는 지점은 "얼마나 빠르게, 빠짐없이 업데이트할 수 있는가"라는 운영 체계입니다. 기술적으로는 Command 한 줄로 끝나는 업데이트라도, 대상 Project의 목록 파악이 안 되어 있으면 Patch가 적용되지 않은 App이 남게 됩니다.
+
+평소에 자사·고객의 어떤 Project가 어떤 Framework의 어떤 Version으로 동작하는지 파악할 수 있는 상태를 만들어 둘 것. 그리고 의존성 Audit을 CI에 통합해 이런 Alert가 자동으로 올라오는 구조를 갖춰 둘 것. 이 두 가지가 있으면 React2Shell 같은 사안이 발생해도 대응을 "조사"가 아니라 "실행"부터 시작할 수 있습니다.
+
+저희는 Framework Version 관리와 취약점 대응 Process 정비를 포함한 개발·운영 지원을 제공하고 있습니다. 이번 React2Shell은 Patch 적용의 빠르기 그 자체보다, "빠르게 움직일 준비가 되어 있는가"가 관건인 사안이라고 봅니다. 우선 `npx fix-react2shell-next`로 우리의 현재 상태를 확인하고, 그것을 계기로 운영 체계 점검에 착수하기를 권합니다.

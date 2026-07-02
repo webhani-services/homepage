@@ -1,0 +1,72 @@
+---
+title: "AI 코딩 Agent의 Token 비용을 절반으로 줄이는 네 가지 실무 Lever"
+description: "Claude Code나 Codex 같은 Agentic Coding은 편리한 만큼 Token 비용이 불어나기 쉽습니다. Prompt Caching, Model 계층 Routing, Context 가지치기, 예산 상한이라는 네 가지 Lever로 품질을 떨어뜨리지 않고 비용을 낮추는 방법을 정리합니다."
+date: "2026-07-03"
+status: "published"
+tags: ["AI", "LLM", "Claude Code", "비용 최적화", "개발 생산성"]
+thumbnail: ""
+author: "webhani"
+slug: "agentic-coding-token-cost-optimization-2026"
+---
+
+AI 코딩 Agent가 실무 도구로 자리 잡는 한편, 더 이상 무시할 수 없게 된 것이 Token 비용입니다. 업계 추산에 따르면 Agentic Workflow는 일반적인 Chat 사용보다 자릿수가 다른 Token을 소비하며, 하나의 Task에서 수십만~수백만 Token의 Input이 API로 흘러가는 일도 드물지 않습니다. 개발자 한 명당 월 150~250달러 규모라는 비용 감각도 보고되고 있습니다. 이 글에서는 품질을 희생하지 않고 비용을 낮추는 네 가지 실무 Lever를 정리합니다.
+
+## Lever 1: Prompt Caching을 활용한다
+
+비용 분석에서 자주 지적되는 사실이 "청구의 대부분은 재전송되는 Context"라는 점입니다. 한 Audit에서는 반복 전송되는 Context가 청구의 62%를 차지했다고 보고했습니다. Agent는 대화할 때마다 System Prompt와 Project 정보를 다시 보내므로, 이곳이 가장 큰 절감 대상이 됩니다.
+
+Claude의 API는 반복 사용되는 Prefix(System Prompt나 긴 전제 정보)를 Cache하여 재전송 시 비용을 크게 낮추는 Prompt Caching을 갖추고 있습니다. Claude Code는 이를 자동으로 활용하지만, 직접 Agent를 구성하는 경우에는 Cache가 적중하는 형태로 Request를 설계하는 것이 중요합니다. 핵심은 변하지 않는 부분을 앞에, 변하는 부분을 뒤에 두는 것입니다.
+
+```javascript
+// 변하지 않는 전제를 앞에 고정해 Cache 적중률을 높인다
+const messages = [
+  { role: "system", content: STABLE_SYSTEM_PROMPT }, // Cache 대상
+  { role: "user", content: STABLE_PROJECT_CONTEXT },  // Cache 대상
+  { role: "user", content: perRequestQuestion },       // 매번 변함
+];
+```
+
+전제 정보를 Request마다 재조합해 버리면 Cache Prefix가 무너져 적중하지 않게 됩니다. "안정적인 것은 움직이지 않는다"는 설계만으로도 비용은 눈에 띄게 내려갑니다.
+
+## Lever 2: Model 계층을 Routing한다
+
+모든 작업에 최상위 Model을 쓸 필요는 없습니다. 정형적인 Formatting, 단순 검색, Boilerplate 생성 같은 "머리를 쓰지 않는 작업"에는 경량 Model을, 설계 판단이나 복잡한 Debugging 같은 "어려운 추론"에는 상위 Model을 할당합니다. 이 구분이 비용에 직결됩니다.
+
+발상은 단순합니다. Task를 난이도로 나누는 Router를 한 겹 끼우는 것입니다.
+
+```javascript
+// Task의 성질로 Model 계층을 나눈다
+function pickModel(task) {
+  if (task.kind === "format" || task.kind === "lookup") {
+    return "haiku"; // 정형 작업은 경량 Model
+  }
+  if (task.kind === "architecture" || task.kind === "debug") {
+    return "opus"; // 어려운 추론은 상위 Model
+  }
+  return "sonnet"; // 중간은 Balance형
+}
+```
+
+중요한 것은 "상위 Model을 쓰지 않는" 것이 아니라 "상위 Model을 써야 할 곳에 집중시키는" 것입니다. 싼 Model로 충분한 작업에 상위 Model을 계속 쓰는 것은 단순한 낭비입니다.
+
+## Lever 3: Context를 가지치기한다
+
+Agent는 긴 Task를 진행할수록 대화 이력이 쌓이고, 그것을 매번 다시 보내며 Token을 소비합니다. Claude Code에는 Context가 상한에 가까워지면 이력을 요약하는 Auto-compaction이 있지만, 애초에 넘기는 정보를 좁히는 편이 더 효과적입니다.
+
+특히 효과가 큰 것이 Project 전제를 기술하는 `CLAUDE.md` 같은 설정 File의 재검토입니다. 한 비교에서는 3,847 Token이던 설정 File을 "Code에서 읽어낼 수 없는 정보만"으로 좁혀 312 Token까지 줄였더니, 약 92%의 Context 절감을 달성하면서도 품질 저하는 없었다고 보고되었습니다.
+
+원칙은 "Model이 Code에서 추측할 수 있는 것은 쓰지 않는다"입니다. Directory 구성이나 File 이름 규약처럼 Repository를 보면 알 수 있는 것을 장황하게 나열하기보다, "왜 그 설계인가" "무엇을 피해야 하는가" 같은 Code에서는 읽어낼 수 없는 정보에 집중하는 편이 비용과 품질 양면에서 유리합니다.
+
+또 하나 놓치기 쉬운 것이 Web Page나 외부 Document의 취합입니다. Raw HTML은 한 Page에 수만 Token에 이르는 경우가 있으며, 그대로 넘기면 전량에 과금됩니다. 본문만 추출한 뒤 넘기는 전처리를 한 단계 끼우는 것만으로 불필요한 Token을 크게 줄일 수 있습니다.
+
+## Lever 4: 예산 상한을 둔다
+
+마지막은 폭주를 멈추는 장치입니다. Agent는 자율적으로 움직이는 만큼, 예상치 못한 Loop나 과도한 탐색으로 비용이 치솟을 수 있습니다. 사용자 단위·Task 단위로 예산 상한을 설정하고, 그것을 넘으면 멈추거나 사람의 확인을 끼우는 설계로 두면 최악의 경우를 피할 수 있습니다.
+
+이것은 기술적 기교라기보다 운영의 Guardrail입니다. 상한에 도달하면 통지하고, 상한의 80%에서 경고하는 단계적 장치를 마련해 두면 비용의 "가시화"도 함께 진행됩니다.
+
+## webhani의 관점
+
+이 네 가지 Lever — Prompt Caching, Model Routing, Context 가지치기, 예산 상한 — 은 모두 화려한 시책은 아닙니다. 그러나 여러 Audit에서 "2주 이내에 Agent 비용을 50~70% 절감한" Lever로 반복해서 거론되는 것이 이 조합입니다.
+
+저희가 고객의 AI 활용을 지원할 때 강조하는 것은 "쓰는 양을 줄인다"가 아니라 "낭비되는 양을 줄인다"는 발상입니다. AI 코딩의 가치는 생산성에 있으며, 그것을 비용 우려로 위축시키는 것은 본말전도입니다. 위 네 가지를 구조로 통합하면 생산성을 유지한 채 비용만 깎을 수 있습니다. 우선 자신들의 청구 중 얼마나가 "재전송 Context"로 사라지는지 측정하는 것부터 시작해 보시길 권합니다.

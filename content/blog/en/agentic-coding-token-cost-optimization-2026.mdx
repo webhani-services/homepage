@@ -1,0 +1,72 @@
+---
+title: "Four Practical Levers to Cut AI Coding Agent Token Costs by Half"
+description: "Agentic coding with Claude Code or Codex is powerful, but token costs balloon quickly. Prompt caching, model-tier routing, context pruning, and budget caps are the four levers that reduce cost without sacrificing quality."
+date: "2026-07-03"
+status: "published"
+tags: ["AI", "LLM", "Claude Code", "Cost Optimization", "Developer Productivity"]
+thumbnail: ""
+author: "webhani"
+slug: "agentic-coding-token-cost-optimization-2026"
+---
+
+As AI coding agents settle in as everyday tools, one thing has become impossible to ignore: token cost. Industry estimates put agentic workflows at an order of magnitude more token consumption than ordinary chat use, and it's common for a single task to push hundreds of thousands — even millions — of input tokens through the API. Reports peg per-developer spend at roughly $150–$250 per month. This post lays out four practical levers to bring that down without giving up quality.
+
+## Lever 1: Make prompt caching work
+
+A recurring finding in cost audits is that most of the bill is re-sent context. One audit reported that repeatedly re-sent context accounted for 62% of the bill. Because an agent resends the system prompt and project context on every turn, this is the single biggest reduction target.
+
+The Claude API supports prompt caching, which caches a repeated prefix (system prompt, long standing context) and sharply reduces the cost of resending it. Claude Code uses this automatically, but if you build your own agent, you need to structure requests so the cache actually hits. The rule: put what doesn't change up front, and what changes at the end.
+
+```javascript
+// Pin the stable premise up front to maximize cache hits
+const messages = [
+  { role: "system", content: STABLE_SYSTEM_PROMPT }, // cacheable
+  { role: "user", content: STABLE_PROJECT_CONTEXT },  // cacheable
+  { role: "user", content: perRequestQuestion },       // changes each time
+];
+```
+
+Reshuffling the premise on every request breaks the cached prefix and stops it from hitting. Just designing around "don't move what's stable" produces visible savings.
+
+## Lever 2: Route across model tiers
+
+You don't need the top model for everything. Assign a lightweight model to "no-thinking" work — routine formatting, simple lookups, boilerplate generation — and reserve the top model for "hard reasoning" like design decisions and complex debugging. This split maps directly to cost.
+
+The idea is simple: put a router in front that sorts tasks by difficulty.
+
+```javascript
+// Route to a model tier based on the nature of the task
+function pickModel(task) {
+  if (task.kind === "format" || task.kind === "lookup") {
+    return "haiku"; // routine work → lightweight model
+  }
+  if (task.kind === "architecture" || task.kind === "debug") {
+    return "opus"; // hard reasoning → top model
+  }
+  return "sonnet"; // middle ground → balanced
+}
+```
+
+The point is not "avoid the top model" but "concentrate it where it earns its keep." Running the top model on work a cheap model could handle is pure waste.
+
+## Lever 3: Prune the context
+
+The longer an agent works a task, the more conversation history piles up — and resending it every turn burns tokens. Claude Code has auto-compaction that summarizes history as it nears the context limit, but narrowing what you hand over in the first place is more effective.
+
+The highest-leverage move is reviewing config files like `CLAUDE.md` that describe project premises. One comparison trimmed a 3,847-token config down to only "what the model can't infer from the code," landing at 312 tokens — roughly a 92% context reduction with no quality regression.
+
+The principle: don't write down what the model can infer from the code. Rather than spelling out directory layouts and file-naming conventions that a glance at the repo reveals, focus on what the code can't tell it — why the design is the way it is, what to avoid. That's better on both cost and quality.
+
+Another overlooked source is pulling in web pages and external docs. Raw HTML can hit tens of thousands of tokens per page, and handing it over verbatim means paying for all of it. A preprocessing step that extracts only the main content before passing it along cuts a lot of wasted tokens.
+
+## Lever 4: Set budget caps
+
+The last lever is a mechanism to stop runaway behavior. Because agents act autonomously, an unexpected loop or over-eager exploration can spike costs. Setting per-user and per-task budget caps — and stopping, or inserting a human check, when they're exceeded — keeps the worst case in check.
+
+This is less a technical trick than an operational guardrail. Notify at the cap, warn at 80% of it, and you get cost visibility as a side effect of the same mechanism.
+
+## The webhani take
+
+None of these four levers — prompt caching, model routing, context pruning, budget caps — is flashy. Yet this exact combination keeps showing up across audits as the set that "cut agent costs 50–70% within two weeks."
+
+When we help clients adopt AI, the framing we stress is not "use less" but "waste less." The value of AI coding is productivity, and letting cost anxiety suppress it defeats the purpose. Bake these four in as mechanisms and you shave cost while keeping the productivity. Start by measuring how much of your own bill is going to re-sent context — that number usually settles the argument.
