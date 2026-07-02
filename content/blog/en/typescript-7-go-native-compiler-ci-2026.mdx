@@ -1,0 +1,52 @@
+---
+title: "TypeScript 7.0 RC Is Here: What to Know Before Trialing the Go-Native Compiler in CI"
+description: "The TypeScript 7.0 compiler, rewritten in Go, type-checks roughly 10x faster. With the RC out and GA close, here's how to trial it in CI and what behavior changes to check before migrating."
+date: "2026-07-03"
+status: "published"
+tags: ["TypeScript", "Build Optimization", "CI", "Developer Tooling", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-7-go-native-compiler-ci-2026"
+---
+
+The TypeScript 7.0 RC shipped in June 2026, with GA close behind. The headline change is that the compiler — previously written in TypeScript itself — has been ported to Go. Codenamed Project Corsa, Microsoft reports that type-checks are often roughly 10x faster than 6.0. This post covers the concrete steps to trial it in CI and what to lock down before migrating.
+
+## What changed — a port, not a rewrite
+
+Clear up the common misconception first: Project Corsa did not redesign the type-checker. The team ported the existing TypeScript implementation (the prior codebase, called Strada) to Go largely file-by-file, prioritizing identical type-checking behavior. It's a transplant, not a redesign — the semantics of the type system did not fundamentally change. That's an important premise.
+
+So why is it faster? Two main reasons. One, it runs as a native binary rather than on a JavaScript runtime. Two, it exploits shared-memory parallelism across worker threads. Microsoft attributes the ~10x figure to the combination of the two.
+
+## Trial it in CI — type-checking only
+
+As of the RC, the standard package's `tsc` binary is the Go-native compiler. Earlier previews shipped it under a separate `tsgo` name, but in the RC there's no need to invoke a different name (the `tsgo` binary lives on in the nightly `@typescript/native-preview` builds).
+
+For a first step, don't migrate wholesale — swap only your CI's type-checking stage to the new `tsc` and measure. That's the safe path.
+
+```bash
+# Trial the RC as a dev dependency
+npm install -D typescript@rc
+
+# Type-check only (no emit — just surface type errors)
+npx tsc --noEmit
+```
+
+Running `--noEmit` type-checks without touching your existing build pipeline (bundler, transpile step), so you can compare only the speed and the results of type-checking. Compare the CI job time before and after in your logs to see how much your own codebase actually gains. The larger the codebase, the more noticeable the difference.
+
+## What to check before migrating
+
+"A port, not a rewrite" doesn't make a major-version bump free of caveats. On the road to 7.0, the preceding 6.0 telegraphed default changes — a direction toward stricter strict-mode settings and toward pruning older targets and module-resolution modes. The longer a project has been running, the more likely it is that spots relying on loose settings will surface.
+
+So for a real-world migration, we suggest roughly this order:
+
+- First run the RC with `--noEmit` and check whether new type errors appear
+- If they do, separate "a real bug now surfaced" from "a stricter setting flagging something"
+- Only swap the stages that consume build output (emit results) after the type-check stage is validated
+
+The RC is still an RC. Rather than replacing your production build in one leap, first verify speed and compatibility on type-checking — a stage where a break costs little. This staged approach minimizes migration risk.
+
+## The webhani take
+
+Compiler speedups look unglamorous at a glance. But type-checking is a stage developers run repeatedly on their machines and that CI runs on every push. Making it 10x faster means a permanent reduction in developer wait time and CI cost. Shorten the feedback loop and the compounding effect reshapes the development experience itself.
+
+When we support clients' frontend foundations, this kind of "pays off daily" infrastructure improvement is exactly what we prioritize. TypeScript 7.0 isn't new syntax or a flashy feature — it's a solid update that keeps the existing type system intact and speeds up only the execution substrate. That's precisely why the migration bar is relatively low and the payoff is continuous. Start by measuring `tsc --noEmit` speed in a staging environment to confirm the gain on your own codebase.

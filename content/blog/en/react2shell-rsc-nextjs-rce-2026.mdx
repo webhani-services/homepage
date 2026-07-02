@@ -1,0 +1,68 @@
+---
+title: "Responding to React2Shell (CVE-2025-55182): Closing the RSC / Next.js RCE"
+description: "A practical breakdown of React2Shell, the CVSS 10.0 RCE rooted in React Server Components deserialization. Covers how to check affected versions, apply the patch, and layer defenses beyond the fix itself."
+date: "2026-07-03"
+status: "published"
+tags: ["Security", "Next.js", "React", "RSC", "Vulnerability Response"]
+thumbnail: ""
+author: "webhani"
+slug: "react2shell-rsc-nextjs-rce-2026"
+---
+
+A remote code execution (RCE) flaw rated CVSS 10.0 has been found in the React Server Components (RSC) protocol. Researchers named it React2Shell, and it is tracked as CVE-2025-55182 (React core) and CVE-2025-66478 (Next.js). It affects Next.js 15.x / 16.x using the App Router and React 19.x — which means most projects on our standard stack, including Next.js 16, are in scope. This post lays out the checks and the underlying mindset for handling it without panic.
+
+## What's actually wrong
+
+React2Shell stems from how RSC deserializes incoming requests. RSC exchanges serialized payloads between client and server to carry component state and server actions. When an attacker sends a crafted request into that path, the server can end up executing unintended code — that is the core of the issue.
+
+The severity comes from two properties. First, it is exploitable pre-authentication with a single HTTP request. No login, no special privileges — reaching a public endpoint is enough to attempt the attack. Second, the impact is full code execution on the server. The maximum CVSS score of 10.0 reflects that combination of reachability and impact.
+
+There is also confirmed real-world exploitation. According to multiple security vendors, exploit attempts by several threat groups were observed within hours of public disclosure, most of them aiming to drop coin miners. "We haven't been attacked yet, so we're fine" is not a safe assumption for this one.
+
+## Step one: confirm your exposure
+
+The first move is to determine whether your app runs an affected version. For Next.js, there is an official diagnostic-and-update command.
+
+```bash
+# Check exposure and bump to the recommended patched version
+npx fix-react2shell-next
+```
+
+The tool detects your current Next.js version and proposes (or applies) a bump to the designated patched release. If you prefer to verify manually, here are representative target versions — patches are split per minor line:
+
+- 15.0.x → 15.0.5
+- 15.1.x → 15.1.9
+- 15.5.x → 15.5.7
+- 16.0.x → 16.0.7
+
+For React itself, fixes landed in 19.0.1, 19.1.2, and 19.2.1. If you consume React directly without a framework, match those lines instead.
+
+If you run dependency auditing in CI, check its alerts as well. In environments that pin `package-lock.json`, be sure to regenerate the lockfile after the bump and confirm that the artifact you actually deploy is the patched one.
+
+## Don't stop at the patch — defense in depth
+
+Upgrading is the top priority, but it should not be the entire response. A "single request equals RCE" flaw causes damage during the window before patching, and through subsystems you overlooked. It's worth reviewing the following in parallel.
+
+Start with your WAF or reverse proxy: can it detect and block suspicious payloads aimed at RSC endpoints? As an emergency mitigation, that buys you time until the patch is fully rolled out.
+
+Next, least privilege for the server process. Tighten the permissions of the user running the app; in containers, enforce a read-only filesystem and drop unnecessary capabilities. Even if an exploit succeeds, this makes lateral movement afterward much harder.
+
+Finally, egress monitoring. Most of the real-world damage was coin miner installation. Watching for traffic from your server to unfamiliar mining pools or external hosts lets you catch signs of compromise early.
+
+```javascript
+// Turn "post-exploit behavior" into a monitoring checklist
+const postExploitSignals = [
+  "Egress traffic to unfamiliar external hosts",
+  "Unexpected process launches (e.g. mining binaries)",
+  "Unexpected file writes by the app's runtime user",
+  "Sustained, unexplained high CPU usage",
+];
+```
+
+## The webhani take
+
+What separates good and poor responses to critical vulnerabilities is operational readiness — how fast and how completely you can update. The upgrade itself may be a one-line command, but if you don't have an inventory of your projects, some apps will simply never get patched.
+
+Two things make the difference. Keep a clear picture of which of your (and your clients') projects run which framework at which version. And bake dependency auditing into CI so alerts like this surface automatically. With those in place, an event like React2Shell starts from "execute," not from "investigate."
+
+At webhani, our development and operations support includes framework version management and vulnerability-response process design. We see React2Shell less as a test of how fast you can patch and more as a test of whether you were ready to move fast at all. Start by running `npx fix-react2shell-next` to establish where you stand, then use that as the trigger to review your operational posture.

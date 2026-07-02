@@ -1,0 +1,52 @@
+---
+title: "TypeScript 7.0 RC 도착 — Go Native Compiler를 CI에서 시험하기 전에 알아둘 것"
+description: "Go로 다시 쓰인 TypeScript 7.0의 Compiler는 Type Check가 약 10배 빠르다고 합니다. RC가 공개되고 GA가 목전에 온 지금, CI에서 시험하는 방법과 Migration 전에 확인해야 할 동작 변화를 실무 관점에서 정리합니다."
+date: "2026-07-03"
+status: "published"
+tags: ["TypeScript", "빌드 최적화", "CI", "개발 도구", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-7-go-native-compiler-ci-2026"
+---
+
+TypeScript 7.0의 RC가 2026년 6월에 공개되었고 GA도 임박한 것으로 전해집니다. 가장 큰 변화는 지금까지 TypeScript 자신으로 쓰여 있던 Compiler가 Go로 이식된 것입니다. Code명은 Project Corsa. Microsoft는 Type Check가 6.0 대비 종종 약 10배 빨라진다고 보고했습니다. 이 글에서는 이 변화를 CI에서 시험하기 위한 구체적 절차와 Migration 전에 짚어둘 점을 정리합니다.
+
+## 무엇이 바뀌었나 — "재작성"이 아니라 "이식"
+
+먼저 오해하기 쉬운 점을 정리합니다. Project Corsa는 Type Checker를 다시 설계한 것이 아닙니다. 기존 TypeScript 구현(Strada라 불리는 종전 Codebase)을 File 단위로 거의 충실하게 Go로 이식하는 방침을 택했습니다. Type Check의 동작을 동일하게 유지하는 것을 우선한 "Transplant(이식)"이며, Type System의 의미론이 크게 바뀐 것은 아니라는 것이 중요한 전제입니다.
+
+그렇다면 왜 빨라지는가. 이유는 주로 두 가지입니다. 하나는 JavaScript Runtime 위가 아니라 Native Binary로 동작한다는 것. 다른 하나는 Worker Thread 간 공유 Memory를 사용한 병렬 처리가 작동한다는 것입니다. Microsoft는 이 두 가지의 조합으로 약 10배라는 수치를 설명합니다.
+
+## CI에서 시험한다 — 우선 Type Check만
+
+RC 시점에서는 표준 Package의 `tsc` Binary가 그대로 Go Native Compiler입니다. 이전 Preview에서는 `tsgo`라는 별명으로 제공되었지만, RC에서는 그 이름으로 구분해 부를 필요가 없습니다(`tsgo` Binary는 nightly `@typescript/native-preview`에 남아 있습니다).
+
+도입의 첫걸음으로는 곧바로 전면 Migration하지 말고, CI의 Type Check 공정만 새로운 `tsc`로 교체해 측정하는 것이 안전합니다.
+
+```bash
+# RC를 개발 의존성으로 시험 도입한다
+npm install -D typescript@rc
+
+# Type Check만 실행(출력은 생성하지 않고 Type Error만 확인)
+npx tsc --noEmit
+```
+
+`--noEmit`으로 Type Check만 돌리면 기존 Build Pipeline(Bundler나 Transpile 공정)에 손대지 않고 Type Check의 속도와 결과만 비교할 수 있습니다. CI Log에서 Job 시간을 before / after로 비교하면 자신들의 Codebase에서 실제로 얼마나 단축되는지 알 수 있습니다. 대규모 Codebase일수록 이 차이는 체감하기 쉬워집니다.
+
+## Migration 전에 짚어둘 것
+
+"이식이지 재작성이 아니다"라고 해도, Major Version 업데이트에는 주의점이 있습니다. TypeScript 7.0에 이르는 흐름에서는 그 직전인 6.0에서 기본값 변경이 예고되었고, strict 계열 설정이 더 엄격해지는 방향, 오래된 Target이나 Module 해석 방식의 정리가 진행되는 방향으로 논의되어 왔습니다. 오래 운영해 온 Project일수록 느슨한 설정에 의존하는 부분이 드러날 가능성이 있습니다.
+
+따라서 실무에서의 Migration은 대체로 다음 순서를 권합니다.
+
+- 먼저 RC를 `--noEmit`으로 돌려 새로운 Type Error가 나오지 않는지 확인한다
+- 나온 경우, 그것이 "실제 Bug의 표면화"인지 "설정 엄격화에 의한 지적"인지 구분한다
+- Build 산출물(Emit 결과)을 사용하는 공정은 Type Check 공정의 검증이 끝난 뒤에 교체한다
+
+RC는 어디까지나 RC입니다. Production Build를 단번에 교체하는 것이 아니라, 우선 Type Check라는 "깨져도 피해가 작은 공정"에서 속도와 호환성을 확인한다. 이 단계적 접근이 Migration의 Risk를 최소화합니다.
+
+## webhani의 관점
+
+Compiler의 고속화는 언뜻 보면 수수한 개선으로 보입니다. 그러나 Type Check는 개발자가 Local에서 여러 번 돌리고 CI에서도 매번 실행되는 공정입니다. 이곳이 10배 빨라진다는 것은 개발자의 대기 시간과 CI 실행 비용이 항시적으로 낮아진다는 뜻입니다. Feedback Loop이 짧아지면 그 누적은 개발 경험 그 자체를 바꿉니다.
+
+저희가 고객의 Frontend 기반을 지원할 때 중시하는 것도 이런 "매일 효과가 나타나는" 토대의 개선입니다. TypeScript 7.0은 새로운 구문이나 화려한 기능이 아니라, 기존 Type System을 그대로 두고 실행 기반만 빠르게 하는 견실한 업데이트입니다. 그렇기에 Migration의 장벽은 비교적 낮고, 얻는 효과는 지속적입니다. 우선 검증 환경에서 `tsc --noEmit`의 속도를 측정하여 자신들의 Codebase에서의 효과를 확인하는 것부터 시작해 보시길 권합니다.
