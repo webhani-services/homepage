@@ -1,0 +1,245 @@
+---
+title: "Docker Kanvas: Docker Compose에서 Kubernetes로 가는 실용적 경로"
+description: "Docker Kanvas가 Docker Compose 파일을 Kubernetes 매니페스트로 자동 변환하는 방식과 Helm, Kustomize와의 비교를 통해 실무적 선택 기준을 정리합니다."
+date: "2026-07-04"
+status: "published"
+tags: ["Docker", "Kubernetes", "DevOps", "Helm", "Cloud Native"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-kanvas-compose-k8s-migration-guide"
+---
+
+로컬과 프로덕션 사이의 간극은 항상 존재해왔습니다. Docker Compose로 정의한 서비스 스택은 노트북에서 완벽히 동작하지만, Kubernetes 환경에서는 전혀 다른 세상입니다. Deployment, Service, ConfigMap, Secret, PersistentVolumeClaim—Kubernetes가 기대하는 모든 Resource를 다시 작성해야 합니다. 이 간극을 채우기 위해 팀은 Helm, Kustomize, 또는 수작업 YAML로 대응해왔습니다.
+
+Docker Kanvas는 새로운 접근법을 제시합니다. Compose 파일을 단일 정보원으로 유지하고 프로덕션이 필요로 하는 Kubernetes 매니페스트를 자동 생성하는 것입니다.
+
+## Kanvas가 풀려는 문제
+
+현실적인 로컬 개발 환경의 구성을 살펴봅시다.
+
+```yaml
+# docker-compose.yml
+version: "3.9"
+services:
+  api:
+    image: mycompany/api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgres://postgres:dev@db:5432/app
+      REDIS_URL: redis://cache:6379
+      LOG_LEVEL: debug
+    depends_on:
+      - db
+      - cache
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: app
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  cache:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  postgres_data:
+  redis_data:
+```
+
+이를 Kubernetes로 옮기려면 최소한 3개의 Deployment, 3개의 Service, 2개의 PersistentVolumeClaim, 1~2개의 ConfigMap을 수작업으로 작성해야 합니다. healthcheck는 livenessProbe와 readinessProbe로 변환해야 하고, 환경 변수는 ConfigMap과 Secret으로 분리해야 하며, depends_on은 initContainers 또는 startup probe로 대체해야 합니다. 작업을 완료할 즈음에는 다음 개발자가 계속 동기화해야 할 300줄 이상의 YAML이 탄생합니다.
+
+Kanvas는 이 변환을 자동화하여 기존 Compose 정의에서 프로덕션 대응 매니페스트를 생성합니다.
+
+## Kanvas가 생성하는 것
+
+매핑 전략은 기계적이면서도 신중합니다.
+
+| Compose 요소 | Kubernetes 변환 |
+|-------------|-----------------|
+| `services` | `Deployment` + `Service` |
+| `ports` | `Service.spec.ports` (`ClusterIP`와 `NodePort` 자동 추론) |
+| `environment` | 비밀 항목은 `ConfigMap`, 민감 데이터는 `Secret` |
+| `volumes` | `PersistentVolumeClaim` + Pod의 `volumeMounts` |
+| `depends_on` | 대기 로직이 포함된 `initContainers` + `readinessProbe` |
+| `healthcheck` | `livenessProbe` + `readinessProbe` |
+| `build` context | (아직 미지원; 사전 빌드 이미지 가정) |
+
+위의 Compose 파일에 대해 Kanvas는 다음과 같은 매니페스트를 생성합니다.
+
+```yaml
+# Kanvas 생성물 — api-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      initContainers:
+      - name: wait-for-db
+        image: busybox:1.35
+        command: ['sh', '-c', 'until nc -z db 5432; do echo waiting for db; sleep 2; done']
+      - name: wait-for-cache
+        image: busybox:1.35
+        command: ['sh', '-c', 'until nc -z cache 6379; do echo waiting for cache; sleep 2; done']
+      containers:
+      - name: api
+        image: mycompany/api:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: database-url
+        - name: REDIS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: api-config
+              key: redis-url
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: api-config
+              key: log-level
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector:
+    app: api
+  ports:
+  - protocol: TCP
+    port: 8000
+    targetPort: 8000
+  type: ClusterIP
+```
+
+생성되는 매니페스트는 일반적인 워크로드 패턴에서 추론된 적절한 Resource 요청과 제한을 포함합니다. 의존 관계는 소박한 `depends_on`이 아닌, 적절한 startup probe와 readiness probe로 해결됩니다.
+
+## Helm과 Kustomize와의 비교
+
+| 도구 | 강점 | 약점 | 적합한 경우 |
+|------|------|------|-----------|
+| **Helm** | 풍부한 템플릿 기능, 패키지 관리, 재사용성, 광대한 에코시스템 | 높은 학습 곡선, Go 템플릿 복잡성, 디버깅 어려움 | 대규모 다중 환경 애플리케이션 배포, 패키지 배포 |
+| **Kustomize** | 단순한 overlay 패치, 평문 YAML 호환, kubectl 네이티브 지원 | 제한된 변환 로직, 복잡한 횡단 관심사 대응 약함 | 소규모 팀, 직관적인 환경별 오버라이드 |
+| **Kanvas** | Compose를 정보원으로, 최소한의 Kubernetes 지식, 자동 모범 사례 | 생성물은 출발점만 제공, 기존 Helm 운영 대체 곤란, 지원 범위 제한적 | Compose에서 Kubernetes로의 전환, 신속한 MVP 배포 |
+
+**Helm**은 템플릿 엔진이 탑재된 패키지 매니저입니다. 재사용 가능한 애플리케이션 패키지 배포에 우수하지만 학습 곡선이 가팝니다. Go 템플릿 구문 때문에 장애 조사에 많은 시간을 소비하게 됩니다.
+
+**Kustomize**는 평문 YAML 파일을 overlay로 패치합니다. 단순함이 장점이며, 다른 namespace, 이미지 태그, 레플리카 수 조정 같은 장면에서 잘 작동합니다. 하지만 복잡한 변환—조건부 로직, 계산값, 파일 간 참조—이 필요한 상황에서는 결국 Helm을 작성하거나 수작업 중복을 받아들여야 합니다.
+
+**Kanvas**는 다른 전제를 가지고 시장에 나타났습니다. 이미 작동하는 Compose 파일이 있다면 다시 작성하지 말고 변환하라는 주장입니다. Compose에 투자했지만 Kubernetes도 필요해진 팀, 특히 Helm이나 Kustomize의 학습 곡선을 피하고 싶은 팀에게 호소합니다.
+
+Trade-off는 명확합니다. Kanvas가 생성하는 매니페스트는 기능적인 출발점일 뿐입니다. 프로덕션 수준의 기능—HorizontalPodAutoscaler, PodDisruptionBudget, NetworkPolicy, RBAC, TLS 종료가 있는 Ingress—은 수작업으로 추가해야 합니다. Kubernetes의 복잡성을 회피하는 것이 아니라, 학습을 뒤로 미루는 것입니다.
+
+## 실무 워크플로우
+
+Compose 파일을 변환하는 절차:
+
+```bash
+# Kanvas CLI 설치
+docker install kanvas
+
+# Compose 파일 변환
+kanvas convert docker-compose.yml --output ./k8s/
+
+# 생성된 매니페스트 검토 및 조정
+ls ./k8s/
+# api-deployment.yaml
+# api-service.yaml
+# db-deployment.yaml
+# db-pvc.yaml
+# cache-deployment.yaml
+# cache-pvc.yaml
+# configmaps.yaml
+# secrets.yaml
+
+# 클러스터에 적용
+kubectl apply -k ./k8s/
+```
+
+secrets 파일을 commit하기 전에, base64 인코딩된 값을 적절한 Secrets 관리 시스템(AWS Secrets Manager, HashiCorp Vault, External Secrets Operator)에 대한 참조로 대체하세요.
+
+## Kanvas가 적합한 경우
+
+**Kanvas를 사용해야 할 때:**
+- 로컬에서는 Docker Compose를 사용하지만 Kubernetes 도구가 아직 없다
+- 프로덕션 배포를 이번 주 중에 실행해야 한다
+- 애플리케이션이 중소 규모이고 표준 구성(상태 비저장 API + Database + Cache)이다
+- 팀이 Kubernetes를 단계적으로 학습하고 싶고 Helm 구문에 시간을 들이고 싶지 않다
+
+**Helm이나 Kustomize를 계속 사용해야 할 때:**
+- 이미 잘 유지되는 Helm Chart가 있다—마이그레이션 비용이 이득을 초과한다
+- Custom Resource Definition(Istio Gateways, Operators 등)에 의존한다
+- 여러 Kubernetes 클러스터에 크게 다른 구성으로 배포한다
+- 조직 내 Kubernetes 전문가가 있고 인프라 구성 관리에 강한 의견을 가지고 있다
+
+## Webhani의 관점
+
+Kanvas는 실질적인 필요에 대응합니다. Compose에서 Kubernetes로의 전환 시 활성화 에너지를 낮춥니다. 전담 DevOps 엔지니어가 없는 소규모 팀이나, 새로운 전문성을 고용하지 않고 Kubernetes에서 시범 운영하고 싶은 컨설팅 클라이언트에게 실용적인 지름길을 제공합니다.
+
+하지만 Helm이나 Kustomize의 대체제가 아니라 다리입니다. Kanvas로 배포한 후 프로덕션 토폴로지를 이해하게 되면, 여러 클러스터에 걸친 패키지 관리가 필요해지는 시점에 Helm으로 마이그레이션할 수 있습니다. 또는 Kanvas가 계속 요구사항을 충족하면 그대로 유지할 수 있습니다.
+
+2026년의 광범위한 흐름—AWS EKS Auto, Karpenter, kro, 그리고 이제 Kanvas—은 Kubernetes를 더 간단하고 보이지 않게 만드는 것입니다. 인프라는 평범해야 합니다. Kanvas는 Compose를 알고 있는 개발자가 YAML 매니페스트가 아닌 컨테이너에 대해 생각하도록 함으로써 그 목표에 기여합니다.
+
+## 정리
+
+- Kanvas는 Compose에서 Kubernetes로의 변환을 자동화하여 로컬과 프로덕션 사이의 실질적인 간격을 메운다
+- 생성되는 매니페스트는 Kubernetes 규범적이지만 프로덕션 기능(HPA, PDB, RBAC, 네트워크 정책)의 수작업 추가가 필요하다
+- Helm이나 Kustomize와는 다른 진입점을 제공하며 기존 Kubernetes 인프라가 없는 팀에 적합하다
+- 신규 Kubernetes 배포의 출발점으로 가장 가치있으며, 성숙한 Helm 기반 워크플로우 마이그레이션 도구가 아니다
+- 팀의 규모가 크고 Kubernetes 전문 지식이 적을수록 Kanvas의 효과는 커진다

@@ -1,0 +1,343 @@
+---
+title: "TypeScript 7.0 준비하기: Go 네이티브 컴파일러와 strict-by-default 전환"
+description: "TypeScript 7.0은 Go로 작성된 네이티브 컴파일러를 포함하며 타입 체크 속도가 10배 향상됩니다. 동시에 breaking changes도 큽니다. 팀이 지금부터 준비해야 할 사항을 코드 예제와 함께 설명합니다."
+date: "2026-07-04"
+status: "published"
+tags: ["TypeScript", "Compiler", "Migration", "web-development", "Node.js"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-7-native-go-compiler-migration"
+---
+
+TypeScript 7.0이 2026년 중반 릴리스될 예정이며, 이는 언어 인프라의 근본적인 전환을 의미합니다. Go로 작성된 새로운 네이티브 컴파일러는 타입 체크 속도를 약 10배, 빌드 속도를 대폭 개선합니다. 하지만 breaking changes도 큽니다: strict-by-default, ES5 지원 폐지, 레거시 모듈 형식(AMD/UMD/SystemJS) 삭제가 예정되어 있습니다. 팀은 지금부터 준비해야 합니다.
+
+TypeScript 6.0은 deprecation 사이클을 완성했습니다. 7.0은 그 문을 닫습니다.
+
+## 네이티브 컴파일러가 중요한 이유
+
+기존 JavaScript 기반 컴파일러는 작동하지만, 규모에서는 한계에 도달합니다. VSCode의 타입 체크 시간은 Go 네이티브 버전으로 전환 후 89초에서 9초 미만으로 단축되었습니다. 메모리 사용량은 약 1/3로 감소했습니다. 대규모 Monorepo나 CI 환경에서는 하루에 수백 번의 빌드가 실행되므로, 이 차이는 누적적으로 영향을 미칩니다.
+
+성능은 단순한 속도가 아니라 개발자 경험입니다. 타입 체크가 빠르면 개발자는 Flow 상태를 유지합니다. CI가 빠르면 PR에 대한 피드백 루프가 짧아집니다. 이것이 Migration 비용을 정당화합니다.
+
+## TypeScript 7.0에서 Breaking되는 변경
+
+### Strict-by-Default
+
+가장 중대한 breaking change는 strict 모드가 기본값이 된다는 것입니다.
+
+**Before (TypeScript 6.x, implicit any 활성화 시):**
+
+```typescript
+function processUser(user) {
+  // user는 암시적으로 'any' — 에러 없음
+  return user.profile.name.toUpperCase();
+}
+
+interface Config {
+  timeout?: number;
+}
+
+const config: Config = {};
+// config.timeout은 undefined일 수 있습니다. TypeScript는 runtime 에러를 검출하지 않음
+const delay = config.timeout * 1000; // 잠재적으로 NaN
+```
+
+**After (TypeScript 7.0 strict mode):**
+
+```typescript
+// 에러: Parameter 'user' implicitly has type 'any'
+function processUser(user) {
+  return user.profile.name.toUpperCase();
+}
+
+// 수정:
+function processUser(user: User) {
+  return user.profile.name.toUpperCase();
+}
+
+// Null 안전성 체크도 기본 활성화
+interface Config {
+  timeout?: number;
+}
+
+const config: Config = {};
+// 에러: Object is possibly 'undefined'
+const delay = config.timeout * 1000;
+
+// 수정:
+const delay = (config.timeout ?? 30) * 1000;
+```
+
+기존 코드베이스에서 implicit `any` 에러와 null 안전성 문제를 발견할 것으로 예상하세요. 좋은 소식은 이들이 실제 버그라는 것입니다. Strict 모드는 본래 Production에서 발생했던 잠재적 문제를 포착합니다.
+
+### ES5 Target 폐지
+
+TypeScript 7.0은 ES5로의 트랜스파일을 더 이상 지원하지 않습니다.
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES5"  // 에러: target 'ES5' is no longer supported
+  }
+}
+```
+
+프로젝트가 ES5를 대상으로 하는 경우, 다음 중 하나를 실행해야 합니다:
+
+1. **Target을 업데이트** 해서 ES2020 이상으로 변경
+2. **별도의 Transpiler 사용** (Babel)해서 TypeScript 출력을 ES5로 다운컴파일
+3. **브라우저/Node.js 지원 범위 업데이트** (비즈니스 요건이 허용할 경우)
+
+대부분의 팀이 ES5를 대상으로 하는 것은 습관 때문입니다. Node.js 18+이 사실상의 표준입니다. Safari 12+는 시장 점유율의 99%+ 이상을 차지하며 ES2020 기능을 네이티브로 지원합니다.
+
+### 레거시 모듈 형식 폐지
+
+AMD, UMD, SystemJS 출력은 폐지됩니다. 지원되는 모듈 target은:
+
+- `commonjs` — Node.js와 Bundler
+- `esnext` — 최신 Bundler (Webpack, Vite, Turbopack)
+- `es2015`, `es2020` 등 — 특정 구문 레벨의 ES module 출력
+- `nodenext` — `package.json`의 exports 필드를 지원하는 Node.js 출력
+
+```typescript
+// TypeScript 7.0 config — 이들은 작동
+{
+  "compilerOptions": {
+    "module": "esnext"      // ✓ 최신 프로젝트의 표준
+  }
+}
+
+// 이들은 실패
+{
+  "compilerOptions": {
+    "module": "amd"         // ✗ TypeScript 7.0에서 지원 안 함
+    "module": "umd"         // ✗ TypeScript 7.0에서 지원 안 함
+    "module": "system"      // ✗ TypeScript 7.0에서 지원 안 함
+  }
+}
+```
+
+`module: "commonjs"`을 사용 중이라면 계속 사용할 수 있습니다 — 지원됩니다. 하지만 AMD나 UMD를 대상으로 하는 레거시 설정이 있다면, 최신 Bundler로의 Migration이 필요합니다.
+
+## Node.js 네이티브 TypeScript 지원
+
+Node.js 22.18+ (2026년 초 릴리스)은 타입을 제거하고 TypeScript를 직접 실행할 수 있습니다:
+
+```bash
+# TypeScript를 tsc 없이 직접 실행
+node --loader ts-node/esm src/server.ts
+
+# 또는 네이티브 타입 제거 (Node 22.18+)
+node --experimental-strip-types src/server.ts
+```
+
+이는 CI Pipeline의 TypeScript 편집을 대체하지 않습니다 — 타입 체크된 빌드와 Bundle 출력은 여전히 필요합니다. 하지만 개발 환경과 간단한 스크립트의 경우, 네이티브 지원으로 Pipeline에서 1개의 도구를 제거할 수 있습니다.
+
+## TypeScript 7.0용 Hardened tsconfig.json
+
+다음을 기본선으로 사용하세요. 이 설정은 6.x에서 7.0 준비를 하고, 초기에 버그를 검출합니다:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["ES2020"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "strictFunctionTypes": true,
+    "strictBindCallApply": true,
+    "strictPropertyInitialization": true,
+    "noImplicitThis": true,
+    "alwaysStrict": true,
+
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "exactOptionalPropertyTypes": true,
+
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}
+```
+
+단계적으로 활성화하세요. `strict: true`에서 시작한 후, `noUncheckedIndexedAccess`, 그 다음 `exactOptionalPropertyTypes`를 추가합니다. 각 플래그는 다른 클래스의 버그를 검출하지만, 한 번에 모두 활성화하면 노이즈가 증가합니다.
+
+## Strict-by-Default에서 Breaking되는 코드 패턴
+
+### 패턴 1: 함수 파라미터의 Implicit Any
+
+```typescript
+// 7.0에서 Breaking
+function merge(target, source) {
+  Object.assign(target, source);
+}
+
+// 수정
+function merge<T>(target: T, source: Partial<T>): T {
+  return Object.assign(target, source);
+}
+```
+
+### 패턴 2: Unsafe Index Access
+
+```typescript
+// 7.0에서 Breaking (noUncheckedIndexedAccess 활성화 시)
+const items = ['a', 'b', 'c'];
+const fifth = items[5]; // 에러: 잠재적으로 undefined
+console.log(fifth.toUpperCase()); // 실행 시 에러 (undefined인 경우)
+
+// 수정
+const fifth = items[5];
+if (fifth !== undefined) {
+  console.log(fifth.toUpperCase());
+}
+
+// 또는 optional chaining으로 대응
+console.log(fifth?.toUpperCase());
+```
+
+### 패턴 3: 초기화되지 않은 프로퍼티
+
+```typescript
+// 7.0에서 Breaking
+class User {
+  id: string;
+  name: string;
+  
+  // 에러: 'id'와 'name'이 constructor에서 할당되지 않음
+  constructor() {
+    // 할당 누락
+  }
+}
+
+// 수정
+class User {
+  id: string;
+  name: string;
+  
+  constructor(id: string, name: string) {
+    this.id = id;
+    this.name = name;
+  }
+}
+
+// 또는 definite assignment assertion 사용 (확실한 경우)
+class User {
+  id!: string;
+  name!: string;
+  
+  constructor() {
+    this.initialize();
+  }
+  
+  private initialize() {
+    this.id = '';
+    this.name = '';
+  }
+}
+```
+
+### 패턴 4: Object Field의 Null/Undefined
+
+```typescript
+// 7.0 strict mode에서 Breaking
+interface Response {
+  data: {
+    user: User
+  }
+}
+
+// 이 함수는 null/undefined를 처리하지 않음
+function getName(response: Response): string {
+  return response.data.user.name;
+}
+
+// 수정: 타입을 Narrow하기
+interface Response {
+  data: {
+    user: User
+  } | null
+}
+
+function getName(response: Response): string | null {
+  return response.data?.user.name ?? null;
+}
+
+// 또는 Optional field 사용
+interface Response {
+  data?: {
+    user?: User
+  }
+}
+
+function getName(response: Response): string | undefined {
+  return response.data?.user?.name;
+}
+```
+
+## Migration 체크리스트
+
+### Phase 1: Audit (현재)
+
+- [ ] 현재 코드베이스에서 `npx tsc --noEmit` 실행하여 베이스라인 확립
+- [ ] Implicit `any` 에러 수 카운트 (`noImplicitAny`)
+- [ ] Null/Undefined access 에러 수 카운트 (`strictNullChecks`)
+- [ ] ES5 target을 사용하는 파일 특정 (`target: "ES5"`)
+- [ ] Build config에서 `module: "amd"`, `"umd"`, `"system"` 검색
+- [ ] 기존 코드를 `"strict": true`로 로컬 테스트 (Commit 하지 않음)
+
+```bash
+# Strict mode를 로컬에서 시도 (Commit 하지 않음)
+tsc --strict --noEmit
+```
+
+### Phase 2: 플래그 단계적 활성화 (Week 1-2)
+
+- [ ] Dev/CI에서 `"strict": true` 활성화하고 에러 수정
+- [ ] `"noUnusedLocals": true` 추가, 수정 및 정리
+- [ ] `"noUnusedParameters": true` 추가
+- [ ] Main에 Merge하기 전에 CI에서 테스트
+
+### Phase 3: Target과 모듈 형식 업데이트 (Week 2-3)
+
+- [ ] ES5를 대상으로 하는 경우, ES2020 이상으로 업데이트
+- [ ] 레거시 모듈 형식을 사용하는 경우, `esnext` 또는 `commonjs`로 마이그레이션
+- [ ] Bundler 출력 테스트 (Webpack, Vite, Turbopack)
+- [ ] 브라우저/Node.js Runtime 호환성 확인
+
+### Phase 4: TypeScript 7.0 업그레이드 (Week 3-4)
+
+- [ ] Dev 의존성에서 TypeScript 7.0으로 업그레이드
+- [ ] 완전한 테스트 스위트 실행
+- [ ] 타입 체크 및 빌드 시간 모니터링 (6.x에서의 베이스라인 로깅)
+- [ ] Main에 Merge
+
+### Phase 5: Production Validation
+
+- [ ] Canary 환경에 코드를 스테이징
+- [ ] Runtime 차이가 없는지 모니터링
+- [ ] 성능 메트릭 추적 (빌드 시간, 타입 체크 시간, Bundle 크기)
+
+## webhani의 관점
+
+TypeScript의 네이티브 컴파일러로의 전환은 언어의 성숙함을 보여줍니다. 언어는 실험적인 도구에서 인프라 레벨의 투자 대상으로 진화했습니다. Microsoft가 10배 성능 재작성에 투자하는 이유는 에코시스템이 Compiler 성능이 생산성과 비용에 직접 영향을 미치는 규모에 도달했기 때문입니다.
+
+Breaking changes — strict-by-default, ES5 폐지, 레거시 모듈 형식 — 은 의견이 나뉠 수 있지만 합리적입니다. 역사적으로 방지할 수 있는 버그보다 더 많은 버그를 야기했던 코드 패턴을 차단합니다.
+
+빌드 시간이 병목인 팀에게 7.0 Migration은 성능만으로도 정당화됩니다. 소규모 코드베이스 팀에게도 strict-by-default로부터의 안전성 향상은 타입 에러 수정의 단기적 노력을 정당화합니다.
+
+지금 바로 Audit을 시작하세요. 대부분의 팀은 3~4주 Sprint에서 TypeScript 7.0으로 마이그레이션할 수 있습니다. 오늘부터 준비를 시작한다면.

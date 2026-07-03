@@ -1,0 +1,343 @@
+---
+title: "TypeScript 7.0 への準備：Go ネイティブコンパイラと strict-by-default への移行"
+description: "TypeScript 7.0 は Go で書かれたネイティブコンパイラを搭載し、型チェック速度が 10 倍に高速化されます。一方で breaking changes も大きい。チーム全体が準備すべきことを実装例を交えて解説します。"
+date: "2026-07-04"
+status: "published"
+tags: ["TypeScript", "Compiler", "Migration", "web-development", "Node.js"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-7-native-go-compiler-migration"
+---
+
+TypeScript 7.0 は 2026 年半ばのリリースが予定されており、言語インフラの根本的な転換を意味しています。新しいネイティブコンパイラ（Go で実装）は、型チェック速度を約 10 倍、ビルド速度を大幅に改善します。一方で breaking changes は大きい：strict-by-default、ES5 サポート廃止、レガシーモジュール形式（AMD/UMD/SystemJS）の削除が予定されています。チームは今から準備する必要があります。
+
+TypeScript 6.0 は deprecation サイクルを完成させました。7.0 はその扉を閉じます。
+
+## ネイティブコンパイラが重要な理由
+
+従来の JavaScript ベースコンパイラは動作しますが、スケールでは限界に達します。VSCode の型チェック時間は Go ネイティブ版への移行で 89 秒から 9 秒未満に短縮されました。メモリ使用量は約 3 分の 1 に低下しています。大規模 Monorepo や CI 環境での運用では、1 日に数百回のビルドが実行されるため、この差は累積的に影響します。
+
+パフォーマンスは単なる速度ではなく、開発者体験です。型チェックが高速なら、開発者は Flow 状態を保つことができます。CI が高速なら、PR へのフィードバックループが短くなります。これが Migration コストを正当化します。
+
+## TypeScript 7.0 で Breaking する変更
+
+### Strict-by-Default
+
+最も重大な breaking change は strict モードがデフォルトになることです。
+
+**Before（TypeScript 6.x、implicit any 有効時）：**
+
+```typescript
+function processUser(user) {
+  // user は暗黙的に 'any' — エラーなし
+  return user.profile.name.toUpperCase();
+}
+
+interface Config {
+  timeout?: number;
+}
+
+const config: Config = {};
+// config.timeout は undefined の可能性がある。TypeScript は Runtime エラーを検出しない
+const delay = config.timeout * 1000; // 潜在的に NaN
+```
+
+**After（TypeScript 7.0 strict mode）：**
+
+```typescript
+// エラー: Parameter 'user' implicitly has type 'any'
+function processUser(user) {
+  return user.profile.name.toUpperCase();
+}
+
+// 修正：
+function processUser(user: User) {
+  return user.profile.name.toUpperCase();
+}
+
+// Null 安全性チェックもデフォルト有効
+interface Config {
+  timeout?: number;
+}
+
+const config: Config = {};
+// エラー: Object is possibly 'undefined'
+const delay = config.timeout * 1000;
+
+// 修正：
+const delay = (config.timeout ?? 30) * 1000;
+```
+
+既存コードベースから implicit `any` エラーと null 安全性問題が見つかることを想定してください。朗報は、これらは実在するバグだということです。Strict モードは本来 Production で発生していた潜在的な問題を捕捉します。
+
+### ES5 Target の廃止
+
+TypeScript 7.0 は ES5 へのトランスパイルをサポートしなくなります。
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES5"  // エラー: target 'ES5' is no longer supported
+  }
+}
+```
+
+プロジェクトが ES5 をターゲットにしている場合、以下のいずれかを実施する必要があります：
+
+1. **ターゲットを更新** して ES2020 以上にする
+2. **別の Transpiler を使用**（Babel）して TypeScript 出力から ES5 にダウンコンパイルする
+3. **ブラウザ/Node.js サポート範囲を更新** する（ビジネス要件が許可する場合）
+
+ほとんどのチームが ES5 をターゲットにしているのは習慣です。Node.js 18+ が事実上の標準です。Safari 12+ は市場シェアの 99%+ をカバーし、ES2020 機能をネイティブサポートしています。
+
+### レガシーモジュール形式の廃止
+
+AMD、UMD、SystemJS 出力は廃止されます。サポートされるモジュール target は：
+
+- `commonjs` — Node.js と Bundler
+- `esnext` — 最新の Bundler（Webpack、Vite、Turbopack）
+- `es2015`、`es2020` など — 特定の構文レベルの ES module 出力
+- `nodenext` — `package.json` の exports フィールドに対応した Node.js 出力
+
+```typescript
+// TypeScript 7.0 config — これらは動作
+{
+  "compilerOptions": {
+    "module": "esnext"      // ✓ 最新プロジェクトの標準
+  }
+}
+
+// これらは失敗
+{
+  "compilerOptions": {
+    "module": "amd"         // ✗ TypeScript 7.0 でサポートされない
+    "module": "umd"         // ✗ TypeScript 7.0 でサポートされない
+    "module": "system"      // ✗ TypeScript 7.0 でサポートされない
+  }
+}
+```
+
+`module: "commonjs"` を使用している場合は継続できます — サポートされています。ただし、AMD や UMD をターゲットにしているレガシーセットアップがある場合は、最新 Bundler への Migration が必要です。
+
+## Node.js ネイティブ TypeScript サポート
+
+Node.js 22.18+（2026 年初頭リリース）は型を剥ぎ取り TypeScript を直接実行できます：
+
+```bash
+# TypeScript を tsc なしで直接実行
+node --loader ts-node/esm src/server.ts
+
+# または、ネイティブ型剥ぎ取り（Node 22.18+）
+node --experimental-strip-types src/server.ts
+```
+
+これは CI Pipeline での TypeScript 編集を置き換えません — 型チェック済みビルドと Bundle 出力は依然必要です。しかし開発環境とシンプルなスクリプトについては、ネイティブサポートにより Pipeline から 1 つのツールを排除できます。
+
+## TypeScript 7.0 用の Hardened tsconfig.json
+
+次の設定をベースラインとして使用してください。この config は 6.x では 7.0 に向けた準備を行い、早期にバグを検出します：
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["ES2020"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "strictFunctionTypes": true,
+    "strictBindCallApply": true,
+    "strictPropertyInitialization": true,
+    "noImplicitThis": true,
+    "alwaysStrict": true,
+
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "exactOptionalPropertyTypes": true,
+
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}
+```
+
+段階的に有効化してください。`strict: true` から始め、その後 `noUncheckedIndexedAccess`、次に `exactOptionalPropertyTypes` を追加します。各フラグは異なるクラスのバグを検出しますが、一度にすべて有効化するとノイズが増えます。
+
+## Strict-by-Default で Breaking するコードパターン
+
+### パターン 1：関数パラメータの Implicit Any
+
+```typescript
+// 7.0 で Breaking
+function merge(target, source) {
+  Object.assign(target, source);
+}
+
+// 修正
+function merge<T>(target: T, source: Partial<T>): T {
+  return Object.assign(target, source);
+}
+```
+
+### パターン 2：Unsafe Index Access
+
+```typescript
+// 7.0 で Breaking（noUncheckedIndexedAccess 有効時）
+const items = ['a', 'b', 'c'];
+const fifth = items[5]; // エラー: 潜在的に undefined
+console.log(fifth.toUpperCase()); // 実行時エラー（undefined の場合）
+
+// 修正
+const fifth = items[5];
+if (fifth !== undefined) {
+  console.log(fifth.toUpperCase());
+}
+
+// または optional chaining で対応
+console.log(fifth?.toUpperCase());
+```
+
+### パターン 3：未初期化のプロパティ
+
+```typescript
+// 7.0 で Breaking
+class User {
+  id: string;
+  name: string;
+  
+  // エラー: 'id' と 'name' が constructor で代入されていない
+  constructor() {
+    // 代入忘れ
+  }
+}
+
+// 修正
+class User {
+  id: string;
+  name: string;
+  
+  constructor(id: string, name: string) {
+    this.id = id;
+    this.name = name;
+  }
+}
+
+// または definite assignment assertion を使用（確実な場合）
+class User {
+  id!: string;
+  name!: string;
+  
+  constructor() {
+    this.initialize();
+  }
+  
+  private initialize() {
+    this.id = '';
+    this.name = '';
+  }
+}
+```
+
+### パターン 4：Object Field の Null/Undefined
+
+```typescript
+// 7.0 strict mode で Breaking
+interface Response {
+  data: {
+    user: User
+  }
+}
+
+// この関数は null/undefined を処理していない
+function getName(response: Response): string {
+  return response.data.user.name;
+}
+
+// 修正：型を Narrow にする
+interface Response {
+  data: {
+    user: User
+  } | null
+}
+
+function getName(response: Response): string | null {
+  return response.data?.user.name ?? null;
+}
+
+// または Optional field を使う
+interface Response {
+  data?: {
+    user?: User
+  }
+}
+
+function getName(response: Response): string | undefined {
+  return response.data?.user?.name;
+}
+```
+
+## Migration チェックリスト
+
+### Phase 1：Audit（現在）
+
+- [ ] 現在のコードベースで `npx tsc --noEmit` を実行しベースラインを確立
+- [ ] Implicit `any` エラー数をカウント（`noImplicitAny`）
+- [ ] Null/Undefined access エラー数をカウント（`strictNullChecks`）
+- [ ] ES5 target を使用しているファイルを特定（`target: "ES5"`）
+- [ ] Build config で `module: "amd"`, `"umd"`, `"system"` を検索
+- [ ] 既存コードを `"strict": true` でローカルテスト（Commit しない）
+
+```bash
+# Strict mode をローカルで試す（Commit しない）
+tsc --strict --noEmit
+```
+
+### Phase 2：フラグを段階的に有効化（Week 1-2）
+
+- [ ] Dev/CI で `"strict": true` を有効化し、エラーを修正
+- [ ] `"noUnusedLocals": true` を追加、修正とクリーンアップ
+- [ ] `"noUnusedParameters": true` を追加
+- [ ] Main に Merge する前に CI でテスト
+
+### Phase 3：Target とモジュール形式を更新（Week 2-3）
+
+- [ ] ES5 をターゲットにしている場合、ES2020 以上に更新
+- [ ] レガシーモジュール形式を使用している場合、`esnext` または `commonjs` に移行
+- [ ] Bundler 出力をテスト（Webpack、Vite、Turbopack）
+- [ ] ブラウザ/Node.js Runtime 互換性を確認
+
+### Phase 4：TypeScript 7.0 にアップグレード（Week 3-4）
+
+- [ ] Dev 依存関係で TypeScript 7.0 にアップグレード
+- [ ] 完全なテストスイートを実行
+- [ ] 型チェック時間とビルド時間を監視（6.x からのベースラインをログ）
+- [ ] Main に Merge
+
+### Phase 5：Production Validation
+
+- [ ] Canary 環境にコードをステージング
+- [ ] Runtime の違いがないか監視
+- [ ] パフォーマンスメトリクスを追跡（ビルド時間、型チェック時間、Bundle size）
+
+## webhani からの視点
+
+TypeScript のネイティブコンパイラへの転換は、言語の成熟を示しています。言語は試験的なツールから、インフラレベルの投資対象へと進化してきました。Microsoft が 10 倍のパフォーマンス書き直しに投資するのは、エコシステムが Compiler パフォーマンスが直接生産性とコストに影響するスケールに達したからです。
+
+Breaking changes — strict-by-default、ES5 廃止、レガシーモジュール形式 — は意見の多い選択肢ですが、合理的です。歴史的に防止できるバグよりも多くのバグを引き起こしてきたコードパターンを閉じ込めています。
+
+ビルド時間がボトルネックのチームにとって、7.0 Migration はパフォーマンスだけで正当化されます。小規模コードベースのチームにとっても、strict-by-default からの Safety Gain は型エラー修正の短期的努力に値します。
+
+今から Audit を開始してください。ほとんどのチームは 3～4 週間の Sprint で TypeScript 7.0 に移行できます。今日から準備を始めれば。
