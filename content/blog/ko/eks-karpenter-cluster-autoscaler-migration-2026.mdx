@@ -1,0 +1,80 @@
+---
+title: "EKS Autoscaling을 Cluster Autoscaler에서 Karpenter로 옮기기: 현장 안내서"
+description: "대규모 운영자들이 EKS의 Node Scaling을 Cluster Autoscaler에서 Karpenter로 옮기고 있습니다. 이유는 실용적입니다 — 더 빠른 Scheduling과 더 적은 낭비. 다만 Migration에는 실제 날카로운 부분이 있습니다. 왜, 어떻게, 무엇을 지켜봐야 하는지 차분히 봅니다."
+date: "2026-07-05"
+status: "published"
+tags: ["Kubernetes", "AWS", "DevOps", "Cost Optimization", "Cloud"]
+thumbnail: ""
+author: "webhani"
+slug: "eks-karpenter-cluster-autoscaler-migration-2026"
+---
+
+수년간 Amazon EKS에서 Node를 Scaling하는 기본 방식은 EC2 Auto Scaling Group을 받치는 Kubernetes Cluster Autoscaler였습니다. 잘 동작하고, 많은 Cluster에는 그것으로 충분합니다. 그러나 AWS 자체 Node Provisioning 프로젝트인 Karpenter로의 뚜렷한 업계 이동이 있고, 이것은 과장 광고가 아닙니다. 상당한 규모로 Cluster를 돌리는 운영자들 — 일부는 천 개가 훌쩍 넘는 EKS Cluster를 관리합니다 — 이 단계적 전환을 완료할 때, 그들이 무엇을 풀려는지 이해할 가치가 있습니다. 이 글은 두 접근의 작동 원리, 팀이 Migration하는 이유, 그리고 결정하기 전에 Client가 반드시 보게 하는 날카로운 부분을 설명합니다.
+
+## 같은 일에 대한 두 가지 다른 사고 모델
+
+Cluster Autoscaler는 Node Group 수준에서 일합니다. 각각 특정 Instance 타입과 구성에 고정된 하나 이상의 Auto Scaling Group을 정의하면, Autoscaler의 일은 *미리 정의된 그 Group 안에서* Node를 더하거나 빼는 것입니다. Pod가 Scheduling되지 못하면 그것들을 담을 수 있는 Group을 찾아 그 Group의 원하는 개수를 늘리고, Node가 놀고 있으면 Group을 줄입니다. 모델은 단순하고 예측 가능하지만, 여러분 용량의 형태는 여러분이 정의한 Group에 의해 미리 결정됩니다.
+
+Karpenter는 개별 Pod와 Instance 수준에서 일합니다. 미리 정의된 Group 중에서 고르는 대신, Scheduling되지 못한 Pod의 정확한 자원 요청과 제약을 보고 그것에 맞는 EC2 Instance를 직접 Provisioning합니다. 여러분은 그것이 *써도 되는* Instance 타입의 넓은 집합을 주고, Karpenter는 실제로 대기 중인 것에 따라 실행 시점에 구체적인 Instance를 고릅니다. 유지해야 할 고정된 Node Group 사다리가 없습니다.
+
+그 차이는 두 가지 실용적 결과를 볼 때까지는 학문적으로 들립니다. 속도와 Packing 효율입니다.
+
+## 팀이 Migration하는 이유: 속도와 낭비
+
+**속도** 이득은 한 겹을 걷어내는 데서 옵니다. Cluster Autoscaler에서는 Scale-up이 Auto Scaling Group의 원하는 용량을 조정한 뒤 그 기계장치가 Node를 띄우기를 기다리는 것을 뜻합니다. Karpenter는 대기 중인 Pod에 응답해 Instance를 더 직접적으로 Provisioning하며, 이는 대개 "Pod가 Scheduling 불가"에서 "Pod가 실행 중"까지의 시간을 단축합니다. 폭발적으로 Scale-up하는 Workload — 갑자기 차는 Queue, Event에 급증하는 Traffic — 에서 그 Latency를 깎는 것은 급증을 우아하게 흡수하느냐 Pod가 Pending으로 앉아 있는 것을 지켜보느냐의 차이입니다.
+
+**낭비** 이득은 Packing에서 옵니다. Karpenter가 고정 메뉴가 아니라 실제 수요에 따라 Instance 타입을 고르기 때문에 통합(Consolidation)할 수 있습니다. 반쯤 빈 Node가 셋 있다면, Karpenter는 실행 중인 Pod들이 적절한 크기의 Instance 하나에 들어감을 알아차리고, 그것을 띄우고, 작업을 옮기고, 나머지를 종료할 수 있습니다. 큰 Fleet에서는 이 통합에 비용 절감이 집중됩니다. 고정된 Node Group 크기와 실제 요동치는 수요 사이의 반올림 오차에 돈을 내는 일을 멈추는 것입니다. 또한 Spot 용량을 잘 활용하기 쉽게 만듭니다. Karpenter가 많은 Instance 타입에 퍼질 수 있고 Spot Instance가 회수될 때 빠르게 반응하기 때문입니다.
+
+어느 이득도 마법이 아니고, 둘 다 Cluster 크기에 비례합니다. 작고 안정적인 Cluster에서는 Cluster Autoscaler의 단순함이 Karpenter의 효율보다 여러분에게 더 값질 수 있습니다. Migration은 다양한 Workload를 유의미한 규모로 돌릴 때 가장 크게 보상합니다. 고정 Node Group의 Packing 비효율과 느린 Scale-up이 실제 돈과 실제 Latency로 바뀌는 곳입니다.
+
+## Migration은 실제로 어떻게 진행되는가
+
+우리는 이것을 점진적 변경으로 다루지, 결코 한 방에 갈아엎는 전환으로 다루지 않습니다. Client를 안전하게 지키는 패턴은 이렇습니다.
+
+먼저, 기존 구성 옆에 Karpenter를 설치하고 그것이 Provisioning해도 되는 것을 기술하는 `NodePool`을 줍니다. 허용 Instance 계열, 용량 타입(On-Demand, Spot), 한도입니다. 최소 Pool은 제약을 표현하고 구체적인 것은 Karpenter가 정하게 둡니다.
+
+```yaml
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: general-purpose
+spec:
+  template:
+    spec:
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+  limits:
+    cpu: "1000"
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+```
+
+`disruption` Block은 통합 동작이 사는 곳입니다. Karpenter에게 Packing을 조이기 위해 비었거나 저활용된 Node를 제거해도 된다고 알려줍니다. `limits` Block은 폭주하는 Workload가 다음 달 예산까지 Fleet을 Provisioning하지 못하게 하는 Guardrail입니다.
+
+둘째, Workload를 점진적으로 옮깁니다. 기존 Node Group 하나를 Cordon하고 Drain해서 그 Pod가 Karpenter가 Provisioning한 Node로 다시 Scheduling되게 하고, 실제 Traffic 아래 동작을 관찰한 뒤에야 다음으로 넘어갑니다. 아직 Migration하지 않은 Group은 Cluster Autoscaler가 계속 관리하게 두십시오. 같은 Pod를 두고 다투지만 않으면 전환 동안 둘은 공존할 수 있습니다.
+
+셋째, Workload가 Karpenter 위에서 안정되면 그것의 옛 Auto Scaling Group을 물러나게 합니다. Workload 단위로, 매 단계에서 비용과 Scheduling Latency를 지켜보며 하십시오. 그래야 무언가 나빠져도 Cluster 전체가 아니라 작고 명백한 것을 Rollback하면 됩니다.
+
+## Client가 먼저 보게 하는 날카로운 부분
+
+Karpenter는 2026년에 강력한 Default이지만 공짜 점심은 아니며, 우리는 무는 부분에 대해 Client에게 솔직합니다.
+
+- **Disruption은 기능이자 위험이다.** 돈을 아끼는 바로 그 통합은 Karpenter가 Node를 다시 채우려고 여러분의 Pod를 능동적으로 옮긴다는 뜻입니다. 여러분 Workload가 다시 Scheduling되는 것을 견디지 못하면 — Pod Disruption Budget 없음, 길고 우아하지 못한 Shutdown, Local Disk의 끈적한 State — 통합은 예상치 못한 Churn을 일으킬 수 있습니다. 통합을 풀어놓기 *전에* PDB를 설정하고 종료 Grace Period를 존중하십시오.
+- **넓은 Instance 선택에는 경계가 필요하다.** Karpenter의 강점은 많은 Instance 타입에서 고르는 것이지만, 한도 없는 "많음"은 여러분이 결코 돌릴 생각이 없던 Instance 계열로 놀라게 할 수 있습니다. `NodePool`을 실제로 검증한 계열로 제약하십시오.
+- **Spot은 여전히 중단을 뜻한다.** Karpenter는 Spot 회수를 우아하게 다루지만, 우아함이 곧 보이지 않음은 아닙니다. 2분짜리 축출 통지를 견디지 못하는 Workload는 On-Demand 용량에 속하며, 그것을 희망이 아니라 requirements로 표현합니다.
+- **여러분의 사고 모델이 바뀌어야 한다.** 고정 Node Group으로 추론하는 데 익숙한 팀은 장애 중에 Karpenter의 동적 Fleet을 그리기가 더 어렵다고 느끼기도 합니다. 그것은 실제 운영 비용이며, Dashboard와 약간의 교육을 곁들일 가치가 있습니다. On-call Engineer가 한 번도 본 적 없는 Node 형태에 놀라지 않도록 말입니다.
+
+## 우리의 결론
+
+Karpenter는 새 EKS Cluster에서 우리가 손을 뻗는 Default가 됐고, 다양한 Workload를 규모로 돌리는 기존 Cluster에 권하는 Migration이 됐습니다. 속도와 Packing 이득은 구체적이며, Fleet 규모에서 그것은 곧바로 더 낮은 청구서와 더 적은 Pending Pod로 번역됩니다. 그러나 그것은 전제하는 규율 — Disruption Budget, 제약된 Instance 선택, Spot을 위한 정직한 Workload 분류 — 을 곁들일 때만 제 값을 합니다. 신중하고 점진적으로 Migration하면, 지금 EKS에서 얻을 수 있는 고수익 Infra 변경 중 하나입니다. 부주의하게 Migration하면, Stateful Workload를 여러분 발밑에서 기꺼이 통합해 치워버릴 것입니다.
+
+*webhani는 Autoscaling 전략부터 점진적 Migration, 그리고 비용 최적화가 장애가 되지 않게 지키는 Guardrail까지 — Production 안전을 맨 앞에 두고 Kubernetes와 Cloud 비용 변경의 계획과 실행을 돕습니다.*

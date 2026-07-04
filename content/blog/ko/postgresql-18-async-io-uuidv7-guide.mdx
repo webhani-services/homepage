@@ -1,0 +1,76 @@
+---
+title: "실무로 보는 PostgreSQL 18: Async I/O와 UUIDv7이 실제로 바꾸는 것"
+description: "PostgreSQL 18의 두 간판 기능인 비동기 I/O와 Native UUIDv7 Generator는 내부 잡학처럼 들리지만, Throughput과 Index 건강에 구체적인 영향을 줍니다. 언제 중요하고 어떻게 도입할지 직접 다뤄봅니다."
+date: "2026-07-05"
+status: "published"
+tags: ["PostgreSQL", "Database", "Performance", "Architecture", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-18-async-io-uuidv7-guide"
+---
+
+대부분의 Database Release Note는 여러분이 영영 건드리지 않을 기능의 긴 목록입니다. PostgreSQL 18에는 그런 것과 다른 두 가지가 있습니다. 거의 모든 애플리케이션이 물려받는 Default와 데이터 모델링 습관을 바꾸기 때문입니다. 비동기 I/O Subsystem, 그리고 내장 `uuidv7()` 함수입니다. 둘 다 화려하지 않습니다. 그리고 둘 다 여러분의 Read가 얼마나 빠른지, Index가 얼마나 잘 나이 드는지를 조용히 좌우합니다. 이 글은 그 둘이 무엇을 하는지, 언제 도움이 되는지, 의존하기 전에 무엇을 확인해야 하는지를 실무로 훑는 안내입니다.
+
+## Async I/O: 왜 생겼고 어디서 드러나는가
+
+역사의 대부분 동안 PostgreSQL은 운영체제에 데이터 Block을 한 번에 하나씩 요청하고, 다음을 청하기 전에 각 Read가 돌아오기를 기다렸습니다. 빠른 Local SSD에서는 이 직렬화가 거의 티가 나지 않습니다. 그러나 Cloud Storage — 한 번의 Read가 유의미한 수준의 Latency를 갖는 Network 부착 Volume — 에서는 한 건씩 기다리는 방식이 많은 Throughput을 흘려보냅니다. Disk는 여러 요청을 동시에 처리할 수 있는데, 옛 모델은 그것들을 청하기를 거부했습니다.
+
+PostgreSQL 18은 비동기 I/O를 도입해 Engine이 여러 Read 요청을 동시에 걸어둔 채 대기를 겹치게 합니다. 가장 분명한 이득은 Storage에서 대량의 데이터를 흘려보내는 연산에서 나옵니다. 큰 Table의 Sequential Scan, Bitmap Heap Scan, 그리고 Vacuum입니다. 여러분의 Workload가 Cloud 기반 Storage에서 이런 Scan에 지배된다면, 이번 Release는 단 한 줄의 Query도 다시 쓰지 않고 그것들이 빨라지는 판입니다.
+
+동작은 `io_method` 설정으로 다스려집니다. 알아둘 값이 세 가지입니다.
+
+```sql
+-- 현재 설정 확인
+SHOW io_method;
+
+-- 사용 가능한 값:
+--   sync           전통적인 동기 동작 (비동기 없음)
+--   worker         전용 Background I/O Worker 프로세스를 통한 비동기
+--   io_uring       Linux io_uring 인터페이스를 통한 비동기 (Linux 전용)
+```
+
+Linux에서 `io_uring`은 Batch 처리를 Kernel까지 밀어 넣어 대개 가장 효율적인 선택지이지만, Kernel 지원과 Platform 빌드 방식에 달려 있습니다. `worker`는 이식성 있는 경로입니다. Helper 프로세스로 Read를 동시에 발행하고 여러 Platform에서 동작합니다. 18로 옮길 때, 여러분의 빌드가 어떤 Method를 Default로 쓰는지, 그리고 Managed Cloud Postgres를 쓴다면 Provider가 그 선택을 노출하기는 하는지 확인하십시오.
+
+모든 Client에게 드리는 주의 한마디: 비동기 I/O가 어디서나 공짜라고 가정하지 마십시오. Latency가 높은 Storage 위의 Read 중심·Scan 중심 Workload에서 가장 크게 돕습니다. 이미 RAM에 들어가는 작은 Database나 Working Set이 완전히 Cache된 경우에는 차이가 거의 없을 수 있습니다. 겹칠 물리 I/O가 별로 없기 때문입니다. 남의 하드웨어에서 나온 Benchmark를 믿는 대신, 가장 무거운 Scan에 대해 전후로 `EXPLAIN (ANALYZE, BUFFERS)`를 찍어 실제 Workload를 측정하십시오.
+
+## UUIDv7: 랜덤 UUID가 조용히 만든 문제를 고치다
+
+두 번째 기능은 범위가 더 작지만, 팀이 끊임없이 하는 일 하나를 건드립니다. Primary Key 타입 선택입니다. 수년간의 논쟁은 Auto-increment 정수 대 UUID였습니다. UUID는 몇 가지 실무적 이유로 앞섭니다. Database 왕복 없이 애플리케이션 코드에서 생성할 수 있고, Row 수를 노출하지 않으며, Shard나 Service를 가로질러 절대 충돌하지 않습니다. 언제나 걸림돌은 랜덤 변종인 UUIDv4였습니다.
+
+UUIDv4는 전적으로 무작위입니다. 이것을 Primary Key로 쓰면 새 Row가 Index 정렬 순서에서 예측 불가능한 위치에 떨어집니다. B-tree Index는 새 항목이 끝 근처에 덧붙을 때 가장 행복합니다. 최근에 쓴 Page가 Cache에 뜨겁게 남고 촘촘하게 채워지기 때문입니다. 랜덤 Key는 Insert를 Index 전체에 흩뿌려 차가운 Page를 건드리고, Page Split을 더 많이 일으키며, Index를 필요 이상으로 크고 Cache 비친화적으로 남깁니다. Insert가 많은 Table에서 이것은 실재하고 측정 가능한 세금입니다.
+
+UUIDv7은 밀리초 정밀도의 Timestamp를 상위 Bit에 두고 하위 Bit에만 무작위성을 넣어 이를 해결합니다. 결과는 여전히 전역 고유하고 Database 밖에서 생성해도 안전하지만, 비슷한 시각에 만들어진 값끼리 가까이 정렬됩니다. Insert가 다시 대략 순차적이 되는데, 이는 정확히 B-tree가 원하는 바입니다. PostgreSQL 18은 Native Generator를 제공하므로 더 이상 Extension이나 애플리케이션 측 Library가 필요 없습니다.
+
+```sql
+-- 하나 생성
+SELECT uuidv7();
+
+-- Primary Key Default로 사용
+CREATE TABLE orders (
+    id          uuid PRIMARY KEY DEFAULT uuidv7(),
+    customer_id bigint NOT NULL,
+    total_cents integer NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+```
+
+기분 좋은 부수 효과가 있습니다. Timestamp가 선두 Bit에 살기 때문에 비슷한 시각에 Insert된 Row가 Index에서 물리적으로 뭉치고, 따라서 `id`로 정렬하는 Query가 대략 시간순으로 결과를 공짜로 돌려줍니다. 최신 우선 목록을 위한 별도의 `created_at` Index를 자주 피할 수 있게 해줍니다. 과장하지는 마십시오. 정확한 시간 순서가 필요하면 실제 Timestamp Column을 두고 그것으로 정렬하십시오. 그러나 "최근 N개 Row를 다오" 식의 Pagination이라면, UUIDv7 Primary Key로 정렬하는 것이 흔히 충분하고 더 저렴합니다.
+
+## 기존 UUIDv4 Key를 Migration해야 할까?
+
+곧바로 따라오는 질문이고, 우리의 답은 대개 아니오입니다. 적어도 독립된 프로젝트로는 아닙니다. 큰 기존 Table의 Primary Key를 다시 쓰는 것은 비싸고 위험합니다. Table과 모든 Index를 다시 쓰고, Foreign Key와 세심한 조율이 필요하며, 얻는 것은 *미래의* Insert 패턴 개선일 뿐 과거의 것이 아닙니다. 이미 쓰인 Row는 이미 흩어져 있고, 타입을 바꾼다고 전면 재구축 없이 다시 모아지지 않습니다.
+
+실용적인 경로는 새 Table과, 다른 이유로 이미 재구축 중인 Table에 UUIDv7을 도입하는 것입니다. 완전히 새로운 Service라면 첫날부터 `uuidv7()`을 Default Primary Key로 삼으십시오. UUID의 편리함과 함께 순차 정수에 가까운 Insert 동작을 얻습니다. 거의 모든 이득을 거의 비용 없이 담아냅니다. 기존 뜨거운 Table의 전용 Migration은, Index Bloat나 Insert Contention을 측정했고 그것을 구체적으로 Key 무작위성에 귀속할 수 있는 경우로 아껴 두십시오.
+
+## 짧은 도입 Checklist
+
+Client가 PostgreSQL 18로 옮기는 것을 도울 때, Database 수준 검토는 몇 가지 확인으로 좁혀집니다.
+
+1. **`io_method`를 확인하고 중요한 Scan을 테스트하십시오.** 가장 무거운 Sequential·Bitmap Scan을 식별하고, 18에서 `EXPLAIN (ANALYZE, BUFFERS)`를 잡아 기준선과 비교하십시오. Changelog보다 여러분의 숫자를 믿으십시오.
+2. **새 Primary Key는 `uuidv7()`을 Default로 삼으십시오.** bigint를 선호할 구체적 이유가 없다면 말입니다. UUID의 분산 친화적 성질을 유지하면서 Index Bloat 벌금을 떨굽니다.
+3. **기존 Key를 반사적으로 일괄 Migration하지 마십시오.** UUIDv4에서 UUIDv7로의 전환은 일상적 Upgrade 단계가 아니라 증거에 기반한 표적 수정으로 다루십시오.
+4. **Managed Service 지원을 재확인하십시오.** Managed Cloud Postgres에서 돈다면, 설계를 그 위에 얹기 전에 Provider가 실제로 어떤 `io_method` 값과 기능을 노출하는지 확인하십시오. 겉면의 Version 숫자가 모든 손잡이가 여러분에게 열려 있음을 보장하지는 않습니다.
+
+PostgreSQL 18은 가장 가치 있는 Database 기능이 종종 가장 안 화려하다는 것을 잘 보여줍니다. Async I/O는 대부분의 Cloud 애플리케이션이 실제로 도는 Storage에서 기존 Query를 빠르게 하고, UUIDv7은 모든 Schema가 내리는 결정에 오래 붙어 있던 세금을 없앱니다. 둘 다 애플리케이션을 다시 쓰라고 요구하지 않습니다. 어디에 적용되는지 이해하고 여러분 Workload에서 이득을 검증하기만 하면 됩니다.
+
+*webhani는 Version Migration부터 Primary Key 전략, 그리고 변화가 정말 제 값을 했는지 측정하는 일까지, Production 안전을 염두에 둔 Database Upgrade와 Schema 변경의 계획과 실행을 돕습니다.*
