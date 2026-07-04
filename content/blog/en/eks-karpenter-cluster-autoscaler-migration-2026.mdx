@@ -1,0 +1,80 @@
+---
+title: "Moving EKS Autoscaling from Cluster Autoscaler to Karpenter: A Field Guide"
+description: "Large operators are migrating their EKS node scaling away from the Cluster Autoscaler toward Karpenter. The reasons are practical — faster scheduling and lower waste — but the migration has real edges. A grounded look at why, how, and what to watch."
+date: "2026-07-05"
+status: "published"
+tags: ["Kubernetes", "AWS", "DevOps", "Cost Optimization", "Cloud"]
+thumbnail: ""
+author: "webhani"
+slug: "eks-karpenter-cluster-autoscaler-migration-2026"
+---
+
+For years, the default way to scale nodes on Amazon EKS was the Kubernetes Cluster Autoscaler backed by EC2 Auto Scaling Groups. It works, and for many clusters it is entirely adequate. But there is a clear industry move toward Karpenter — AWS's own node-provisioning project — and it is not hype. When operators running clusters at serious scale, some managing well over a thousand EKS clusters, complete a phased switch, it is worth understanding what they are solving for. This post explains the mechanics of the two approaches, why teams migrate, and the sharp edges we make sure clients see before they commit.
+
+## Two different mental models for the same job
+
+The Cluster Autoscaler works at the level of node groups. You define one or more Auto Scaling Groups, each pinned to a specific instance type and configuration, and the autoscaler's job is to add or remove nodes *within those predefined groups*. When pods cannot be scheduled, it finds a group that could fit them and increases that group's desired count; when nodes sit underused, it scales the group down. The model is simple and predictable, but the shape of your capacity is decided in advance by the groups you defined.
+
+Karpenter works at the level of individual pods and instances. Instead of choosing among predefined groups, it looks at the exact resource requests and constraints of the pods that cannot be scheduled and provisions EC2 instances that fit them directly. You give it a broad set of instance types it is *allowed* to use, and it picks specific instances at launch time based on what is actually pending. There is no fixed ladder of node groups to maintain.
+
+That difference sounds academic until you see its two practical consequences: speed and packing efficiency.
+
+## Why teams migrate: speed and waste
+
+The **speed** win comes from cutting out a layer. With the Cluster Autoscaler, a scale-up means adjusting an Auto Scaling Group's desired capacity and then waiting for that machinery to launch a node. Karpenter provisions instances more directly in response to pending pods, which typically shortens the time from "pod is unschedulable" to "pod is running." For workloads that scale up in bursts — a queue that suddenly fills, traffic that spikes on an event — shaving that latency is the difference between absorbing a surge gracefully and watching pods sit Pending.
+
+The **waste** win comes from packing. Because Karpenter chooses instance types per actual demand rather than from a fixed menu, it can consolidate. If you have three half-empty nodes, Karpenter can recognize that the running pods would fit onto one appropriately sized instance, launch it, move the work, and terminate the others. Over a large fleet this consolidation is where the cost savings concentrate — you stop paying for the rounding error between your fixed node-group sizes and your real, fluctuating demand. It also makes Spot capacity easier to exploit well, because Karpenter can spread across many instance types and react quickly when a Spot instance is reclaimed.
+
+Neither benefit is magic, and both scale with cluster size. On a small, steady cluster the Cluster Autoscaler's simplicity may be worth more to you than Karpenter's efficiency. The migration pays off most when you run diverse workloads at meaningful scale, where the packing inefficiency and slower scale-up of fixed node groups turn into real money and real latency.
+
+## How a migration actually goes
+
+We treat this as an incremental change, never a big-bang cutover. The pattern that keeps clients safe looks like this.
+
+First, install Karpenter alongside the existing setup and give it a `NodePool` describing what it may provision — the allowed instance families, capacity types (On-Demand, Spot), and limits. A minimal pool expresses the constraints and lets Karpenter decide specifics:
+
+```yaml
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: general-purpose
+spec:
+  template:
+    spec:
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+  limits:
+    cpu: "1000"
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+```
+
+The `disruption` block is where the consolidation behavior lives — telling Karpenter it may remove nodes that are empty or underutilized to tighten packing. The `limits` block is a guardrail so a runaway workload cannot provision the fleet into next month's budget.
+
+Second, shift workloads gradually. Cordon and drain one existing node group so its pods reschedule onto Karpenter-provisioned nodes, observe behavior under real traffic, and only then move the next. Keep the Cluster Autoscaler managing the groups you have not migrated yet; the two can coexist during transition as long as they are not fighting over the same pods.
+
+Third, once a workload is stable on Karpenter, retire its old Auto Scaling Group. Do this per workload, watching cost and scheduling latency at each step, so if something regresses you have a small, obvious thing to roll back rather than a whole cluster.
+
+## The sharp edges we make clients look at first
+
+Karpenter is a strong default in 2026, but it is not a free lunch, and we are direct with clients about the parts that bite.
+
+- **Disruption is a feature and a risk.** The same consolidation that saves money means Karpenter will actively move your pods to repack nodes. If your workloads do not tolerate being rescheduled — no Pod Disruption Budgets, long ungraceful shutdowns, sticky state on local disk — consolidation can cause churn you did not expect. Set PDBs and honor termination grace periods *before* you turn consolidation loose.
+- **Broad instance choice needs boundaries.** Karpenter's strength is picking from many instance types, but "many" without limits can surprise you with instance families you never meant to run. Constrain the `NodePool` to families you have actually validated for your workloads.
+- **Spot still means interruptions.** Karpenter handles Spot reclamation gracefully, but gracefully is not invisibly. Workloads that cannot tolerate a two-minute eviction notice belong on On-Demand capacity, and you express that with requirements, not hope.
+- **Your mental model has to change.** Teams comfortable reasoning about fixed node groups sometimes find Karpenter's dynamic fleet harder to picture during an incident. That is a real operational cost, worth pairing with dashboards and a little training so on-call engineers are not surprised by a node shape they have never seen.
+
+## Where we land
+
+Karpenter has become the default we reach for on new EKS clusters and the migration we recommend for established ones running diverse workloads at scale. The speed and packing benefits are concrete, and at fleet scale they translate directly into lower bills and fewer Pending pods. But it earns its keep only when you pair it with the discipline it assumes — disruption budgets, constrained instance selection, and honest workload classification for Spot. Migrated carefully and incrementally, it is one of the higher-return infrastructure changes available on EKS right now. Migrated carelessly, it will happily consolidate a stateful workload out from under you.
+
+*webhani helps teams plan and execute Kubernetes and cloud-cost changes with production safety front and center — from autoscaling strategy to incremental migration to the guardrails that keep a cost optimization from becoming an outage.*

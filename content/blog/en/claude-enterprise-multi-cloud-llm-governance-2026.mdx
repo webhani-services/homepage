@@ -1,0 +1,96 @@
+---
+title: "Governing LLM Access Across Clouds: Gateways, Spend Controls, and Guardrails"
+description: "As teams run the same model through Amazon Bedrock, Google Cloud, and a vendor API at once, the hard problem shifts from prompting to governance. A practical look at gateway routing, spend visibility, and access guardrails for enterprise LLM use."
+date: "2026-07-05"
+status: "published"
+tags: ["LLM", "Cloud", "Governance", "FinOps", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-enterprise-multi-cloud-llm-governance-2026"
+---
+
+A year ago, most of the LLM questions clients brought to us were about prompting. Which model, what temperature, how to squeeze a better answer out of a stubborn task. In 2026 those questions have not disappeared, but they are no longer the ones that keep engineering managers up at night. The new questions are organizational: who is allowed to call which model, through which cloud, with what budget, and how would we even notice if something went wrong?
+
+This shift tracks a concrete change in how models are delivered. Anthropic's Claude models, for example, are now reachable not only through the vendor's own API but also as managed offerings inside Amazon Bedrock and Google Cloud, and Anthropic has been adding admin-side controls for spend visibility. The same is broadly true across the major model providers. The practical consequence is that a single company often ends up calling the *same* model family through three different front doors, each with its own billing, IAM model, and logging. Governance is what ties those doors together. This post is the framework we use with clients to do that.
+
+## Why multi-cloud LLM access happens whether you plan for it or not
+
+Nobody sets out to fragment their model access. It happens incrementally. The data team already lives in Google Cloud, so their pipeline calls the model there to stay inside the same VPC. The application team is deep in AWS, so their production service uses Bedrock to keep traffic on the private network and inherit existing IAM roles. Meanwhile a product manager signed up for the vendor's direct API to prototype, put it on a company card, and that key is now quietly powering a "temporary" internal tool that has been running for four months.
+
+Each of those decisions is locally reasonable. Keeping inference inside the same cloud as your data avoids egress costs and data-residency headaches. Using the platform-native offering means you reuse audit logging, key management, and network policy you already trust. But summed across an organization, you get three unrelated billing lines, three permission systems, and no single place to answer "how much are we spending on AI this month, and on what?"
+
+The mistake is treating this as a problem to eliminate. You will not consolidate everyone onto one path — the reasons above are real. The goal is to put a governance layer *over* the fragmentation, not to pretend it away.
+
+## The gateway pattern: one front door, many back ends
+
+The single most useful architectural move is to route application traffic through an internal gateway rather than letting each service call a provider directly. A gateway is a thin service — yours, or an off-the-shelf one — that accepts a normalized request, decides which back end to use, attaches the right credentials, and records what happened.
+
+Conceptually it looks like this:
+
+```typescript
+// Every internal caller hits the gateway, never a provider SDK directly.
+async function complete(req: LlmRequest, ctx: CallerContext) {
+  const route = pickRoute(req.model, ctx.team); // e.g. bedrock | gcp | vendor
+  const started = Date.now();
+
+  const res = await route.client.send(req);
+
+  await recordUsage({
+    team: ctx.team,
+    model: req.model,
+    route: route.name,
+    inputTokens: res.usage.inputTokens,
+    outputTokens: res.usage.outputTokens,
+    latencyMs: Date.now() - started,
+  });
+
+  return res;
+}
+```
+
+Nothing here is exotic, and that is the point. Once every call passes through one function, four things that were previously impossible become trivial: attributing cost to a team, switching a route without touching callers, enforcing a policy in one place, and getting a unified usage log. `pickRoute` is where the multi-cloud reality is absorbed — a request from the data team resolves to Google Cloud, a production request resolves to Bedrock, and the caller never has to know or care.
+
+The gateway also gives you a failover seam. If one back end returns errors or rate-limits, `pickRoute` can fall back to another provider of the same model without a code change in the caller. We treat this as a reliability feature first and a cost feature second.
+
+## Spend visibility: attribution beats a bigger dashboard
+
+When a client says "our AI bill is out of control," the problem is almost never the raw number. It is that nobody can decompose it. A $40,000 monthly spend that breaks cleanly into "$28k production inference, $9k analytics batch jobs, $3k experimentation" is a manageable business input. The same $40,000 as one opaque line is a source of anxiety and bad decisions.
+
+Provider-side spend controls — the admin views that clouds and vendors now expose — are necessary but not sufficient. They tell you what *that* provider charged. They cannot tell you that the analytics team's nightly job is responsible, because the provider does not know your org chart. Attribution has to happen on your side, which is exactly what the `recordUsage` call above captures. Once you have per-team, per-model token counts in your own store, a monthly rollup is a simple query:
+
+```sql
+SELECT team,
+       model,
+       sum(input_tokens)  AS input_tokens,
+       sum(output_tokens) AS output_tokens,
+       count(*)           AS calls
+FROM llm_usage
+WHERE created_at >= date_trunc('month', now())
+GROUP BY team, model
+ORDER BY output_tokens DESC;
+```
+
+Pair those token counts with each route's published per-token price and you get an estimated cost per team without waiting for the cloud invoice. The number will not match the bill to the cent — providers round and bundle differently — but it is directionally accurate and, crucially, available in real time. That is what lets you catch a runaway job on day two instead of on the invoice.
+
+## Guardrails that belong in the gateway, not in prompts
+
+Because every call passes through one place, the gateway is also the right home for a handful of controls that are painful to scatter across services:
+
+- **Budgets with teeth.** A soft budget that only emails someone is a suggestion. Track spend per team against a monthly cap in the gateway and start rejecting or downgrading non-critical requests when the cap is hit. It is far better to degrade an internal tool than to discover a five-figure overrun after the fact.
+- **Model allowlists per team.** Not every team should be able to invoke your most expensive model for a task a cheaper one handles fine. Encode that as policy in `pickRoute`, not as a code-review convention people forget.
+- **A logging boundary for sensitive data.** The gateway is the natural place to enforce that certain request categories only route to a back end inside your own cloud and network, keeping regulated data off paths you would rather it not touch.
+
+We deliberately keep these controls out of prompts and out of individual services. Prompt-level rules are trivially bypassed and impossible to audit; per-service rules drift apart the moment two teams implement them. The gateway is the one choke point where a policy written once actually holds.
+
+## What we recommend to teams starting now
+
+If you are early in this, resist the urge to build a heavyweight platform. Start with the smallest thing that ends the blind spots:
+
+1. **Put a thin gateway in front of all application traffic.** Even a hundred-line service is enough to begin logging and attributing usage. You can adopt a mature open-source gateway later once your requirements are clear.
+2. **Record usage in your own store from day one.** The token counts you fail to capture this month are gone forever. This is the highest-leverage, lowest-effort step.
+3. **Turn on every provider-side spend control you have** — as a backstop, not your primary defense. Your own attribution is the primary defense.
+4. **Write down which team may use which model on which cloud,** then encode that list in routing. An unwritten policy is not a policy.
+
+The organizations handling LLM governance well in 2026 are not the ones with the cleverest prompts. They are the ones who decided early that model access is infrastructure, and gave it the same attribution, budgeting, and access discipline they already apply to databases and cloud compute. The gateway is how you get there without freezing the fragmentation that real teams will always produce.
+
+*If your LLM spend has become hard to explain or your model access has quietly fragmented across clouds, this is precisely the kind of architecture work webhani helps clients untangle — from gateway design to cost attribution to access policy.*

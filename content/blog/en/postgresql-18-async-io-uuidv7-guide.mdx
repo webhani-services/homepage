@@ -1,0 +1,76 @@
+---
+title: "PostgreSQL 18 in Practice: What Async I/O and UUIDv7 Actually Change"
+description: "Two headline features in PostgreSQL 18 — asynchronous I/O and a native UUIDv7 generator — sound like internals trivia but have concrete effects on throughput and index health. A hands-on look at when they matter and how to adopt them."
+date: "2026-07-05"
+status: "published"
+tags: ["PostgreSQL", "Database", "Performance", "Architecture", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-18-async-io-uuidv7-guide"
+---
+
+Most database release notes are a long list of features you will never touch. PostgreSQL 18 has two that are different, because they change defaults and data-modeling habits that nearly every application inherits: an asynchronous I/O subsystem, and a built-in `uuidv7()` function. Neither is glamorous. Both quietly affect how fast your reads are and how well your indexes age. This is a practical walk-through of what they do, when they help, and what to check before you rely on them.
+
+## Async I/O: why it exists and where it shows up
+
+For most of its history, PostgreSQL asked the operating system for one block of data at a time and waited for each read to come back before requesting the next. On fast local SSDs that serialization is barely noticeable. On cloud storage — network-attached volumes where a single read can take a meaningful fraction of a millisecond of latency — waiting one-read-at-a-time leaves a lot of throughput on the table. The disk can handle many requests in flight; the old model refused to ask for them.
+
+PostgreSQL 18 introduces asynchronous I/O so the engine can have multiple read requests outstanding at once, overlapping the waiting. The clearest wins are in operations that stream large amounts of data from storage: sequential scans over big tables, bitmap heap scans, and vacuum. If your workload is dominated by such scans on cloud-backed storage, this is the release where they get faster without you rewriting a single query.
+
+The behavior is governed by a setting, `io_method`. It accepts three values worth knowing:
+
+```sql
+-- Inspect the current setting
+SHOW io_method;
+
+-- Available values:
+--   sync           the traditional synchronous behavior (no async)
+--   worker         async via dedicated background I/O worker processes
+--   io_uring       async via the Linux io_uring interface (Linux only)
+```
+
+On Linux, `io_uring` pushes the batching down into the kernel and tends to be the most efficient option, but it depends on kernel support and how your platform is built. `worker` is the portable path — it uses helper processes to issue reads concurrently and works across platforms. When you move to 18, confirm which method your build defaults to and, if you are on managed cloud Postgres, whether the provider exposes the choice at all.
+
+A word of caution we give every client: do not assume async I/O is free everywhere. It helps read-heavy, scan-heavy workloads on higher-latency storage the most. On a small database that already fits in RAM, or one whose working set is fully cached, you may see little difference, because there is barely any physical I/O to overlap. Measure your actual workload — `EXPLAIN (ANALYZE, BUFFERS)` on your heaviest scans before and after — rather than trusting a benchmark from someone else's hardware.
+
+## UUIDv7: fixing the problem random UUIDs quietly created
+
+The second feature is smaller in scope but touches something teams do constantly: choosing a primary key type. For years the debate has been auto-incrementing integers versus UUIDs. UUIDs win on a few practical grounds — you can generate them in application code without a database round trip, they do not leak row counts, and they never collide across shards or services. The catch has always been the random variant, UUIDv4.
+
+A UUIDv4 is entirely random. When you use it as a primary key, each new row lands at an unpredictable position in the index's sort order. B-tree indexes are happiest when new entries append near the end, keeping recently written pages hot in cache and packed densely. Random keys scatter inserts across the whole index, touching cold pages, causing more page splits, and leaving indexes larger and less cache-friendly than they need to be. On a high-insert table this is a real, measurable tax.
+
+UUIDv7 solves this by putting a millisecond-precision timestamp in the high-order bits, with randomness only in the lower bits. The result is still globally unique and still safe to generate outside the database, but values created near the same time sort near each other. Inserts become roughly sequential again, which is exactly what a B-tree wants. PostgreSQL 18 ships a native generator so you no longer need an extension or application-side library:
+
+```sql
+-- Generate one
+SELECT uuidv7();
+
+-- Use it as a primary key default
+CREATE TABLE orders (
+    id          uuid PRIMARY KEY DEFAULT uuidv7(),
+    customer_id bigint NOT NULL,
+    total_cents integer NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+```
+
+There is a pleasant side benefit. Because the timestamp lives in the leading bits, rows inserted around the same time are physically clustered in the index, so a query ordering by `id` returns them in roughly chronological order for free — often letting you avoid a separate `created_at` index for recent-first listings. Do not overstate this; if you need exact time ordering, keep and order by a real timestamp column. But for "give me the latest N rows" pagination, ordering by a UUIDv7 primary key is frequently good enough and cheaper.
+
+## Should you migrate existing UUIDv4 keys?
+
+This is the question that follows immediately, and our answer is usually no — not as a standalone project. Rewriting the primary key of a large existing table is expensive and risky: it rewrites the table and every index, needs careful coordination with foreign keys, and buys you an improvement on *future* insert patterns, not past ones. The rows already written are already scattered; changing their type does not un-scatter them without a full rebuild.
+
+The pragmatic path is to adopt UUIDv7 for new tables and for any table you are already rebuilding for another reason. For a brand-new service, make `uuidv7()` your default primary key from day one and you get the ergonomics of UUIDs with insert behavior close to sequential integers. That captures nearly all the benefit at nearly no cost. Reserve a dedicated migration of an existing hot table for cases where you have measured index bloat or insert contention and can attribute it specifically to key randomness.
+
+## A short adoption checklist
+
+When we help a client move to PostgreSQL 18, the database-level review comes down to a few checks:
+
+1. **Confirm `io_method` and test the scans that matter.** Identify your heaviest sequential and bitmap scans, capture `EXPLAIN (ANALYZE, BUFFERS)` on 18, and compare against your baseline. Trust your numbers over the changelog's.
+2. **Default new primary keys to `uuidv7()`** unless you have a specific reason to prefer bigint. You keep the distributed-friendly properties of UUIDs and drop the index-bloat penalty.
+3. **Do not bulk-migrate existing keys reflexively.** Treat a UUIDv4-to-UUIDv7 conversion as a targeted fix backed by evidence, not a routine upgrade step.
+4. **Re-check managed-service support.** If you run on managed cloud Postgres, verify which `io_method` values and features your provider actually exposes before you design around them — the version number on the tin does not guarantee every knob is turned to you.
+
+PostgreSQL 18 is a good illustration of how the most valuable database features are often the least flashy. Async I/O makes existing queries faster on the storage most cloud applications actually run on, and UUIDv7 removes a long-standing tax on a decision every schema makes. Neither requires you to rewrite your application — just to understand where they apply and to verify the wins on your own workload.
+
+*webhani helps teams plan and execute database upgrades and schema changes with production safety in mind — from version migrations to primary-key strategy to measuring whether a change actually earned its keep.*
