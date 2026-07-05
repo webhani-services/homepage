@@ -1,0 +1,115 @@
+---
+title: "Why AI Agents Write Subtly Wrong AWS Code — And How Agent Toolkit Fixes It"
+description: "AI coding agents generate AWS code that runs but misses SDK best practices. The AWS Agent Toolkit for AWS uses on-demand skills to keep agents context-aware of DynamoDB pagination, async patterns, and security guardrails without bloating the token window."
+date: "2026-07-06"
+status: "published"
+tags: ["AWS", "AI", "LLM", "Cloud", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-agent-toolkit-coding-agents-2026"
+---
+
+AI coding agents work well for general software engineering. They debug code, add tests, refactor cleanly. But deploy them to AWS infrastructure without training, and they ship code that runs but isn't production-ready.
+
+The problem isn't that agents can't write AWS code. It's that AWS has too many APIs, too many options, and too many ways to do the same thing incorrectly. An untrained agent sees "scan a DynamoDB table" and calls the scan API in a loop. It works, until the table hits a few million records and the application silently returns incomplete results. Uncharged API costs, pagination handled manually instead of via paginators, file uploads that don't use high-level transfer managers—these are consistent mistakes from agents that don't know better.
+
+The AWS Agent Toolkit for AWS, released in 2026 as the successor to AWS Labs MCP servers, solves this by making SDK best practices available on-demand. Only the skills relevant to the current task get loaded, keeping the agent's context window tight while guaranteeing production-grade output.
+
+## The Three Layers
+
+The toolkit has a layered architecture:
+
+**Agent Skills** — Curated packages of instructions, code examples, and reference material in your SDK's language. A DynamoDB Pagination skill teaches the agent to use paginators instead of manual loops. A Python Async skill covers asyncio event loop ownership and `gather` vs `wait` semantics. With the skill installed, the agent doesn't guess; it knows the right pattern.
+
+**AWS MCP Server** — A fully managed MCP server that can invoke any AWS service. Crucially, it respects IAM-based guardrails. You define "this task gets S3 read-only access," and the MCP server enforces it. CloudWatch and CloudTrail log every operation so you can audit what the agent touched. Multi-step operations run in sandboxed execution, so if an agent script fails midway, you see exactly where.
+
+**Plugins** — AWS Core for full-stack applications, AWS Data Analytics for data pipelines and queries, AWS Agents for building agentic systems on Amazon Bedrock AgentCore.
+
+The toolkit ships with 20+ skills covering the most common SDK pitfalls. The key: the agent doesn't auto-load all of them. Instead, you provide a config file (`.agentconfig` or equivalent) that lists which skills are available. When the agent encounters a task, it searches the skill registry, downloads the relevant one, and incorporates its guidance into its context.
+
+This is a context-engineering pattern, not just a feature. Skills-on-demand preserves token budget while ensuring the agent has exactly the knowledge it needs to generate correct code.
+
+## The Problem: A DynamoDB Example
+
+Here's what an untrained agent produces:
+
+```javascript
+// ❌ No pagination — returns only up to 1MB or the item limit
+const params = {
+  TableName: 'Orders'
+};
+const response = await dynamodb.scan(params).promise();
+console.log(response.Items.length); // May be incomplete
+```
+
+The agent knows scan returns items. It doesn't know that DynamoDB scans are paginated. The application works fine until the table grows large enough to require pagination, then silently fails.
+
+With the DynamoDB Pagination skill loaded, the same agent writes:
+
+```javascript
+// ✓ Paginator API — handles pagination transparently
+const { DynamoDBClient, ScanCommand } = require('@aws-sdk/client-dynamodb');
+const { paginateScans } = require('@aws-sdk/lib-dynamodb');
+
+const client = new DynamoDBClient({});
+const paginator = paginateScans({ client }, { TableName: 'Orders' });
+
+let allItems = [];
+for await (const page of paginator) {
+  allItems = allItems.concat(page.Items || []);
+}
+console.log(allItems.length); // Complete
+```
+
+The paginator handles `ExclusiveStartKey`, retry logic, and state management internally. The agent learns from the skill that pagination is the default pattern for list operations.
+
+## Python Async Patterns
+
+Waiting for an RDS instance to become available. Without a skill:
+
+```python
+# ❌ Manual polling — reinvents sleep and retry logic
+import time
+while True:
+    response = rds_client.describe_db_instances(DBInstanceIdentifier='prod-db')
+    status = response['DBInstances'][0]['DBInstanceStatus']
+    if status == 'available':
+        break
+    print(f"Current status: {status}. Waiting...")
+    time.sleep(30)
+```
+
+With the Python Async skill:
+
+```python
+# ✓ Waiter API — SDK owns retry, backoff, and timeout
+waiter = rds_client.get_waiter('db_instance_available')
+waiter.wait(DBInstanceIdentifier='prod-db')
+```
+
+The waiter encapsulates exponential backoff, max attempts, and delay logic. The agent doesn't re-invent polling; it uses the SDK's waiter, which is tested and tuned for production use.
+
+## IAM Scoping and MCP Observability
+
+The MCP server enforces IAM permissions at the service level. You assign the agent an IAM role that allows only S3 reads. The MCP server checks every API call against that role. If the agent tries to delete from DynamoDB, the call fails before it reaches AWS.
+
+This isn't a guideline. It's an architectural guarantee.
+
+Additionally, every action is logged to CloudTrail. You can audit exactly which API calls the agent made, against which resources, at what time. This is essential for production use—you need to know what an autonomous system did, and why it did it.
+
+## Checklist for Adoption
+
+- [ ] Install Agent Toolkit (`npm install @aws-sdk/agent-toolkit` or equivalent)
+- [ ] Create `.agentconfig` with skill manifest (e.g., `skills: ["dynamodb-pagination", "s3-transfer-manager", "lambda-async"]`)
+- [ ] Set up IAM role(s) per task type (read-only for inspection, write-limited for deployment)
+- [ ] Start the MCP server locally or in a container
+- [ ] Begin with low-risk tasks: boilerplate generation, configuration fetching
+- [ ] Monitor CloudTrail for audit trail
+
+## Why This Matters
+
+The bottleneck of AI agents on cloud infrastructure isn't code generation speed. It's generating code that follows SDK best practices, respects security boundaries, and makes cost-efficient resource choices. An agent that omits pagination or doesn't use async patterns is an agent that will surprise you in production.
+
+Skills-on-demand is the pattern that solves this. By delivering knowledge contextually, only when the agent needs it, you preserve the agent's ability to reason about the problem while ensuring it reasons about it with correct AWS primitives.
+
+*At webhani, we help clients safely adopt AI agents for infrastructure by treating skill management and IAM guardrails as part of the platform layer, not an afterthought.*

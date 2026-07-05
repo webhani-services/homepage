@@ -1,0 +1,111 @@
+---
+title: "AI Coding Agent と AWS の相性問題 — Agent Toolkit for AWS が必要な理由"
+description: "AI Coding Agent は AWS コードを書けますが、SDK ベストプラクティスを外します。Agent Toolkit for AWS はスキルオンデマンド方式で、Agent にだけ必要な知識を届け、文脈を節約しながら本番環境対応コードを実現します。"
+date: "2026-07-06"
+status: "published"
+tags: ["AWS", "AI", "LLM", "Cloud", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-agent-toolkit-coding-agents-2026"
+---
+
+AI Coding Agent は一般的なソフトウェア開発では優秀です。バグ修正、テスト追加、リファクタリング — タスク定義が明確なら Agent はコードを書きます。ただし AWS 環境でのコード生成は別の問題を抱えています。
+
+AWS API は豊富です。DynamoDB だけで数十個のメソッドがあります。JavaScript SDK にはページネーション、ウェイター、高レベル転送マネージャーといった便利な仕組みがある一方、それらを知らない Agent は下位レベルの API を何度も繰り返し呼び出します。結果として、動くが本番環境には向かないコードが生成されます。
+
+これが AWS Agent Toolkit for AWS が解決する問題です。
+
+## スキルオンデマンド: 文脈効率と正確性のバランス
+
+Agent Toolkit は 3 層から構成されています。
+
+**Agent Skills** — 言語別の AWS SDK ベストプラクティス集。DynamoDB スキャンのページネーション、Python での非同期パターン、ファイル転送での高レベル API の使用などを明記した指示とコード例。必要な場合だけ Agent に読み込まれます。
+
+**AWS MCP Server (GA)** — あらゆる AWS サービスと連携する完全管理型 MCP サーバー。IAM ベースの権限スコープ、CloudWatch/CloudTrail による監査、マルチステップ操作のサンドボックス実行を備えます。
+
+**Plugins** — AWS Core (フルスタックアプリ)、AWS Data Analytics (データパイプライン)、Amazon Bedrock 上での Agent 構築用 AWS Agents プラグイン。
+
+Agent Toolkit は 20 以上のスキルをバンドルしていますが、適切な設定ファイルがなければ Agent は自動で読み込みません。重要なのは、タスクが発生した時点で Agent が「このタスク用のスキルが存在するか」を知ることです。
+
+たとえば「DynamoDB テーブルをスキャンして全レコードを集計してください」というタスクが降ると、Agent はスキルリストから DynamoDB ページネーション・スキルを検索して読み込みます。その結果、Agent は最初からページネーター API を使うコードを書きます。文脈は節約でき、かつ本番環境対応のコードが出てくる。これがスキルオンデマンド方式の価値です。
+
+## 具体例: ページネーション パターン
+
+素朴な Agent がやらかしがちな間違いです。
+
+```javascript
+// ❌ ページネーションなし — 最大 1MB (またはアイテム上限) しか返らない
+const params = {
+  TableName: 'MyTable'
+};
+const response = await dynamodb.scan(params).promise();
+console.log(response.Items); // 不完全
+```
+
+Agent が認識していることは「scan を呼べば結果が返る」だけ。スキルがなければ、結果がページング可能であることを知りません。
+
+スキルを読み込んだ同じ Agent は:
+
+```javascript
+// ✓ ページネーター使用 — すべてのレコードを自動で取得
+const dynamodb = new DynamoDBClient({});
+const paginator = paginateScans({ client: dynamodb }, { TableName: 'MyTable' });
+
+let allItems = [];
+for await (const page of paginator) {
+  allItems = allItems.concat(page.Items || []);
+}
+console.log(allItems); // 完全
+```
+
+ページネーター API は `for await...of` で構文的に優れており、SDK は内部で `ExclusiveStartKey` を管理します。Agent はスキルから「DynamoDB スキャンはページネーターを使え」と学びます。
+
+## Python での非同期ウェイター
+
+Python で RDS インスタンスの起動を待つパターン。
+
+スキル未装備の Agent:
+
+```python
+# ❌ ポーリング自分実装 — 手作業でループと遅延
+while True:
+    response = rds.describe_db_instances(DBInstanceIdentifier='mydb')
+    if response['DBInstances'][0]['DBInstanceStatus'] == 'available':
+        break
+    time.sleep(10)
+```
+
+スキル装備の Agent:
+
+```python
+# ✓ ウェイター使用 — SDK が遅延・リトライを管理
+waiter = rds.get_waiter('db_instance_available')
+waiter.wait(DBInstanceIdentifier='mydb')
+```
+
+ウェイターは指数バックオフ、タイムアウト、最大試行回数を SDK が面倒を見ます。Agent がスキルから学んでいれば、ポーリングロジックをゼロから書きません。
+
+## IAM スコープと MCP サーバー
+
+Agent Toolkit の MCP サーバーは IAM 権限と連動します。「このタスク用に S3 読み取り権限だけを持つ IAM ロールを用意しておけば、Agent は S3 しかアクセスできない」という約束です。
+
+つまり、Agent に本番データベースへのアクセス権を与えなければ、意図せずそれを削除することはありません。これは単なる「ベストプラクティス」ではなく、アーキテクチャレベルの保証です。
+
+CloudWatch/CloudTrail で全操作が記録されるため、「Agent は何をしたのか」を後から追跡できます。
+
+## 導入チェックリスト
+
+- [ ] Agent Toolkit for AWS を npm/pip でインストール
+- [ ] プロジェクトに `.agentconfig` ファイルを配置（スキル自動読み込み用）
+- [ ] IAM ロールを task 別に分割（読み取り専用、書き込み限定など）
+- [ ] MCP サーバーをローカル/コンテナで起動
+- [ ] 最初は低リスク作業（ボイラープレート生成、設定取得）で試す
+- [ ] CloudTrail ダッシュボードで Agent アクション監査
+
+## まとめ
+
+AI Coding Agent が本番環境対応 AWS コードを書くには、単なる「良い指示」では足りません。スキルオンデマンド方式で、タスク固有の SDK ベストプラクティスをその時点で Agent に届けることが必要です。加えて、IAM スコープ付き MCP サーバーで Agent の行動範囲を制限すれば、誤操作のリスクが格段に下がります。
+
+webhani では、クライアントの AI Agent 導入時に「スキル + IAM ガードレール」をセットで設定し、Agent が確実に本番環境レベルのコードを生成する環境を整えています。
+
+*AI Agent の導入を検討中なら、スキルと権限スコープを組み込みから計画することが失敗を防ぐ鍵です。*
