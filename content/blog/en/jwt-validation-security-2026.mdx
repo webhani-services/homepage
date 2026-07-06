@@ -1,0 +1,100 @@
+---
+title: "JWT Authentication Bypass in 2026: Validate the Header, Not Just the Signature"
+description: "A 2026 authentication-bypass CVE in a widely used JWT library is a reminder that most JWT failures come from validation gaps, not broken crypto. A practical guide to validating tokens correctly."
+date: "2026-07-07"
+status: "published"
+tags: ["Security", "JWT", "Authentication", "OAuth", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "jwt-validation-security-2026"
+---
+
+A critical vulnerability disclosed in 2026, CVE-2026-29000, describes an authentication bypass in the JWT authenticator of a widely used Java security library (pac4j) when it processes encrypted JWTs. It sits in a long line of JWT problems that share a root cause: the token's cryptography was fine, but the code around it trusted something it should have verified.
+
+JWTs fail in predictable ways, and almost none of them are "the attacker broke the signature algorithm." They're validation gaps — the library or the calling code accepted a token it should have rejected. This post walks through the recurring failure patterns and what correct validation looks like, with examples in Node.js. The principles carry over to any language.
+
+## The Header Is Attacker-Controlled
+
+The most important thing to internalize: a JWT's header is supplied by whoever sends the token. The `alg` field in particular is a claim, not a fact. Historically, the two classic bypasses both live in the header.
+
+The first is the `alg: none` bypass. Some libraries, told a token uses "no algorithm," would helpfully skip signature verification entirely. The second is the RS256-to-HS256 confusion: an endpoint expecting an RSA-signed token (verified with a public key) is handed an HMAC-signed token, and a naive verifier uses the RSA *public* key as the HMAC *secret* — which is public, so the attacker can forge freely.
+
+The defense for both is the same: never let the token tell you how to verify itself. Pin the algorithm on the server side.
+
+```javascript
+import jwt from "jsonwebtoken";
+
+// WRONG — trusts whatever alg the token's header claims
+jwt.verify(token, key); // may accept none / confused algorithms
+
+// RIGHT — the server dictates the acceptable algorithm(s)
+const payload = jwt.verify(token, publicKey, {
+  algorithms: ["RS256"],       // pin it; reject everything else
+  issuer: "https://auth.example.com",
+  audience: "api.example.com",
+});
+```
+
+The `algorithms` allowlist is not optional. Without it, the header decides — and the header is the attacker's input.
+
+## Encrypted vs. Signed Are Different Guarantees
+
+The pac4j advisory involves encrypted JWTs, which is worth dwelling on because the two token types are routinely confused.
+
+A **signed** JWT (JWS) guarantees *integrity and authenticity* — you know who issued it and that it wasn't altered — but the payload is readable by anyone (base64, not encryption). An **encrypted** JWT (JWE) guarantees *confidentiality* — the payload is hidden — but encryption alone does not authenticate the sender. A token that is encrypted but whose signature or integrity is not properly checked can still be forged or replayed if the validation path has a gap.
+
+The practical takeaway: encryption is not authentication. If your system uses JWE, the code must still verify that the token came from a trusted issuer through the appropriate mechanism, and must not treat "it decrypted successfully" as "it's authentic." Bypass bugs in this area typically come from a validation branch that returns a valid session when it should have rejected an untrusted token.
+
+## Validate Every Claim You Depend On
+
+A signature check proves the token is unmodified. It says nothing about whether the token is *for you*, *still valid*, or *from someone you trust*. Those are separate checks, and skipping them is where real systems get breached.
+
+```javascript
+import jwt from "jsonwebtoken";
+
+function verifyAccessToken(token) {
+  const payload = jwt.verify(token, publicKey, {
+    algorithms: ["RS256"],
+    issuer: "https://auth.example.com",   // who signed it
+    audience: "api.example.com",          // who it's for
+    clockTolerance: 5,                    // small skew allowance, in seconds
+    maxAge: "15m",                        // reject stale tokens
+  });
+
+  // exp/nbf are enforced by verify() above, but application-level
+  // claims are your responsibility:
+  if (payload.token_use !== "access") {
+    throw new Error("refresh token presented to an access-token endpoint");
+  }
+  if (!payload.scope?.split(" ").includes("api:write")) {
+    throw new Error("insufficient scope");
+  }
+  return payload;
+}
+```
+
+Two mistakes to avoid here. Do not use a refresh token where an access token is expected — check a `token_use`-style claim. And do not authorize on the `sub` alone; verify `iss` and `aud` so a valid token minted for a *different* service can't be replayed against yours.
+
+## Rotation, Revocation, and the Stateless Trap
+
+JWTs are attractive because they're stateless: verify the signature and you're done, no database lookup. That same property is their weakness — a stateless token cannot be revoked before it expires. If a token leaks, it's valid until `exp`.
+
+Two mitigations matter in practice. Keep access tokens short-lived (minutes, not days) and rely on refresh tokens for longevity, so a leaked access token has a small window. For high-value operations, maintain a revocation list — a small, fast store (Redis is the usual choice) keyed by a token identifier (`jti`) — and check it on sensitive routes:
+
+```javascript
+async function assertNotRevoked(payload, store) {
+  if (payload.jti && (await store.exists(`revoked:${payload.jti}`))) {
+    throw new Error("token revoked");
+  }
+}
+```
+
+This reintroduces a lookup, which partly defeats the "stateless" appeal — but only where you need it. Most read endpoints can stay stateless; the handful of operations that must honor immediate revocation pay the lookup cost.
+
+## Rely on Maintained Libraries — and Keep Them Current
+
+The pac4j CVE also underscores an operational point: JWT handling is exactly the kind of code you should not write yourself, and exactly the kind of dependency you must keep patched. The subtle validation logic — algorithm pinning, key selection, JWE handling — is where hand-rolled implementations and stale libraries alike go wrong. Pin algorithms explicitly even when using a trusted library, and treat security advisories for your auth dependencies as patch-now items, not backlog.
+
+## Our Take
+
+Every few months another JWT CVE lands, and the pattern rarely changes: the cryptography held, but a validation branch trusted the wrong thing. That's good news, because it means the defenses are knowable and cheap. Pin the algorithm server-side so the header can't choose it. Verify `iss`, `aud`, `exp`, and a token-use claim on every request, not just the signature. Understand whether you need signing, encryption, or both — and never treat "it decrypted" as "it's authentic." Keep tokens short-lived, add revocation only where immediacy matters, and keep your auth libraries patched. None of this is exotic; it's discipline applied consistently at the boundary where your system decides who someone is.
