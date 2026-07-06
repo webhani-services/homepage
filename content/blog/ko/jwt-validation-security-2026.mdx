@@ -1,0 +1,100 @@
+---
+title: "2026년 JWT 인증 우회: Signature뿐 아니라 Header를 검증하라"
+description: "2026년 널리 쓰이는 JWT Library에서 공개된 인증 우회 CVE는, JWT 실패의 대부분이 암호의 붕괴가 아니라 검증의 누락에서 온다는 것을 상기시킵니다. Token을 올바르게 검증하기 위한 실전 Guide입니다."
+date: "2026-07-07"
+status: "published"
+tags: ["Security", "JWT", "Authentication", "OAuth", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "jwt-validation-security-2026"
+---
+
+2026년에 공개된 중대한 취약점 CVE-2026-29000은, 널리 쓰이는 Java Security Library(pac4j)의 JWT authenticator가 암호화된 JWT를 처리할 때의 인증 우회를 기술합니다. 이는 같은 근본 원인을 공유하는 JWT 문제의 긴 계보에 속합니다 — Token의 암호 자체는 문제없었는데, 그 주변 Code가 "검증해야 할 것"을 신뢰해 버린 것입니다.
+
+JWT는 예측 가능한 방식으로 실패하며, 그 대부분은 "공격자가 Signature Algorithm을 깼다"가 아닙니다. 검증의 누락 — Library나 호출 측 Code가 거부해야 할 Token을 받아들이는 것 — 입니다. 이 글에서는 반복해서 나타나는 실패 Pattern과 올바른 검증이 어떤 모습인지를 Node.js 예제로 설명합니다. 원칙은 어느 언어에도 통용됩니다.
+
+## Header는 공격자가 제어할 수 있다
+
+가장 내면화해야 할 것: JWT의 Header는 Token을 보내는 자가 공급합니다. 특히 `alg` 필드는 "사실"이 아니라 "주장(claim)"입니다. 역사적으로 두 가지 고전적 우회는 모두 Header에 존재합니다.
+
+첫째는 `alg: none` 우회. 일부 Library는 "이 Token은 Algorithm 없음"이라고 들으면 친절하게도 Signature 검증을 완전히 건너뛰었습니다. 둘째는 RS256-to-HS256 혼동. RSA 서명 Token(Public Key로 검증)을 기대하는 Endpoint에 HMAC 서명 Token을 건네면, 순진한 검증기는 RSA의 *Public* Key를 HMAC의 *Secret*으로 써 버립니다 — Public Key이므로 공격자는 자유롭게 위조할 수 있습니다.
+
+둘 다에 대한 방어는 같습니다. Token에게 "자신을 어떻게 검증할지"를 정하게 하지 않는 것. Server 측에서 Algorithm을 고정합니다.
+
+```javascript
+import jwt from "jsonwebtoken";
+
+// 잘못됨 — Token의 Header가 주장하는 alg를 신뢰해 버린다
+jwt.verify(token, key); // none / 혼동된 Algorithm을 받아들일 수 있음
+
+// 올바름 — Server가 허용할 Algorithm을 지정한다
+const payload = jwt.verify(token, publicKey, {
+  algorithms: ["RS256"],       // 고정하고, 그 외는 모두 거부
+  issuer: "https://auth.example.com",
+  audience: "api.example.com",
+});
+```
+
+`algorithms` 허용 목록은 선택이 아닙니다. 이것이 없으면 Header가 결정합니다 — 그리고 Header는 공격자의 입력입니다.
+
+## 암호화와 서명은 다른 보증
+
+pac4j Advisory는 암호화된 JWT에 관한 것으로, 이 두 종류의 Token이 일상적으로 혼동되기에 파고들 가치가 있습니다.
+
+**서명된** JWT(JWS)는 *무결성과 진정성*을 보증합니다 — 누가 발행했는지, 변조되지 않았는지 알 수 있습니다 — 하지만 Payload는 누구나 읽을 수 있습니다(암호화가 아니라 base64). **암호화된** JWT(JWE)는 *기밀성*을 보증합니다 — Payload는 숨겨집니다 — 하지만 암호화만으로는 송신자를 인증하지 않습니다. 암호화되었더라도 Signature나 무결성이 적절히 확인되지 않은 Token은, 검증 Path에 누락이 있으면 여전히 위조나 Replay가 가능합니다.
+
+실전적 요점: 암호화는 인증이 아닙니다. System이 JWE를 쓴다면, Code는 여전히 "Token이 신뢰할 수 있는 발행자로부터 왔다"는 것을 적절한 메커니즘으로 검증해야 하며, "복호에 성공했다"를 "진정하다"로 다루어서는 안 됩니다. 이 영역의 우회 Bug는, 신뢰할 수 없는 Token을 거부해야 할 곳에서 유효한 Session을 반환해 버리는 검증 분기에서 나오는 것이 전형적입니다.
+
+## 의존하는 모든 Claim을 검증한다
+
+Signature Check는 Token이 변조되지 않았음을 증명합니다. 그것이 *당신에게 온 것*인지, *아직 유효*한지, *신뢰할 수 있는 상대로부터*인지에 대해서는 아무것도 말하지 않습니다. 이들은 별개의 Check이며, 생략하는 것이 실제 System이 침해되는 지점입니다.
+
+```javascript
+import jwt from "jsonwebtoken";
+
+function verifyAccessToken(token) {
+  const payload = jwt.verify(token, publicKey, {
+    algorithms: ["RS256"],
+    issuer: "https://auth.example.com",   // 누가 서명했는가
+    audience: "api.example.com",          // 누구에게 온 것인가
+    clockTolerance: 5,                    // 작은 Clock 오차 허용(초)
+    maxAge: "15m",                        // 너무 오래된 Token을 거부
+  });
+
+  // exp/nbf는 위의 verify()가 강제하지만, Application 계층의
+  // Claim은 당신의 책임:
+  if (payload.token_use !== "access") {
+    throw new Error("access Token Endpoint에 refresh Token이 제시됨");
+  }
+  if (!payload.scope?.split(" ").includes("api:write")) {
+    throw new Error("Scope 부족");
+  }
+  return payload;
+}
+```
+
+여기서 피해야 할 두 가지 실수. access Token이 기대되는 곳에서 refresh Token을 쓰지 말 것 — `token_use` 상당의 Claim을 확인합니다. 그리고 `sub`만으로 인가하지 말 것 — `iss`와 `aud`를 검증해, *다른* Service를 위해 발행된 유효한 Token이 당신의 Service에 Replay되지 않게 합니다.
+
+## Rotation, Revocation, 그리고 Stateless의 함정
+
+JWT가 매력적인 것은 Stateless이기 때문입니다 — Signature를 검증하면 끝, Database 조회 없음. 바로 그 성질이 약점이기도 합니다 — Stateless Token은 만료 전에 Revoke할 수 없습니다. Token이 새면 `exp`까지 유효합니다.
+
+실전에서 중요한 완화책은 두 가지. access Token을 짧게 유지하고(일 단위가 아니라 분 단위), 수명은 refresh Token에 맡겨 샌 access Token의 Window를 작게 합니다. 고가치 작업에는 Revocation List — Token 식별자(`jti`)를 Key로 한 작고 빠른 Store(Redis가 정석) — 를 유지하고 민감한 Route에서 확인합니다.
+
+```javascript
+async function assertNotRevoked(payload, store) {
+  if (payload.jti && (await store.exists(`revoked:${payload.jti}`))) {
+    throw new Error("Token은 Revoke됨");
+  }
+}
+```
+
+이는 조회를 다시 도입해 "Stateless"의 매력을 부분적으로 상쇄합니다 — 하지만 필요한 곳에서만입니다. 대부분의 읽기 Endpoint는 Stateless로 남길 수 있고, 즉시 Revocation을 존중해야 하는 소수의 작업만 조회 비용을 냅니다.
+
+## 유지보수되는 Library에 의존하고, 최신으로 유지하라
+
+pac4j CVE는 운영상의 요점도 강조합니다. JWT 처리는 바로 "직접 짜서는 안 되는" 종류의 Code이며, 바로 "Patch를 계속 적용해야 하는" 종류의 의존성입니다. 미묘한 검증 Logic — Algorithm 고정, Key 선택, JWE 처리 — 이야말로 수제 구현도 낡은 Library도 똑같이 틀리는 지점입니다. 신뢰할 수 있는 Library를 쓸 때도 Algorithm을 명시적으로 고정하고, 인증 의존성의 Security Advisory를 "Backlog"가 아니라 "지금 Patch" 항목으로 다루세요.
+
+## Webhani의 견해
+
+몇 달마다 또 다른 JWT CVE가 오지만, Pattern은 거의 바뀌지 않습니다 — 암호는 버텼는데 검증 분기가 잘못된 것을 신뢰했다. 이는 희소식입니다. 방어가 알려져 있고 저렴하다는 뜻이니까요. Header가 고를 수 없도록 Algorithm을 Server 측에서 고정하라. Signature뿐 아니라 Request마다 `iss`·`aud`·`exp`·Token 용도 Claim을 검증하라. 서명·암호화·둘 다 중 무엇이 필요한지 이해하고, "복호됐다"를 "진정하다"로 결코 다루지 말라. Token을 짧게 유지하고, 즉시성이 중요한 곳에만 Revocation을 더하고, 인증 Library를 계속 Patch하라. 어느 것도 기이하지 않습니다. System이 "상대가 누구인지"를 결정하는 경계에서, 일관되게 적용되는 규율입니다.
