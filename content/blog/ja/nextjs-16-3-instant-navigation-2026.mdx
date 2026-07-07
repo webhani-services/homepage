@@ -1,0 +1,97 @@
+---
+title: "Next.js 16.3のInstant Navigation: クリックが即座に感じられる仕組み"
+description: "Next.js 16.3が打ち出す即時ナビゲーション。Prefetchとstreamingの改善で画面遷移がどう速く感じられるのか、その仕組みと実務での活かし方、注意点をNext.jsを使う立場から整理します。"
+date: "2026-07-08"
+status: "published"
+tags: ["Next.js", "React", "Performance", "Web Development", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-3-instant-navigation-2026"
+---
+
+## 「速い」ではなく「即座」を目指す
+
+2026年6月29日にリリースされたNext.js 16.3では、Turbopackのメモリ削減やビルドキャッシュに注目が集まりましたが（[Next.js Blog](https://nextjs.org/blog/next-16-3-turbopack)）、実際のユーザー体験に直結するのは「Instant Navigation」の改善です。よりスマートなPrefetchとstreamingにより、リンクをクリックした瞬間に画面が反応するように感じられる、という方向性です。
+
+ここで大切なのは「速い」と「即座」の違いです。ページ全体の読み込みが1秒で終わることと、クリックした瞬間に何かが動くことは、体感上まったく別物です。人間の知覚では、100ミリ秒以内に反応があれば「直接操作している」と感じ、それを超えると「待たされている」と感じ始めます。Instant Navigationは、この知覚の境界を意識した設計です。
+
+この記事では、この仕組みを支えるPrefetchとstreamingの考え方、そしてNext.jsを使う開発者として何に気をつけるべきかを整理します。
+
+## Prefetch: クリック前に準備を終える
+
+Next.jsのApp Routerでは、`<Link>`コンポーネントがビューポートに入ると、遷移先のデータを事前に取得しようとします。ユーザーがまだクリックしていない段階で必要なものを揃えておくため、実際にクリックしたときには表示に必要な材料が手元にある、という発想です。
+
+```tsx
+import Link from "next/link";
+
+// ビューポートに入った時点でprefetchが走る
+export function ArticleCard({ slug, title }: { slug: string; title: string }) {
+  return (
+    <Link href={`/blog/${slug}`} prefetch>
+      <article className="card">
+        <h2>{title}</h2>
+      </article>
+    </Link>
+  );
+}
+```
+
+16.3の改善のポイントは、このPrefetchが「よりスマート」になったことです。すべてを一律に先読みするのではなく、何を優先して取得するかの判断が洗練され、無駄な通信を抑えつつ体感速度を上げる方向に進んでいます。
+
+ただし、Prefetchは万能ではありません。ビューポートに大量のリンクがある一覧ページで全部を先読みすると、かえって帯域を圧迫します。私たちが実装をレビューする際は、一覧の各カードで無条件にprefetchを有効化していないか、必ず確認するようにしています。
+
+## Streaming: 揃った部分から先に見せる
+
+もう一つの柱がstreamingです。ページ全体のデータが揃うのを待たずに、準備できた部分から順にHTMLを送り出す仕組みで、React Server ComponentsとSuspenseの組み合わせで実現します。
+
+```tsx
+import { Suspense } from "react";
+
+export default function BlogPage() {
+  return (
+    <main>
+      {/* すぐ出せるヘッダーは即座に表示 */}
+      <BlogHeader />
+
+      {/* 重い一覧はSuspenseで囲み、準備でき次第流し込む */}
+      <Suspense fallback={<PostListSkeleton />}>
+        <PostList />
+      </Suspense>
+    </main>
+  );
+}
+```
+
+この構造にしておくと、`PostList`のデータ取得に時間がかかっても、ヘッダーやレイアウトは即座に表示されます。ユーザーは「何も起きない白い画面」を見ずに済み、待ち時間そのものは変わらなくても体感の速さは大きく改善します。
+
+Instant Navigationは、このPrefetch（クリック前の準備）とstreaming（揃った部分から表示）を組み合わせることで、遷移が途切れず滑らかに感じられるようにする設計だと理解すると分かりやすいです。
+
+## 実務で気をつける3つのこと
+
+### 1. Suspense境界の粒度を設計する
+
+Suspenseで囲む範囲が大きすぎると、streamingの恩恵が薄れます。逆に細かく分けすぎると、スケルトンがちらついて落ち着きません。「最初に見せたい部分」と「遅れても許される部分」を分けて境界を引くのが実務の勘所です。
+
+### 2. Prefetchの対象を絞る
+
+前述のとおり、無条件のprefetchは帯域を無駄にします。重要な導線（記事詳細への遷移など）に絞り、優先度の低いリンクは控えめにするのが定石です。
+
+### 3. 体感速度を計測で確認する
+
+Instant Navigationの効果は主観的に感じられますが、思い込みで終わらせず計測することが重要です。Core Web VitalsのINP（Interaction to Next Paint）は、クリックからの反応速度を測る指標として特に有効です。改善前後で数値を比較する習慣をつけると、施策の効果を客観的に判断できます。
+
+## webhaniの視点
+
+Instant Navigationのような改善は、Frameworkのバージョンを上げるだけで自動的に効いてくれる部分と、こちらの実装次第で効果が変わる部分があります。Prefetchとstreamingは後者です。Suspense境界の引き方やPrefetchの対象選定といった設計判断が、体感速度を大きく左右します。
+
+私たちが顧客のNext.jsプロジェクトを支援する際は、まずINPを計測して現状の遷移体験を数値化し、そのうえでSuspense境界とPrefetch戦略を見直す、という順序で進めます。「なんとなく速くなった気がする」で終わらせず、計測に基づいて改善するのが確実です。
+
+## まとめ
+
+Next.js 16.3のInstant Navigationは、Prefetchでクリック前に準備を終え、streamingで揃った部分から表示することで、遷移を「即座」に感じさせる設計です。Frameworkが土台を用意してくれる一方、Suspense境界の粒度やPrefetchの対象選定といった実装判断が効果を左右します。
+
+バージョンを上げたら、まずINPを計測してみてください。数値で現状を把握することが、体感速度改善の最初の一歩です。
+
+---
+
+*webhaniはNext.jsをはじめとするモダンWeb開発のコンサルティングを行っています。パフォーマンス改善のご相談はお気軽にどうぞ。*
