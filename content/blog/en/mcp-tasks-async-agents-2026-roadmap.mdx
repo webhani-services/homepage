@@ -1,0 +1,101 @@
+---
+title: "MCP's 2026 Roadmap: Why Async Tasks and Stateless HTTP Matter"
+description: "A look at two upcoming Model Context Protocol capabilities — the Tasks primitive and stateless HTTP transport — and what they mean for teams building production MCP servers."
+date: "2026-07-09"
+status: "published"
+tags: ["MCP", "AI Agents", "Architecture", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "mcp-tasks-async-agents-2026-roadmap"
+---
+
+Most MCP servers today are built the same way you'd build a REST endpoint: client sends a request, server does the work, server sends back a response. That model works fine for reading a file or querying a database. It falls apart the moment a tool needs to run for 20 minutes.
+
+The MCP steering committee's 2026 roadmap addresses this directly with two changes that sound modest on paper but reshape how you architect an MCP server: a **Tasks primitive** for long-running operations, and a **stateless HTTP transport** variant. We've been tracking both because they solve real problems we've already hit while building MCP integrations for clients.
+
+## The problem: synchronous request/response doesn't fit agent workloads
+
+An HTTP request has an implicit contract: the connection stays open until the server responds, and both sides expect that to happen in seconds, not minutes. MCP inherited this shape from JSON-RPC over stdio and SSE, and it's a reasonable default for tool calls like "look up this record" or "format this JSON."
+
+But agents increasingly kick off work that doesn't fit that contract — training a model, running a multi-step data pipeline, waiting on a third-party batch API, or crawling a large document set. If your MCP server tries to model that as a single synchronous `tools/call`, you end up with one of three bad outcomes:
+
+- The client times out and the agent thinks the tool failed, even though the job is still running.
+- You hold the connection open for 20 minutes, which is fragile under any network hiccup and expensive if you're paying for compute per open connection.
+- You build your own ad-hoc polling scheme on top of MCP, which defeats the point of using a standard protocol.
+
+Persistent, always-on agents make this worse. An agent that's supposed to run unattended for hours can't afford to block on a single tool call. It needs to dispatch the job, go do other things, and check back later.
+
+## What the Tasks primitive actually changes
+
+The Tasks primitive turns a long-running operation into a first-class object with its own lifecycle instead of a single request/response pair. Conceptually, the flow looks like this:
+
+```typescript
+// 1. Client dispatches work and gets a task handle back immediately
+const { taskId } = await mcpClient.callTool("run-data-pipeline", {
+  source: "s3://raw-events/2026-07-09/",
+  transform: "dedupe-and-enrich",
+});
+
+// 2. Client polls (or the agent's scheduler does) instead of blocking
+async function waitForTask(taskId: string) {
+  while (true) {
+    const status = await mcpClient.getTaskStatus(taskId);
+
+    if (status.state === "completed") return status.result;
+    if (status.state === "failed") throw new Error(status.error);
+
+    // still "running" or "queued" — back off and check again later
+    await sleep(status.suggestedPollIntervalMs ?? 5000);
+  }
+}
+```
+
+The important part isn't the polling loop itself — it's what this does to server design. Your MCP server now needs:
+
+- A way to durably track task state (in-memory is fine for a demo, but production means a database row or a queue entry that survives a server restart).
+- An identifier scheme so a client reconnecting an hour later can still ask "how's task `abc123` doing?"
+- A cancellation path, because agents change their mind or get killed mid-run.
+- Sensible status semantics (`queued`, `running`, `completed`, `failed` — and ideally partial progress reporting for long jobs).
+
+This is a genuine shift from "MCP server as a thin RPC wrapper" to "MCP server as a small job orchestration system." If you're already running background job infrastructure (Celery, Sidekiq, a cloud task queue), Tasks is largely a thin adapter layer on top of what you have. If you're not, this is the point where you need one.
+
+## Stateless HTTP: scaling MCP servers like any other service
+
+The second piece is a stateless HTTP transport option. Today, a lot of MCP servers use Server-Sent Events, which means the server holds a persistent connection per client. That's fine at low scale, but it means your load balancer has to do sticky sessions, your servers hold open file descriptors per connected agent, and horizontal scaling gets awkward — a new instance can't "steal" an in-flight SSE session from another instance.
+
+Stateless HTTP means each request carries everything the server needs to handle it, with no requirement to keep a connection or in-memory session alive between calls. A conceptual handler looks like an ordinary HTTP endpoint:
+
+```typescript
+// A stateless MCP HTTP handler — no session object, no held connection
+export async function handleMcpRequest(req: Request): Promise<Response> {
+  const rpcMessage = await req.json();
+
+  // Any state needed (task status, resource cache) is looked up
+  // from an external store, not from server memory
+  const result = await routeMcpMethod(rpcMessage, {
+    store: sharedTaskStore, // e.g. Redis, Postgres — not process memory
+  });
+
+  return Response.json(result);
+}
+```
+
+Any standard load balancer can round-robin these requests across instances, because no instance is special. Combine this with the Tasks primitive and you get a clean pattern: a client dispatches a task to whichever instance answers the request, and polls task status from whichever instance answers the next request — because task state lives in shared storage, not in a specific process.
+
+This is the same lesson web backends learned a decade ago moving from sticky-session app servers to stateless services behind a load balancer. MCP is just catching up to it for agent tooling.
+
+## webhani's take: when to adopt this, and when not to
+
+We wouldn't tell every team to rebuild their MCP server around Tasks and stateless HTTP tomorrow. A few practical guidelines from what we've seen:
+
+**Keep it simple if your tools are genuinely fast.** If every tool call in your server finishes in a couple of seconds — CRUD operations, lookups, simple transforms — synchronous request/response is still the right default. Don't add task-polling machinery for work that doesn't need it; it's pure overhead.
+
+**Adopt Tasks when you have anything that can plausibly exceed your client's timeout**, especially anything involving external APIs with unpredictable latency, batch processing, or multi-step chains where one step depends on a slow upstream system. If you're already reaching for `setTimeout`-based keep-alives or manual retry logic to survive a long call, that's your signal.
+
+**Move to stateless HTTP when you're actually scaling horizontally**, not preemptively. A single-instance internal tool doesn't need this. A shared MCP server fronting multiple teams or handling meaningful request volume does — and it's much easier to design for statelessness from the start than to retrofit it after you've accumulated in-memory session state.
+
+**Plan your task storage layer before you need it.** The Tasks primitive doesn't specify how you persist task state — that's on you. Decide early whether that's a Redis TTL-based store, a Postgres table, or your existing job queue's status table. Retrofitting durability after an agent loses track of a running job mid-migration is a bad time to design this.
+
+**Watch the spec, but build defensively.** The roadmap items aren't finalized yet, and SDK support will land unevenly across languages. If you're building now, isolate the transport and task-tracking logic behind your own interface so you can swap in the official primitive later without rewriting your tool handlers.
+
+The common thread across both changes: MCP is maturing from "protocol for a single assistant calling a few tools" toward "protocol for production agent infrastructure." That's a good direction, but it does mean the servers we build need to look more like real backend services and less like request handlers.

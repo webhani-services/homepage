@@ -1,0 +1,113 @@
+---
+title: "2026년 중반 Infrastructure as Code — Terraform, OpenTofu, Pulumi 그리고 Agentic IaC의 등장"
+description: "Terraform과 OpenTofu의 갈라짐이 깊어지고 Pulumi Neo로 대표되는 Agentic IaC가 실전 단계에 들어선 2026년 중반 상황을 정리하고, 도입 시 필요한 Guardrail을 소개합니다."
+date: "2026-07-09"
+status: "published"
+tags: ["Infrastructure as Code", "Terraform", "OpenTofu", "Pulumi", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "iac-2026-agentic-pulumi-neo-opentofu"
+---
+
+Terraform과 OpenTofu 중 무엇을 쓸지 고민하는 팀에게 최근 반년 사이 상황이 꽤 바뀌었다는 걸 먼저 말씀드리고 싶습니다. 두 프로젝트의 기능 격차는 계속 벌어지고 있고, Pulumi는 AI Agent가 Infrastructure 변경을 스스로 계획하고 실행하는 Pulumi Neo를 정식 출시했습니다. HashiCorp의 무료 Plan도 크게 바뀌었습니다. webhani가 고객사의 Infrastructure 구성을 지원하며 확인한 실무 관점에서 이 변화를 정리해봅니다.
+
+## 세 개의 Tool, 세 개의 철학
+
+Terraform, OpenTofu, Pulumi 사이의 삼파전은 이제 "HCL 방언 중 뭐가 취향에 맞는가" 수준의 이야기가 아닙니다. 각자 다른 User층을 겨냥해 진화하고 있습니다.
+
+**Terraform**은 2026년 3월 1.14 Version이 Stable로 전환됐고, 현재 1.15가 Release Candidate 단계로 Windows ARM64 지원이 추가됐습니다. IBM 산하 HashiCorp의 방향성은 명확히 Enterprise 중심입니다 — Terraform Cloud/Enterprise 통합, Sentinel Policy Set, Support 계약이 축입니다. 올해 가장 화제였던 건 HashiCorp의 기존 무료 Plan이 2026년 3월 31일부로 End of Life 되고, 사용량 제한이 다른 "Enhanced Free" Tier로 대체된 일입니다. 기존 무료 Plan을 쓰던 팀은 이 공지를 대충 넘기지 않고 실제로 대응해야 했습니다.
+
+**OpenTofu**는 Linux Foundation 산하 Fork로서, Terraform에는 없는 기능을 Community 주도로 계속 추가하고 있습니다. OpenTofu 1.12 Release Notes에 따르면 1.12.x Version(2026년 6월 12일경 배포된 1.12.2 포함)에서 Provider/Module용 OCI Registry 지원, DynamoDB 없이 동작하는 Native S3 State Locking, Plan/Apply 실행에 대한 Experimental OpenTelemetry Tracing이 추가됐습니다. Container 관련해서 이미 OCI Registry를 표준으로 쓰고 있는 조직이라면, Terraform Provider와 Module도 같은 Registry에서 가져올 수 있다는 건 실무적으로 꽤 의미 있는 단순화입니다.
+
+**Pulumi**는 아예 다른 노선을 택했습니다. DSL 대신 범용 Programming 언어(TypeScript, Python, Go, Java, .NET)를 쓰고, 그 위에 점점 더 Agentic Layer를 쌓고 있습니다. Pulumi ESC(Environments, Secrets, Configuration)는 계층적이고 Dynamic한 Secret 관리를 담당하며, "production" Config가 "base" Config를 상속하는 식으로 Environment를 합성할 수 있어 값을 여러 File에 복사-붙여넣기할 필요가 없습니다.
+
+실무 판단 기준은 "기술적으로 어느 게 더 우수한가"가 아닙니다. 셋 다 같은 Cloud Resource를 구성할 수 있습니다. 중요한 건 어느 Failure Mode에 더 익숙한가입니다 — HCL의 Declarative한 제약인지, 범용 Programming 언어의 유연함(그리고 6개월 뒤엔 아무도 못 읽을 만큼 정교한 Infrastructure Logic을 누군가 짜버릴 위험)인지를 선택하는 문제입니다.
+
+## Agentic IaC가 실제로 의미하는 것
+
+정식 출시된 Pulumi Neo는 2026년에 "Agentic IaC"라고 부르는 것의 가장 명확한 사례입니다. 단순한 Autocomplete가 아닙니다. Workflow는 다음과 같습니다.
+
+1. 자연어로 Infrastructure 목표를 서술합니다("orders Database에 Read Replica를 추가하고 자동 Failover를 설정해줘").
+2. Agent가 기존 Stack을 검사하고 Plan을 세운 뒤, 그에 맞는 Pulumi Program을 생성합니다(또는 기존 Program과의 Diff를 생성합니다).
+3. 내부적으로 `pulumi preview`를 실행해 Diff를 평가하고 — 여기가 핵심인데 — Team이 설정한 경계에서 반드시 Review를 위해 멈춥니다.
+4. 승인(사람에 의한 것이든 자동화된 Policy Check든)을 거친 뒤에야 `pulumi up`을 실행합니다.
+
+여기서 중요한 구분이 있습니다. IaC를 "생성"하는 Agent는 Editor에서 HCL을 Autocomplete하는 LLM과 본질적으로 다르지 않습니다. 하지만 실제 Cloud Account에 대해 변경을 "계획하고 실행"하는 Agent는 다른 Risk 범주에 속합니다. Blast Radius에 여러분이 작성한 것뿐 아니라 Agent가 판단한 것까지 포함되기 때문입니다.
+
+그래서 "Agentic"한 IaC Tool들은 원시 능력이 아니라 Guardrail을 중심으로 설계됩니다.
+
+- **권한 범위 제한.** Agent의 Execution Role은 다루는 Stack보다 넓게 접근할 수 없어야 합니다. Staging VPC를 관리 중이라면 `iam:*`이나 Cross-Account Trust를 가지면 안 됩니다.
+- **Plan Review 필수화.** Agent가 생성한 모든 변경은 Apply 전에 반드시 Plan File을 생성해야 합니다. 신입 Engineer의 PR에 요구하는 것과 같은 원칙입니다.
+- **Policy-as-Code Gate.** 비용 임계치, Tagging 요구사항, "Public S3 Bucket 금지" 같은 자동 Check를 사람이 Plan을 보기 전에 실행해서, Review 시간을 Linting이 아니라 판단이 필요한 부분에 쓸 수 있게 합니다.
+- **Blast Radius 제한.** 명시적인 사람의 승인 없이 Agent가 N개 이상 Resource를 건드리거나 Stateful한 것을 삭제하는 걸 강제로 막는 장치입니다.
+
+아래는 OpenTofu의 JSON Plan 출력과 간단한 Rego 스타일 Policy를 이용해, Agent가 생성한 Plan을 Apply 전에 Policy-as-Code로 Gating하는 개념적 예시입니다.
+
+```hcl
+# ci/policy/no-public-buckets.rego
+package iac.review
+
+deny[msg] {
+  resource := input.resource_changes[_]
+  resource.type == "aws_s3_bucket_acl"
+  resource.change.after.acl == "public-read"
+  msg := sprintf("agent-proposed change makes %s public", [resource.address])
+}
+
+deny[msg] {
+  resource := input.resource_changes[_]
+  resource.change.actions[_] == "delete"
+  resource.type == "aws_db_instance"
+  msg := sprintf("agent-proposed plan deletes a database instance: %s", [resource.address])
+}
+```
+
+```bash
+# CI 단계: Agent가 Plan을 제안하고, Policy Gate가 이를 심사하며, 통과한 경우에만 사람이 승인
+tofu plan -out=agent.plan
+tofu show -json agent.plan > agent-plan.json
+opa eval --input agent-plan.json --data ci/policy/ -f pretty \
+  "data.iac.review.deny" > violations.txt
+
+if [ -s violations.txt ]; then
+  echo "Policy 위반 발견 — 자동 Apply를 막고 사람의 Review로 넘김"
+  exit 1
+fi
+
+# 위반이 없는 경우에만, Apply 전에 명시적인 사람의 승인을 요구
+tofu apply agent.plan
+```
+
+핵심은 Rego 문법 자체가 아니라 패턴입니다. Agent의 결과물은 사람이 만든 Plan과 정확히 같은 Gate를 통과해야 하고, 깨끗한 Policy Check는 Apply를 위한 필요조건이지 충분조건이 아닙니다. 결국엔 누군가 Diff를 직접 봐야 합니다.
+
+## Native S3 State Locking — 화려하진 않지만 실질적인 효과는 큼
+
+Agentic 계열만큼 화려하진 않지만, 대다수 Team에게 더 즉각적으로 유용한 건 OpenTofu 1.12에 추가된 S3 Backend Native State Locking입니다. `use_lockfile`을 통해, 동시 실행되는 Apply가 State를 손상시키는 걸 막기 위해서만 존재하던 DynamoDB Table 의존성이 사라졌습니다.
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket       = "acme-corp-tfstate"
+    key          = "prod/network/terraform.tfstate"
+    region       = "ap-northeast-1"
+    use_lockfile = true # native locking, dynamodb_table 불필요
+    encrypt      = true
+  }
+}
+```
+
+몇 년째 Terraform/OpenTofu 구성을 운영해왔다면, Environment마다, 때로는 Module마다 만들어둔 자잘한 DynamoDB Lock Table이 쌓여 있을 겁니다. 각각 별도의 IAM 권한이 있고, 별도의 비용 항목이 있으며, Access 감사를 할 때마다 "이게 왜 있는 거지"라는 질문의 대상이 됩니다. DynamoDB를 제거한다고 Architecture가 근본적으로 바뀌는 건 아니지만, "이게 왜 있고 삭제해도 되는가" 하는 부류의 질문을 Infrastructure에서 하나 줄일 수 있고, IAM Policy를 잘못 설정할 Resource도 하나 줄어듭니다.
+
+**마이그레이션 시 주의사항.** `use_lockfile = true`로 바꾸고 끝내면 안 됩니다. 먼저 `plan`을 실행해 아무도 오래된 Lock을 쥐고 있지 않은지 확인하세요. Backend 변경 도중 진행 중인 State Operation과 경합이 생기면 그게 바로 State File이 손상되는 전형적인 패턴이므로, 마이그레이션은 트래픽이 적은 시간대에 진행합니다. 그리고 Native Locking으로 최소 한 번의 깨끗한 Apply Cycle을 확인한 뒤에야 DynamoDB Table을 삭제하세요. 바로 지우지 말고 한 Sprint 정도는 남겨두는 게 안전합니다. Idle 상태 비용은 거의 없으니 저렴한 보험이라고 생각하면 됩니다.
+
+## webhani의 관점
+
+저희는 Agentic IaC를 일시적인 유행이라고 보지 않습니다. 하지만 동시에, 대다수 Team이 지금 당장 Production에 Agent를 붙여야 한다고도 생각하지 않습니다. 2026년 시점 실무 Guidance는 다음과 같습니다.
+
+- **Agentic IaC는 Blast Radius가 작은 Environment에서 시작하세요.** Sandbox와 Staging Account, 일시적인 Preview Environment, Ticket 단위로 분리된 Sandbox가 좋은 후보입니다. Production Database나 Network 변경은 최소 몇 달간 Guardrail의 실적을 쌓기 전까지는 대상에서 제외해야 합니다.
+- **Agent가 Loop에 들어온 순간부터 Policy-as-Code는 선택이 아니라 필수입니다.** 사람이 HCL을 작성하면 Code Review가 명백한 실수를 잡아줍니다. Agent가 작성한다면 같은 Catch를 Automation에 내장해야 합니다. Agent는 나쁜 Diff를 내놓아도 사람처럼 민망함을 느끼지 않기 때문입니다.
+- **Plan Review는 형식적 절차가 아니라 Hard Gate로 취급하세요.** Agentic Tool을 쓰다 보면 "Agent는 대체로 맞다"는 이유로 Plan을 기계적으로 승인하고 싶어집니다. 그게 바로 Guardrail이 막으려는 Failure Mode입니다.
+- **HashiCorp의 기존 무료 Plan을 아직 쓰고 있다면, 한계에 부딪히고 나서 허둥대지 말고 지금부터 전환 시간을 확보하세요.**
+- **DynamoDB에서 Native Locking으로의 마이그레이션은 Agentic 요소를 건드리지 않고도 2026년 OpenTofu 기능을 경험해볼 수 있는 Risk 낮은 좋은 시작점입니다.** 먼저 이것부터 해보세요. Backend 구성을 다시 들여다보는 계기가 되고, 더 자율적인 것에 Infrastructure를 맡기기 전 기반을 다지는 작업으로도 유용합니다.
+
+Terraform, OpenTofu, Pulumi의 삼파전은 올해 안에 승자 하나로 정리되지 않을 겁니다. 2026년에 진짜로 달라진 건, 이 선택에 "얼마나 많은 자율성을 위임할 수 있는가"라는 축이 더해졌다는 점입니다. 이건 관성대로 흘러갈 게 아니라 의도적으로 결정해야 할 문제라고 생각합니다.

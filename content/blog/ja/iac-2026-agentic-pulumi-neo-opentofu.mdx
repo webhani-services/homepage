@@ -1,0 +1,113 @@
+---
+title: "2026年中盤のInfrastructure as Code — Terraform・OpenTofu・Pulumiと「Agentic IaC」の到来"
+description: "TerraformとOpenTofuの分岐が進み、Pulumi NeoによるAgentic IaCが実用段階に入った2026年中盤の状況を整理し、導入時に押さえるべきガードレールを解説します。"
+date: "2026-07-09"
+status: "published"
+tags: ["Infrastructure as Code", "Terraform", "OpenTofu", "Pulumi", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "iac-2026-agentic-pulumi-neo-opentofu"
+---
+
+「TerraformとOpenTofu、どっちを使うべきか」という質問は2023年のフォーク騒動の頃からよく聞かれますが、2026年中盤の今、状況はさらに複雑になっています。両者の機能差は広がり続け、PulumiはAIエージェントがInfrastructureの変更を自律的に計画・実行する「Pulumi Neo」を一般提供開始しました。HashiCorpの無料Planも大きく変わりました。この記事では、私たちwebhaniが顧客のInfrastructure構成を支援する中で見えてきた実務上の論点を整理します。
+
+## 3つのTool、3つの思想
+
+TerraformとOpenTofuとPulumiの分岐は、もはや「HCLの方言のどちらが好みか」というLevelの話ではなくなっています。それぞれが異なるUser層を意識した進化を遂げています。
+
+**Terraform**は2026年3月にVersion 1.14がStableとなり、現在1.15がRelease Candidate中でWindows ARM64対応が追加されています。IBM傘下でのHashiCorpの方向性は明確にEnterprise寄りで、Terraform Cloud/Enterpriseとの統合、Sentinelによるポリシー管理、サポート契約が軸になっています。今年最も話題になったのは、HashiCorpの旧無料Planが2026年3月31日をもってEnd of Lifeとなり、利用量制限の異なる「Enhanced Free」Tierに置き換わったことです。旧無料Planを使っていたTeamは、この移行通知を読み飛ばさず実際に対応する必要がありました。
+
+**OpenTofu**はLinux Foundation配下のForkとして、Terraformにはない機能を Communityドリブンで追加し続けています。OpenTofuの1.12 Release Notesによると、Version 1.12.x（2026年6月12日頃リリースの1.12.2を含む）ではProviderやModule向けのOCI Registry対応、DynamoDBなしのNative S3 State Lockingの実装、Plan/Apply実行のExperimentalなOpenTelemetry Traceが追加されました。すでにContainer関連でOCI Registryを標準化している組織にとっては、Terraform ProviderやModuleも同じRegistryから取得できることは実務上小さくない簡素化です。
+
+**Pulumi**は全く別の路線を歩んでいます。DSLではなく汎用Programming言語（TypeScript、Python、Go、Java、.NET）を使い、その上にAgentic Layerを重ねてきています。Pulumi ESC（Environments, Secrets, Configuration）は階層的でDynamicなSecret管理を担い、「production」Configが「base」Configを継承する形でEnvironmentを合成でき、値を複数Fileにコピペする必要がなくなります。
+
+実務上の判断基準は「技術的にどちらが優れているか」ではありません。3つとも同じCloud Resourceを構築できます。重要なのは、どちらのFailure Modeにより耐性があるかです。HCLのDeclarativeな制約か、汎用Programming言語の柔軟性（そして、半年後には誰も読めないほど凝ったInfrastructure Logicを誰かが書いてしまうリスク）か、という選択です。
+
+## 「Agentic IaC」とは実際何を指すのか
+
+一般提供が始まったPulumi Neoは、2026年に「Agentic IaC」と呼ばれるものの最も分かりやすい実例です。単なるAutocompleteではありません。Workflowはこうです。
+
+1. 自然言語でInfrastructureの目標を記述する（「ordersデータベースにRead Replicaを追加し、自動Failoverを設定する」など）。
+2. AgentがExisting Stackを検査し、Planを起案してPulumi Programを生成する（あるいはExisting Programとの差分を生成する）。
+3. 内部で`pulumi preview`を実行し、差分を評価した上で — ここが重要ですが — Teamが設定した境界で必ずReviewのために停止する。
+4. 承認（人間によるものか、自動化されたPolicy Checkか）を経て初めて`pulumi up`を実行する。
+
+ここで重要な区別があります。IaCを「生成する」Agentは、EditorでHCLをAutocompleteするLLMと本質的に変わりません。しかし、実際のCloud Accountに対してChangeを「計画し実行する」Agentは、別次元のRiskを持ちます。なぜならBlast Radiusには、あなたが書いたことだけでなく、Agentが判断したことも含まれるからです。
+
+だからこそ、「Agentic」なIaC Toolは生の能力ではなくGuardrailを中心に設計されています。
+
+- **権限のスコープ限定。** AgentのExecution Roleは、触っているStackより広くAccessできてはいけません。StagingのVPCを管理しているなら、`iam:*`やCross-Account Trustを持つべきではありません。
+- **Plan Reviewの必須化。** Agentが生成したすべてのChangeは、Apply前に必ずPlan Fileを生成する必要があります。新人EngineerのPRに求めるのと同じ規律です。
+- **Policy-as-CodeによるGate。** Cost閾値、Tagging要件、「Public S3 Bucket禁止」といった自動Checkを、人間がPlanを見る前にかけることで、Reviewの時間をLintingではなく判断が必要な部分に使えます。
+- **Blast Radiusの上限設定。** 明示的な人間の承認なしに、AgentがN個以上のResourceを触ったり、Statefulなものを削除したりすることをHard Stopさせる仕組みです。
+
+以下は、OpenTofuのJSON Plan出力とシンプルなRego風Policyを使って、Agentが生成したPlanをApply前にPolicy-as-Codeでゲーティングする概念的な例です。
+
+```hcl
+# ci/policy/no-public-buckets.rego
+package iac.review
+
+deny[msg] {
+  resource := input.resource_changes[_]
+  resource.type == "aws_s3_bucket_acl"
+  resource.change.after.acl == "public-read"
+  msg := sprintf("agent-proposed change makes %s public", [resource.address])
+}
+
+deny[msg] {
+  resource := input.resource_changes[_]
+  resource.change.actions[_] == "delete"
+  resource.type == "aws_db_instance"
+  msg := sprintf("agent-proposed plan deletes a database instance: %s", [resource.address])
+}
+```
+
+```bash
+# CI Step: AgentがPlanを提案し、Policy Gateがそれを審査し、通過した場合のみ人間が承認
+tofu plan -out=agent.plan
+tofu show -json agent.plan > agent-plan.json
+opa eval --input agent-plan.json --data ci/policy/ -f pretty \
+  "data.iac.review.deny" > violations.txt
+
+if [ -s violations.txt ]; then
+  echo "Policy違反を検出 — 自動Applyをブロックし人間のReviewへ回す"
+  exit 1
+fi
+
+# クリーンな場合のみ、Apply前に明示的な人間の承認を要求
+tofu apply agent.plan
+```
+
+ここで重要なのはRegoの具体的な書き方ではなく、パターンです。Agentの出力は人間のPlanと全く同じGateを通り、クリーンなPolicy Checkは Applyのための必要条件であって十分条件ではありません。最終的には誰かが必ず差分を見ます。
+
+## Native S3 State Locking — 地味だが実務的な効果は大きい
+
+Agentic系ほど華やかではありませんが、多くのTeamにとってより即効性のある改善が、OpenTofu 1.12で追加されたS3 BackendのNative State Lockingです。`use_lockfile`により、同時実行のApplyがStateを壊すのを防ぐためだけに用意していたDynamoDB Tableへの依存が不要になりました。
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket       = "acme-corp-tfstate"
+    key          = "prod/network/terraform.tfstate"
+    region       = "ap-northeast-1"
+    use_lockfile = true # native locking、dynamodb_tableは不要
+    encrypt      = true
+  }
+}
+```
+
+数年以上TerraformやOpenTofuの構成を運用しているなら、Environmentごと、時にはModuleごとに作られた小さなDynamoDB Lock Tableが積み上がっているはずです。それぞれに個別のIAM権限があり、個別のコストLine Itemがあり、Access監査のたびに「これは何のためにあるのか」と考える対象になります。DynamoDBを外すこと自体はArchitectureを大きく変えるものではありませんが、「これは何のためにあって削除していいのか」という類の疑問をInfrastructureから一つ減らせますし、IAM Policyを誤設定するResourceも一つ減ります。
+
+**移行時の注意点。** `use_lockfile = true`にして終わり、ではありません。まず`plan`を実行し、誰も古いLockを保持していないことを確認してください。Backend変更の途中でStateへのOperationが競合すると、まさにState Fileが壊れるパターンになるため、移行はトラフィックの少ない時間帯に行いましょう。そして、Native Lockingで少なくとも1回はクリーンなApplyサイクルを確認してから、DynamoDB Tableを削除してください。すぐに削除せず1スプリント程度残しておくのが安全です。Idle状態でのコストはほぼゼロで、安価な保険になります。
+
+## webhaniの見解
+
+私たちはAgentic IaCを一時的な流行だとは考えていませんが、同時に、多くのTeamが今すぐProductionにAgentを向けるべきだとも考えていません。2026年時点での実務的なGuidanceは以下の通りです。
+
+- **Agentic IaCはBlast Radiusの小さいEnvironmentから始める。** SandboxやStaging Account、一時的なPreview Environment、Ticket単位で切られたSandboxが良い候補です。ProductionのDatabaseやNetworク変更は、数ヶ月間Guardrailの実績を積むまでは対象外にすべきです。
+- **Agentがループに入った時点で、Policy-as-Codeは選択肢ではなく必須になります。** 人間がHCLを書くならCode Reviewが明らかなミスを拾いますが、Agentが書く場合は同じCatchをAutomationに組み込む必要があります。Agentは悪い差分を出しても人間のように気まずさを感じないからです。
+- **Plan ReviewはFormalityではなくHard Gateとして扱う。** Agentic Toolを使い始めると「Agentは大体正しい」という理由でPlanを機械的に承認したくなりますが、それこそGuardrailが防ごうとしているFailure Modeです。
+- **HashiCorpの旧無料Planをまだ使っているなら、限界に達してから慌てるのではなく今から移行の時間を確保してください。**
+- **DynamoDBからNative Lockingへの移行は、Agentic要素に触れずに2026年のOpenTofu機能に足を踏み入れる、リスクの低い良い出発点です。** まずこれをやりましょう。Backend構成に改めて向き合う良い機会にもなり、より自律的なものにInfrastructureを触らせる前の土台作りとしても有用です。
+
+TerraformとOpenTofuとPulumiの三すくみは、今年中に一つの勝者に収束することはないでしょう。2026年に本当に新しいのは、この選択にどれだけの自律性を委ねることを許容できるかという軸が加わったことです。これは既定路線に流されるのではなく、意識的に決めるべき判断だと考えています。

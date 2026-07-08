@@ -1,0 +1,138 @@
+---
+title: "MCPの2026年ロードマップ — Tasksとステートレスな HTTP Transport が変えるサーバー設計"
+description: "Model Context Protocol の2026年ロードマップから、非同期処理のための Tasks primitive と、水平 Scaling を可能にするステートレス HTTP Transport を解説します。"
+date: "2026-07-09"
+status: "published"
+tags: ["MCP", "AI Agents", "Architecture", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "mcp-tasks-async-agents-2026-roadmap"
+---
+
+MCP Server を作るとき、多くの Team は普通の REST API と同じ発想で実装します。Client が Request を送り、Server が処理して Response を返す。これで十分な Tool も多いですが、20分かかる処理を挟んだ瞬間に破綻します。
+
+MCP の Steering Committee が公開した2026年ロードマップには、この問題に正面から向き合う2つの変更が含まれています。長時間実行される処理のための **Tasks primitive** と、**ステートレスな HTTP Transport** です。地味に見えますが、実際に MCP Server を Client 案件で構築していると、どちらも「あ、これ欲しかったやつだ」となる内容でした。
+
+## 同期的な Request/Response が Agent の Workload に合わない理由
+
+HTTP の Request には暗黙の前提があります。Server が応答するまで Connection を張り続け、その応答は数秒〜数十秒で返ってくるという前提です。MCP は JSON-RPC over stdio や SSE をベースにしているため、この前提をそのまま引き継いでいます。「このレコードを検索して」「この JSON を整形して」のような Tool Call であれば全く問題ありません。
+
+しかし Agent が実行したい処理は、この前提に収まらないケースが増えています。Model の Training、複数 Step の Data Pipeline、外部 Batch API の完了待ち、大量の Document の Crawling — こういった処理を1回の同期的な `tools/call` として設計すると、次のいずれかの困った状態に陥ります。
+
+- Client 側が Timeout してしまい、実際は処理が継続しているのに Agent は「失敗した」と誤認する
+- 20分間 Connection を張り続ける実装にする — Network の瞬断に弱く、Connection を保持する分だけ Compute Cost もかかる
+- MCP の上に独自の Polling の仕組みを作り込む — これでは標準 Protocol を使う意味が薄れる
+
+さらに、常時稼働する Persistent な Agent ではこの問題が深刻化します。何時間も無人で動き続ける Agent は、1つの Tool Call のために Block され続ける余裕がありません。処理を投げたら他の作業に移り、後で結果を確認できる必要があります。
+
+問題の本質は、MCP が元々「対話的な Assistant が Tool を1つずつ呼ぶ」Use Case を想定して設計されている点にあります。Chat の中で Web を検索する、File を1つ読む、といった Interaction では、数秒の待ち時間はむしろ自然です。ところが Agent が Autonomous に動き出すと、Tool 呼び出しは「対話の一部」ではなく「Pipeline の1 Step」に変わります。この変化に Protocol の Transport 層が追いついていなかった、というのが正確な状況です。
+
+実務上もっと厄介なのは、Timeout の閾値が Client の実装ごとにバラバラなことです。ある Client は30秒で諦め、別の Client は5分待ってくれる。同じ MCP Server を複数の Client から使ってもらう場合、この不一致に振り回されて「動くこともあれば動かないこともある」Tool ができあがってしまいます。Tasks primitive は、この不確実性を Protocol Level で解消しようとする試みでもあります。
+
+## Tasks primitive が Server 設計に与える影響
+
+Tasks primitive は、長時間実行される処理を単発の Request/Response ではなく、独自の Lifecycle を持つ「Object」として扱います。概念的な流れは次のようになります。
+
+```typescript
+// 1. Client が処理を投げ、即座に Task Handle を受け取る
+const { taskId } = await mcpClient.callTool("run-data-pipeline", {
+  source: "s3://raw-events/2026-07-09/",
+  transform: "dedupe-and-enrich",
+});
+
+// 2. Block する代わりに Polling する（Client 側 or Agent の Scheduler が実施）
+async function waitForTask(taskId: string) {
+  while (true) {
+    const status = await mcpClient.getTaskStatus(taskId);
+
+    if (status.state === "completed") return status.result;
+    if (status.state === "failed") throw new Error(status.error);
+
+    // "running" か "queued" のまま — 少し待って再確認
+    await sleep(status.suggestedPollIntervalMs ?? 5000);
+  }
+}
+```
+
+重要なのは Polling の Loop そのものではなく、これが Server 設計に何を要求するかです。Production レベルの MCP Server には以下が必要になります。
+
+- Task の State を永続的に管理する仕組み（Demo なら In-Memory で十分ですが、Production では Server 再起動を跨いで生き残る DB の Row や Queue の Entry が必要）
+- Client が1時間後に再接続しても「Task `abc123` はどうなった？」と聞ける ID の設計
+- Cancel の経路 — Agent が途中で気が変わったり、Kill されたりするため
+- 妥当な Status の意味づけ（`queued`、`running`、`completed`、`failed`。長時間処理なら Progress の途中経過報告もあると理想的）
+
+これは「薄い RPC Wrapper としての MCP Server」から「小さな Job Orchestration System としての MCP Server」への明確な転換です。すでに Celery や Sidekiq、Cloud の Task Queue のような Background Job 基盤を持っている Team なら、Tasks はその上に薄い Adapter を被せるだけで済みます。持っていない Team は、ここが導入のタイミングです。
+
+もう少し具体的に、Server 側の実装イメージも見ておきます。`tools/call` を受けた瞬間に処理を Background へ逃がし、即座に `taskId` を返す形です。
+
+```typescript
+// Server 側: Tool 呼び出しを受けたら即座に Task を発行し、
+// 実際の処理は Background Worker に渡す
+async function handleRunPipeline(params: PipelineParams) {
+  const taskId = generateTaskId();
+
+  await taskStore.create(taskId, { state: "queued", params });
+
+  // 実処理は非同期で Kick するだけ。Handler はここで return する
+  enqueueBackgroundJob(taskId, async () => {
+    await taskStore.update(taskId, { state: "running" });
+    try {
+      const result = await runPipeline(params);
+      await taskStore.update(taskId, { state: "completed", result });
+    } catch (err) {
+      await taskStore.update(taskId, { state: "failed", error: String(err) });
+    }
+  });
+
+  return { taskId }; // Client にはこれだけをすぐ返す
+}
+```
+
+ここで意識すべきなのは、Handler 自体は一瞬で return している点です。実処理の成否は完全に別の経路（`taskStore` の更新）で管理され、Client 側の `getTaskStatus` はこの Store を読むだけの薄い Endpoint になります。この分離ができていれば、Server の再起動や Deploy が処理の途中で挟まっても、Task の State さえ永続化されていれば Client 側は何事もなく Polling を続けられます。
+
+## ステートレス HTTP — 他の Service と同じように Scale する
+
+もう1つの柱がステートレスな HTTP Transport です。現在多くの MCP Server は Server-Sent Events を使っており、Client ごとに Persistent な Connection を Server 側で保持します。Scale が小さいうちは問題ありませんが、Load Balancer で Sticky Session が必要になり、接続中の Agent の数だけ File Descriptor を保持し続け、水平 Scaling がやりにくくなります。ある Instance が処理中の SSE Session を、別の Instance が引き継ぐことはできません。
+
+ステートレスな HTTP では、各 Request がその処理に必要な情報をすべて持ち、Call の間で Connection や In-Memory の Session を維持する必要がありません。概念的な Handler は普通の HTTP Endpoint と同じ形になります。
+
+```typescript
+// ステートレスな MCP HTTP Handler — Session Object も保持し続ける Connection もない
+export async function handleMcpRequest(req: Request): Promise<Response> {
+  const rpcMessage = await req.json();
+
+  // 必要な State（Task の Status、Resource の Cache）は
+  // Server の Memory ではなく外部 Store から取得する
+  const result = await routeMcpMethod(rpcMessage, {
+    store: sharedTaskStore, // 例: Redis や Postgres — Process の Memory ではない
+  });
+
+  return Response.json(result);
+}
+```
+
+どの Instance も特別扱いされないため、標準的な Load Balancer で Round-Robin に振り分けられます。これを Tasks primitive と組み合わせると、Client がどの Instance に Task を投げても、次の Polling は別の Instance が応答しても構わない、というきれいな構成になります。Task の State が特定の Process ではなく共有 Storage にあるからです。
+
+これは、10年前に Web の Backend が Sticky Session 前提の App Server から、Load Balancer 配下のステートレスな Service へ移行した流れと同じ教訓です。MCP が Agent Tooling の文脈でようやくそこに追いついてきた、という見方もできます。
+
+運用面での恩恵はさらに具体的です。SSE ベースの MCP Server では、Deploy の度に「今 Connection を張っている Client をどう扱うか」という悩みがつきまといます。Graceful Shutdown で既存の Connection が閉じるまで待つのか、それとも切ってしまって Client 側の再接続に任せるのか。ステートレスな HTTP なら、そもそも長寿命の Connection が存在しないため、この悩みがほぼ消えます。Instance を1つ落として新しい Instance に置き換える Rolling Update も、普通の Stateless Web Service と同じ感覚で行えます。
+
+Auto Scaling とも相性が良くなります。SSE 前提だと「Connection 数」という Scaling の指標自体が扱いにくく（1 Connection が軽い場合も重い場合もある）、Scale Out しても新しい Instance に既存の負荷を分散できません。ステートレスな HTTP なら CPU 使用率や Request Rate といった、普通の Web Service で使い慣れた指標でそのまま Auto Scaling を組めます。Observability の面でも、各 Request が独立している分、Trace や Log の相関が取りやすいという副次的なメリットもあります。
+
+## webhani としての見解 — いつ採用すべきか
+
+すべての Team に「明日から Tasks とステートレス HTTP に全面移行してください」とは言いません。実際に構築してきた経験から、いくつか実務的な指針を挙げます。
+
+**Tool が本当に速いなら、Simple なままで十分です。** Server 内のすべての Tool Call が数秒で終わる — CRUD 操作、検索、単純な変換など — であれば、同期的な Request/Response が今でも正しい Default です。不要な処理に Task Polling の仕組みを足すのは、純粋な Overhead でしかありません。
+
+**Client の Timeout を超え得る処理があるなら Tasks を採用してください。** 特に、Latency が読めない外部 API を呼ぶ場合、Batch 処理、あるいは前段の遅い上流 System に依存する多 Step の Chain などです。長時間の Call を生き延びさせるために `setTimeout` ベースの Keep-Alive や独自の Retry Logic に手を出しているなら、それがまさにそのサインです。
+
+**水平 Scaling を実際に必要とするタイミングでステートレス HTTP に移行してください。** 事前に先回りする必要はありません。単一 Instance の社内 Tool には不要です。複数 Team が共有する MCP Server や、まとまった Request 量を捌く Server には必要になります。そして、In-Memory の Session State を溜め込んでから後付けで対応するより、最初からステートレス前提で設計するほうがずっと楽です。
+
+**Task の Storage 層は必要になる前に決めておいてください。** Tasks primitive 自体は Task の State をどう永続化するかを規定していません。それは実装側の責任です。Redis の TTL ベースの Store にするのか、Postgres の Table にするのか、既存の Job Queue の Status Table を使うのか、早めに決めましょう。Migration の途中で Agent が実行中の Job を見失ってから設計し直すのは、避けたい状況です。
+
+**仕様を注視しつつ、防御的に実装してください。** ロードマップの項目はまだ確定しておらず、SDK の対応も言語ごとにばらつきが出るはずです。今実装するなら、Transport と Task 管理の Logic を自分たちの Interface の裏に隠しておき、公式の Primitive が固まった段階で Tool Handler を書き直さずに差し替えられるようにしておくのがおすすめです。
+
+**既存 Client との互換性も考慮してください。** Tasks やステートレス HTTP に対応していない古い Client が残っている間は、同期的な Fallback Path をしばらく併走させる必要が出てきます。Server 側で Client の Capability を見て挙動を切り替える、あるいは同じ Tool を「同期版」「非同期版」の2つの名前で公開するといった移行戦略も、実装前に決めておくと後で楽になります。私たちが Client 案件で MCP 移行を支援する際も、まずこの互換性の線引きから始めることが多いです。
+
+両方の変更に共通するのは、MCP が「1つの Assistant がいくつかの Tool を呼ぶための Protocol」から「Production レベルの Agent Infrastructure のための Protocol」へと成熟しつつあるということです。良い方向ですが、それは私たちが構築する Server も、単なる Request Handler ではなく、本物の Backend Service に近い形へと近づく必要があることを意味します。

@@ -1,0 +1,126 @@
+---
+title: "React 19 이후 react-test-renderer 없이 컴포넌트 테스트하기"
+description: "React 19에서 react-test-renderer가 Deprecated되면서 더 이상 관리되지 않습니다. 기존 테스트 스위트에서 무엇이 깨지는지, @testing-library/react로 어떻게 옮겨가야 하는지 정리합니다."
+date: "2026-07-09"
+status: "published"
+tags: ["React", "Testing", "Testing Library", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "react-19-test-renderer-removal-testing-2026"
+---
+
+React 19로 Upgrade한 뒤 테스트를 돌려보면 `react-test-renderer`가 Deprecation Warning을 뱉는 걸 보게 됩니다. 착각이 아닙니다. 이 Package는 더 이상 Maintain되지 않고, `react-test-renderer/shallow`를 비롯한 일부 Test Utility는 이미 삭제됐습니다. 버그가 아니라 React Team이 이 방식 자체를 접기로 한 결정입니다.
+
+최근 몇 달간 여러 Client 프로젝트의 Test Suite를 `@testing-library/react`로 옮겼습니다. 작업 자체는 기계적이지만, 왜 옮기는지 이해하지 않으면 기존 Test를 문법만 바꿔서 옮기는 데 그치고, 정작 새로 작성하는 Test의 품질은 그대로일 수 있습니다. 배경과 구체적인 이관 방법을 정리했습니다.
+
+## 왜 없어지는가
+
+`react-test-renderer`는 Component Tree를 실제 DOM 없이 JSON 형태로 Render하는 도구였습니다. `toJSON()`으로 Snapshot Test를 찍는 게 편해 보였지만, 이는 결국 React 내부 Fiber Tree에 직접 접근해서 "Test를 위해서만 존재하는 가짜 환경"을 만들어낸 것이었습니다.
+
+여기서 두 가지 문제가 생깁니다.
+
+1. **React의 공식 Contract가 아니라 Internal 구현에 묶여 있었습니다.** Concurrent Rendering으로 넘어가면서 React 내부 Scheduling 방식이 바뀌자 `react-test-renderer`도 따라가야 했는데, Shallow Renderer처럼 그대로 유지하기 어려운 부분들이 있었습니다. Internal에 강하게 결합된 Library는 Internal이 바뀔 때마다 깨집니다. 지금 벌어지고 있는 일이 정확히 그것입니다.
+2. **동작이 아니라 구현 세부사항을 Test하게 만듭니다.** Snapshot Diff는 "Render 결과가 바뀌었다"는 사실만 알려줄 뿐, "그 변화가 사용자에게 의미가 있는지"는 알려주지 않습니다. className 순서만 바뀌어도 Test는 실패하고, 진짜 중요한 Interaction이 깨져도 똑같이 실패합니다. 결국 팀은 Diff를 제대로 읽지 않고 `--updateSnapshot`을 반사적으로 누르게 되고, Test는 더 이상 아무것도 지켜주지 못하게 됩니다.
+
+이 흐름은 처음 있는 일이 아닙니다. Enzyme도 몇 년 전 같은 길을 걸었습니다. React Internal에 깊이 접근하는 구조 때문에 React Version이 바뀔 때마다 취약해졌고, 결국 React 본체의 발전 속도를 따라가지 못하고 Maintain이 끊겼습니다. `react-test-renderer`는 같은 이야기를 반복하고 있을 뿐입니다. 이번엔 React Core Team 스스로가 그 결정을 내렸다는 점이 다릅니다.
+
+React가 공식적으로 권장하는 방향은 `@testing-library/react`입니다. jsdom 위에서(혹은 Playwright의 Component Testing 같은 실제 Browser 환경에서) 동작하며, 실제 사용자가 Component를 다루는 방식 그대로 Test를 작성합니다 — Role이나 Text로 Element를 찾고, `user-event`로 Click과 Type을 수행하고, 실제로 DOM에 렌더링된 내용을 Assert합니다. Fiber Tree 접근도, 가짜 환경도 필요 없습니다. Production에서 쓰는 것과 같은 DOM API를 그대로 씁니다.
+
+## 실제로 무엇이 깨지는가
+
+간단한 Toggle Component Test를 예로 들어보겠습니다.
+
+```jsx
+// Toggle.jsx
+import { useState } from "react";
+
+export function Toggle({ label }) {
+  const [on, setOn] = useState(false);
+  return (
+    <button onClick={() => setOn((prev) => !prev)}>
+      {label}: {on ? "ON" : "OFF"}
+    </button>
+  );
+}
+```
+
+```jsx
+// Toggle.test.jsx (Before — react-test-renderer)
+import { act } from "react-test-renderer";
+import TestRenderer from "react-test-renderer";
+import { Toggle } from "./Toggle";
+
+test("클릭하면 State가 Toggle된다", () => {
+  const renderer = TestRenderer.create(<Toggle label="Notifications" />);
+
+  expect(renderer.toJSON()).toMatchSnapshot();
+
+  const button = renderer.root.findByType("button");
+  act(() => {
+    button.props.onClick();
+  });
+
+  expect(renderer.toJSON()).toMatchSnapshot();
+});
+```
+
+React 19에서 이 Test를 돌리면 바로 Deprecation Warning이 나옵니다. 더 큰 문제는 React 19와 무관하게 이 Test 자체가 원래 Fragile했다는 점입니다. `button.props.onClick()`은 Handler를 직접 호출할 뿐, 실제 Click Event를 전혀 거치지 않습니다. 즉 "실제 사용자가 Click할 수 있는가"는 아무것도 검증하지 않는 셈입니다. 게다가 Snapshot은 무엇이 의미상 바뀌었는지 Reviewer에게 알려주지 않습니다. JSON Diff를 읽고 의도를 추측해야 합니다.
+
+## 이관 방법
+
+먼저 필요한 Package를 설치합니다.
+
+```bash
+npm install --save-dev @testing-library/react @testing-library/user-event
+```
+
+같은 Test를 실제 DOM Query와 Interaction 기반으로 다시 작성합니다.
+
+```jsx
+// Toggle.test.jsx (After — @testing-library/react)
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { Toggle } from "./Toggle";
+
+test("클릭하면 State가 Toggle된다", async () => {
+  const user = userEvent.setup();
+  render(<Toggle label="Notifications" />);
+
+  const button = screen.getByRole("button", { name: /notifications/i });
+  expect(button).toHaveTextContent("OFF");
+
+  await user.click(button);
+
+  expect(button).toHaveTextContent("ON");
+});
+```
+
+단순히 문법만 바뀐 게 아니라 접근 방식 자체가 바뀌었다는 점을 눈여겨봐야 합니다.
+
+- `render()`는 JSON Tree가 아니라 실제 jsdom Container에 Mount합니다.
+- `screen.getByRole`은 Screen Reader나 실제 사용자와 같은 방식으로 — Accessible Role과 Name으로 — Button을 찾습니다. Accessible Name이 잘못됐거나 없으면 이 Query 자체가 실패하는데, 이는 그 자체로 유용한 Signal입니다.
+- `userEvent.click`은 DOM을 통해 실제 Event를 Dispatch하고, React의 실제 Event Handling 경로를 거칩니다. Prop을 직접 호출하는 게 아닙니다.
+- Assertion(`toHaveTextContent`)은 Internal Tree의 모양이 아니라 사용자가 보는 내용을 표현합니다.
+
+Snapshot Test가 많은 Suite라면, 모든 Snapshot을 한 줄 한 줄 Assertion으로 기계적으로 바꾸려 하지 마세요. 먼저 "이 Snapshot이 실제로 제 역할을 하고 있었는가"를 물어봐야 합니다. Interaction이 없고 안정적인 Structural Component(예: Design System Wrapper)의 Snapshot은 여전히 저렴한 Regression Net으로 쓸 만합니다 — 이 경우 `@testing-library/react`의 `render` 결과에 `container.innerHTML`이나 Serializer를 붙여 유지해도 됩니다. 하지만 "Click하면 올바른 Text가 뜨는가" 같은 Interaction Test 대신 Snapshot을 쓰고 있었다면, 그건 Behavior Assertion으로 바꿔야 합니다. 이것이 의도를 문서화하는 Test와, 뭔가 바뀔 때마다 그냥 불평만 하는 Test의 차이입니다.
+
+## 대규모 Suite의 단계적 이관
+
+수백 개의 `react-test-renderer` Test가 있는 Suite라면 한 번에 전환하는 건 현실적이지 않습니다. 저희가 실제로 효과를 본 방식은 다음과 같습니다.
+
+1. **먼저 확산을 막습니다.** ESLint나 Code Review에서 신규 `react-test-renderer` 사용을 금지해, Backlog를 정리하는 동안 문제가 계속 늘어나지 않게 합니다.
+2. **File 순서가 아니라 Risk 기준으로 이관합니다.** Form, Button, Toggle처럼 실제 User Interaction이 있는 Component를 우선순위에 둡니다. `user-event`의 효과가 가장 크고, Snapshot만으로는 검증이 가장 약한 지점이기도 합니다.
+3. **다시 쓰기 전에 삭제부터 고려합니다.** 일부 Snapshot Test는 예전에 누군가 Diff를 확인하지 않고 `--updateSnapshot`을 눌러서 남아있는 것뿐입니다. 무엇을 지키고 있는지 아무도 설명하지 못하는 Snapshot이라면, 이관 대상이 아니라 삭제 대상입니다.
+4. **Structural Snapshot을 위한 좁은 예외는 남겨둡니다.** Icon Set이나 Layout Shell처럼 정적이고 Interaction이 없는 Markup은 Snapshot 방식 Check를 남겨둘 만한 자리입니다. 다만 `react-test-renderer`를 쓸 필요는 없고, `@testing-library/react`의 Render 결과로도 충분합니다.
+5. **기한이 있는 Tech Debt로 관리합니다.** "언젠가 하면 되는" 일이 아니라 기한을 정해 Track합니다. React 19 이후 Major Version에서는 이런 Warning이 더 강해질 가능성이 높습니다.
+
+## Checklist
+
+- `react-test-renderer`와 `react-test-renderer/shallow` Import를 제거하고, `@testing-library/react`와 `@testing-library/user-event`를 추가합니다.
+- `TestRenderer.create()`를 `render()`로 바꿉니다.
+- `renderer.root.find*`와 Prop 직접 호출을, `screen.getByRole` / `getByText`와 `user-event` Interaction으로 바꿉니다.
+- Interactive 출력에 대한 Snapshot Assertion을 `expect(...).toHaveTextContent(...)`, `toBeVisible()` 같은 명시적 Assertion으로 바꿉니다.
+- Snapshot은 정말 정적이고 Interaction 없는 Markup에만 남기고, 각각 왜 존재하는지 설명할 수 있게 합니다.
+- Lint Rule이나 CI Check를 추가해 새로운 `react-test-renderer` 사용이 다시 들어오지 않게 막습니다.
+
+이 원칙은 React Version이 바뀌어도 변하지 않습니다 — 사용자가 실제로 조작하는 방식 그대로 DOM을 Query하는 Test는, Component의 내부 구현을 Refactor해도 동작이 그대로면 계속 통과합니다. 반면 Internal Fiber Node를 직접 건드리는 Test는 Internal이 바뀌는 순간 깨집니다. 그리고 그 Internal의 변화는, 이번 Deprecation이 보여주듯 우리가 통제할 수 있는 영역이 아닙니다.
