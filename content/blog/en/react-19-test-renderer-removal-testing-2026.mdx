@@ -1,0 +1,126 @@
+---
+title: "Migrating Off react-test-renderer After React 19"
+description: "react-test-renderer is deprecated in React 19 and no longer receives updates. Here's what breaks in an existing suite and a concrete path to @testing-library/react."
+date: "2026-07-09"
+status: "published"
+tags: ["React", "Testing", "Testing Library", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "react-19-test-renderer-removal-testing-2026"
+---
+
+If your test suite still calls `react-test-renderer`, React 19 is telling you, loudly, to stop. The package is deprecated, no longer maintained, and now logs a deprecation warning on import. `react-test-renderer/shallow` and several related test utilities have already been removed outright. None of this is a bug — it's the React team walking away from an approach they no longer think is a good idea.
+
+We've moved several client projects off `react-test-renderer` over the past few months. The migration is mechanical once you understand the shape of it, but the "why" matters, because it changes how you write new tests, not just how you patch old ones.
+
+## Why it's actually going away
+
+`react-test-renderer` renders your component tree into a lightweight, in-memory JSON representation — no real DOM. That's what made `toJSON()` snapshot tests possible. It sounds convenient, but it means your tests are exercising a fake environment that only exists for testing, driven by direct access to React's internal fiber tree.
+
+Two consequences follow from that:
+
+1. **It's tied to React's internals, not React's contract.** When React changed its internal scheduling model to support concurrent rendering, `react-test-renderer` had to be adapted to keep working, and parts of its API (like the shallow renderer) just couldn't be cleanly carried forward. A library glued to internals breaks every time internals change — which is exactly what's happening.
+2. **It encourages testing implementation, not behavior.** Snapshot diffs and internal tree introspection tell you *the render output changed*, not *whether the change matters to a user*. A snapshot test fails just as loudly for a harmless className reorder as it does for a genuinely broken interaction. Teams learn to `--updateSnapshot` reflexively, and the tests stop protecting anything.
+
+This is not a new lesson. Enzyme went through the same arc years earlier — deep internal access made it fragile across React versions, and it eventually fell out of maintenance step with React itself. `react-test-renderer` is repeating that story, just from inside the React core team this time.
+
+React's own recommendation is to move to `@testing-library/react`, run on top of jsdom (or a real browser environment like Playwright's component testing), and interact with components the way a user would: find things by role or visible text, click and type through `user-event`, and assert on what's rendered to the DOM. No fiber tree, no internals, no fake environment — just the same DOM APIs your app runs against in production.
+
+## What actually breaks
+
+Here's a typical `react-test-renderer` test for a simple toggle component:
+
+```jsx
+// Toggle.jsx
+import { useState } from "react";
+
+export function Toggle({ label }) {
+  const [on, setOn] = useState(false);
+  return (
+    <button onClick={() => setOn((prev) => !prev)}>
+      {label}: {on ? "ON" : "OFF"}
+    </button>
+  );
+}
+```
+
+```jsx
+// Toggle.test.jsx (before — react-test-renderer)
+import { act } from "react-test-renderer";
+import TestRenderer from "react-test-renderer";
+import { Toggle } from "./Toggle";
+
+test("toggles state on click", () => {
+  const renderer = TestRenderer.create(<Toggle label="Notifications" />);
+
+  expect(renderer.toJSON()).toMatchSnapshot();
+
+  const button = renderer.root.findByType("button");
+  act(() => {
+    button.props.onClick();
+  });
+
+  expect(renderer.toJSON()).toMatchSnapshot();
+});
+```
+
+Run this under React 19 and you'll see the deprecation warning immediately. Worse, the test itself is fragile in a way that has nothing to do with React 19: `button.props.onClick()` calls the handler directly, bypassing the actual click event entirely. It doesn't verify a real user could trigger this. And the snapshot doesn't tell a reviewer *what* changed semantically — they have to read JSON diffs and infer intent.
+
+## The migration path
+
+Install the two packages you need:
+
+```bash
+npm install --save-dev @testing-library/react @testing-library/user-event
+```
+
+Then rewrite the same test around real DOM queries and real interactions:
+
+```jsx
+// Toggle.test.jsx (after — @testing-library/react)
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { Toggle } from "./Toggle";
+
+test("toggles state on click", async () => {
+  const user = userEvent.setup();
+  render(<Toggle label="Notifications" />);
+
+  const button = screen.getByRole("button", { name: /notifications/i });
+  expect(button).toHaveTextContent("OFF");
+
+  await user.click(button);
+
+  expect(button).toHaveTextContent("ON");
+});
+```
+
+Notice what changed conceptually, not just syntactically:
+
+- `render()` mounts into a real jsdom container, not a JSON tree.
+- `screen.getByRole` finds the button the way a screen reader or a real user would — by its accessible role and name. If the button's accessible name is wrong or missing, this query fails, which is itself useful signal.
+- `userEvent.click` dispatches an actual event through the DOM, running through React's real event handling, not a direct prop call.
+- The assertion (`toHaveTextContent`) describes *what the user sees*, not what the internal tree looks like.
+
+If you have a suite full of snapshot tests, don't try to convert every snapshot into an assertion line-by-line. Ask first whether the snapshot was pulling its weight. A snapshot of a stable, rarely-changing structural component (say, a design-system wrapper with no interaction) can still be a cheap regression net — that's fine to keep, using `@testing-library/react`'s `render` output with `container.innerHTML` or a serializer, if you want it. But a snapshot standing in for interaction testing — "click this, does the right text show up" — should become a behavior assertion. That's the difference between a test that documents intent and one that just complains when anything moves.
+
+## A phased approach for larger suites
+
+For a suite with hundreds of `react-test-renderer` tests, doing this in one pass isn't realistic. What's worked for us:
+
+1. **Stop the bleeding first.** Ban new `react-test-renderer` usage in ESLint/review, so the problem stops growing while you migrate the backlog.
+2. **Migrate by risk, not by file order.** Prioritize components with real user interaction (forms, buttons, toggles) — these benefit most from `user-event` and are also where snapshot-only coverage is weakest.
+3. **Delete before you rewrite.** Some existing snapshot tests exist only because someone once ran `--updateSnapshot` without reading the diff. If nobody can explain what a snapshot is protecting against, it's a candidate for deletion, not migration.
+4. **Keep a narrow allowance for structural snapshots.** Static, non-interactive markup (icon sets, layout shells) is a reasonable place to keep snapshot-style checks — just don't reach for `react-test-renderer` to get them; `@testing-library/react`'s render output works fine for this too.
+5. **Track it as tech debt with a deadline**, not an open-ended nice-to-have. React 19 warnings will only get louder in future majors.
+
+## Checklist
+
+- Remove `react-test-renderer` and `react-test-renderer/shallow` imports; add `@testing-library/react` and `@testing-library/user-event`.
+- Replace `TestRenderer.create()` with `render()`.
+- Replace `renderer.root.find*` + direct prop calls with `screen.getByRole` / `getByText` + `user-event` interactions.
+- Replace snapshot assertions on interactive output with explicit `expect(...).toHaveTextContent(...)` / `toBeVisible()` / etc. assertions.
+- Keep snapshots only for genuinely static, non-interactive markup, and know why each one exists.
+- Add a lint rule or CI check to prevent new `react-test-renderer` usage from creeping back in.
+
+The underlying principle survives every React version: a test that queries the DOM the way a user does will still pass after you refactor a component's internals, as long as the behavior is unchanged. A test that pokes at internal fiber nodes breaks the moment those internals shift — which, as this deprecation shows, is entirely out of your control.

@@ -1,0 +1,113 @@
+---
+title: "Infrastructure as Code in Mid-2026: Terraform, OpenTofu, Pulumi, and the Agentic Turn"
+description: "A practical look at how Terraform, OpenTofu, and Pulumi have diverged by mid-2026, and what it actually means to let an AI agent plan and apply infrastructure changes."
+date: "2026-07-09"
+status: "published"
+tags: ["Infrastructure as Code", "Terraform", "OpenTofu", "Pulumi", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "iac-2026-agentic-pulumi-neo-opentofu"
+---
+
+If you last picked a side in the Terraform/OpenTofu split back in 2023, it's worth revisiting. The two projects have kept diverging feature-by-feature, Pulumi has shipped an agent that writes and applies infrastructure changes on its own, and HashiCorp quietly ended its old free tier. None of this is hype — it's just where the ecosystem landed. Here's what changed and how we're advising clients to think about it.
+
+## Three tools, three philosophies
+
+The three-way split is no longer just "which HCL dialect do you prefer." Each project is now optimizing for a different audience.
+
+**Terraform** reached 1.14 stable in March 2026, with 1.15 currently in release candidate and adding Windows ARM64 support. HashiCorp's direction under IBM is enterprise-first: Terraform Cloud/Enterprise integration, Sentinel policy sets, and a support contract. The catch that got the most attention this year: HashiCorp's legacy free plan reached end-of-life on March 31, 2026, replaced by an "enhanced free" tier with different usage caps. Teams on the old free plan needed to actually read the migration notice, not just skim it.
+
+**OpenTofu**, the Linux Foundation fork, keeps shipping community-driven features that Terraform doesn't have. Per the OpenTofu 1.12 release notes, version 1.12.x (1.12.2 landed around June 12, 2026) added OCI registry support for providers and modules, native S3 state locking without DynamoDB, and experimental OpenTelemetry tracing for `plan`/`apply` runs. If your organization already standardized on OCI registries for containers, being able to pull Terraform providers and modules from the same registry is a genuine operational simplification, not a nice-to-have.
+
+**Pulumi** has staked out a different lane entirely: general-purpose languages (TypeScript, Python, Go, Java, .NET) instead of a DSL, plus increasingly, an agentic layer on top. Pulumi ESC (Environments, Secrets, Configuration) handles hierarchical, dynamic secrets — composing environments so a "production" config inherits from a "base" config without copy-pasting values across files.
+
+The practical decision isn't "which is technically superior" — all three can provision the same cloud resources. It's about which failure mode you're more comfortable with: HCL's declarative constraints, or a full programming language's flexibility (and its capacity to let someone write infrastructure logic that's clever but unreadable six months later).
+
+## What "agentic IaC" actually means
+
+Pulumi Neo, now generally available, is the clearest example of what people mean by "agentic IaC" in 2026. It's not autocomplete. The workflow looks like this:
+
+1. You describe an infrastructure goal in natural language ("add a read replica to the orders database with automated failover").
+2. The agent inspects your existing stack, drafts a plan, and generates the corresponding Pulumi program (or a diff against the existing one).
+3. It runs `pulumi preview` internally, evaluates the diff, and — critically — stops for review at any boundary your team has configured.
+4. Only after approval (human or automated policy check) does it run `pulumi up`.
+
+The distinction that matters: an agent that *generates* IaC is not fundamentally different from an LLM autocompleting HCL in your editor. An agent that *plans and executes* changes against real cloud accounts is a different risk category, because now the blast radius includes whatever the agent decided to do, not just what you typed.
+
+This is why "agentic" IaC tools are built around guardrails rather than around raw capability:
+
+- **Scoped credentials.** The agent's execution role should not be able to reach further than the stack it's touching. If it's managing a staging VPC, it should not hold `iam:*` or cross-account trust.
+- **Mandatory plan review.** Every agent-generated change produces a plan file before anything is applied — same discipline you'd want from a junior engineer's PR.
+- **Policy-as-code gates.** Automated checks (cost thresholds, tagging requirements, "no public S3 buckets") run against the plan before a human even looks at it, so review time is spent on judgment calls, not linting.
+- **Blast-radius limits.** Guardrails that hard-stop an agent from touching more than N resources, or from deleting anything stateful, without an explicit human override.
+
+Here's a conceptual example of gating an agent-generated plan with policy-as-code before it can reach `apply`, using OpenTofu's JSON plan output and a simple Rego-style policy:
+
+```hcl
+# ci/policy/no-public-buckets.rego
+package iac.review
+
+deny[msg] {
+  resource := input.resource_changes[_]
+  resource.type == "aws_s3_bucket_acl"
+  resource.change.after.acl == "public-read"
+  msg := sprintf("agent-proposed change makes %s public", [resource.address])
+}
+
+deny[msg] {
+  resource := input.resource_changes[_]
+  resource.change.actions[_] == "delete"
+  resource.type == "aws_db_instance"
+  msg := sprintf("agent-proposed plan deletes a database instance: %s", [resource.address])
+}
+```
+
+```bash
+# CI step: agent proposes a plan, policy gate reviews it, human approves only if it passes
+tofu plan -out=agent.plan
+tofu show -json agent.plan > agent-plan.json
+opa eval --input agent-plan.json --data ci/policy/ -f pretty \
+  "data.iac.review.deny" > violations.txt
+
+if [ -s violations.txt ]; then
+  echo "Policy violations found — blocking auto-apply, routing to human review"
+  exit 1
+fi
+
+# Only if clean: require explicit human approval before apply
+tofu apply agent.plan
+```
+
+The point isn't the specific Rego syntax — it's the pattern: an agent's output goes through the exact same gate a human's plan would, and a clean policy check is a necessary but not sufficient condition for applying. Someone still looks at the diff.
+
+## Native S3 state locking: small feature, real operational win
+
+Less flashy than agentic anything, but arguably more immediately useful for most teams: OpenTofu 1.12 added native state locking on S3 backends via `use_lockfile`, removing the hard dependency on a DynamoDB table just to prevent concurrent `apply` runs from corrupting state.
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket       = "acme-corp-tfstate"
+    key          = "prod/network/terraform.tfstate"
+    region       = "ap-northeast-1"
+    use_lockfile = true # native locking, no dynamodb_table needed
+    encrypt      = true
+  }
+}
+```
+
+If you've maintained a Terraform/OpenTofu setup for more than a couple of years, you've almost certainly got a small pile of DynamoDB lock tables — one per environment, sometimes one per module — each with its own IAM permissions, its own line item, its own thing to remember when you're auditing access. Dropping DynamoDB doesn't change your architecture in any deep way, but it removes a category of "why does this exist and can I delete it" question from your infrastructure, and it's one less resource to get IAM policy wrong on.
+
+**Migration note:** don't just flip `use_lockfile = true` and walk away. Run a `plan` first to confirm no one holds a stale lock, do the migration during a low-traffic window since a mid-flight state operation racing a backend change is exactly the kind of thing that produces a corrupted state file, and only delete the DynamoDB table after you've confirmed at least one clean `apply` cycle with native locking. Keep the table around for a sprint before deleting it — it costs almost nothing to leave idle, and it's cheap insurance.
+
+## webhani's take
+
+We don't think agentic IaC is a fad, but we also don't think most teams should point an agent at production yet. Our practical guidance for 2026:
+
+- **Start agentic IaC in low-blast-radius environments.** Sandbox and staging accounts, ephemeral preview environments, or ticket-scoped sandboxes are good candidates. Production database and network changes are not, at least not without months of guardrail track record first.
+- **Policy-as-code isn't optional once an agent is in the loop.** If a human writes the HCL, code review catches obvious mistakes. If an agent writes it, you need the same catch built into automation, because the agent won't feel embarrassed about a bad diff the way a person might.
+- **Treat "plan review" as a hard gate, not a formality.** The temptation with agentic tools is to rubber-stamp the plan because the agent "usually gets it right." That's exactly the failure mode guardrails exist to prevent.
+- **If you're still on Terraform's legacy free plan, budget time for the transition now**, not when you hit a hard limit mid-project.
+- **The DynamoDB-to-native-locking migration is a good, low-risk way to dip a toe into 2026's OpenTofu features** without touching anything agentic. Do that first; it'll also make you re-familiarize yourself with your backend configuration, which is useful groundwork before you let anything more autonomous touch it.
+
+The three-way split between Terraform, OpenTofu, and Pulumi isn't going to resolve into one winner this year. What's actually new in 2026 is that the choice increasingly also has to account for how much autonomy you're comfortable delegating — and that's a decision worth making deliberately, not by default.

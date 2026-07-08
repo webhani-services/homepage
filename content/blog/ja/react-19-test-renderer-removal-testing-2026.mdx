@@ -1,0 +1,126 @@
+---
+title: "react-test-rendererからの移行 — React 19時代のコンポーネントテスト"
+description: "React 19でreact-test-rendererがDeprecatedになりました。既存のテストスイートで何が壊れるのか、@testing-library/reactへの具体的な移行手順を解説します。"
+date: "2026-07-09"
+status: "published"
+tags: ["React", "Testing", "Testing Library", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "react-19-test-renderer-removal-testing-2026"
+---
+
+React 19にUpgradeした直後、CIログに`react-test-renderer`のDeprecation Warningが並んでいるのを見て「あれ、これ壊れる前兆では」と思った方は少なくないはずです。実際その通りで、`react-test-renderer`はもうMaintainされておらず、`react-test-renderer/shallow`などのUtilityはすでに削除済みです。バグではなく、React Team自身がこのアプローチを見限った結果です。
+
+弊社でもいくつかのClient案件で既存のTest Suiteを`@testing-library/react`へ移行してきました。作業自体は機械的ですが、「なぜ移行するのか」を理解しておかないと、単なる書き換え作業で終わってしまい、新しく書くTestの質は変わりません。今回はその背景と、具体的な移行手順を共有します。
+
+## なぜReact Teamはこれを切り捨てたのか
+
+`react-test-renderer`はComponent TreeをReal DOMなしでJSON表現にRenderするToolでした。`toJSON()`によるSnapshot Testが便利だと感じていた方も多いと思いますが、これは実質的に「Testのためだけに存在するFake環境」を、React内部のFiber Treeに直接アクセスして作り出していたということでもあります。
+
+これには二つの問題がありました。
+
+1. **React本体のContractではなく、Internal実装に依存していた。** ConcurrentレンダリングへのMigrationでReactの内部スケジューリングが変わった際、`react-test-renderer`もそれに追従する必要が生じましたが、Shallow Rendererのように、そのまま維持できない部分が出てきました。Internalに密結合したLibraryは、Internalが変わるたびに壊れます。今まさにそれが起きているわけです。
+2. **振る舞いではなく実装の詳細をTestしてしまう。** Snapshot Diffは「Render結果が変わった」ことは教えてくれますが、「その変更がUserにとって意味があるかどうか」は教えてくれません。ClassNameの並び順が変わっただけでもTestは落ちますし、本当に重要なInteractionが壊れても同じように落ちます。結果として、Diffを見ずに`--updateSnapshot`を打つ癖がつき、Testが何も守らなくなっていきます。
+
+これは初めての話ではありません。EnzymeもReact Internalへの深いAccessが原因で、React本体のUpdateに追従できなくなり、次第にMaintainされなくなりました。`react-test-renderer`は同じ道を、今度はReact Core Team自身がたどっている形です。
+
+React公式が推奨しているのは`@testing-library/react`への移行です。jsdom（もしくはPlaywrightのComponent Testingのような実Browser環境）の上で動き、UserがActualにComponentを操作するのと同じ方法でTestを書きます — RoleやText でElementを見つけ、`user-event`でClickやTypeを行い、DOMに実際に表示された内容をAssertする。Fiber TreeへのAccessも、Fake環境も不要で、Productionと同じDOM APIをそのまま使えます。
+
+## 実際に何が壊れるのか
+
+シンプルなToggle ComponentのTestを例に見てみましょう。
+
+```jsx
+// Toggle.jsx
+import { useState } from "react";
+
+export function Toggle({ label }) {
+  const [on, setOn] = useState(false);
+  return (
+    <button onClick={() => setOn((prev) => !prev)}>
+      {label}: {on ? "ON" : "OFF"}
+    </button>
+  );
+}
+```
+
+```jsx
+// Toggle.test.jsx (Before — react-test-renderer)
+import { act } from "react-test-renderer";
+import TestRenderer from "react-test-renderer";
+import { Toggle } from "./Toggle";
+
+test("クリックでStateがToggleされる", () => {
+  const renderer = TestRenderer.create(<Toggle label="Notifications" />);
+
+  expect(renderer.toJSON()).toMatchSnapshot();
+
+  const button = renderer.root.findByType("button");
+  act(() => {
+    button.props.onClick();
+  });
+
+  expect(renderer.toJSON()).toMatchSnapshot();
+});
+```
+
+React 19でこれを実行するとDeprecation Warningが即座に出ます。それ以上に問題なのは、このTest自体がReact 19とは無関係にFragileだということです。`button.props.onClick()`はHandlerを直接呼んでいるだけで、実際のClick Eventを一切経由していません。つまり「本当にUserがClickできるか」は何もVerifyしていないのです。さらにSnapshotは、何がSemantic的に変わったのかReviewerに伝えません。JSON Diffを読んで意図を推測するしかない状態です。
+
+## 移行手順
+
+まず必要なPackageをInstallします。
+
+```bash
+npm install --save-dev @testing-library/react @testing-library/user-event
+```
+
+同じTestを、実際のDOM QueryとInteractionベースで書き直します。
+
+```jsx
+// Toggle.test.jsx (After — @testing-library/react)
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { Toggle } from "./Toggle";
+
+test("クリックでStateがToggleされる", async () => {
+  const user = userEvent.setup();
+  render(<Toggle label="Notifications" />);
+
+  const button = screen.getByRole("button", { name: /notifications/i });
+  expect(button).toHaveTextContent("OFF");
+
+  await user.click(button);
+
+  expect(button).toHaveTextContent("ON");
+});
+```
+
+Syntaxだけでなく、考え方自体が変わっている点に注目してください。
+
+- `render()`はJSON Treeではなく、実際のjsdom Container内にMountします。
+- `screen.getByRole`は、Screen Readerや実際のUserと同じ方法で — Accessible RoleとNameで — Buttonを見つけます。Accessible Nameが間違っていたり存在しなければ、このQuery自体が失敗します。これは有用なSignalです。
+- `userEvent.click`はDOMを通じて実際のEventをDispatchし、Reactの本来のEvent Handlingを経由します。Propの直接呼び出しではありません。
+- Assertion（`toHaveTextContent`）はInternal Treeの形ではなく、Userが見ている内容を表現しています。
+
+Snapshot Testが大量にある場合、すべてを機械的にAssertion一行ずつに変換しようとしないでください。まず「このSnapshotは本当に役に立っていたか」を問い直すべきです。Interactionのない、安定したStructural Component（例えばDesign SystemのWrapperなど）のSnapshotは、Regression Netとしてそれなりに安く機能します。`@testing-library/react`の`render`結果に対して`container.innerHTML`やSerializerを使えば、それも維持可能です。しかし「Clickしたら正しいTextが表示されるか」のようなInteraction Testの代わりにSnapshotを使っている場合は、Behavior Assertionに置き換えるべきです。これがIntentをDocumentするTestと、何かが変わるたびに文句を言うだけのTestの違いです。
+
+## 大規模Suiteの段階的移行
+
+数百件の`react-test-renderer` Testを抱えるSuiteでは、一気にやるのは現実的ではありません。弊社でうまくいっている進め方は以下の通りです。
+
+1. **まず増加を止める。** ESLintやReviewで新規`react-test-renderer`利用を禁止し、Backlogを減らしている間に問題が増え続けないようにします。
+2. **File順ではなくRiskベースで移行する。** Form、Button、Toggleなど実際のUser Interactionを含むComponentを優先します。`user-event`の恩恵が最も大きく、Snapshotだけでは検証が弱い箇所でもあります。
+3. **書き直す前に削除を検討する。** 一部のSnapshot Testは、過去に誰かがDiffを見ずに`--updateSnapshot`を打っただけで存在しています。何を守っているのか誰も説明できないSnapshotは、移行対象ではなく削除対象です。
+4. **Structural SnapshotのためのNarrowな余地は残す。** IconセットやLayout Shellのような静的でInteractionのないMarkupは、Snapshot形式のCheckを残す妥当な場所です。ただし`react-test-renderer`を使う必要はなく、`@testing-library/react`のRender結果でも十分です。
+5. **期限付きのTech Debtとして管理する。** 「いつかやる」ではなく、期限を切ってTrackします。React 19以降のMajor Versionで、この種のWarningはさらに厳しくなっていくはずです。
+
+## Checklist
+
+- `react-test-renderer`と`react-test-renderer/shallow`のImportを削除し、`@testing-library/react`と`@testing-library/user-event`をAdd。
+- `TestRenderer.create()`を`render()`に置き換え。
+- `renderer.root.find*`とPropの直接呼び出しを、`screen.getByRole` / `getByText`と`user-event`によるInteractionに置き換え。
+- Interactive出力に対するSnapshot Assertionを、`expect(...).toHaveTextContent(...)`や`toBeVisible()`などの明示的なAssertionに置き換え。
+- Snapshotは本当に静的でInteractionのないMarkupにのみ残し、それぞれ「なぜ存在するのか」を説明できる状態にする。
+- Lint RuleやCI Checkを追加し、新規の`react-test-renderer`利用が再び紛れ込まないようにする。
+
+根底にある原則はReactのVersionが変わっても揺らぎません — UserがOperateするのと同じ方法でDOMをQueryするTestは、Componentの内部実装をRefactorしてもBehaviorが変わらない限りPassし続けます。一方、Internal Fiber Nodeを直接触るTestは、Internalが変わった瞬間に壊れます。そしてそのInternalの変化は、今回のDeprecationが示す通り、こちらでControlできるものではありません。
