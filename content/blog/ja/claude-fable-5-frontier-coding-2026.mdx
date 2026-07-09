@@ -1,0 +1,179 @@
+---
+title: "Claude Fable 5 — Anthropic の最新フロンティア コーディングモデル"
+description: "Fable 5 の実装力と費用対効果を、マルチモデル戦略の観点から検証。実践的なルーティング戦略とコード例。"
+date: "2026-07-10"
+status: "published"
+tags: ["Claude", "LLM", "コスト最適化", "マルチモデル戦略", "開発効率"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-fable-5-frontier-coding-2026"
+---
+
+## 最高性能、最高コスト
+
+Anthropic が発表した Claude Fable 5 は、ソフトウェアエンジニアリングベンチマーク（SWE-bench Verified）で約 95% のスコアを達成し、現在利用可能なコーディングモデルの中で最高の推論性能を備えています。これは事実です。一方、価格は入力トークンあたり $10/百万トークン、出力トークンあたり $50/百万トークンと高い。この特性を理解しないと、コスト爆発につながります。
+
+webhani の顧客との運用を通じて学んだことは、Fable 5 は「すべてに使うモデル」ではなく、「いつ使うかを決めるモデル」ということです。
+
+## モデルの階層化戦略
+
+実践的なアプローチは、タスクの難易度に応じてモデルを切り替えることです。
+
+**軽量タスク** — ボイラープレートコード生成、既存パターンの単純な拡張、フォーマット変換。Claude Haiku やより廉価な Opus で十分。実行時間短く、コストも低い。
+
+**中程度タスク** — バグ修正の初期段階、設計検証、テストの追加。Claude Opus あるいは Sonnet が有力。推論能力と費用のバランスが取れています。
+
+**複雑タスク** — マルチステップの最適化問題、レガシーシステムの深いデバッグ、新規アーキテクチャの設計。ここで Fable 5 は投資額に見合う結果をもたらします。
+
+この階層化戦略により、全体のトークン消費の 70-80% を低コストモデルで処理し、残る 20-30% の最難関問題だけを Fable 5 に割り当てることが可能になります。
+
+## ルーティングロジックの実装
+
+実際にこの戦略をシステムに組み込む場合、タスク難易度を評価するルーターが必要です。以下は TypeScript での実装例です。
+
+```typescript
+interface CodeTask {
+  description: string;
+  codeContext?: string;
+  estimatedComplexity?: number;
+}
+
+interface ModelConfig {
+  model: string;
+  maxInputTokens: number;
+  costPerMInputTokens: number;
+  costPerMOutputTokens: number;
+}
+
+const modelTiers: Record<string, ModelConfig> = {
+  haiku: {
+    model: "claude-3-5-haiku-20241022",
+    maxInputTokens: 8000,
+    costPerMInputTokens: 0.8,
+    costPerMOutputTokens: 4,
+  },
+  sonnet: {
+    model: "claude-3-5-sonnet-20241022",
+    maxInputTokens: 200000,
+    costPerMInputTokens: 3,
+    costPerMOutputTokens: 15,
+  },
+  opus: {
+    model: "claude-3-opus-20250219",
+    maxInputTokens: 200000,
+    costPerMInputTokens: 15,
+    costPerMOutputTokens: 75,
+  },
+  fable: {
+    model: "claude-fable-5",
+    maxInputTokens: 300000,
+    costPerMInputTokens: 10,
+    costPerMOutputTokens: 50,
+  },
+};
+
+function assessTaskComplexity(task: CodeTask): number {
+  let score = 0;
+
+  // コード量の評価
+  if (task.codeContext) {
+    const lineCount = task.codeContext.split("\n").length;
+    score += Math.min(lineCount / 100, 20); // 最大 20 点
+  }
+
+  // キーワードベース評価
+  const complexKeywords = [
+    "memory leak",
+    "concurrency",
+    "optimization",
+    "race condition",
+    "performance bottleneck",
+    "architecture",
+    "multi-tenant",
+  ];
+  const keywordMatches = complexKeywords.filter((kw) =>
+    task.description.toLowerCase().includes(kw)
+  ).length;
+  score += keywordMatches * 15; // キーワードあたり 15 点
+
+  // ユーザー指定スコア
+  if (task.estimatedComplexity) {
+    score += task.estimatedComplexity;
+  }
+
+  return Math.min(score, 100);
+}
+
+function routeTask(task: CodeTask): string {
+  const complexity = assessTaskComplexity(task);
+
+  if (complexity < 30) {
+    return "haiku";
+  } else if (complexity < 60) {
+    return "sonnet";
+  } else if (complexity < 85) {
+    return "opus";
+  } else {
+    return "fable";
+  }
+}
+
+async function solveTask(task: CodeTask): Promise<string> {
+  const modelKey = routeTask(task);
+  const config = modelTiers[modelKey];
+
+  console.log(`Task complexity: ${assessTaskComplexity(task)}/100`);
+  console.log(`Selected model: ${config.model}`);
+
+  // API 呼び出し（実装は省略）
+  // const response = await client.messages.create({
+  //   model: config.model,
+  //   max_tokens: 2000,
+  //   messages: [{ role: "user", content: task.description }],
+  // });
+
+  return `Using ${config.model}`;
+}
+
+// 使用例
+const debugTask: CodeTask = {
+  description:
+    "レガシー Node.js アプリでメモリリークを特定。マルチテナント環境での race condition の疑い。",
+  codeContext: "// 数百行のコード...",
+  estimatedComplexity: 30,
+};
+
+routeTask(debugTask); // → "fable" を返す
+```
+
+このルーターは以下の観点から難易度を判定します：
+
+1. **コード量** — 扱うコンテキストが大きいほど、より強力なモデルが有利
+2. **問題の性質** — 並行処理、パフォーマンス最適化、メモリ管理などのキーワード
+3. **ユーザーの明示的な指定** — チーム経験による難易度の上書き
+
+## コスト管理の実践パターン
+
+**トークンキャッシング** — 同じドキュメントやコード片を繰り返し参照する場合、Prompt Caching を活用すると 2 回目以降 90% のコスト削減が可能です。特に複数回の反復が予定される大型プロジェクト分析で有効。
+
+**コンテキストスコーピング** — 不要な情報を最初から除外する。ログ全体ではなく関連部分だけを渡す。Fable 5 のコンテキストウィンドウは広いが、トークンは費用です。
+
+**バッチ処理** — 一度に複数タスクを処理できるなら、バッチ API を活用。単発呼び出しより 50% 安くなります。
+
+**段階的な精緻化** — 初回を Opus で試し、うまくいかなかった場合だけ Fable 5 を投入。「最初から最高性能」より「段階的アップグレード」の方が総コストが低い傾向です。
+
+## 現実的な意思決定
+
+Fable 5 が「最高性能」であることと「すべてに使うべき」であることは別です。webhani のチームでは、以下の基準を満たすときだけ Fable 5 を指定します：
+
+- 既存モデルでの試行が失敗している
+- 問題が 8 時間以上のエンジニア時間を消費している可能性がある
+- バグの影響が本番環境に及んでいる
+
+月間のモデル利用料を見ると、Fable 5 の割合は全体の 5-15% 程度に収まっています。残りは Opus と Sonnet で処理され、これで大部分のタスクが完結します。
+
+## まとめ
+
+Claude Fable 5 は確かに強力です。しかし強力さは高い代償を伴います。重要なのは、モデルの選択をビジネス判断、つまり「このタスクに投じられるコストと得られる効果」で決めることです。ルーターと段階的戦略により、Fable 5 の価値を最大化しながら、全体のコストを制御できます。
+
+webhani では、このアプローチをクライアント案件にも提案しています。LLM の費用対効果は、単一の「最高モデル」を選ぶのではなく、「適切なタイミングで適切なモデルを使う」ことで初めて実現されるのです。
