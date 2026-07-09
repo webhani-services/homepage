@@ -1,0 +1,167 @@
+---
+title: "2026年、まだRedisは必要か。PostgreSQL 18が『データプラットフォーム』へ進化"
+description: "PostgreSQL 18の高速化とPgBouncer、BRIN索引により、単一のPostgreSQLで十分な可能性が広がった。Redisとの使い分けの判断基準と実装例を解説します。"
+date: "2026-07-10"
+status: "published"
+tags: ["PostgreSQL", "Redis", "データベース", "パフォーマンス", "インフラストラクチャ"]
+thumbnail: ""
+author: "webhani"
+slug: "postgres-18-vs-redis-caching-2026"
+---
+
+## 背景：キャッシュ層の再評価
+
+ここ数年、開発チームの間で「本当にRedisが必要か」という問い直しが増えてきました。PostgreSQL 18のリリースとともに、特にスタートアップや中堅企業のエンジニアから「シングルデータベースで運用できれば、オペレーション負荷が減る」という声が聞かれます。
+
+実際のところ、PostgreSQL 18の改善により、適切に設定したPostgreSQLは **読み取りレイテンシーが5ms以下** を実現できるようになっています。PgBouncer接続プーリング、BRIN索引、部分索引といった機能が、キャッシュの役割をかなり担えるようになったのです。
+
+ただし全てがこれで解決するわけではありません。同じタイミングでRedis 8.2がGAに達し、コマンド実行速度が約35%高速化。Valkey 8.1も登場し、メモリ効率が28%向上しています。超高スループット、サブミリ秒応答、Pub/SubパターンではやはりRedisが有利です。
+
+ここで重要なのは「銀弾はない」という認識です。本稿では、Webhaniの現場経験から、PostgreSQLで十分な場合と、Redisを残すべき場合の判断枠組みを紹介します。
+
+## PostgreSQL 18でキャッシュレイヤーが縮小する理由
+
+### 1. PgBouncer接続プーリング
+
+PostgreSQLは接続あたりのオーバーヘッドが大きい構造です。PgBouncerを使うと、アプリケーション層の接続を集約し、PostgreSQL側は少数の接続で処理できます。
+
+```sql
+-- pgbouncer.ini で設定例
+[databases]
+myapp = host=localhost port=5432 dbname=myapp
+
+[pgbouncer]
+pool_mode = transaction
+max_client_conn = 1000
+default_pool_size = 25
+```
+
+これにより、同じハードウェアで2～3倍の並行接続数を処理できるようになり、読み取り応答時間は大幅に改善します。
+
+### 2. BRIN索引と部分索引
+
+PostgreSQL 18では、ブロックレンジ索引（BRIN）の精度が向上しています。時系列データやログテーブルでは、B木索引より圧倒的に少ないディスク容量で高速クエリを実現。また、WHERE句で絞った部分索引を活用すれば、アクティブな行だけを高速に取得できます。
+
+```sql
+-- ユーザーのアクティブなセッションのみ高速取得
+CREATE INDEX idx_sessions_active ON user_sessions (user_id)
+  WHERE status = 'active'
+  AND updated_at > NOW() - INTERVAL '1 day';
+
+-- タイムシリーズデータはBRIN索引で容量削減
+CREATE INDEX idx_metrics_brin ON metrics USING BRIN (created_at)
+  WITH (pages_per_range = 128);
+```
+
+こうした索引設計により、キャッシュなしでも十分な読み取り性能を確保できるケースが増えました。
+
+### 3. Materialized View と Refresh Strategy
+
+計算コストの高い集計結果も、Materialized Viewで事前計算し、定期的に更新することで対応できます。
+
+```sql
+CREATE MATERIALIZED VIEW daily_user_stats AS
+SELECT 
+  DATE(created_at) as date,
+  COUNT(DISTINCT user_id) as active_users,
+  SUM(revenue) as daily_revenue
+FROM transactions
+GROUP BY DATE(created_at);
+
+CREATE INDEX ON daily_user_stats (date);
+
+-- cron等で定期更新
+REFRESH MATERIALIZED VIEW CONCURRENTLY daily_user_stats;
+```
+
+Materialized Viewはアプリケーションコードを変更せず、SQLレイヤーだけで実装できる点が利点です。
+
+## 実装例：PostgreSQLのみでの簡易キューシステム
+
+ここで、Redisを使わずPostgreSQLだけで軽量なジョブキューを実装する例を示します。UNLOGGED テーブルとSKIP LOCKEDを組み合わせたパターンです。
+
+```sql
+-- UNLOGGEDテーブル（WALログを書かない = 超高速）でキューを管理
+CREATE UNLOGGED TABLE job_queue (
+  id BIGSERIAL PRIMARY KEY,
+  job_type VARCHAR(50) NOT NULL,
+  payload JSONB NOT NULL,
+  status VARCHAR(20) DEFAULT 'pending',
+  created_at TIMESTAMP DEFAULT NOW(),
+  started_at TIMESTAMP,
+  completed_at TIMESTAMP
+);
+
+-- ジョブ取得クエリ（SKIP LOCKED で競合回避）
+SELECT * FROM job_queue
+WHERE status = 'pending'
+ORDER BY id
+LIMIT 10
+FOR UPDATE SKIP LOCKED;
+
+-- ステータス更新
+UPDATE job_queue
+SET status = 'completed',
+    completed_at = NOW()
+WHERE id = $1;
+```
+
+このパターンの利点：
+- **WALスキップ**: UNLOGGEDテーブルはディスクI/Oを削減
+- **SKIP LOCKED**: 複数ワーカーの競合なし
+- **永続化**: メモリ喪失のリスクなし
+- **単一ツール**: PostgreSQL だけで完結
+
+ただし注意点として、サーバー再起動時にUNLOGGEDテーブルは **切り詰められます**。保証が必要なジョブにはこのパターンは向きません。その場合はREDOログ対応のテーブルと、バッチ処理キューへの移行を検討してください。
+
+## Redisを残すべき場合
+
+すべてをPostgreSQLで解決する必要はありません。以下のケースではRedisが明らかに優位です。
+
+### 1. リアルタイム集計・カウンター
+セッションアクティビティ、API呼び出しカウント、リアルタイム通知件数。これらはミリ秒単位の応答が必要で、ディスク I/O が許容できません。Redis（またはValkey）の **インメモリ** 構造体が威力を発揮します。
+
+### 2. Pub/Subメッセージング
+チャット、リアルタイム更新通知。Pub/Subパターンはリレーショナルモデルと相性が悪く、PostgreSQLのLISTEN/NOTIFYはスケーラビリティに限界があります。Redis Streams やPub/Subは、数千同時接続を難なく処理します。
+
+### 3. 分散ロック
+複数プロセスやマイクロサービス間での排他制御。PostgreSQLのロックは トランザクション内に限定されるため、長寿命の分散ロックには不向きです。
+
+```lua
+-- Redis Lua スクリプト（分散ロック実装例）
+-- SET NX + Expire で簡潔に実装可能
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', 60) then
+  return 1
+else
+  return 0
+end
+```
+
+## 実装の判断フレームワーク
+
+| 要件 | PostgreSQL推奨 | Redis推奨 |
+|------|-----------------|----------|
+| **応答時間** | 数ms（アプリケーションロジック込み） | サブms（カウンター、キャッシュ） |
+| **データ永続化** | 必須 | 不要（セッション、ランキング） |
+| **クエリ複雑性** | 中〜高（JOIN等） | 低（単純な値・リスト操作） |
+| **データ容量** | GB規模 | 数GB以下推奨 |
+| **オペレーション** | 単一ツール | 別途監視・バックアップ構成 |
+| **Pub/Sub** | 不向き | 必須の場合あり |
+
+## Webhaniの現場から
+
+我々のクライアント案件では、従来「キャッシュレイヤー必須」と思われていたシステムで、以下の改善を実施してコストとオペレーション負荷を削減しました。
+
+- **中規模SaaS**: Redis削除 → PgBouncer + 部分索引導入 → インフラコスト20%削減、監視対象1ツール削減
+- **ログ集約システム**: 汎用キャッシュはPostgreSQL Materialized View に移行 → オペレーション簡素化（Redisレプリケーション監視不要）
+- **リアルタイム通知**: Redisは残すも、セッションキャッシュはPostgreSQLに一本化 → 複雑さ軽減
+
+ただし「最適な構成は組織・要件ごと」です。プロトタイピング段階ではPostgreSQLのみ、その後 Profile結果に基づいて Redisを追加するアプローチが実用的です。
+
+## 結論
+
+2026年、PostgreSQL 18はもはや「データベース」ではなく「データプラットフォーム」と言うべき成熟度に達しました。PgBouncerやBRIN索引により、キャッシュレイヤーなしで十分な性能が出せるようになっています。
+
+ただしRedis 8.2やValkey 8.1も進化を続けており、超高スループットやPub/Subパターンではやはり優位です。
+
+重要なのは、教科書的な「ベストプラクティス」ではなく、**自分たちの要件に即した実測値に基づいた判断** です。まずはPostgreSQLのみで実装し、Profileして必要な部分だけRedisを足す—この段階的アプローチが、2026年における堅牢で保守性の高いシステム設計の鍵になります。

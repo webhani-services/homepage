@@ -1,0 +1,171 @@
+---
+title: "Do You Still Need Redis in 2026? PostgreSQL 18 as a Data Platform"
+description: "With PgBouncer, BRIN indexes, and PostgreSQL 18's optimizations, a single well-tuned database can deliver sub-5ms read latency. When does Redis still win? A practical decision framework."
+date: "2026-07-10"
+status: "published"
+tags: ["PostgreSQL", "Redis", "caching", "database", "infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "postgres-18-vs-redis-caching-2026"
+---
+
+## The Cache Question Resurfaces
+
+For nearly a decade, the answer was automatic: add Redis. Fast reads, simple API, decouples application logic from database latency. But in 2026, that reflex is worth questioning. PostgreSQL 18 has crossed a threshold where developers—particularly at startups and mid-market companies—are genuinely asking whether a separate cache layer pays for its operational cost.
+
+The trend is real. PostgreSQL's improvements are substantial: with PgBouncer connection pooling, BRIN indexes, and partial indexes, a properly configured PostgreSQL can deliver **sub-5ms read latency** on common access patterns. Meanwhile, Redis 8.2 shipped with 35% faster command execution and Valkey 8.1 dropped memory consumption by 28%. Both Redis and PostgreSQL have evolved. The question is no longer "cache or not," but rather "what should live in the cache and what belongs in the database."
+
+At Webhani, we've worked through this decision on real systems. The calculus has shifted, and it's worth understanding why—and when to make each call.
+
+## Why PostgreSQL 18 Reduces Cache Pressure
+
+### Connection pooling changes everything
+
+PostgreSQL's per-connection overhead is substantial. Each connection acquires memory, participates in the buffer manager, and adds latency when queries execute. PgBouncer sits between your application and the database, multiplexing many application connections into a smaller pool of long-lived database connections.
+
+```sql
+-- pgbouncer.ini configuration
+[databases]
+myapp = host=localhost port=5432 dbname=myapp
+
+[pgbouncer]
+pool_mode = transaction
+max_client_conn = 1000
+default_pool_size = 25
+reserve_pool_size = 5
+reserve_pool_timeout = 3
+```
+
+The impact: a hardware configuration that once handled 200 concurrent application connections can now handle 1000+. Read latency drops because less time is spent acquiring connections. For many I/O-bound workloads, this alone eliminates the case for Redis.
+
+### Indexes evolved
+
+BRIN (Block Range INdex) trades index size for precision. On a time-series table with millions of rows, a BRIN index consumes a fraction of the disk space of a B-tree while maintaining fast sequential access. Partial indexes let you index only the rows you actually query—active sessions, unresolved tickets, unexpired tokens.
+
+```sql
+-- Partial index: only active sessions
+CREATE INDEX idx_sessions_active ON user_sessions (user_id)
+  WHERE status = 'active'
+  AND updated_at > NOW() - INTERVAL '1 day';
+
+-- BRIN for time-series data (much smaller than B-tree)
+CREATE INDEX idx_events_time ON events USING BRIN (created_at)
+  WITH (pages_per_range = 128);
+```
+
+Combined with PostgreSQL's improved query planner, these indexes let you fetch hot data without touching Redis at all. The latency delta between a well-tuned query and an in-memory cache fetch has narrowed significantly.
+
+### Materialized views as the middle ground
+
+Not everything needs to be precomputed. But some things do. Materialized views let you define expensive aggregations once in SQL, refresh them on a schedule, and serve fresh results without a separate caching system.
+
+```sql
+CREATE MATERIALIZED VIEW daily_revenue AS
+SELECT 
+  DATE(created_at) as date,
+  COUNT(*) as orders,
+  SUM(amount) as revenue
+FROM transactions
+WHERE created_at > NOW() - INTERVAL '90 days'
+GROUP BY DATE(created_at);
+
+CREATE INDEX ON daily_revenue (date);
+
+-- Refresh nightly or on-demand
+REFRESH MATERIALIZED VIEW CONCURRENTLY daily_revenue;
+```
+
+Your application queries the view like a normal table. PostgreSQL handles the refresh schedule. No client-side caching logic, no TTL bugs, no stale-data surprises.
+
+## Postgres-Only Queue: A Practical Example
+
+One pattern we've migrated successfully: lightweight job queues. Traditionally, teams reached for Redis for task queues (reliability, persistence). But PostgreSQL can do this—cheaply—with UNLOGGED tables and SKIP LOCKED semantics.
+
+```sql
+-- UNLOGGED table: persisted but without WAL overhead
+CREATE UNLOGGED TABLE job_queue (
+  id BIGSERIAL PRIMARY KEY,
+  job_type VARCHAR(50) NOT NULL,
+  payload JSONB NOT NULL,
+  status VARCHAR(20) DEFAULT 'pending',
+  created_at TIMESTAMP DEFAULT NOW(),
+  started_at TIMESTAMP,
+  completed_at TIMESTAMP
+);
+
+-- Worker claims next job without blocking others
+SELECT * FROM job_queue
+WHERE status = 'pending'
+ORDER BY id
+LIMIT 10
+FOR UPDATE SKIP LOCKED;
+
+-- Mark complete
+UPDATE job_queue
+SET status = 'completed', completed_at = NOW()
+WHERE id = $1;
+```
+
+**Advantages:**
+- UNLOGGED skips write-ahead-log overhead; 3-5x faster than logged tables
+- SKIP LOCKED prevents workers from locking each other
+- Persistence: data survives server restarts (with caveats—see below)
+- Single tool: PostgreSQL only
+
+**Critical caveat:** UNLOGGED tables are **truncated on unclean shutdown**. For mission-critical work, pair this with a separate durable queue or use logged tables with aggressive archiving.
+
+## When Redis Still Wins
+
+This isn't about replacing Redis wholesale. It's about choosing the right tool per use case.
+
+### Real-time counters and rate limits
+
+Session activity count, API call throttling, live user count, request rate. These need **sub-millisecond response time** and don't tolerate disk I/O. Redis's in-memory structure wins decisively here.
+
+```lua
+-- Redis Lua for atomic rate-limit check
+if redis.call('INCR', KEYS[1]) == 1 then
+  redis.call('EXPIRE', KEYS[1], 60)
+end
+```
+
+Postgres can't match this latency without sacrificing durability.
+
+### Pub/Sub and streaming
+
+Real-time chat, activity feeds, live notifications. Redis Streams and Pub/Sub are built for many-to-many communication patterns. PostgreSQL's LISTEN/NOTIFY is designed for intra-system notifications, not high-fan-out messaging. If you need thousands of subscribers on a single topic, Redis is the answer.
+
+### Distributed locks
+
+Coordinating work across multiple processes or services. PostgreSQL locks are transactional—they release when the transaction ends. For long-lived distributed locks (database migration in progress, job running), you need Redis.
+
+## The Decision Framework
+
+| Requirement | PostgreSQL Best | Redis Better |
+|-------------|---|---|
+| **Latency** | Millisecond range (with app logic) | Sub-millisecond (atomic ops) |
+| **Persistence** | Essential | Optional (ephemeral) |
+| **Query complexity** | Medium to high (JOINs, WHERE) | Simple (key lookup, list ops) |
+| **Data volume** | Gigabytes to terabytes | Up to 100GB practical limit |
+| **Operations** | Single tool | Separate monitoring, backups, failover |
+| **Pub/Sub** | Awkward scaling | Primary use case |
+
+## What We've Done in Practice
+
+Across several Webhani client engagements, we've deleted Redis from architectures that had stopped needing it:
+
+1. **Mid-scale SaaS platform**: Removed Redis for session cache, replaced with PostgreSQL + PgBouncer + partial index on active sessions. Result: 20% infrastructure cost reduction, one fewer tool to monitor and upgrade.
+
+2. **Log aggregation service**: Session-level aggregates (unique users per hour) moved from Redis to PostgreSQL Materialized View refreshed every 10 minutes. Result: eliminated cron jobs that polled Redis, simplified data consistency guarantees.
+
+3. **Real-time notification system**: Kept Redis for Pub/Sub (non-negotiable), moved other caches to PostgreSQL. Result: reduced Redis memory pressure, simplified Redis operations.
+
+The pattern: measure first, then decide. Don't delete Redis because it's fashionable. Delete it because profiling proves the database is sufficient.
+
+## Conclusion
+
+PostgreSQL 18 is no longer just a database. It's matured into a data platform—capable of handling caching, queuing, and analytics workloads alongside transactional queries. PgBouncer, BRIN indexes, and Materialized Views let you consolidate infrastructure without sacrificing performance.
+
+Redis 8.2 and Valkey 8.1 haven't been displaced. They've found their place: real-time operations, Pub/Sub, and ultra-high throughput where sub-millisecond latency is non-negotiable.
+
+The 2026 best practice isn't "always use Redis" or "never use Redis." It's **measure your workload, profile your queries, and let the data decide**. Start with PostgreSQL. Add Redis only where profiling shows you need it. This disciplined approach cuts operational overhead and keeps your stack simple—which, in production, is often the best performance gain of all.
