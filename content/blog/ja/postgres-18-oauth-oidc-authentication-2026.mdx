@@ -1,0 +1,72 @@
+---
+title: "PostgreSQL 18のOAuth/OIDC認証 — DB接続にSSOを持ち込む"
+description: "PostgreSQL 18が標準でOAuth 2.0認証に対応しました。外部Validatorに委ねる設計の理由と、pg_oidc_validatorを使った構成の考え方を整理します。"
+date: "2026-07-11"
+status: "published"
+tags: ["PostgreSQL", "データベース", "セキュリティ", "OAuth", "認証"]
+thumbnail: ""
+author: "webhani"
+slug: "postgres-18-oauth-oidc-authentication-2026"
+---
+
+## PostgreSQLがOAuthに対応した意味
+
+PostgreSQL 18で、標準機能としてOAuth 2.0ベースの認証がサポートされました。これは地味に見えて、運用の勘所を大きく変える変更です。これまでデータベースの認証は、パスワードや証明書、あるいはLDAP連携で対応するのが一般的でした。しかし組織全体でIdP（Identity Provider）を使ったSSO（シングルサインオン）を導入している場合、「データベースだけ別の認証系」という状態が残りがちでした。
+
+PostgreSQL 18のOAuth対応は、この分断を埋める第一歩です。OpenID Connect（OIDC）を通じて、KeycloakやPing IdentityといったIdPの発行するトークンでデータベースに接続できるようになります。本稿では、その設計思想と実務での考え方を整理します。
+
+## なぜ「外部Validator」に委ねる設計なのか
+
+PostgreSQL 18のOAuth実装で特徴的なのは、トークンの検証をコア本体で完結させず、外部のValidatorライブラリに委ねている点です。一見すると回りくどく見えますが、これには理由があります。
+
+OIDCは仕様としては共通でも、IdPごとにトークンの形式やクレームの持ち方、検証手順が微妙に異なります。もしPostgreSQL本体が特定のIdPの流儀を前提に実装すると、他のIdPとの相性問題や、仕様変更への追従が負担になります。そこでPostgreSQLは「トークンをどう検証するか」を差し替え可能なプラグインに切り出しました。
+
+この役割を担う実装のひとつが、Perconaの `pg_oidc_validator` です。これはPostgreSQLと任意のOIDC準拠IdPを橋渡しするExtensionで、deb/rpmパッケージが配布されています。
+
+## 構成の全体像
+
+OAuth認証を有効にする際の流れを、概念的に整理します（実際のパラメータ名は環境やバージョンで異なるため、必ず公式ドキュメントを確認してください）。
+
+1. **サーバー側の準備**：PostgreSQL 18サーバーパッケージに加え、Validator（例：`pg_oidc_validator`）を導入します。
+2. **設定ファイルでValidatorを読み込む**：どのValidatorを使うか、どのクレームをPostgreSQLのユーザー名に対応づけるか（例：`authn_field`）を指定します。
+3. **認証設定とIDマップの定義**：`pg_hba.conf` に相当する認証設定でOAuthを指定し、IdP上のユーザーとデータベースユーザーを対応づけるIDマップを作成します。
+
+```text
+# 概念図（実際の記法はドキュメント参照）
+[クライアント (psql 等)]
+      │  IdP発行のトークンを提示
+      ▼
+[PostgreSQL 18] --委譲--> [OIDC Validator (例: pg_oidc_validator)]
+      │                          │
+      │  <--検証結果・ユーザーマッピング--
+      ▼
+接続許可（IdP上のユーザー → DBユーザーへマップ）
+```
+
+クライアント側でも対応が必要です。`psql` のようなコマンドラインクライアントとValidatorを組み合わせれば、現時点でも試すことができます。
+
+## 導入判断のための現実的な視点
+
+新機能ではありますが、Webhaniとしては次の点を踏まえて段階的に検討することを勧めます。
+
+### 1. まだ「実験フェーズ」であることを前提に
+
+OAuth対応はPostgreSQL 18以降でのみ利用可能で、クライアント側の対応や外部Validatorを必要とします。本格的な普及には時間がかかる見込みです。まずは検証環境で、自社のIdPと組み合わせて動作を確認するところから始めるのが現実的です。
+
+### 2. 得られるメリットを具体的に評価する
+
+OIDC対応の価値は、認証の一元化にあります。IdP側でユーザーのライフサイクル（入社・退職・権限変更）を管理していれば、データベースアクセスもその管理に乗せられます。パスワードをデータベースごとに配布・ローテーションする運用から離れられるのは、監査対応やゼロトラスト設計の観点でも大きな利点です。
+
+### 3. セキュリティ設定の初期値に注意
+
+認証の一元化はセキュリティを底上げしますが、設定の作り込みを誤れば逆効果です。クレームのマッピングを緩く設定すると、意図しないユーザーが権限を得るリスクがあります。IDマップは最小権限の原則にもとづき、慎重に設計してください。
+
+## Webhaniの見立て
+
+データベースの認証をIdPに寄せる流れは、他のミドルウェアで起きてきたことの延長線上にあります。アプリケーションはとうにSSOに移行しているのに、データベースだけがパスワード運用で取り残されている——この状態はセキュリティ上の弱点になりがちです。PostgreSQL 18のOAuth対応は、その最後のピースを埋める動きだと捉えています。
+
+現時点では成熟途上ですが、方向性としては本流です。特に金融・医療など監査要件の厳しい領域や、ゼロトラストを進める組織では、早めに検証しておく価値があります。Webhaniでも、顧客のインフラ設計において「データベース認証のSSO統合」を選択肢のひとつとして提案していく方針です。
+
+---
+
+*参考: [PostgreSQL 18 Documentation: OAuth Authorization/Authentication](https://www.postgresql.org/docs/current/auth-oauth.html), [PostgreSQL OIDC Authentication with pg_oidc_validator (Percona)](https://www.percona.com/blog/postgresql-oidc-authentication-with-pg_oidc_validator/)*

@@ -1,0 +1,111 @@
+---
+title: "ES2026 Is Official — How Temporal and using Change Everyday JavaScript"
+description: "Ecma approved ES2026 in June 2026. Here is a practical, field-tested look at Temporal, using/await using, Math.sumPrecise, and the other additions that matter day to day."
+date: "2026-07-11"
+status: "published"
+tags: ["JavaScript", "ECMAScript", "TypeScript", "Frontend", "Node.js"]
+thumbnail: ""
+author: "webhani"
+slug: "es2026-temporal-resource-management-2026"
+---
+
+## ES2026 is approved
+
+On June 30, 2026, Ecma approved ECMAScript 2026 (ES2026), the 17th edition of the JavaScript specification. The headline additions are the long-awaited `Temporal` API and explicit resource management via `using` / `await using`. These are not flashy syntax sugar. They fill gaps in the language that teams have been patching with third-party libraries and boilerplate for years — which is exactly why they show up in everyday code.
+
+This post walks through the features most likely to earn their keep in real projects, in rough priority order, and covers what to watch for when you adopt them.
+
+## Temporal: moving on from `Date`
+
+The largest addition in ES2026 is `Temporal`. Roughly 4,500 tests were added to the Test262 conformance suite for this feature alone, which tells you how much surface area it covers.
+
+The old `Date` object has well-known problems: zero-indexed months, ambiguous time zone handling, and mutability that invites subtle bugs. `Temporal` is a ground-up redesign — an immutable, time-zone-aware, calendar-aware date/time API.
+
+```javascript
+// Before: time zone handling is implicit and easy to get wrong
+const d = new Date("2026-07-11");
+d.setMonth(d.getMonth() + 1); // mutates in place
+
+// ES2026: intent is explicit and the original value is untouched
+const date = Temporal.PlainDate.from("2026-07-11");
+const nextMonth = date.add({ months: 1 }); // returns a new value
+
+// Current time with an explicit time zone
+const nowTokyo = Temporal.Now.zonedDateTimeISO("Asia/Tokyo");
+```
+
+In practice, date bugs cluster around anything that crosses time zones — booking systems, billing cutoffs, scheduling. `Temporal` splits its types deliberately: `PlainDate` (date only), `PlainTime` (time only), and `ZonedDateTime` (with a zone). That separation makes the granularity you are working with explicit in the code, instead of hidden inside a `Date`. Much of what teams reach for `date-fns`, `dayjs`, or `Luxon` to do can move to the standard library.
+
+## `using` / `await using`: reliable cleanup
+
+The second important addition is explicit resource management. File handles, database connections, locks — anything that must be released when you are done — can now be disposed automatically as the scope exits.
+
+```javascript
+// Before: nested try...finally is noisy and easy to forget
+function processFile(path) {
+  const handle = openFile(path);
+  try {
+    return handle.read();
+  } finally {
+    handle.close(); // forget this and you leak a resource
+  }
+}
+
+// ES2026: using disposes automatically at end of scope
+function processFile(path) {
+  using handle = openFile(path); // object implements Symbol.dispose
+  return handle.read();
+} // handle is closed here, automatically
+```
+
+For asynchronous resources, use `await using`. It fits network streams and transactions where cleanup itself is async.
+
+```javascript
+async function withTransaction(db) {
+  await using tx = await db.begin(); // uses Symbol.asyncDispose
+  await tx.query("UPDATE ...");
+  await tx.commit();
+} // cleaned up reliably even if an exception is thrown
+```
+
+From our experience at Webhani, connection leaks and missed lock releases are the kind of defect that stays invisible until it surfaces in production. `using` removes a whole class of these mistakes at the syntax level — a quiet feature with an outsized impact.
+
+## Small additions that still pay off
+
+ES2026 also ships several smaller functions that land squarely in real code.
+
+- **`Math.sumPrecise`**: sums an array of floats while controlling rounding error. Useful anywhere `reduce((a, b) => a + b)` was quietly accumulating drift, such as monetary totals.
+- **`Error.isError()`**: reliably checks whether a value is a genuine `Error`. `instanceof` can break across realms (iframes, workers); this works across them.
+- **base64 / hex methods on `Uint8Array`**: binary-to-string conversion is now standardized, so you no longer need `Buffer` or a hand-rolled helper.
+
+```javascript
+// Sum with controlled rounding error
+const total = Math.sumPrecise([0.1, 0.2, 0.3]); // high-precision result
+
+// Error check that survives realm boundaries
+if (Error.isError(caught)) {
+  console.error(caught.message);
+}
+
+// base64 encode/decode in the standard library
+const bytes = Uint8Array.fromBase64("aGVsbG8=");
+const encoded = new Uint8Array([104, 105]).toBase64();
+```
+
+## Practical notes for adoption
+
+The features are appealing, but you cannot use all of them tomorrow. Here is what we check before rolling them into client projects.
+
+1. **Confirm runtime support first.** Coverage varies by Node.js and browser version. `Temporal` in particular is a young implementation — check the release notes for your target environment to see whether it has landed in a stable build, and reach for a polyfill where needed.
+2. **`using` depends on your build config.** TypeScript and bundler transpilation may need to down-level `Symbol.dispose`. Set your target explicitly so the output is correct.
+3. **Do not rush a wholesale replacement.** Migrating away from `date-fns` and friends is safest module by module, starting where test coverage is strong. Date logic is prone to regressions, so add tests that compare behavior before and after the switch.
+
+## Takeaways
+
+ES2026 is less about a new way to write code and more about firming up foundations the language was missing. `Temporal` cuts down date-handling bugs, `using` makes cleanup reliable, and `Math.sumPrecise` and `Error.isError()` close small but real pitfalls. None of it is flashy, but all of it pays off during the maintenance phase.
+
+The pragmatic path is to confirm runtime support and adopt incrementally, starting where your tests are strongest. At Webhani, we plan to revisit the date logic and resource management in existing projects first and expand from there.
+
+---
+
+*References: [ECMAScript 2026 specification approved (InfoWorld)](https://www.infoworld.com/article/4193461/ecmascript-2026-specification-approved.html), [What's new in ECMAScript 2026 (pawelgrzybek.com)](https://pawelgrzybek.com/whats-new-in-ecmascript-2026/)*

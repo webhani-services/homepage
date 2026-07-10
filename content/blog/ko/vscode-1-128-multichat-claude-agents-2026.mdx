@@ -1,0 +1,79 @@
+---
+title: "VS Code 1.128의 Multi-Chat — Claude Agent를 병렬로 돌리는 개발 흐름"
+description: "VS Code 1.128이 하나의 Claude Session 안에서의 병렬 Chat을 지원합니다. Fork, Peer Chat, 동시 실행이 실무에서 무엇을 바꾸는지 정리합니다."
+date: "2026-07-11"
+status: "published"
+tags: ["Claude", "AI 코딩", "VS Code", "개발 도구", "생산성"]
+thumbnail: ""
+author: "webhani"
+slug: "vscode-1-128-multichat-claude-agents-2026"
+---
+
+## VS Code 1.128이 도착했습니다
+
+2026년 7월 8일, Visual Studio Code 1.128이 릴리스되었습니다. 이번 핵심 기능 중 하나가 Claude Agent Session 안에서의 Multi-Chat 지원입니다. 하나의 Session 안에 여러 관련 Chat을 두어 Approach를 비교하거나, 중간 Turn에서 분기하거나, 병렬로 작업을 돌릴 수 있게 되었습니다.
+
+언뜻 보면 소소한 UI 개선처럼 보이지만, AI 코딩 실무에서는 "Context의 분기"를 다룰 수 있느냐가 효율을 크게 좌우합니다. 이 글에서는 이 기능이 무엇을 해결하는지 Webhani의 관점에서 정리합니다.
+
+## Multi-Chat이 해결하는 문제
+
+지금까지 AI 코딩은 하나의 대화에 Context가 쌓여가는 방식이었습니다. 편리한 반면 다음과 같은 상황에서 다루기 어려웠습니다.
+
+- 구현 A와 구현 B를 비교하고 싶은데, 같은 대화에서 시도하면 Context가 섞입니다
+- 특정 시점으로 돌아가 다른 방침을 시도하고 싶지만, 그때까지의 경위는 유지하고 싶습니다
+- Test 작성과 본체 구현을 동시에 진행하고 싶습니다
+
+VS Code 1.128의 Multi-Chat은 이를 "하나의 Session에 여러 Chat을 매다는" 구조로 해결합니다. 각 Chat은 고유한 History·제목·Model 선택을 유지하고, 재시작 후에도 부모 Session과 함께 복원됩니다. Peer Chat은 Session 아래에 묶여 Top-level Session 목록을 어지럽히지 않습니다.
+
+## 세 가지 조작 모델
+
+공식 설명에 따르면 주요 조작은 다음 세 가지입니다.
+
+### 1. Peer Chat 추가
+
+같은 Session에 병렬 Chat을 더할 수 있습니다. 예를 들어 메인 Chat에서 Express App에 `/health` Endpoint를 추가하면서, Peer Chat에서 동시에 그 Test를 작성하는 식의 분담이 가능합니다.
+
+```text
+Claude Session: user-service 개선
+├─ 메인 Chat    : /health Endpoint 추가
+├─ Peer Chat #1 : 위 코드의 Test를 병행 작성
+└─ Peer Chat #2 : 대체 구현(다른 방식) 검토
+```
+
+### 2. Fork(분기)
+
+대화 중간 Turn에서 분기할 수 있습니다. 1.128에서는 Fork가 Top-level의 새 Session이 아니라, 같은 Session 안의 새 Peer Chat으로 만들어지도록 바뀌었습니다. Fork한 Chat은 분기점까지의 대화를 이어받고, 형제 Chat과 독립적으로 동작하며, 제목은 자동 생성됩니다.
+
+"여기까지의 이해는 공유하고 싶지만, 이 다음은 다른 방침으로"라는 상황에 잘 맞습니다.
+
+### 3. 동시 실행(Turn 동시 전송)
+
+여러 Chat에 Turn을 동시에 보낼 수 있습니다. 사람이 하나씩 답변을 기다리는 대신 병행해서 여러 작업을 진행할 수 있어 대기 시간이 줄어듭니다.
+
+## 실무에서의 활용 지점
+
+Webhani가 고객 Project에서 AI 코딩을 쓸 때 이 기능이 효과를 낼 만한 상황을 꼽아봅니다.
+
+- **구현과 검증의 분리**: 본체 구현 Chat과 Test·Review 관점 Chat을 나누면 Context 혼선을 피할 수 있습니다.
+- **설계 비교 검토**: 같은 요구사항에 대해 두 가지 Approach를 별도 Chat에서 병주시키고, 출력을 대조해 고르는 진행 방식이 자연스러워집니다.
+- **조사와 구현의 병행**: Library 동작을 조사하는 Chat과 구현을 진행하는 Chat을 나눠두면, 조사로 대화가 길어져도 구현 쪽 Context가 오염되지 않습니다.
+
+다만 주의점도 있습니다. 병렬화할수록 Review해야 할 출력의 총량은 늘어납니다. AI가 병행 생성한 코드를 사람이 하나씩 끝까지 검증할 수 있는지는 별개의 문제입니다. Webhani는 "병렬로 빠르게 만드는 것"과 "검증의 눈을 통과시키는 것"을 한 세트로 설계할 것을 권장합니다. 병렬화는 Throughput을 올리지만, Quality Gate를 느슨하게 해도 되는 이유는 아닙니다.
+
+## 운영 측면의 고려사항
+
+팀에서 쓸 경우 다음을 미리 정해두면 혼란이 줄어듭니다.
+
+1. **Chat 명명 규칙**: 자동 생성 제목은 편리하지만, 나중에 History를 따라갈 때 "무엇을 위한 Chat인가"를 팀 내에서 알 수 있게 명명하면 회고가 수월합니다.
+2. **Model 사용 구분**: 각 Chat이 고유하게 Model을 고를 수 있으므로, 가벼운 조사는 빠르고 저렴한 Model, 어려운 구현은 상위 Model로 나눠 쓸 수 있습니다. Cost와 품질의 균형을 설계에 담을 수 있습니다.
+3. **검증 담당의 명확화**: 병렬로 돌린 만큼 최종적으로 사람이 Review할 책임 범위를 모호하게 두지 않는 것. 생성량이 늘수록 이 경계 설정이 중요해집니다.
+
+## 정리
+
+VS Code 1.128의 Multi-Chat은 AI 코딩을 "하나의 대화"에서 "분기·병렬이 가능한 작업 공간"으로 넓히는 변경입니다. Fork가 같은 Session 안의 Peer Chat이 되면서, Context를 유지한 채 방침을 나누기 쉬워졌습니다.
+
+다만 병렬화 자체가 성과를 보장하지는 않습니다. 빠르게 만들 수 있게 될수록 검증 설계가 효과를 발휘합니다. Webhani는 이런 도구의 진화를 따라가며 "병렬로 만들고 확실히 검증하는" Workflow 설계를 고객에게 제안하고 있습니다.
+
+---
+
+*참고: [Visual Studio Code 1.128 (code.visualstudio.com)](https://code.visualstudio.com/updates/v1_128), [Claude AI Gets Yet Another Boost in VS Code 1.128 (Visual Studio Magazine)](https://visualstudiomagazine.com/articles/2026/07/08/claude-ai-gets-yet-another-boost-in-vs-code-1-128.aspx)*
