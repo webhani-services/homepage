@@ -1,0 +1,72 @@
+---
+title: "OAuth/OIDC Authentication in PostgreSQL 18 — Bringing SSO to the Database"
+description: "PostgreSQL 18 ships built-in OAuth 2.0 authentication. Here is why it delegates token validation to external validators, and how to think about a pg_oidc_validator setup."
+date: "2026-07-11"
+status: "published"
+tags: ["PostgreSQL", "Database", "Security", "OAuth", "Authentication"]
+thumbnail: ""
+author: "webhani"
+slug: "postgres-18-oauth-oidc-authentication-2026"
+---
+
+## What OAuth in PostgreSQL actually means
+
+PostgreSQL 18 adds OAuth 2.0-based authentication as a built-in feature. It looks understated, but it changes an important operational reality. Database authentication has traditionally meant passwords, certificates, or an LDAP integration. Yet when an organization runs SSO through an IdP (identity provider) across everything else, the database often ends up as the one system on a separate auth track.
+
+PostgreSQL 18's OAuth support is a first step toward closing that gap. Through OpenID Connect (OIDC), you can connect to the database using tokens issued by an IdP such as Keycloak or Ping Identity. This post walks through the design and how to think about it in practice.
+
+## Why delegate to an "external validator"
+
+A distinctive part of PostgreSQL 18's OAuth implementation is that it does not validate tokens entirely in the core. Instead, it delegates validation to an external validator library. That looks roundabout at first, but there is a good reason.
+
+OIDC is a shared spec, but every IdP implements it slightly differently — token formats, how claims are carried, and validation steps all vary. If PostgreSQL core baked in one IdP's conventions, it would create compatibility problems with others and a maintenance burden every time a spec detail changed. So PostgreSQL carved out "how a token is validated" into a swappable plugin.
+
+One implementation of that role is Percona's `pg_oidc_validator`, an extension that bridges PostgreSQL with any OIDC-compliant IdP and ships as downloadable deb/rpm packages.
+
+## The shape of a setup
+
+Here is the flow for enabling OAuth authentication, described conceptually (actual parameter names vary by environment and version, so always confirm against the official docs).
+
+1. **Prepare the server.** In addition to the PostgreSQL 18 server packages, install a validator (for example, `pg_oidc_validator`).
+2. **Load the validator in the config.** Specify which validator to use and which claim maps to the PostgreSQL user name (for example, an `authn_field` setting).
+3. **Define auth config and an identity map.** In the authentication config (the `pg_hba.conf` equivalent), select OAuth and create an identity map that ties IdP users to database users.
+
+```text
+# Conceptual diagram (see the docs for real syntax)
+[client (psql, etc.)]
+      │  presents an IdP-issued token
+      ▼
+[PostgreSQL 18] --delegates--> [OIDC validator (e.g. pg_oidc_validator)]
+      │                              │
+      │  <--validation result + user mapping--
+      ▼
+connection allowed (IdP user → mapped to a DB user)
+```
+
+The client side needs support too. You can already experiment today by pairing a command-line client like `psql` with a validator.
+
+## A realistic view for adoption decisions
+
+It is a new feature, and at Webhani we recommend evaluating it in stages, keeping these points in mind.
+
+### 1. Treat it as still experimental
+
+OAuth support is only available from PostgreSQL 18 onward and requires client-side support plus an external validator. Broad adoption will take time. The pragmatic start is a test environment where you confirm it works with your own IdP.
+
+### 2. Evaluate the concrete benefit
+
+The value of OIDC support is centralized authentication. If your IdP already manages the user lifecycle — onboarding, offboarding, permission changes — database access can ride on that same management. Moving away from distributing and rotating passwords per database is a real win for audit readiness and zero-trust design.
+
+### 3. Watch the security defaults
+
+Centralizing authentication raises your baseline, but a careless configuration can backfire. If claim mapping is set too loosely, unintended users could gain access. Design the identity map around least privilege.
+
+## Webhani's read
+
+Shifting database authentication toward the IdP is a continuation of what has already happened with other middleware. Applications moved to SSO long ago, while the database was often left behind on password-based operations — a state that tends to become a security weak point. PostgreSQL 18's OAuth support fills in that last piece.
+
+It is still maturing, but the direction is the mainstream one. It is especially worth validating early in audit-heavy domains such as finance and healthcare, or in organizations pushing zero trust. At Webhani, we plan to offer "SSO integration for database authentication" as one option in client infrastructure designs.
+
+---
+
+*References: [PostgreSQL 18 Documentation: OAuth Authorization/Authentication](https://www.postgresql.org/docs/current/auth-oauth.html), [PostgreSQL OIDC Authentication with pg_oidc_validator (Percona)](https://www.percona.com/blog/postgresql-oidc-authentication-with-pg_oidc_validator/)*

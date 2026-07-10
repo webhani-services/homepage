@@ -1,0 +1,111 @@
+---
+title: "ES2026が正式承認 — Temporal と using で変わる日常のJavaScript"
+description: "Ecmaが2026年6月にES2026を承認しました。Temporal API、using/await using、Math.sumPrecise など、実務に効く新機能を現場目線で整理します。"
+date: "2026-07-11"
+status: "published"
+tags: ["JavaScript", "ECMAScript", "TypeScript", "フロントエンド", "Node.js"]
+thumbnail: ""
+author: "webhani"
+slug: "es2026-temporal-resource-management-2026"
+---
+
+## ES2026が承認された
+
+2026年6月30日、EcmaがECMAScript 2026（ES2026）を正式に承認しました。JavaScript仕様としては17回目の版になります。今回の目玉は、長年待たれていた `Temporal` API と、`using` / `await using` によるリソース管理です。派手な構文糖ではなく、これまで外部ライブラリや定型コードで補ってきた「言語の穴」を埋める内容が中心で、その分だけ日常のコードに効いてきます。
+
+本稿では、Webhaniの開発現場で実際に価値が出そうな機能を優先度順に整理し、移行時の注意点まで踏み込みます。
+
+## Temporal：`Date` からの脱却
+
+ES2026で最も規模の大きい追加が `Temporal` です。仕様準拠テスト（Test262）にこの機能だけで約4,500件のテストが追加されたと報告されており、その本気度がうかがえます。
+
+これまでの `Date` オブジェクトは、月が0始まり、タイムゾーンの扱いが曖昧、ミュータブルで副作用を生みやすい、といった問題を抱えていました。`Temporal` はこれらを設計から作り直し、イミュータブルでタイムゾーン・カレンダーを意識した日時APIを提供します。
+
+```javascript
+// これまで：タイムゾーンの扱いが暗黙的で事故りやすい
+const d = new Date("2026-07-11");
+d.setMonth(d.getMonth() + 1); // ミュータブルに書き換わる
+
+// ES2026：意図が明示的で、元の値は変わらない
+const date = Temporal.PlainDate.from("2026-07-11");
+const nextMonth = date.add({ months: 1 }); // 新しい値を返す
+
+// タイムゾーンを明示した現在時刻
+const nowTokyo = Temporal.Now.zonedDateTimeISO("Asia/Tokyo");
+```
+
+実務では、予約システムや請求の締め日計算など「タイムゾーンをまたぐ日付処理」でバグが起きがちです。`Temporal` は `PlainDate`（日付のみ）、`PlainTime`（時刻のみ）、`ZonedDateTime`（タイムゾーン付き）と型を分けているため、「どの粒度を扱っているか」がコード上で明確になります。これまで `date-fns` や `dayjs`、`Luxon` に頼っていた処理の多くが標準機能で置き換えられる見込みです。
+
+## `using` / `await using`：確実な後始末
+
+2つ目の重要な追加が、明示的リソース管理です。ファイルハンドルやDB接続、ロックといった「使い終わったら必ず解放したいもの」を、スコープを抜けるタイミングで自動的に破棄できます。
+
+```javascript
+// これまで：try...finally が入れ子になり読みにくい
+function processFile(path) {
+  const handle = openFile(path);
+  try {
+    return handle.read();
+  } finally {
+    handle.close(); // 忘れると資源リーク
+  }
+}
+
+// ES2026：using でスコープ終了時に自動 dispose
+function processFile(path) {
+  using handle = openFile(path); // Symbol.dispose を持つオブジェクト
+  return handle.read();
+} // ここで自動的に handle が閉じられる
+```
+
+非同期リソースには `await using` を使います。ネットワークストリームやトランザクションの後始末に向いています。
+
+```javascript
+async function withTransaction(db) {
+  await using tx = await db.begin(); // Symbol.asyncDispose を利用
+  await tx.query("UPDATE ...");
+  await tx.commit();
+} // 途中で例外が出ても確実にクリーンアップ
+```
+
+Webhaniの経験では、接続リークやロック解放漏れは本番で顕在化するまで気づきにくい種類の不具合です。`using` はこうしたミスを構文レベルで減らせるため、地味ですが影響の大きい機能だと考えています。
+
+## 小粒だが効く追加
+
+ES2026には、細かいながら実務で刺さる関数もいくつか入りました。
+
+- **`Math.sumPrecise`**：浮動小数点の配列を誤差を抑えて合計します。金額集計などで `reduce((a, b) => a + b)` の丸め誤差に悩んでいた場面で有効です。
+- **`Error.isError()`**：値が本物の `Error` インスタンスかを確実に判定します。`instanceof` はrealm（iframeやWorker）をまたぐと壊れることがありますが、これは横断的に機能します。
+- **`Uint8Array` の base64 / hex メソッド**：バイナリと文字列の相互変換が標準化され、`Buffer` や自前実装に頼らずに済みます。
+
+```javascript
+// 誤差を抑えた合計
+const total = Math.sumPrecise([0.1, 0.2, 0.3]); // 精度の高い結果
+
+// realm をまたいでも壊れない Error 判定
+if (Error.isError(caught)) {
+  console.error(caught.message);
+}
+
+// base64 のエンコード／デコードが標準に
+const bytes = Uint8Array.fromBase64("aGVsbG8=");
+const encoded = new Uint8Array([104, 105]).toBase64();
+```
+
+## 移行時の実践的な注意点
+
+新機能は魅力的ですが、明日からすべて使えるわけではありません。Webhaniが顧客プロジェクトで移行を進める際に確認しているポイントを挙げます。
+
+1. **ランタイム対応を先に確認する**：Node.jsやブラウザのバージョンによってサポート状況が異なります。特に `Temporal` は実装が新しいため、対象環境のリリースノートで安定版に入っているかを確かめてください。必要に応じてポリフィルを併用します。
+2. **`using` はビルド設定に依存する**：TypeScriptやバンドラのトランスパイル設定で `Symbol.dispose` のダウンレベル出力が必要になる場合があります。ターゲットを明示しておきましょう。
+3. **一括置換を急がない**：`date-fns` などからの移行は、テストが厚いモジュールから段階的に進めるのが安全です。日付ロジックは回帰が起きやすいため、移行前後で挙動を比較するテストを用意することを勧めます。
+
+## まとめ
+
+ES2026は、新しい書き味を提供するというより「これまで言語に足りなかった土台」を固める版です。`Temporal` で日時処理の事故を減らし、`using` でリソースの後始末を確実にし、`Math.sumPrecise` や `Error.isError()` で細かな落とし穴を埋める。どれも派手さはありませんが、保守フェーズで効いてくる改善です。
+
+まずは対象ランタイムの対応状況を確認し、テストの厚い箇所から少しずつ取り入れていくのが現実的です。Webhaniでも、既存プロジェクトの日付ロジックとリソース管理から順次見直しを進めていく予定です。
+
+---
+
+*参考: [ECMAScript 2026 specification approved (InfoWorld)](https://www.infoworld.com/article/4193461/ecmascript-2026-specification-approved.html), [What's new in ECMAScript 2026 (pawelgrzybek.com)](https://pawelgrzybek.com/whats-new-in-ecmascript-2026/)*

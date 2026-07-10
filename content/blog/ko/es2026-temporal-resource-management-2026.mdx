@@ -1,0 +1,111 @@
+---
+title: "ES2026 정식 승인 — Temporal과 using이 바꾸는 일상의 JavaScript"
+description: "Ecma가 2026년 6월 ES2026을 승인했습니다. Temporal API, using/await using, Math.sumPrecise 등 실무에 바로 와닿는 신기능을 현장 관점에서 정리합니다."
+date: "2026-07-11"
+status: "published"
+tags: ["JavaScript", "ECMAScript", "TypeScript", "Frontend", "Node.js"]
+thumbnail: ""
+author: "webhani"
+slug: "es2026-temporal-resource-management-2026"
+---
+
+## ES2026이 승인되었습니다
+
+2026년 6월 30일, Ecma가 ECMAScript 2026(ES2026)을 정식 승인했습니다. JavaScript Specification으로는 17번째 판입니다. 이번 핵심은 오래 기다려온 `Temporal` API와 `using` / `await using`을 통한 Resource 관리입니다. 화려한 문법 설탕이라기보다는, 그동안 외부 Library나 Boilerplate로 메워온 언어의 빈틈을 채우는 내용이 중심이라 일상 코드에 그만큼 크게 작용합니다.
+
+이 글에서는 Webhani의 개발 현장에서 실제로 가치가 나올 만한 기능을 우선순위 순으로 정리하고, 도입 시 주의할 점까지 짚어봅니다.
+
+## Temporal: `Date`에서 벗어나기
+
+ES2026에서 가장 규모가 큰 추가가 `Temporal`입니다. 이 기능 하나만으로 Test262 Conformance Suite에 약 4,500개의 Test가 추가되었다고 보고될 정도로 범위가 넓습니다.
+
+기존 `Date` 객체는 월이 0부터 시작하고, Time Zone 처리가 모호하며, Mutable이라 부작용을 만들기 쉽다는 문제를 안고 있었습니다. `Temporal`은 이를 처음부터 다시 설계해 Immutable하고 Time Zone·Calendar를 인식하는 날짜/시간 API를 제공합니다.
+
+```javascript
+// 기존: Time Zone 처리가 암묵적이라 실수하기 쉽습니다
+const d = new Date("2026-07-11");
+d.setMonth(d.getMonth() + 1); // 제자리에서 값이 바뀝니다
+
+// ES2026: 의도가 명시적이고 원래 값은 그대로 유지됩니다
+const date = Temporal.PlainDate.from("2026-07-11");
+const nextMonth = date.add({ months: 1 }); // 새로운 값을 반환합니다
+
+// Time Zone을 명시한 현재 시각
+const nowTokyo = Temporal.Now.zonedDateTimeISO("Asia/Tokyo");
+```
+
+실무에서 날짜 관련 Bug는 예약 System, 청구 마감일 계산처럼 Time Zone을 넘나드는 처리에서 몰려서 발생합니다. `Temporal`은 `PlainDate`(날짜만), `PlainTime`(시각만), `ZonedDateTime`(Time Zone 포함)으로 Type을 나누기 때문에 "어떤 단위를 다루고 있는가"가 코드에 명확히 드러납니다. 그동안 `date-fns`, `dayjs`, `Luxon`에 의존하던 처리 상당수를 표준 기능으로 대체할 수 있게 됩니다.
+
+## `using` / `await using`: 확실한 뒷정리
+
+두 번째 중요한 추가는 명시적 Resource 관리입니다. File Handle, Database 연결, Lock처럼 "다 쓰면 반드시 해제해야 하는 것"을 Scope를 벗어나는 시점에 자동으로 Dispose할 수 있습니다.
+
+```javascript
+// 기존: try...finally가 중첩되어 읽기 어렵습니다
+function processFile(path) {
+  const handle = openFile(path);
+  try {
+    return handle.read();
+  } finally {
+    handle.close(); // 빠뜨리면 Resource Leak
+  }
+}
+
+// ES2026: using으로 Scope 종료 시 자동 dispose
+function processFile(path) {
+  using handle = openFile(path); // Symbol.dispose를 구현한 객체
+  return handle.read();
+} // 여기서 handle이 자동으로 닫힙니다
+```
+
+비동기 Resource에는 `await using`을 씁니다. Network Stream이나 Transaction처럼 뒷정리 자체가 비동기인 경우에 적합합니다.
+
+```javascript
+async function withTransaction(db) {
+  await using tx = await db.begin(); // Symbol.asyncDispose 사용
+  await tx.query("UPDATE ...");
+  await tx.commit();
+} // 중간에 예외가 발생해도 확실히 정리됩니다
+```
+
+Webhani의 경험상 연결 Leak이나 Lock 해제 누락은 Production에서 드러날 때까지 알아차리기 어려운 종류의 결함입니다. `using`은 이런 실수를 문법 수준에서 줄여주기 때문에, 눈에 띄지 않아도 영향이 큰 기능이라고 봅니다.
+
+## 작지만 실속 있는 추가들
+
+ES2026에는 소소하지만 실무에 정확히 꽂히는 함수도 몇 가지 들어왔습니다.
+
+- **`Math.sumPrecise`**: 부동소수점 배열을 오차를 억제하며 합산합니다. 금액 집계에서 `reduce((a, b) => a + b)`의 반올림 오차에 시달리던 상황에 유용합니다.
+- **`Error.isError()`**: 값이 진짜 `Error` Instance인지 확실히 판정합니다. `instanceof`는 realm(iframe, Worker)을 넘나들면 깨질 수 있지만, 이 함수는 경계를 넘어도 동작합니다.
+- **`Uint8Array`의 base64 / hex Method**: Binary와 문자열 간 변환이 표준화되어 `Buffer`나 자체 구현에 의존하지 않아도 됩니다.
+
+```javascript
+// 오차를 억제한 합계
+const total = Math.sumPrecise([0.1, 0.2, 0.3]); // 정밀도 높은 결과
+
+// realm 경계를 넘어도 깨지지 않는 Error 판정
+if (Error.isError(caught)) {
+  console.error(caught.message);
+}
+
+// base64 Encode/Decode가 표준으로
+const bytes = Uint8Array.fromBase64("aGVsbG8=");
+const encoded = new Uint8Array([104, 105]).toBase64();
+```
+
+## 도입 시 실무 관점의 주의점
+
+기능은 매력적이지만 내일 당장 전부 쓸 수 있는 것은 아닙니다. Webhani가 고객 Project에 도입할 때 확인하는 지점을 정리합니다.
+
+1. **Runtime 지원을 먼저 확인합니다.** Node.js와 Browser 버전에 따라 지원 상황이 다릅니다. 특히 `Temporal`은 구현이 아직 새로워서, 대상 환경의 Release Note에서 안정 버전에 포함되었는지 확인하고 필요하면 Polyfill을 함께 씁니다.
+2. **`using`은 Build 설정에 의존합니다.** TypeScript나 Bundler의 Transpile 설정에서 `Symbol.dispose`를 Down-level로 출력해야 할 수 있습니다. Target을 명시해 두세요.
+3. **일괄 교체를 서두르지 않습니다.** `date-fns` 등에서의 이전은 Test가 두꺼운 Module부터 단계적으로 진행하는 것이 안전합니다. 날짜 Logic은 Regression이 나기 쉬우므로 이전 전후 동작을 비교하는 Test를 준비하길 권합니다.
+
+## 정리
+
+ES2026은 새로운 작성 방식을 제공한다기보다 그동안 언어에 부족했던 토대를 다지는 판입니다. `Temporal`로 날짜 처리 사고를 줄이고, `using`으로 Resource 뒷정리를 확실히 하며, `Math.sumPrecise`와 `Error.isError()`로 작지만 실재하는 함정을 메웁니다. 어느 것도 화려하지 않지만 모두 유지보수 단계에서 효과가 드러나는 개선입니다.
+
+현실적인 접근은 대상 Runtime 지원 상황을 확인하고 Test가 두꺼운 곳부터 조금씩 도입하는 것입니다. Webhani도 기존 Project의 날짜 Logic과 Resource 관리부터 순차적으로 재점검할 예정입니다.
+
+---
+
+*참고: [ECMAScript 2026 specification approved (InfoWorld)](https://www.infoworld.com/article/4193461/ecmascript-2026-specification-approved.html), [What's new in ECMAScript 2026 (pawelgrzybek.com)](https://pawelgrzybek.com/whats-new-in-ecmascript-2026/)*
