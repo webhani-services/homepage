@@ -1,0 +1,102 @@
+---
+title: "GitHub Actions OIDC Immutable Subject Claims: What Changes for New Repos After July 15"
+description: "For GitHub repositories created on or after July 15, 2026, the OIDC token's sub claim moves to a new format that embeds immutable IDs. Here is the impact on AWS IAM and GCP trust policies, and how to migrate."
+date: "2026-07-12"
+status: "published"
+tags: ["GitHub Actions", "OIDC", "Security", "AWS", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-oidc-immutable-subject-claims-2026"
+---
+
+Authenticating from GitHub Actions to a cloud provider keylessly is now a standard setup. Instead of parking a long-lived access key in CI, the cloud verifies an OIDC token issued by GitHub and hands back temporary permissions. The format of that OIDC token's `sub` (subject) claim changes on July 15, 2026. This post walks through what changes and which trust policies it affects.
+
+## What changes
+
+Until now the OIDC token's `sub` claim was built from the repository path and the branch name, like this:
+
+```text
+repo:octocat/my-repo:ref:refs/heads/main
+```
+
+The new format appends an immutable owner ID and repository ID:
+
+```text
+repo:octocat@123456/my-repo@456789:ref:refs/heads/main
+```
+
+`@123456` is the owner's immutable ID and `@456789` is the repository's immutable ID. These are numeric internal IDs and stay constant even if you rename. Every repository created on or after July 15, 2026 defaults to this new format (source: the GitHub Changelog).
+
+## Why immutable IDs
+
+The old name-based `sub` carried an impersonation risk. Organization and repository names can be changed, so one attack path is theoretically viable: delete a repository and recreate a different one under the same name, and the name-based claim resolves to the same string. If a trust policy judges by name alone, the recreated — and different — repository could inherit the original's permissions.
+
+Embedding immutable IDs ties the claim permanently to the original repository. Even if a name is reused, the internal ID will not match, so a delete-and-recreate takeover is blocked. This is part of the supply-chain hardening GitHub has been rolling out through 2025 and into 2026.
+
+## The impact is on the trust policy side
+
+The issue is any cloud-side configuration that verifies the `sub` claim by string match. Because the string changes in the new format, a trust policy matching the old format will start rejecting authentication from new repositories.
+
+Take an AWS IAM role. A conventional trust policy is often written like this:
+
+```json
+{
+  "Effect": "Allow",
+  "Principal": {
+    "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+  },
+  "Action": "sts:AssumeRoleWithWebIdentity",
+  "Condition": {
+    "StringEquals": {
+      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+    },
+    "StringLike": {
+      "token.actions.githubusercontent.com:sub": "repo:octocat/my-repo:ref:refs/heads/*"
+    }
+  }
+}
+```
+
+That `StringLike` pattern on `sub` assumes the old string. In the new format an ID is inserted, as in `octocat@123456`, so the pattern no longer matches. Create a new repository and try to use this role, and the AssumeRole fails.
+
+## How to migrate
+
+There are two directions.
+
+The first is to update the pattern to the new format that includes the immutable IDs. This gives you stricter matching and blocks name-reuse takeovers:
+
+```json
+"StringLike": {
+  "token.actions.githubusercontent.com:sub": "repo:octocat@123456/my-repo@456789:ref:refs/heads/*"
+}
+```
+
+The second is to verify against dedicated claims (`repository_id` and `repository_owner_id`) instead of `sub`. The OIDC token includes these as independent claims, so your design no longer depends on the `sub` format:
+
+```json
+"StringEquals": {
+  "token.actions.githubusercontent.com:repository_id": "456789"
+}
+```
+
+`repository_id` is invariant under renames, so dropping name-based matching altogether is the most robust option. If your existing trust policies depend on the `sub` string pattern, this is a good moment to consider migrating to `repository_id`-based checks.
+
+## What about existing repositories
+
+This change targets repositories created on or after July 15, 2026. The `sub` format of repositories that already exist does not change instantly. That said, GitHub is moving toward immutable identifiers incrementally, so it is reasonable to expect existing repositories to shift to the new format over time as well.
+
+The practical recommendation follows: you do not need to rewrite every repository's trust policy right now, but organizations that routinely create new repositories can hit "for some reason only the new repos fail cloud auth in CI" after July 15. Simply knowing this symptom in advance changes how long it takes to isolate the cause.
+
+## The webhani view: lean on ID-based verification
+
+When we design and review clients' cloud authentication, we recommend building OIDC trust policies on immutable IDs wherever possible. Name-based matching reads well, but it stakes your security on a mutable attribute — the name. GitHub's change here exists precisely to close that weakness.
+
+The concrete action is three steps:
+
+1. Inventory your existing trust policies and identify where they depend on the `sub` string pattern.
+2. Migrate what you can to `repository_id` / `repository_owner_id`-based verification.
+3. For teams that create new repositories, communicate the July 15 `sub` format change.
+
+## Wrapping up
+
+Immutable subject claims in GitHub Actions OIDC are a security hardening that closes name-reuse impersonation. For repositories created on or after July 15, 2026, the `sub` moves to a new format, and trust policies string-matching the old format will reject authentication from new repositories. The most robust response is to stop string-matching `sub` and verify on an immutable claim such as `repository_id`. Inventory your trust policies now and lean toward ID-based checks.

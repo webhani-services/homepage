@@ -1,0 +1,95 @@
+---
+title: "Next.js 16.3 の Rust 版 React Compiler と永続ビルドキャッシュ — 大規模アプリのビルド時間を削る"
+description: "Next.js 16.3 で Turbopack に統合された Rust 版 React Compiler と、CI をまたいで再利用できる永続ビルドキャッシュの使い方を整理します。従来の Babel 変換との違いと、有効化の手順を解説します。"
+date: "2026-07-12"
+status: "published"
+tags: ["Next.js", "React", "Turbopack", "Performance", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-3-rust-react-compiler-2026"
+---
+
+Next.js 16.3 の Turbopack には、ビルドまわりで実務に効く変更が三つ入りました。開発時のメモリ退避（デフォルト有効）、ビルド用の永続ファイルキャッシュ、そして実験的な Rust 版 React Compiler です。本記事では特に、アプリが大きくなるほど効いてくる Rust 版 React Compiler と永続ビルドキャッシュの二つに絞って、仕組みと有効化の手順を整理します。
+
+## これまでの React Compiler の課題
+
+React Compiler は、`useMemo` や `useCallback` を手で書かなくても、コンパイル時に自動でメモ化を挿入してくれるツールです。再レンダリングの最適化をコードの見た目を汚さずに実現できるため、採用が広がってきました。
+
+ただし、これまで React Compiler は Babel 変換としてのみ提供されていました。ここに大規模アプリでの問題があります。Babel の変換は JavaScript の実行リソースを使うため、コード量が増えるほどビルドを遅くする要因になっていました。せっかく Turbopack が Rust で高速にビルドしても、React Compiler の部分が JS 実行の待ちで足を引っ張る、という構図です。
+
+## Rust 版 React Compiler
+
+React チームがコンパイラのネイティブ Rust ポートを公開し、Vercel がそれを Turbopack に統合しました。これにより、React Compiler の処理が Turbopack のビルドパイプラインの中で Rust ネイティブに実行されます。JS 実行リソースの取り合いが解消されるため、大規模アプリほど効果が出ます。
+
+Vercel の初期テストでは、v0 のような大規模 React アプリに対して 20〜50% のコンパイル時間短縮が報告されています（出典: Next.js 公式ブログ）。効果はアプリの規模とコンポーネント数に依存するため、小さなアプリでは差が小さく、大きなアプリほど恩恵が大きくなります。
+
+16.3 時点では実験的機能なので、明示的に有効化します。設定は `next.config.ts` で行います。
+
+```typescript
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  experimental: {
+    reactCompiler: true,
+  },
+};
+
+export default nextConfig;
+```
+
+React Compiler 自体を段階的に導入したい場合は、対象ディレクトリを絞る運用が現実的です。まず影響範囲の小さい機能から有効化し、レンダリングの挙動が変わらないことを確認してから広げていきます。React Compiler はメモ化を自動挿入するため、副作用に依存した実装や、参照の同一性に依存したコードでは挙動が変わる可能性があります。導入時は既存のテストで回帰を確認するのが前提です。
+
+## 永続ビルドキャッシュ
+
+もう一つの実務的な変更が、ビルド用の永続ファイルキャッシュです。`turbopackFileSystemCacheForBuild` フラグで有効化します。
+
+```typescript
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  experimental: {
+    turbopackFileSystemCacheForBuild: true,
+  },
+};
+
+export default nextConfig;
+```
+
+これを有効にすると、生成された `.next` ディレクトリを実行間で再利用できます。ローカルでの連続ビルドはもちろん、CI での効果が大きい機能です。多くの CI プロバイダはキャッシュステップを持っているので、`.next` をキャッシュ対象に加えることで、変更されていない部分の再コンパイルを避けられます。
+
+たとえば GitHub Actions では、次のようにビルド出力をキャッシュします。
+
+```yaml
+- name: Cache Next.js build
+  uses: actions/cache@v4
+  with:
+    path: |
+      .next/cache
+    key: nextjs-${{ hashFiles('**/package-lock.json') }}-${{ github.sha }}
+    restore-keys: |
+      nextjs-${{ hashFiles('**/package-lock.json') }}-
+```
+
+小さな PR を一日に何度もマージするチームでは、この効果が積み上がります。アプリの 95% が変わっていないなら、その 95% のコールドコンパイルのコストを毎回払わずに済むからです。マージのたびにフルビルドしていたパイプラインでは、体感できる短縮になります。
+
+## 開発時のメモリ退避
+
+三つ目の変更として、開発サーバーのメモリ退避がデフォルトで有効になりました。16.1 で導入されたファイルシステム永続化を土台に、Turbopack はメモリ上のキャッシュ結果をファイルへ退避し、メモリから取り除けるようになりました。長時間の開発セッションでメモリが際限なく膨らむ問題が緩和されます。
+
+これは設定不要でデフォルト有効なので、16.3 に上げるだけで恩恵を受けられます。長時間 `next dev` を立ち上げっぱなしにする開発スタイルでは、メモリ使用量の頭打ちが体感できるはずです。
+
+## 導入時に決めておくこと — キャッシュ運用が先
+
+これらの機能を入れるときに先に決めておくべきなのは、キャッシュの運用ポリシーです。永続ビルドキャッシュは強力ですが、キャッシュキーの設計を誤ると「古いキャッシュを引いてしまい、変更が反映されない」というトラブルにつながります。
+
+webhani では次の順序を推奨しています。
+
+1. まず `turbopackFileSystemCacheForBuild` をローカルで有効化し、連続ビルドで期待どおりキャッシュが効くか確認する。
+2. CI のキャッシュキーに、依存関係のハッシュ（`package-lock.json` など）を必ず含める。依存が変わったらキャッシュを作り直す設計にする。
+3. Rust 版 React Compiler は、回帰テストが整っているプロジェクトから段階的に有効化する。
+
+Rust 版 React Compiler は「速くなる」機能ですが、永続ビルドキャッシュは「運用を決めてから使う」機能です。順序を逆にすると、速度のために入れたはずのキャッシュがデバッグの原因になります。まずキャッシュの挙動を理解し、キーの設計を固めてから CI に載せるのが安全です。
+
+## まとめ
+
+Next.js 16.3 のビルド系の変更は、大規模アプリの実務にまっすぐ効きます。Rust 版 React Compiler は JS 実行の待ちを解消し、コンポーネント数が多いほど短縮幅が大きくなります。永続ビルドキャッシュは、小さな PR を頻繁にマージするチームで効いてきます。開発時のメモリ退避はデフォルト有効で、アップグレードするだけで恩恵があります。導入の順序としては、キャッシュの運用ポリシーを先に固め、React Compiler は回帰テストの整ったところから段階的に、が現実的です。

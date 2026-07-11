@@ -1,0 +1,92 @@
+---
+title: "Governing Claude Code Subagents Across a Team: Parameter-Level Permission Rules and Dynamic Workflow Size"
+description: "The July 2026 Claude Code update adds Tool(param:value) permission rules, a Dynamic workflow size setting, and pre-launch classifier checks for subagents. Here is how to run autonomous coding agents safely on a team."
+date: "2026-07-12"
+status: "published"
+tags: ["Claude Code", "AI", "Subagent", "DevOps", "Security"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-subagent-permission-controls-2026"
+---
+
+The first real question when you put autonomous coding agents in front of a team is how much freedom to hand them. If a subagent can spawn other subagents without bound and reach a dangerous operation without review, you have created a path around your approval gates. The July 2026 Claude Code update ships several practical controls for exactly this problem. This post walks through parameter-level permission rules, the Dynamic workflow size setting, and the pre-launch classifier check for subagents.
+
+## Tool(param:value): permission rules that match input parameters
+
+Until now, permission rules operated at the tool level — allow or deny `Bash`, for example. The new `Tool(param:value)` syntax lets a rule match against the values of a tool's input parameters, and it supports the `*` wildcard.
+
+The clearest use case is restricting which model a subagent may run. For cost control, you often want to block subagents from spawning on Opus:
+
+```json
+{
+  "permissions": {
+    "deny": [
+      "Agent(model:opus)"
+    ]
+  }
+}
+```
+
+Drop this into `.claude/settings.json` and any subagent launch request specifying `model: opus` is rejected. You can also invert the pattern to allow only specific models:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Agent(model:sonnet)",
+      "Agent(model:haiku)"
+    ],
+    "deny": [
+      "Agent(model:*)"
+    ]
+  }
+}
+```
+
+Here Sonnet and Haiku subagents are permitted while every other model specification is denied. The more specific allow rules win over the broad wildcard deny, so anything not explicitly allowed is blocked.
+
+The same idea applies to Bash command arguments. If you want to stop production `kubectl` calls specifically, you can match on the command string pattern. Wildcards make fine-grained control realistic — for instance, denying only invocations that contain a particular flag rather than blocking the tool wholesale.
+
+## Pre-launch checks: evaluating a subagent before it exists
+
+Auto mode — where permission decisions are automated — had one gap. A subagent could be launched first, and then request a blocked action from inside itself, slipping past the parent agent's permission check. The child could reach a dangerous operation the parent would never have been allowed to run directly.
+
+The July 2026 update closes this. Subagent launch requests are now evaluated by the classifier *before* the subagent spawns. What you are about to have the child do is judged before it comes into existence. The "just spin up a subagent and do whatever inside it" loophole is gone.
+
+The practical meaning is direct: permission rules set on the parent can no longer be circumvented through a child. In workflows that run unattended in CI, whether this pre-check exists is a large part of what makes the run safe.
+
+## Curbing re-delegation
+
+A second improvement: subagents are now less likely to re-delegate an entire received task to yet another subagent. Previously, a subagent handed a task might decide "this is not my job" and pass the whole thing straight down to the next subagent. Deep delegation chains make it hard to trace who actually did what, and they inflate token usage.
+
+With re-delegation curbed, a subagent that receives a task tends to finish it in place. Execution paths get shallower and logs get easier to follow. On a team, that shallowness maps directly onto review cost, which makes this an unglamorous but meaningful change.
+
+## Dynamic workflow size: steering how big a workflow gets
+
+`/config` now has a `Dynamic workflow size` setting. It steers how large the workflows Claude generates dynamically become — that is, how many subagents get spawned — across small / medium / large.
+
+The important detail is that this is an advisory guideline, not an enforced cap. Choosing large may still resolve to a handful of subagents when the task is small, and choosing small can grow if the work demands it. It sets a direction: "roughly operate at this scale."
+
+A reasonable mapping for team use:
+
+- **small**: simple fixes, reviews, investigations — everyday tasks where you want to keep token cost down.
+- **medium**: multi-file implementation or mid-sized work that parallelizes cleanly.
+- **large**: big refactors, exhaustive audits, migrations — cases where you want to buy wall-clock time through parallelism.
+
+For unattended CI pipelines, lean toward small–medium, and raise to large only when you interactively hand off a big piece of work. Because the size choice drives cost predictability, pinning a default in the project's `.claude/settings.json` reduces variance across the team.
+
+## The webhani view: governance does not bolt on afterward
+
+What these features share is that they exist to balance an agent's autonomy against its reviewability. When we introduce AI coding into a client's team, the first thing we set up is the permission boundary. If you do not decide up front what to allow and what to stop, you fall back on catching the agent's output in review after the fact — and things slip through, every time.
+
+Concretely, we recommend:
+
+1. Put write operations against production and cost-heavy model specifications in the `deny` list of `.claude/settings.json`.
+2. Pin a `Dynamic workflow size` default per project, and lean small–medium in CI.
+3. If you use Auto mode, confirm you are on a version where the pre-launch classifier check is active.
+
+Writing permission rules into a config file is more than a safety measure. It records a decision — "in this project, this is what we let agents do" — as code. The same boundary applies no matter who on the team runs the agent, which lowers review load and makes audits tractable.
+
+## Wrapping up
+
+The July 2026 Claude Code update pushes agents from a personal tool toward a team tool. Parameter-level control via `Tool(param:value)`, the pre-launch classifier check on subagents, curbed re-delegation, and `Dynamic workflow size` are individually undramatic, but they matter once several people share autonomous agents. Nail down the permission boundary as a config file early, decide your size default, and you have the shortest path to drawing out autonomy safely.

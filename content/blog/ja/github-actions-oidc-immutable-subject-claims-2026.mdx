@@ -1,0 +1,102 @@
+---
+title: "GitHub Actions OIDC の Immutable Subject Claim — 7月15日以降の新規リポジトリで変わること"
+description: "2026年7月15日以降に作成される GitHub リポジトリでは、OIDC トークンの sub クレームが Immutable な ID を含む新形式になります。AWS IAM や GCP のトラストポリシーへの影響と、移行の考え方を整理します。"
+date: "2026-07-12"
+status: "published"
+tags: ["GitHub Actions", "OIDC", "Security", "AWS", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-oidc-immutable-subject-claims-2026"
+---
+
+GitHub Actions からクラウドへキーレスで認証する仕組みは、いまや標準的な構成です。長期のアクセスキーを CI に置く代わりに、GitHub が発行する OIDC トークンをクラウド側で検証して一時的な権限を渡します。この OIDC トークンの `sub`（subject）クレームの形式が、2026年7月15日を境に変わります。本記事では、何が変わり、どのトラストポリシーに影響するのかを整理します。
+
+## 何が変わるのか
+
+これまでの OIDC トークンの `sub` クレームは、リポジトリのパスとブランチ名などで構成されていました。たとえば次のような形です。
+
+```text
+repo:octocat/my-repo:ref:refs/heads/main
+```
+
+新形式では、ここに Immutable なオーナー ID とリポジトリ ID が付与されます。
+
+```text
+repo:octocat@123456/my-repo@456789:ref:refs/heads/main
+```
+
+`@123456` がオーナーの Immutable な ID、`@456789` がリポジトリの Immutable な ID です。これらは数値の内部 ID であり、名前を変更しても不変です。2026年7月15日以降に作成されるすべてのリポジトリで、この新形式がデフォルトになります（出典: GitHub Changelog）。
+
+## なぜ Immutable ID が必要なのか
+
+従来の名前ベースの `sub` には、なりすましのリスクがありました。組織やリポジトリの名前は変更できるため、次のような攻撃経路が理論上成立します。あるリポジトリを削除し、同じ名前で別のリポジトリを作り直すと、名前ベースのクレームは同じ文字列になります。トラストポリシーが名前だけで判定していると、作り直された別物のリポジトリが元の権限を引き継いでしまう余地がありました。
+
+Immutable ID を付与することで、クレームが元のリポジトリに恒久的に結びつきます。名前を再利用しても内部 ID は一致しないため、削除・再作成による横取りを防げます。これはサプライチェーン攻撃対策の一環であり、GitHub が2025年から2026年にかけて進めている一連の強化の一つです。
+
+## 影響するのはトラストポリシー側
+
+問題は、クラウド側で `sub` クレームを文字列マッチで検証している設定です。新形式では文字列が変わるため、旧形式でマッチさせているトラストポリシーは、新規リポジトリからの認証を弾くようになります。
+
+AWS の IAM ロールを例に取ります。従来のトラストポリシーは次のように書かれていることが多いはずです。
+
+```json
+{
+  "Effect": "Allow",
+  "Principal": {
+    "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+  },
+  "Action": "sts:AssumeRoleWithWebIdentity",
+  "Condition": {
+    "StringEquals": {
+      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+    },
+    "StringLike": {
+      "token.actions.githubusercontent.com:sub": "repo:octocat/my-repo:ref:refs/heads/*"
+    }
+  }
+}
+```
+
+この `sub` の `StringLike` パターンは、旧形式の文字列を前提にしています。新形式では `octocat@123456` のように ID が挟まるため、このパターンには一致しません。新規リポジトリを作ってこのロールを使おうとすると、AssumeRole が失敗します。
+
+## 移行の考え方
+
+対応の方向性は二つあります。
+
+一つ目は、Immutable ID を含む新形式に合わせてパターンを更新する方法です。より厳密なマッチングになり、名前の再利用による横取りを防げます。
+
+```json
+"StringLike": {
+  "token.actions.githubusercontent.com:sub": "repo:octocat@123456/my-repo@456789:ref:refs/heads/*"
+}
+```
+
+二つ目は、`sub` の代わりに個別のクレーム（`repository_id` や `repository_owner_id`）で検証する方法です。OIDC トークンにはこれらが独立したクレームとして含まれているため、`sub` の形式変更に依存しない設計にできます。
+
+```json
+"StringEquals": {
+  "token.actions.githubusercontent.com:repository_id": "456789"
+}
+```
+
+`repository_id` は名前変更に対して不変なので、そもそも名前ベースのマッチをやめてしまうのが最も堅牢です。既存のトラストポリシーが `sub` の文字列パターンに依存している場合、この機会に `repository_id` ベースへ移行することを検討する価値があります。
+
+## 既存リポジトリはどうなるか
+
+この変更は「2026年7月15日以降に作成されるリポジトリ」が対象です。それ以前から存在するリポジトリの `sub` 形式が即座に変わるわけではありません。ただし、GitHub は Immutable な識別子への移行を段階的に進めているため、既存リポジトリも将来的に新形式へ寄せていく方向と見るのが自然です。
+
+したがって、実務上の推奨は次の通りです。今すぐ全リポジトリのトラストポリシーを書き換える必要はありませんが、新規リポジトリを作る運用がある組織では、7月15日以降に「なぜか新しいリポジトリだけ CI のクラウド認証が通らない」というトラブルが起きえます。この症状を事前に知っておくだけで、原因の切り分けにかかる時間が大きく変わります。
+
+## webhani の視点 — ID ベースの検証へ寄せる
+
+私たちが顧客のクラウド認証を設計・レビューするとき、OIDC のトラストポリシーはできるだけ Immutable な ID で組むことを推奨しています。名前ベースのマッチは読みやすい反面、名前という可変な属性に安全性を預けることになります。今回の GitHub 側の変更は、まさにその弱点を塞ぐためのものです。
+
+具体的なアクションは三段階です。
+
+1. 既存のトラストポリシーを棚卸しし、`sub` の文字列パターンに依存している箇所を特定する。
+2. 可能なものから `repository_id` / `repository_owner_id` ベースの検証へ移行する。
+3. 新規リポジトリを作る運用があるチームには、7月15日以降の `sub` 形式変更を周知しておく。
+
+## まとめ
+
+GitHub Actions の OIDC における Immutable subject claim は、名前の再利用によるなりすましを塞ぐためのセキュリティ強化です。2026年7月15日以降に作成されるリポジトリでは `sub` が新形式になり、旧形式で文字列マッチしているトラストポリシーは新規リポジトリからの認証を弾きます。最も堅牢な対応は、`sub` の文字列マッチをやめ、`repository_id` などの Immutable なクレームで検証することです。今のうちにトラストポリシーを棚卸しし、ID ベースへ寄せておくのが安全です。
