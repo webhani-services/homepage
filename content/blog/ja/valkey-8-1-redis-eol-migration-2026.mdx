@@ -1,0 +1,115 @@
+---
+title: "Redis 7.2 の EOL と Valkey 8.1 — キャッシュ層をどう移すか"
+date: "2026-07-13"
+description: "Redis 7.2 のサポート終了を機に、Valkey への移行を検討する。互換性、コスト、運用面から実践的な判断基準を整理します。"
+status: "published"
+tags: ["Valkey", "Redis", "キャッシュ", "インフラ", "移行"]
+thumbnail: ""
+author: "webhani"
+slug: "valkey-8-1-redis-eol-migration-2026"
+---
+
+## 期限が判断を迫っている
+
+Redis OSS 7.2 系のサポートが 2026 年 2 月末で終了しました。EOL を過ぎたバージョンをそのまま本番で使い続けることは、セキュリティ修正が届かなくなることを意味します。多くのチームがこのタイミングで「次にどこへ移るか」を決める必要に迫られています。
+
+選択肢は主に二つです。ライセンス変更後の Redis に追随するか、BSD ライセンスのフォークである Valkey に移るか。Valkey 8.1 は Amazon ElastiCache で一般提供され、クラウド上のキャッシュ選択肢として一級市民の地位を確立しました。報告されている価格差は Redis OSS 比で約 33% 安いというもので、キャッシュ層のコストが積み上がっている環境では無視できない数字です。
+
+webhani でも複数クライアントのキャッシュ基盤でこの判断に関わりました。結論から言うと、多くのワークロードで Valkey への移行は技術的にスムーズです。ただし「スムーズ」であることと「無検証で移してよい」ことは別です。
+
+## Valkey は何なのか
+
+Valkey は Redis OSS からフォークされたプロジェクトで、コマンド互換性を維持しています。既存の Redis クライアントライブラリ、既存の `redis-cli` に相当するツール、既存のデータ構造（String, Hash, List, Set, Sorted Set, Stream など）はそのまま使えます。アプリケーション側のコードを書き換えずに接続先だけを切り替えられる、というのが移行の容易さの根拠です。
+
+セキュリティ面でも、Valkey は 9.0 系のリリース候補で CVE を修正しており、メンテナンスが継続しています。EOL を迎えた 7.2 を使い続けるより、パッチが届く系統に移る方が運用上は健全です。
+
+## 移行前に測っておくこと
+
+コマンド互換があるとはいえ、本番投入の前に確認すべき点があります。
+
+**永続化とレプリケーションの挙動** — RDB スナップショットや AOF の設定、レプリカへの伝播タイミングは、バージョン間で微妙に異なる場合があります。フェイルオーバー時の挙動は必ずステージングで確認してください。
+
+**クライアントライブラリのバージョン** — 古いライブラリが特定のバージョン文字列を前提にハンドシェイクしていると、接続時に想定外の分岐に入ることがあります。ライブラリ側を最新にしてから移行するのが安全です。
+
+**モジュールの依存** — RediSearch や RedisJSON のような追加モジュールに依存している場合、そのまま移せるとは限りません。ここは事前調査が必須です。純粋なキャッシュ用途（キーバリューと TTL）であれば問題は起きにくいですが、モジュール依存があると話が変わります。
+
+## 安全な切り替え手順
+
+いきなり本番の接続先を差し替えるのではなく、段階的に進めます。
+
+```bash
+# 1. 現行 Redis のデータ規模と接続数を把握
+redis-cli INFO keyspace
+redis-cli INFO clients
+
+# 2. Valkey インスタンスを別途立ち上げ、接続確認
+valkey-cli -h <valkey-host> -p 6379 PING
+# → PONG
+
+# 3. 主要なコマンドの互換性をスモークテスト
+valkey-cli -h <valkey-host> SET smoke:test "ok" EX 60
+valkey-cli -h <valkey-host> GET smoke:test
+valkey-cli -h <valkey-host> TTL smoke:test
+```
+
+アプリケーション側では、接続先を環境変数で切り替えられるようにしておくと、ロールバックが容易になります。
+
+```typescript
+// 接続先を環境変数で制御し、問題があれば即座に戻せるようにする
+import { createClient } from "redis"; // Valkey ともプロトコル互換
+
+const client = createClient({
+  url: process.env.CACHE_URL, // Redis / Valkey どちらでも指すだけ
+  socket: {
+    reconnectStrategy: (retries) => Math.min(retries * 50, 2000),
+  },
+});
+
+client.on("error", (err) => {
+  // 移行期間中はエラーを必ず可視化する
+  console.error("[cache] connection error:", err.message);
+});
+
+await client.connect();
+
+// キャッシュはフォールバック可能な設計にしておく
+async function getCached<T>(
+  key: string,
+  loader: () => Promise<T>,
+  ttlSeconds = 300
+): Promise<T> {
+  try {
+    const hit = await client.get(key);
+    if (hit) return JSON.parse(hit) as T;
+  } catch (err) {
+    // キャッシュ障害時は元データ取得に倒す
+    console.warn("[cache] read failed, falling back:", (err as Error).message);
+  }
+
+  const value = await loader();
+
+  try {
+    await client.set(key, JSON.stringify(value), { EX: ttlSeconds });
+  } catch (err) {
+    console.warn("[cache] write failed:", (err as Error).message);
+  }
+
+  return value;
+}
+```
+
+このように、キャッシュを「あれば速い、なくても動く」層として設計しておくと、移行中に接続が不安定になっても本体機能は止まりません。移行に限らず、キャッシュ層はこの前提で組むべきです。
+
+## コストだけで決めない
+
+Valkey が約 33% 安いという数字は魅力的ですが、移行判断をコストだけで下すのは早計です。webhani がクライアントに勧める判断軸は次の三つです。
+
+1. **現行が EOL に達しているか** — セキュリティ修正が止まる方が、多くの場合コストより大きなリスク
+2. **モジュール依存の有無** — 純粋なキャッシュ用途なら移行は容易、モジュール依存があれば要精査
+3. **運用チームの習熟** — マネージドサービス（ElastiCache 等）を使うなら運用負荷は小さいが、自前運用ならツールチェーンの検証が必要
+
+多くの Web アプリケーションのキャッシュ用途は 1 番目と 2 番目をクリアします。その場合、コスト削減とサポート継続の両方が得られる Valkey は合理的な選択です。
+
+## まとめ
+
+Redis 7.2 の EOL は、キャッシュ層を見直す良い機会です。Valkey はコマンド互換を保ちつつ、パッチが届く系統として、そしてより安価な選択肢として現実的です。ただし「互換だから無検証で移せる」わけではなく、永続化・レプリケーション・モジュール依存の三点はステージングで必ず確認すべきです。キャッシュをフォールバック可能な設計にし、接続先を環境変数で切り替えられるようにしておけば、移行のリスクは十分に管理できます。

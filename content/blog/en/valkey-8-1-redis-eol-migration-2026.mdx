@@ -1,0 +1,115 @@
+---
+title: "Redis 7.2 EOL and Valkey 8.1: How to Move Your Cache Layer"
+date: "2026-07-13"
+description: "With Redis 7.2 reaching end of life, it's time to weigh a move to Valkey. A practical framework covering compatibility, cost, and operations."
+status: "published"
+tags: ["Valkey", "Redis", "Caching", "Infrastructure", "Migration"]
+thumbnail: ""
+author: "webhani"
+slug: "valkey-8-1-redis-eol-migration-2026"
+---
+
+## A deadline is forcing the decision
+
+Support for the Redis OSS 7.2 line ended at the end of February 2026. Running an EOL version in production means security fixes stop arriving. A lot of teams now face the same question at the same time: where do we move next?
+
+There are two main paths — follow Redis under its changed license, or move to Valkey, the BSD-licensed fork. Valkey 8.1 is generally available on Amazon ElastiCache, which cements the fork as a first-class option for cloud caching. The reported price difference is roughly 33% cheaper than Redis OSS — not a number you can ignore when cache-layer cost is stacking up.
+
+At webhani we've been involved in this decision across several clients' caching stacks. The short version: for most workloads, migrating to Valkey is technically smooth. But "smooth" and "move it without testing" are two different things.
+
+## What Valkey actually is
+
+Valkey is a fork of Redis OSS that preserves command compatibility. Your existing Redis client libraries, your existing `redis-cli`-equivalent tooling, and your existing data structures (String, Hash, List, Set, Sorted Set, Stream, and so on) all work unchanged. You can switch the connection target without rewriting application code — that's the basis for how easy the migration is.
+
+On security, Valkey patched CVEs in its 9.0 release candidates, so maintenance is ongoing. Moving to a line that still receives patches is operationally healthier than staying on an EOL 7.2.
+
+## Measure this before you cut over
+
+Command compatibility is real, but there are things to confirm before production.
+
+**Persistence and replication behavior.** RDB snapshot and AOF settings, and the timing of propagation to replicas, can differ subtly between versions. Always verify failover behavior in staging.
+
+**Client library version.** If an old library handshakes against a specific version string, it may hit an unexpected branch on connect. Update the library first, then migrate.
+
+**Module dependencies.** If you depend on add-on modules like RediSearch or RedisJSON, don't assume they port over cleanly. This needs investigation up front. Pure caching use (key-value plus TTL) rarely runs into trouble, but module dependencies change the picture entirely.
+
+## A safe cutover procedure
+
+Don't swap the production target in one move. Go incrementally.
+
+```bash
+# 1. Understand current data size and connection count
+redis-cli INFO keyspace
+redis-cli INFO clients
+
+# 2. Stand up a separate Valkey instance and confirm connectivity
+valkey-cli -h <valkey-host> -p 6379 PING
+# → PONG
+
+# 3. Smoke-test compatibility of the commands you rely on
+valkey-cli -h <valkey-host> SET smoke:test "ok" EX 60
+valkey-cli -h <valkey-host> GET smoke:test
+valkey-cli -h <valkey-host> TTL smoke:test
+```
+
+On the application side, make the connection target switchable via an environment variable so rollback is trivial.
+
+```typescript
+// Control the target via env var so you can revert instantly if needed
+import { createClient } from "redis"; // protocol-compatible with Valkey too
+
+const client = createClient({
+  url: process.env.CACHE_URL, // point at Redis or Valkey — same code
+  socket: {
+    reconnectStrategy: (retries) => Math.min(retries * 50, 2000),
+  },
+});
+
+client.on("error", (err) => {
+  // during the migration window, always surface errors
+  console.error("[cache] connection error:", err.message);
+});
+
+await client.connect();
+
+// design the cache so it can fall back to the source of truth
+async function getCached<T>(
+  key: string,
+  loader: () => Promise<T>,
+  ttlSeconds = 300
+): Promise<T> {
+  try {
+    const hit = await client.get(key);
+    if (hit) return JSON.parse(hit) as T;
+  } catch (err) {
+    // on cache failure, fall through to loading the real data
+    console.warn("[cache] read failed, falling back:", (err as Error).message);
+  }
+
+  const value = await loader();
+
+  try {
+    await client.set(key, JSON.stringify(value), { EX: ttlSeconds });
+  } catch (err) {
+    console.warn("[cache] write failed:", (err as Error).message);
+  }
+
+  return value;
+}
+```
+
+Design the cache as a "faster if present, still works if absent" layer, and an unstable connection during migration won't take core functionality down with it. This isn't just migration advice — caches should be built on this assumption regardless.
+
+## Don't decide on cost alone
+
+The ~33% cheaper figure is attractive, but deciding a migration on cost alone is premature. The three axes we use with clients:
+
+1. **Has the current version hit EOL?** Losing security fixes is usually a bigger risk than cost.
+2. **Any module dependencies?** Pure caching is easy to migrate; module dependencies need scrutiny.
+3. **Team familiarity.** A managed service (ElastiCache, etc.) keeps operational load low; self-hosting means validating your toolchain.
+
+Most web-application caching use clears items one and two. In that case Valkey — offering both cost savings and continued support — is a reasonable choice.
+
+## Takeaway
+
+The Redis 7.2 EOL is a good moment to revisit your cache layer. Valkey is a realistic option: command-compatible, on a line that still receives patches, and cheaper. But "compatible" doesn't mean "migrate without testing" — always verify persistence, replication, and module dependencies in staging. Make the cache fall back gracefully and keep the connection target env-switchable, and the migration risk stays well within your control.

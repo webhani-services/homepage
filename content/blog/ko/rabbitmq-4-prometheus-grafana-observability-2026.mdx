@@ -1,0 +1,107 @@
+---
+title: "RabbitMQ 4.x 감시는 Prometheus 전제로 — Management UI에서의 이전"
+date: "2026-07-13"
+description: "RabbitMQ 4.0에서 Management UI와 HTTP API에서 Metric이 제거되었습니다. Prometheus + Grafana를 표준 구성으로 만드는 실전 Guide."
+status: "published"
+tags: ["RabbitMQ", "Prometheus", "Grafana", "Monitoring", "Observability"]
+thumbnail: ""
+author: "webhani"
+slug: "rabbitmq-4-prometheus-grafana-observability-2026"
+---
+
+## 감시의 Default가 바뀌었다
+
+RabbitMQ 4.0에서 운영 면의 큰 변경이 있었습니다. Performance Metric이 Management UI와 HTTP API에서 제거된 것입니다. 지금까지 관리 화면을 열어 Queue 깊이나 Message Rate를 지켜보던 Team은 이 전제가 무너진 셈입니다.
+
+대신 공식이 권하는 구성은 `rabbitmq_prometheus` Plugin으로 Metric을 공개하고, Prometheus로 수집하고, Grafana로 시각화하는 것입니다. 즉 RabbitMQ 감시는 "관리 화면을 본다"에서 "Prometheus Stack을 구성한다"로, 표준적인 방식 자체가 옮겨갔습니다.
+
+webhani는 Messaging 기반의 운영 지원을 하고 있는데, 4.x로의 Upgrade를 계기로 이 감시 구성의 재검토를 요청받는 경우가 늘고 있습니다. 관리 화면 Graph에 의존한 운영 절차서나 Alert 체계는 그대로는 통용되지 않습니다.
+
+## 왜 이 변경이 합리적인가
+
+언뜻 기능 후퇴처럼 보이지만 운영 관점에서는 타당한 판단입니다. 관리 화면 Metric은 그 UI를 제공하는 Node 자신에 부하를 줍니다. 대규모 Cluster에서는 감시를 위한 Metric 집계가 Node 성능을 갉아먹는 본말전도가 자주 일어났습니다.
+
+Prometheus Pull 모델에서는 Metric의 수집·저장·시각화를 RabbitMQ 본체에서 분리할 수 있습니다. Node는 자기 Metric을 공개하기만 하고, 집계와 보존은 외부 Stack이 담당합니다. 이는 감시 대상과 감시 기반을 분리한다는 Observability의 기본 원칙에 부합합니다.
+
+## 최소 구성 Setup
+
+먼저 Plugin을 활성화합니다.
+
+```bash
+# rabbitmq_prometheus Plugin 활성화
+rabbitmq-plugins enable rabbitmq_prometheus
+
+# Metric Endpoint 확인 (Default는 15692 Port)
+curl http://localhost:15692/metrics | head -n 20
+```
+
+다음으로 Prometheus 쪽에서 Scrape 대상으로 등록합니다.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: "rabbitmq"
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - "rabbitmq-node-1:15692"
+          - "rabbitmq-node-2:15692"
+          - "rabbitmq-node-3:15692"
+    metric_relabel_configs:
+      # 불필요한 Metric을 걸러 보존 Cost를 억제
+      - source_labels: [__name__]
+        regex: "rabbitmq_erlang_.*"
+        action: drop
+```
+
+Grafana에서는 공식이 배포하는 Dashboard를 Import하는 것이 빠른 길입니다. Queue 깊이, Message 발행/전달 Rate, Connection 수, Node의 Memory와 Disk 같은 주요 지표가 처음부터 갖춰집니다. 처음부터 만들 필요가 없습니다.
+
+## 봐야 할 Metric과 Threshold 사고방식
+
+모든 Metric을 똑같이 감시할 필요는 없습니다. 운영에서 정말 효과 있는 것은 다음 셋입니다.
+
+**Queue 깊이(미처리 Message 수)** — 이것이 계속 늘어난다면 Consumer의 처리 능력이 발행 Rate를 따라가지 못하는 것입니다. 단발성 Spike는 정상이어도 우상향이 지속되면 Alert 대상입니다.
+
+**Consumer 수** — 예상보다 적으면 Worker가 죽었거나 접속에 실패한 것입니다. Queue 깊이와 함께 보면 "막힌 것이 부하 탓인지 Worker 부재 탓인지"를 구분할 수 있습니다.
+
+**Memory와 Disk 여유** — RabbitMQ는 Memory Threshold나 Disk Threshold에 도달하면 발행을 Block합니다. 이 상태에 들어가기 전에 감지하면 막힘을 미연에 방지할 수 있습니다.
+
+```yaml
+# Prometheus Alert Rule 예시
+groups:
+  - name: rabbitmq
+    rules:
+      - alert: RabbitMQQueueBacklogGrowing
+        expr: rabbitmq_queue_messages_ready > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Queue {{ $labels.queue }} 적체가 10분 지속"
+          description: "미처리 Message가 10000을 초과했습니다. Consumer 처리 능력을 확인하세요."
+
+      - alert: RabbitMQNoConsumers
+        expr: rabbitmq_queue_consumers == 0 and rabbitmq_queue_messages_ready > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Queue {{ $labels.queue }}에 Consumer가 없음"
+          description: "미처리 Message가 있는데 Consumer가 0입니다. Worker 가동 상태를 확인하세요."
+```
+
+Threshold는 환경에 따라 적정값이 다릅니다. 위의 10000이라는 숫자는 어디까지나 출발점이며, 평상시 Queue 깊이를 실측한 뒤 조정하세요. 평상시가 이미 수천에 이르는 환경에서 10000을 Threshold로 잡으면 Alert가 기능하지 않습니다.
+
+## Khepri 이전도 함께 확인
+
+4.0에서는 Metadata Store의 Default가 Mnesia에서 Khepri로 바뀌었습니다. 이는 Cluster의 Metadata 관리를 더 견고하게 하는 변경이지만, Upgrade 시에는 기존 Cluster로부터의 이전 절차를 밟아야 합니다. 감시 구성 재검토와 같은 Timing에 Metadata Store 이전 계획도 세워두는 것이 효율적입니다.
+
+## Kafka와 RabbitMQ의 구분
+
+감시 구성 이야기와는 별개로, 애초에 어느 Messaging 기반을 쓸지라는 물음도 있습니다. 2026년 시점에서 Kafka는 Broker당 초당 100만 Message 규모의 Throughput을 가져 대량 Event Stream 처리에 적합합니다. 반면 RabbitMQ의 Classic Queue는 Node당 초당 5만 Message 정도이며, 복잡한 Routing이나 Task Queue 용도에 강점이 있습니다.
+
+Throughput 한 점으로 고르면 Kafka로 보이지만, 많은 업무 System이 필요로 하는 것은 "확실한 전달"과 "유연한 Routing"이며 그곳은 RabbitMQ의 특기 영역입니다. 둘 다 Prometheus와 OpenTelemetry에 대응하므로 감시 관점에서 한쪽이 극단적으로 불리해지지는 않습니다.
+
+## 정리
+
+RabbitMQ 4.x에서는 감시의 Default가 Prometheus + Grafana로 옮겨갔습니다. 관리 화면 Graph에 의존하던 Team은 이 구성으로의 이전이 사실상 필수입니다. Plugin을 활성화하고 Queue 깊이·Consumer 수·Resource 여유 세 가지를 축으로 Alert를 짜면 큰 되돌림 없이 이전할 수 있습니다. Threshold는 실측에 근거해 조정하고 Khepri 이전도 동시에 계획한다 — 이 두 가지를 챙기면 4.x로의 Upgrade는 감시의 질을 높이는 기회가 됩니다.
