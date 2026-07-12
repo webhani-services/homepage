@@ -1,0 +1,107 @@
+---
+title: "RabbitMQ 4.x Monitoring Now Assumes Prometheus — Migrating Off the Management UI"
+date: "2026-07-13"
+description: "RabbitMQ 4.0 removed metrics from the Management UI and HTTP API. A practical guide to making Prometheus + Grafana your standard setup."
+status: "published"
+tags: ["RabbitMQ", "Prometheus", "Grafana", "Monitoring", "Observability"]
+thumbnail: ""
+author: "webhani"
+slug: "rabbitmq-4-prometheus-grafana-observability-2026"
+---
+
+## The monitoring default has shifted
+
+RabbitMQ 4.0 brought a significant operational change: performance metrics were removed from the Management UI and HTTP API. Teams that used to open the admin console to watch queue depth and message rates have lost that assumption.
+
+The setup the project now recommends: expose metrics through the `rabbitmq_prometheus` plugin, scrape with Prometheus, and visualize in Grafana. In other words, RabbitMQ monitoring moved from "look at the admin console" to "stand up a Prometheus stack" — the standard approach itself has changed.
+
+At webhani we support messaging platforms in production, and upgrades to 4.x increasingly come with a request to rethink the monitoring setup. Runbooks and alerting built around the admin console's graphs simply don't carry over as-is.
+
+## Why this change makes sense
+
+At first glance it looks like a regression, but operationally it's a sound call. Admin-console metrics load the very node that serves that UI. On large clusters this led to a backwards situation where aggregating metrics for monitoring ate into node performance.
+
+A Prometheus pull model decouples collection, storage, and visualization from RabbitMQ itself. Each node only exposes its own metrics; aggregation and retention live in an external stack. That aligns with a basic observability principle — separate the thing being monitored from the monitoring infrastructure.
+
+## A minimal setup
+
+First, enable the plugin.
+
+```bash
+# Enable the rabbitmq_prometheus plugin
+rabbitmq-plugins enable rabbitmq_prometheus
+
+# Verify the metrics endpoint (default port 15692)
+curl http://localhost:15692/metrics | head -n 20
+```
+
+Next, register the nodes as scrape targets in Prometheus.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: "rabbitmq"
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - "rabbitmq-node-1:15692"
+          - "rabbitmq-node-2:15692"
+          - "rabbitmq-node-3:15692"
+    metric_relabel_configs:
+      # Drop noisy metrics to keep retention cost down
+      - source_labels: [__name__]
+        regex: "rabbitmq_erlang_.*"
+        action: drop
+```
+
+For Grafana, importing the officially distributed dashboard is the fast path. Queue depth, publish/deliver rates, connection counts, and per-node memory and disk are all there from the start. There's no need to build from scratch.
+
+## Which metrics matter, and how to think about thresholds
+
+You don't need to watch every metric equally. Three genuinely earn their keep in operations.
+
+**Queue depth (messages ready).** If this keeps climbing, consumer capacity isn't keeping up with the publish rate. A one-off spike can be normal, but a sustained upward slope is an alerting condition.
+
+**Consumer count.** Fewer than expected means workers are down or failing to connect. Read alongside queue depth, it tells you whether a backlog is from load or from missing workers.
+
+**Free memory and disk.** RabbitMQ blocks publishing once it hits its memory or disk alarm thresholds. Detecting the approach before you enter that state lets you prevent a stall.
+
+```yaml
+# Example Prometheus alerting rules
+groups:
+  - name: rabbitmq
+    rules:
+      - alert: RabbitMQQueueBacklogGrowing
+        expr: rabbitmq_queue_messages_ready > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Queue {{ $labels.queue }} backlog sustained for 10m"
+          description: "Ready messages exceed 10000. Check consumer throughput."
+
+      - alert: RabbitMQNoConsumers
+        expr: rabbitmq_queue_consumers == 0 and rabbitmq_queue_messages_ready > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Queue {{ $labels.queue }} has no consumers"
+          description: "Ready messages exist but consumer count is 0. Check worker status."
+```
+
+The right threshold depends on the environment. The 10000 above is just a starting point — measure your steady-state queue depth first, then tune. In an environment where steady state already sits in the thousands, a threshold of 10000 won't alert usefully.
+
+## Plan the Khepri migration alongside it
+
+4.0 also changed the default metadata store from Mnesia to Khepri. This makes cluster metadata management more robust, but upgrading an existing cluster requires following a migration procedure. It's efficient to plan the metadata-store migration at the same time as the monitoring rework.
+
+## Choosing between Kafka and RabbitMQ
+
+Separate from monitoring, there's the question of which messaging platform to use at all. As of 2026, Kafka sustains throughput on the order of a million messages per second per broker, suiting high-volume event streaming. RabbitMQ classic queues run around 50,000 messages per second per node and shine at complex routing and task-queue workloads.
+
+Pick on throughput alone and Kafka looks obvious, but what most business systems actually need is reliable delivery and flexible routing — RabbitMQ's home turf. Both support Prometheus and OpenTelemetry, so neither is at a serious monitoring disadvantage.
+
+## Takeaway
+
+In RabbitMQ 4.x the monitoring default moved to Prometheus + Grafana. Teams that leaned on the admin console's graphs effectively must migrate to this setup. Enable the plugin and build alerts around three axes — queue depth, consumer count, and resource headroom — and you can migrate without major rework. Tune thresholds from real measurements and plan the Khepri migration in parallel. Nail those two, and the 4.x upgrade becomes a chance to raise the quality of your monitoring.

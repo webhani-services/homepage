@@ -1,0 +1,107 @@
+---
+title: "RabbitMQ 4.x の監視は Prometheus 前提へ — Management UI からの移行"
+date: "2026-07-13"
+description: "RabbitMQ 4.0 で Management UI と HTTP API からメトリクスが削除された。Prometheus + Grafana を標準構成にするための実践ガイド。"
+status: "published"
+tags: ["RabbitMQ", "Prometheus", "Grafana", "監視", "オブザーバビリティ"]
+thumbnail: ""
+author: "webhani"
+slug: "rabbitmq-4-prometheus-grafana-observability-2026"
+---
+
+## 監視のデフォルトが変わった
+
+RabbitMQ 4.0 で運用面の大きな変更がありました。パフォーマンスメトリクスが Management UI と HTTP API から削除されたのです。これまで管理画面を開いてキューの深さやメッセージレートを眺めていたチームは、この前提が崩れたことになります。
+
+代わりに公式が推す構成は、`rabbitmq_prometheus` プラグインでメトリクスを公開し、Prometheus で収集、Grafana で可視化するというものです。つまり RabbitMQ の監視は「管理画面を見る」から「Prometheus スタックを組む」へと、標準的なやり方そのものが移りました。
+
+webhani ではメッセージング基盤の運用支援を行っていますが、4.x へのアップグレードを機にこの監視構成の見直しを求められるケースが増えています。管理画面のグラフに依存した運用手順書やアラート体制は、そのままでは通用しません。
+
+## なぜこの変更が理にかなっているか
+
+一見すると機能後退のように見えますが、運用の観点では妥当な判断です。管理画面のメトリクスは、その UI を提供するノード自身に負荷をかけます。大規模クラスタでは、監視のためのメトリクス集計がノードの性能を食う、という本末転倒が起きがちでした。
+
+Prometheus プル型のモデルでは、メトリクスの収集・保存・可視化を RabbitMQ 本体から切り離せます。ノードは自分のメトリクスを公開するだけで、集計と保持は外部のスタックが担う。これは監視対象と監視基盤を分離するという、オブザーバビリティの基本原則に沿っています。
+
+## 最小構成のセットアップ
+
+まずプラグインを有効化します。
+
+```bash
+# rabbitmq_prometheus プラグインを有効化
+rabbitmq-plugins enable rabbitmq_prometheus
+
+# メトリクスエンドポイントの確認（デフォルトは 15692 番ポート）
+curl http://localhost:15692/metrics | head -n 20
+```
+
+次に Prometheus 側でスクレイプ対象として登録します。
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: "rabbitmq"
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - "rabbitmq-node-1:15692"
+          - "rabbitmq-node-2:15692"
+          - "rabbitmq-node-3:15692"
+    metric_relabel_configs:
+      # 不要なメトリクスを間引いて保持コストを抑える
+      - source_labels: [__name__]
+        regex: "rabbitmq_erlang_.*"
+        action: drop
+```
+
+Grafana では公式が配布しているダッシュボードをインポートするのが早道です。キューの深さ、メッセージ発行/配信レート、コネクション数、ノードのメモリとディスクといった主要指標が最初から揃います。ゼロから作る必要はありません。
+
+## 見るべきメトリクスと閾値の考え方
+
+すべてのメトリクスを等しく監視する必要はありません。運用で本当に効くのは次の三つです。
+
+**キューの深さ（未処理メッセージ数）** — これが増え続けているなら、コンシューマの処理能力が発行レートに追いついていません。単発のスパイクは正常でも、右肩上がりが続く場合はアラート対象です。
+
+**コンシューマ数** — 想定より少なければ、ワーカーが落ちているか接続に失敗しています。キューの深さと組み合わせて見ると、「詰まっているのは負荷のせいか、ワーカー不在のせいか」が切り分けられます。
+
+**メモリとディスクの空き** — RabbitMQ はメモリ閾値やディスク閾値に達すると発行をブロックします。この状態に入る前に検知できれば、詰まりを未然に防げます。
+
+```yaml
+# Prometheus アラートルールの例
+groups:
+  - name: rabbitmq
+    rules:
+      - alert: RabbitMQQueueBacklogGrowing
+        expr: rabbitmq_queue_messages_ready > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "キュー {{ $labels.queue }} の滞留が 10 分継続"
+          description: "未処理メッセージが 10000 を超えています。コンシューマの処理能力を確認してください。"
+
+      - alert: RabbitMQNoConsumers
+        expr: rabbitmq_queue_consumers == 0 and rabbitmq_queue_messages_ready > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "キュー {{ $labels.queue }} にコンシューマが存在しない"
+          description: "未処理メッセージがあるのにコンシューマが 0 です。ワーカーの稼働状況を確認してください。"
+```
+
+閾値は環境によって適正値が異なります。上記の 10000 という数字はあくまで出発点で、平常時のキュー深さを実測してから調整してください。平常時が既に数千に達している環境で 10000 を閾値にすると、アラートが機能しません。
+
+## Khepri への移行も併せて確認
+
+4.0 ではメタデータストアのデフォルトが Mnesia から Khepri に変わりました。これはクラスタのメタデータ管理をより堅牢にする変更ですが、アップグレード時には既存クラスタからの移行手順を踏む必要があります。監視構成の見直しと同じタイミングで、メタデータストアの移行計画も立てておくのが効率的です。
+
+## Kafka と RabbitMQ の使い分け
+
+監視構成の話とは別に、そもそもどちらのメッセージング基盤を使うかという問いもあります。2026 年時点で、Kafka は 1 ブローカーあたり毎秒 100 万メッセージ規模のスループットを持ち、大量のイベントストリーム処理に向きます。一方 RabbitMQ のクラシックキューはノードあたり毎秒 5 万メッセージ程度で、複雑なルーティングやタスクキュー用途に強みがあります。
+
+スループット一点で選ぶと Kafka に見えますが、多くの業務システムが必要とするのは「確実な配信」と「柔軟なルーティング」であり、そこは RabbitMQ の得意領域です。どちらも Prometheus と OpenTelemetry に対応しているため、監視の観点で片方が極端に不利になることはありません。
+
+## まとめ
+
+RabbitMQ 4.x では監視のデフォルトが Prometheus + Grafana へと移りました。管理画面のグラフに依存していたチームは、この構成への移行が実質的に必須です。プラグインを有効化し、キューの深さ・コンシューマ数・リソース空きの三点を軸にアラートを組めば、大きな手戻りなく移行できます。閾値は実測に基づいて調整し、Khepri への移行も同時に計画する。この二点を押さえれば、4.x へのアップグレードは監視の質を上げる機会になります。
