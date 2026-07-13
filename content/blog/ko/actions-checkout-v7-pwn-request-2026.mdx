@@ -1,0 +1,177 @@
+---
+title: "actions/checkout v7, pwn request를 기본 차단한다 — 7월 16일 백포트 전에 할 일"
+description: "pull_request_target에 head SHA checkout을 더하면 왜 secrets가 털리는지, actions/checkout v7이 무엇을 거부하는지, 그리고 올바른 두 단계 Workflow 분리를 YAML과 함께 정리합니다."
+date: "2026-07-14"
+status: "published"
+tags: ["GitHub Actions", "보안", "CI/CD", "공급망", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "actions-checkout-v7-pwn-request-2026"
+---
+
+## 기본값이 바뀝니다, 그리고 빌드가 깨집니다
+
+2026년 7월, actions/checkout v7이 GA로 올라왔습니다. 핵심은 새 기능이 아니라 거부입니다. GitHub 공지에 따르면 v7은 전형적인 "pwn request" 형태 — `pull_request_target`이나 일부 `workflow_run` 같은 특권 Context에서 신뢰할 수 없는 Fork의 ref를 checkout 하려는 시도 — 를 기본적으로 실패시킵니다. 그리고 2026년 7월 16일, 같은 보호 장치가 현재 지원되는 모든 Major Version으로 백포트될 예정입니다. `actions/checkout@v4`에 고정해 두고 몇 년째 손대지 않은 Repository라도, 그날부터 해당 Workflow는 빨간불이 켜집니다.
+
+깨지는 게 맞는 동작입니다. 다만 릴리스 도중에 알게 되는 건 최악의 타이밍입니다. webhani의 권고는 단순합니다. 백포트가 오기 전에 이번 주에 Workflow를 감사하세요. 아래에서 이 취약점 클래스가 왜 생기는지, 무엇이 깨지는지, 어떻게 다시 써야 하는지를 정리합니다.
+
+## `pull_request_target`은 왜 존재하고 왜 무는가
+
+전제부터. `pull_request` Trigger는 비특권입니다. Fork에서 온 PR의 Job에는 secrets가 주입되지 않고 `GITHUB_TOKEN`은 읽기 전용으로 내려갑니다. 안전한 설계이고, 옳습니다.
+
+동시에 불편합니다. Coverage를 PR에 Comment로 달고 싶고, Label을 붙이고 싶고, Preview 환경에 배포하고 싶고, 사내 Private Registry에서 Package를 당겨오고 싶습니다. 전부 쓰기 권한이나 secrets가 필요합니다. 그래서 많은 팀이 `pull_request_target`으로 손을 뻗습니다. 이 Trigger는 Workflow를 PR의 내용이 아니라 **base Repository의 Context**에서 평가하며, secrets와 쓰기 Scope의 Token을 전부 넘겨줍니다.
+
+여기가 분기점입니다. `pull_request_target`은 기본적으로 base Branch를 checkout 합니다. 그래서 secrets가 Scope에 있어도 방어가 됩니다 — 실제로 실행되는 코드는 Maintainer가 이미 리뷰한 코드뿐이니까요.
+
+그리고 그 전제를 무너뜨리는 한 줄이 있습니다.
+
+```yaml
+# 안티패턴. 이렇게 쓰지 마세요.
+name: pr-checks
+on:
+  pull_request_target:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 특권 Context에서 신뢰할 수 없는 Fork 코드를 가져온다
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - run: npm ci          # Fork의 postinstall Script가 실행된다
+      - run: npm test        # Fork의 test Script가 실행된다
+      - run: npm run build   # Fork의 build 설정이 실행된다
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+동기는 지극히 합리적입니다. Contributor의 코드를 실제로 테스트하고 싶은 것이고, YAML도 평범해 보입니다. 하지만 결과적으로 **누구나 작성할 수 있는 코드가 Repository의 secrets를 Scope에 둔 채 실행되는** 구조를 만든 겁니다. 이게 pwn request입니다.
+
+공격자는 취약점을 찾을 필요조차 없습니다. Fork 하고, PR 열고, `package.json`에 `postinstall` 한 줄 추가하면 됩니다. `npm ci`가 그걸 실행합니다. Test Runner, Build Script, `Makefile`, `conftest.py`, pre-commit Hook — Workflow가 호출하는 모든 Entry Point가 Fork 쪽 통제 아래 있습니다. 그 다음은 `env`를 외부로 던지는 명령 하나면 끝이고, `GITHUB_TOKEN`도 Cloud 배포 Credential도 Slack Webhook도 함께 나갑니다. OSS Repository가 정확히 이 경로로 털린 사례는 몇 년째 반복돼 왔습니다.
+
+## 왜 수정이 checkout에 들어갔나
+
+위험한 조합은 checkout 실행 시점에 기계적으로 판별됩니다. "지금 특권 Trigger 아래에서 돌고 있는가", "요청받은 ref가 Fork 소유인가" — 둘 다 Runtime에 알 수 있는 정보입니다. 그러니 checkout이 그냥 거절하면 됩니다.
+
+옳은 위치입니다. "`pull_request_target`에서 신뢰할 수 없는 코드를 실행하지 마세요"라고 문서에 적어두는 방식은 10년째 실패해 왔습니다. Hardening 문서를 읽는 사람은 이미 알고 있는 사람이기 때문입니다. 규모에 맞게 동작하는 유일한 Security Control은 기본값입니다. v7은 조용히 발등을 찍는 함정을 시끄럽게 실패하는 Build Error로 바꿔 놓았습니다. Pipeline이 빨개지는 비용은 Token이 유출되는 비용보다 압도적으로 쌉니다.
+
+GitHub은 이를 2026년 Actions 보안 로드맵의 일부로 설명하고 있고, 여기에는 Self-hosted Runner 최소 Version 강제나 CodeQL 2.26.0의 JS/TS 대상 AI Prompt Injection 탐지 같은 항목도 함께 있습니다. 방향은 일관됩니다. CI를 "뭐든 도는 상자"에서 "권한이 명시된 실행 환경"으로 옮기는 것입니다.
+
+## 그럼 Fork 코드를 빌드해야 할 땐
+
+정당한 필요는 존재합니다. Preview 배포, Visual Regression, Coverage Comment. 전부 Contributor 코드를 빌드한 결과가 필요합니다.
+
+정답은 **실행과 게시를 서로 다른 Workflow로 분리**하는 것입니다.
+
+1단계, 신뢰할 수 없는 코드의 빌드는 권한 없이 돌리고 Artifact만 남깁니다.
+
+```yaml
+# .github/workflows/build.yml
+name: build
+on:
+  pull_request:
+
+permissions:
+  contents: read   # secrets 없음, 쓰기 없음
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7  # 기본값인 PR merge commit
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - run: npm ci
+      - run: npm test -- --coverage
+
+      - name: Save results
+        run: |
+          mkdir -p results
+          cp coverage/coverage-summary.json results/
+          echo "${{ github.event.number }}" > results/pr-number.txt
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: pr-results
+          path: results/
+```
+
+이 Job에서 무엇이 실행되든 상관없습니다. 훔칠 secrets가 없고 Token은 읽기 전용이니까요.
+
+2단계, 특권이 필요한 "게시"만 `workflow_run`으로 받습니다.
+
+```yaml
+# .github/workflows/publish.yml
+name: publish-results
+on:
+  workflow_run:
+    workflows: ["build"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  comment:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      # Fork 코드를 checkout 하지 않는다. 경계를 넘는 건 Artifact뿐이다.
+      - uses: actions/download-artifact@v6
+        with:
+          name: pr-results
+          path: results
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require("fs");
+            const pr = Number(fs.readFileSync("results/pr-number.txt", "utf8").trim());
+            const cov = JSON.parse(fs.readFileSync("results/coverage-summary.json", "utf8"));
+            const pct = cov.total.lines.pct;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr,
+              body: `Line coverage: ${pct}%`,
+            });
+```
+
+핵심은 특권 Job이 **Fork 코드를 단 한 줄도 실행하지 않는다**는 점입니다. checkout 하지 않고, `npm ci`도 돌리지 않고, 데이터만 읽습니다. Artifact 내용은 여전히 신뢰할 수 없는 입력이므로 Shell에 그대로 펼치지 말고 파싱해서 다뤄야 합니다. 위에서 PR 번호를 `Number()`에 통과시킨 이유가 그것입니다.
+
+같이 굳혀둘 습관 세 가지. Job마다 최소 권한 `permissions:` Block을 명시할 것. Third-party Action은 떠다니는 Tag가 아니라 Commit SHA로 Pin 할 것. 배포 Credential을 건드리는 Job은 required reviewers가 걸린 Environment 뒤에 둘 것.
+
+## 7월 16일 전에 할 일
+
+먼저 위험한 Workflow를 찾습니다. 로컬이라면:
+
+```bash
+grep -rlZ 'pull_request_target' .github/workflows \
+  | xargs -0 grep -l 'pull_request.head'
+```
+
+조직 전체를 훑는다면 GitHub code search가 빠릅니다:
+
+```bash
+gh api -X GET search/code \
+  -f q='org:YOUR_ORG path:.github/workflows pull_request_target head.sha' \
+  --jq '.items[] | "\(.repository.full_name)  \(.path)"'
+```
+
+찾은 결과는 눈으로 확인하세요. `head.ref`나 `merge_commit_sha`를 쓰는 변형, `workflow_run` Job에서 head SHA를 직접 해석해 오는 Pattern도 똑같이 위험하고 단순 Pattern으로는 잡히지 않습니다.
+
+webhani의 권고는 단순합니다. 백포트가 찾아주기 전에 직접 찾으세요. 릴리스 도중에 Workflow가 죽으면 원인 분리에 한 시간이 날아가고, 최악의 선택 — Pipeline을 초록으로 만들기 위해 checkout Version을 내리는 결정 — 쪽으로 사람을 밀어붙입니다. 2026년에 마감 압박 아래에서 내리게 하고 싶지 않은 결정입니다.
+
+마지막으로 하나 더. 감사에서 나온 `pull_request_target` 대부분은 "다른 방법을 몰라서" 쓰인 것입니다. 위의 두 단계 분리를 사내 Workflow Template으로 가지고 있으면, 다음에 같은 요구사항이 왔을 때 아무도 그 한 줄을 다시 쓰지 않습니다.

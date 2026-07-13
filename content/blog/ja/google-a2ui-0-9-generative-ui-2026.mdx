@@ -1,0 +1,187 @@
+---
+title: "A2UI v0.9 が示す Generative UI の正しい設計 — コードを吐かせず、意図を宣言させる"
+description: "Google が公開した A2UI v0.9 は、AI エージェントに UI コードではなく UI の意図を宣言させる標準です。なぜこの方向が正しいのか、そして今日から自分のコードベースで採用できる移植可能な設計を、React 19 / TypeScript の実装例とともに解説します。"
+date: "2026-07-14"
+status: "published"
+tags: ["A2UI", "Generative UI", "AI Agent", "React", "アーキテクチャ"]
+thumbnail: ""
+author: "webhani"
+slug: "google-a2ui-0-9-generative-ui-2026"
+---
+
+## エージェントに JSX を書かせるのをやめる
+
+2026 年 7 月、Google が **A2UI v0.9** を公開しました。a2ui.org で仕様書、移行ガイド、そして React / Flutter / Lit / Angular 向けの公式レンダラーが公開されており、エージェント側の SDK は PyPI 経由で Python から使えます。InfoQ や CopilotKit の記事でも取り上げられていますが、リリースノートを読むより先に押さえるべきなのは、この仕様が何を「禁止」しているかです。
+
+A2UI の主張は一行で書けます。**エージェントは UI コードを生成してはならない。UI の意図だけを宣言し、レンダリングはホストアプリの既存デザインシステムに任せる。**
+
+これは些細な API 設計の話ではなく、いま多くのチームが踏んでいる地雷を正面から避けるための構造的な選択です。webhani としては、A2UI というライブラリを今すぐ本番に入れることは勧めません。ただし、**この境界の引き方だけは、今日から自分のコードベースに写経する価値がある**と考えています。以下、その理由と、実際の設計を書いていきます。
+
+## 現行の Generative UI が抱える構造的な欠陥
+
+いま主流の「Generative UI」は、要するに LLM に JSX や HTML を吐かせて、それをクライアントで評価するパターンです。デモは派手に見えますが、本番投入を検討した瞬間に問題が並びます。
+
+**セキュリティ。** モデルの出力がそのまま DOM になるということは、モデルの出力が XSS のペイロードになりうるということです。プロンプトインジェクションを一度でも通せば、攻撃者はあなたのオリジンで動くマークアップを書けます。サニタイズで塞ごうとしても、それは「あらゆる危険なパターンを列挙できる」という前提に立った戦い方で、歴史的に負け続けている側の戦略です。
+
+**一貫性。** モデルは平気で `<button class="bg-blue-500">` を書きます。あなたのデザインシステムが amber を primary にしていることなど知りません。デザイントークンは無視され、アクセシビリティ属性は運任せになり、ダークモードは壊れます。
+
+**テスト不能性。** 出力が任意のマークアップである以上、「モデルが何をレンダリングしうるか」の集合は定義できません。定義できない集合に対して、あなたはテストを書けません。
+
+多くのチームはここで iframe サンドボックスに逃げます。確かに XSS は封じ込められますが、代わりにアプリ本体との統合が死にます。ルーティングも、認証状態も、共有ストアも、フォーカス管理も、iframe の境界で切れます。安全になった代わりに、ただの埋め込みウィジェットに戻ってしまう。
+
+## 出力空間を狭める、という発想
+
+A2UI が採る立場は「サニタイズする」ではなく「**そもそも危険なものを表現できない語彙にする**」です。エージェントが送るのは、スキーマで縛られた宣言的な JSON です。「この 2 つの選択肢を持つ確認ダイアログを出せ」とは言えるが、「この生の HTML を出せ」とは言えない。
+
+この構図には既視感があるはずです。**パラメータ化クエリと文字列連結 SQL の関係**とまったく同じです。文字列連結の SQL を後からエスケープで守るのは、常に攻撃者が一手先を行くゲームになります。一方でプレースホルダを使った SQL は、そもそもユーザー入力が構文として解釈される経路が存在しない。安全なのはチェックが厳しいからではなく、**危険を表現する文法が存在しない**からです。
+
+A2UI はこれを UI レイヤーでやります。レンダリング可能な表面は、あなたが監査済みの、閉じたコンポーネント集合に限定されます。結果として:
+
+- モデルの出力はスキーマで検証できる（不正なら描画前に落とせる）
+- 描画されうる UI の全パターンを列挙できるので、テストとスナップショットが書ける
+- デザインシステムから外れることが構造的に不可能になる
+
+## 双方向性がなぜ効くのか
+
+v0.9 はマイナーアップデートではありません。中核の思想も、JSON 構造も、スキーマも変わり、そして**プロトコルが双方向になりました**。UI はレンダーツリーを受け取るだけでなく、エージェントに向かって喋り返せます。
+
+これは地味に見えて、実用性の分水嶺です。一方向のレンダーツリーで表現できるのは、せいぜい「エージェントが何かを表示した」までです。しかし現実の UI は会話です。ユーザーがフォームに住所を入れる、エージェントが配送可能かを判定する、選択肢を絞る、確認を求める、ユーザーが最終承認を押す。この往復がプロトコルの一部としてモデル化されていなければ、あなたは結局その部分を独自の RPC で継ぎ足すことになります。
+
+双方向化は、Generative UI を「デモ」から「チェックアウトフローを背負わせられるもの」に変える最低条件です。逆に言えば、双方向でない Generative UI の提案を見たら、それは決済や予約のような真面目なフローには使えないと判断していい。
+
+## webhani の見解: ライブラリではなくパターンを採る
+
+率直に言って、**v0.9 を今日の本番決済フローに乗せるのは早い**です。pre-1.0 であり、しかも直近で思想・構造・スキーマを丸ごと壊した実績があります。次の破壊的変更が来ない保証はどこにもありません。
+
+一方で、A2UI が示した「エージェントと UI の境界の引き方」は、ライブラリを採用しなくても今すぐ真似できます。必要なのは 3 つだけです。
+
+1. **スキーマで縛った UI インテントのペイロード**
+2. **インテント種別 → 自社コンポーネントのレジストリ**
+3. **レジストリにないものは描画せず落ちるレンダラー（fail closed）**
+
+この 3 点セットを自分のコードベースに置いておけば、A2UI が 1.0 で勝とうが、別の標準が勝とうが、あなたのアーキテクチャは既にその形をしています。移行コストは「インテント JSON の形を変える」だけに閉じ込められます。
+
+## 実装例: このプロジェクトのスタックで書く
+
+以下は A2UI の API ではなく、**同じパターンを React 19 / TypeScript / Next.js で自前実装したもの**です。A2UI のシグネチャを推測するより、この形のほうが正確で、そのまま使えます。
+
+まず、モデルに許す語彙を zod で定義します。ここが唯一の「モデルが表現できる世界」になります。
+
+```ts
+// lib/agent-ui/schema.ts
+import { z } from "zod";
+
+const actionSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1).max(40),
+  intent: z.enum(["confirm", "cancel", "retry"]),
+});
+
+export const uiIntentSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("confirmation"),
+    title: z.string().min(1).max(80),
+    body: z.string().max(400),
+    actions: z.array(actionSchema).min(1).max(3),
+  }),
+  z.object({
+    type: z.literal("choice"),
+    prompt: z.string().min(1).max(120),
+    options: z
+      .array(z.object({ value: z.string(), label: z.string().max(60) }))
+      .min(2)
+      .max(6),
+  }),
+  z.object({
+    type: z.literal("summary"),
+    heading: z.string().max(80),
+    // 生 HTML は受け取らない。プレーンテキストの行だけ。
+    lines: z.array(z.string().max(200)).max(10),
+  }),
+]);
+
+export type UiIntent = z.infer<typeof uiIntentSchema>;
+```
+
+注目すべきは、ここに `html` も `className` も `style` も存在しないことです。モデルは色を指定できません。要素を作れません。文字数の上限すら仕様の一部です。**出力空間が閉じている**とはこういう意味です。
+
+次に、インテント種別を自社デザインシステムのコンポーネントに写像するレジストリです。
+
+```tsx
+// lib/agent-ui/registry.tsx
+import type { ComponentType } from "react";
+import type { UiIntent } from "./schema";
+import { ConfirmationCard } from "@/components/agent/ConfirmationCard";
+import { ChoiceList } from "@/components/agent/ChoiceList";
+import { SummaryPanel } from "@/components/agent/SummaryPanel";
+
+type IntentOf<T extends UiIntent["type"]> = Extract<UiIntent, { type: T }>;
+
+type Registry = {
+  [T in UiIntent["type"]]: ComponentType<{
+    intent: IntentOf<T>;
+    onReply: (payload: unknown) => void;
+  }>;
+};
+
+export const registry: Registry = {
+  confirmation: ConfirmationCard,
+  choice: ChoiceList,
+  summary: SummaryPanel,
+};
+```
+
+レジストリの型が `UiIntent["type"]` に対して網羅的なので、スキーマに新しいインテントを足してレジストリを更新し忘れると、実行時ではなく**型検査で落ちます**。
+
+最後にレンダラーです。ここでの唯一のルールは「知らないものは描かない」。
+
+```tsx
+// components/agent/AgentSurface.tsx
+"use client";
+
+import { uiIntentSchema } from "@/lib/agent-ui/schema";
+import { registry } from "@/lib/agent-ui/registry";
+
+type Props = {
+  payload: unknown; // エージェントから来た未検証の JSON
+  onReply: (payload: unknown) => void;
+};
+
+export function AgentSurface({ payload, onReply }: Props) {
+  const parsed = uiIntentSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    // fail closed: 検証に落ちたら何も描画しない
+    console.error("rejected agent ui intent", parsed.error.issues);
+    return <FallbackNotice />;
+  }
+
+  const intent = parsed.data;
+  const Component = registry[intent.type];
+
+  // レジストリ外の type は型上ありえないが、実行時にも守る
+  if (!Component) return <FallbackNotice />;
+
+  return <Component intent={intent as never} onReply={onReply} />;
+}
+```
+
+`onReply` が双方向性の入り口です。`ConfirmationCard` の「同意する」を押すと、その結果は同じチャネルでエージェントに返り、エージェントは次のインテントを送ってきます。レンダーツリーの片道配信ではなく、往復するステートマシンとして扱えるようになります。
+
+## 実務で効いてくる副作用
+
+この境界を引くと、副次的な効果がいくつも出てきます。
+
+**テストが普通に書けます。** `uiIntentSchema` に適合する JSON はすべて有限の形をしているので、各インテントのスナップショットテストが書けます。モデルを呼ばずに UI をテストできるということです。
+
+**モデルを差し替えても UI が壊れません。** モデルの責務は「スキーマに適合する JSON を出す」だけになるので、Claude から別のモデルに乗り換えても、影響範囲は生成品質だけです。マークアップの癖に依存しません。
+
+**監査ログが人間に読めます。** エージェントが何を表示したかが、DOM のダンプではなく意味のある JSON として残ります。インシデント調査のときに効きます。
+
+**プロンプトインジェクションの被害が上限つきになります。** 最悪ケースでも、攻撃者ができるのは「あなたのコンポーネントを、あなたの許した文字数で、意図しない文言で表示させる」ことまでです。任意のスクリプト実行には到達できません。これは根絶ではありませんが、被害の天井が設計で決まっているという点が重要です。
+
+## まとめ
+
+A2UI v0.9 の価値は、Google が新しいレンダラーを配ったことではなく、**Generative UI の正しい境界線を業界標準として明文化した**ことにあります。エージェントに書かせるのはコードではなく意図であり、描画権限はあなたのデザインシステムが握る。
+
+仕様自体は pre-1.0 で、まだ動きます。webhani の推奨は、A2UI をウォッチしつつ、**スキーマ制約されたインテント + コンポーネントレジストリ + fail closed のレンダラー**という 3 点構成を先に自分のコードに入れることです。標準がどう転んでも、あなたのアーキテクチャは既に正しい形をしています。
