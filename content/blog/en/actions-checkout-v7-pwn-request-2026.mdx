@@ -1,0 +1,177 @@
+---
+title: "actions/checkout v7 Blocks Pwn Requests by Default — Audit Your Workflows Before July 16"
+description: "Why pull_request_target plus a head-SHA checkout hands your secrets to strangers, what actions/checkout v7 now refuses, and the correct two-workflow split, with YAML."
+date: "2026-07-14"
+status: "published"
+tags: ["GitHub Actions", "Security", "CI/CD", "Supply Chain", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "actions-checkout-v7-pwn-request-2026"
+---
+
+## A default is changing, and it will break builds
+
+actions/checkout v7 went GA in July 2026. The headline is not a feature — it is a refusal. Per GitHub's announcement, v7 now hard-fails the classic "pwn request" shape: a privileged trigger such as `pull_request_target` (and certain `workflow_run` cases) combined with a checkout of a ref that belongs to an untrusted fork. And on July 16, 2026, GitHub plans to backport that same protection to every currently supported major version. If you pinned `actions/checkout@v4` and never touched it again, your affected workflows still start failing that day.
+
+Failing is the correct behavior. Discovering it mid-release is not. Our recommendation at webhani is blunt: audit your workflows this week, before the backport lands. Below is why this vulnerability class exists, what breaks, and how to rewrite it.
+
+## Why `pull_request_target` exists, and why it bites
+
+The `pull_request` trigger is unprivileged. On a fork PR, the job gets no secrets and a read-only `GITHUB_TOKEN`. That is the safe design, and it is correct.
+
+It is also inconvenient. You want to post a coverage comment, apply a label, deploy a preview environment, pull from a private registry. Every one of those needs write scope or secrets. So teams reach for `pull_request_target`, which evaluates the workflow in the context of the **base** repository, with full secrets and a write-scoped token.
+
+Here is the hinge: `pull_request_target` checks out the base branch by default. Because of that, having secrets in scope is defensible — the only code that runs is code a maintainer already reviewed.
+
+And here is the one line that destroys the premise.
+
+```yaml
+# ANTI-PATTERN. Do not ship this.
+name: pr-checks
+on:
+  pull_request_target:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Untrusted fork code, fetched inside a privileged context.
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - run: npm ci          # runs the fork's postinstall scripts
+      - run: npm test        # runs the fork's test script
+      - run: npm run build   # runs the fork's build config
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+The motivation is entirely reasonable — you want to actually test the contributor's code — and the YAML looks unremarkable. But you have now arranged for **code that any stranger can write to execute with your repository's secrets in scope**. That is the pwn request.
+
+An attacker does not need to find a bug. They fork, open a PR, and add one `postinstall` line to `package.json`. `npm ci` executes it. The test runner, the build script, the `Makefile`, `conftest.py`, a pre-commit hook — every entry point your workflow invokes is under the fork's control. From there, dumping `env` to a remote host takes one command, and out goes the `GITHUB_TOKEN`, the cloud deploy credentials, the Slack webhook. Open source repositories have been compromised this exact way for years.
+
+## Why the fix belongs in checkout
+
+The dangerous combination is mechanically detectable at checkout time. "Am I running under a privileged trigger?" and "is the ref I was asked to fetch owned by a fork?" are both answerable at runtime. So checkout can simply say no.
+
+That is the right place for it. The documentation-only approach — "do not execute untrusted code under `pull_request_target`" — has been failing for a decade, because the people who read hardening guides are the people who already knew. Defaults are the only security control that scales. v7 converts a quiet footgun into a loud build failure, and a red pipeline is far cheaper than a leaked token.
+
+GitHub frames this as part of a broader 2026 Actions security roadmap that also includes minimum-version enforcement for self-hosted runners and CodeQL 2.26.0 adding AI prompt-injection detection for JavaScript and TypeScript. The direction is consistent: move CI from "a box where anything runs" toward "an execution context with explicit privileges."
+
+## So how do you build fork code?
+
+Some workflows legitimately must. Preview deploys, visual regression, coverage comments — all of them need the contributor's code built.
+
+The answer is to **separate execution from publication**.
+
+Step one: build untrusted code with no privileges, and hand off an artifact.
+
+```yaml
+# .github/workflows/build.yml
+name: build
+on:
+  pull_request:
+
+permissions:
+  contents: read   # no secrets, no write scope
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7  # PR merge commit, the default
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - run: npm ci
+      - run: npm test -- --coverage
+
+      - name: Save results
+        run: |
+          mkdir -p results
+          cp coverage/coverage-summary.json results/
+          echo "${{ github.event.number }}" > results/pr-number.txt
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: pr-results
+          path: results/
+```
+
+It does not matter what this job executes. There are no secrets to steal and the token is read-only.
+
+Step two: do the privileged part — and only the privileged part — from `workflow_run`.
+
+```yaml
+# .github/workflows/publish.yml
+name: publish-results
+on:
+  workflow_run:
+    workflows: ["build"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  comment:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      # No checkout of fork code. Only the artifact crosses the boundary.
+      - uses: actions/download-artifact@v6
+        with:
+          name: pr-results
+          path: results
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require("fs");
+            const pr = Number(fs.readFileSync("results/pr-number.txt", "utf8").trim());
+            const cov = JSON.parse(fs.readFileSync("results/coverage-summary.json", "utf8"));
+            const pct = cov.total.lines.pct;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr,
+              body: `Line coverage: ${pct}%`,
+            });
+```
+
+The point is that the privileged job never executes a single line of fork code. It does not check out, it does not `npm ci`, it reads data. The artifact is still untrusted input, so parse it instead of interpolating it into a shell — that is why the PR number goes through `Number()` above.
+
+Three more habits worth enforcing while you are in there. Declare a least-privilege `permissions:` block per job. Pin third-party actions to a commit SHA, not a floating tag. Put anything that touches deploy credentials behind an environment with required reviewers.
+
+## What to do before July 16
+
+Find the at-risk workflows. Locally:
+
+```bash
+grep -rlZ 'pull_request_target' .github/workflows \
+  | xargs -0 grep -l 'pull_request.head'
+```
+
+Across an org, GitHub code search is faster:
+
+```bash
+gh api -X GET search/code \
+  -f q='org:YOUR_ORG path:.github/workflows pull_request_target head.sha' \
+  --jq '.items[] | "\(.repository.full_name)  \(.path)"'
+```
+
+Then eyeball the hits. Variants using `head.ref`, `merge_commit_sha`, or a `workflow_run` job that resolves the head SHA itself are equally dangerous and will not always match a naive pattern.
+
+webhani's recommendation is simple: find these yourself instead of letting the backport find them for you. A workflow that dies in the middle of a release burns an hour of triage and pushes someone toward the worst possible fix — downgrading checkout to make the pipeline green. That is not a decision you want anyone making under deadline pressure in 2026.
+
+One more thing. Most of the `pull_request_target` usage you turn up was written because nobody knew another way. Keep the two-workflow split above as an internal template, and the next person with the same requirement never has to write that line.

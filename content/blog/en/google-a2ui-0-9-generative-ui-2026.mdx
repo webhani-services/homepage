@@ -1,0 +1,185 @@
+---
+title: "A2UI v0.9 and the Right Boundary for Generative UI: Declare Intent, Don't Emit Code"
+description: "Google's A2UI v0.9 asks agents to declare UI intent instead of generating markup. Here is the architectural case for that choice, and a portable React 19 / TypeScript implementation of the pattern you can adopt today without the library."
+date: "2026-07-14"
+status: "published"
+tags: ["A2UI", "Generative UI", "AI Agents", "React", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "google-a2ui-0-9-generative-ui-2026"
+---
+
+## Stop letting the model write JSX
+
+Google published **A2UI v0.9** in July 2026. The spec, migration guides, and official renderers for React, Flutter, Lit, and Angular are all on a2ui.org, with an agent-side SDK available for Python through PyPI. InfoQ and CopilotKit have both covered the release. But the interesting part is not what A2UI adds — it is what it forbids.
+
+The thesis fits in one sentence: **an agent must not generate UI code. It declares UI intent, and the host application renders that intent with its own design system.**
+
+That is not an API preference. It is a structural fix for a mistake most teams building generative UI are currently making. webhani's position is that you should not put A2UI itself into production yet — but you should copy the boundary it draws into your own codebase this week.
+
+## What's structurally wrong with generative UI today
+
+The dominant pattern is simple: have the LLM emit JSX or HTML, ship it to the client, evaluate it. It demos beautifully. It falls apart the moment you take it seriously.
+
+**Security.** If model output becomes DOM, then model output is an XSS payload waiting for a prompt injection to carry it. Once an attacker gets one injection through, they are writing markup that runs on your origin. Sanitizing after the fact is a strategy that assumes you can enumerate every dangerous construct. That side of the argument has been losing for twenty years.
+
+**Consistency.** The model will cheerfully write `<button class="bg-blue-500">`. It does not know your primary color is amber. Design tokens get ignored, accessibility attributes become a coin flip, dark mode breaks in ways no one notices until a customer screenshots it.
+
+**Untestability.** If the output is arbitrary markup, the set of things your model can render is undefined. You cannot write tests against an undefined set. You can only write tests against the handful of outputs you happened to observe.
+
+The usual escape hatch is an iframe sandbox. It contains the XSS, and it kills the integration. Routing, auth state, shared stores, focus management, and your own theming all stop at the iframe boundary. You traded a security problem for an embedded-widget problem.
+
+## Constrain the output space instead of sanitizing it
+
+A2UI's answer is not "sanitize harder." It is "make dangerous things inexpressible." The agent emits a declarative JSON payload constrained by a schema. It can say *show a confirmation with these two options*. It cannot say *inject this raw HTML*, because there is no field for that.
+
+You have seen this shape before. It is exactly the relationship between **parameterized queries and string-concatenated SQL**. Escaping a concatenated query is an arms race you eventually lose. A placeholder-based query is safe not because the checks are strict, but because there is no grammar in which user input can become syntax. The safety is structural.
+
+A2UI applies that principle to the render surface. Everything renderable is a member of a closed set of components you already own and audited. Three concrete consequences:
+
+- The model's output is validatable — you can reject it before it ever touches the DOM.
+- The renderable UI space is finite and enumerable, so snapshot and unit tests are actually possible.
+- Design-system drift becomes structurally impossible, not merely discouraged in a prompt.
+
+## Why bidirectionality is the part that matters
+
+v0.9 is a breaking change, not a version bump. The core philosophy, the JSON structure, and the schema all changed — and crucially, the protocol became **bidirectional**. The UI no longer just receives a render tree; it can talk back to the agent.
+
+That sounds like plumbing. It is the difference between a demo and a product. A one-way render tree can express "the agent displayed something." It cannot express a conversation. Real flows are round trips: the user types an address, the agent checks shipping eligibility, narrows the options, asks for confirmation, the user approves. If that loop is not part of the protocol, you will bolt it on with a bespoke RPC channel and lose every guarantee the schema gave you.
+
+Bidirectionality is the minimum requirement for putting a checkout flow behind generative UI. If you evaluate a generative-UI proposal that is one-way, you can safely conclude it is not for payments or bookings.
+
+## webhani's take: adopt the pattern, not (yet) the library
+
+Directly: **do not build a production checkout on v0.9 today.** It is pre-1.0, and it just rewrote its own philosophy, structure, and schema in a single release. Nothing suggests that was the last such release.
+
+But you do not need the library to get the architecture. You need three things:
+
+1. A **schema-constrained UI-intent payload**.
+2. A **registry** mapping intent types to your own design-system components.
+3. A **renderer that fails closed** — anything not in the registry does not render.
+
+Put those three in place and it stops mattering which standard wins. If A2UI reaches 1.0 and takes the market, your migration is "change the shape of the intent JSON." If something else wins, same answer.
+
+## The pattern, implemented in your own codebase
+
+What follows is not A2UI's API — inventing signatures for a spec you haven't pinned is how you ship documentation bugs. This is **the same pattern, written in React 19 / TypeScript / Next.js**, which is both accurate and immediately usable.
+
+Start by defining the vocabulary the model is allowed to speak. This schema *is* the model's entire world.
+
+```ts
+// lib/agent-ui/schema.ts
+import { z } from "zod";
+
+const actionSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1).max(40),
+  intent: z.enum(["confirm", "cancel", "retry"]),
+});
+
+export const uiIntentSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("confirmation"),
+    title: z.string().min(1).max(80),
+    body: z.string().max(400),
+    actions: z.array(actionSchema).min(1).max(3),
+  }),
+  z.object({
+    type: z.literal("choice"),
+    prompt: z.string().min(1).max(120),
+    options: z
+      .array(z.object({ value: z.string(), label: z.string().max(60) }))
+      .min(2)
+      .max(6),
+  }),
+  z.object({
+    type: z.literal("summary"),
+    heading: z.string().max(80),
+    // No raw HTML. Plain text lines only.
+    lines: z.array(z.string().max(200)).max(10),
+  }),
+]);
+
+export type UiIntent = z.infer<typeof uiIntentSchema>;
+```
+
+Note what is absent: no `html`, no `className`, no `style`. The model cannot pick a color. It cannot invent an element. Even the string lengths are part of the contract. That is what a closed output space looks like.
+
+Next, the registry that maps each intent type onto a component you own.
+
+```tsx
+// lib/agent-ui/registry.tsx
+import type { ComponentType } from "react";
+import type { UiIntent } from "./schema";
+import { ConfirmationCard } from "@/components/agent/ConfirmationCard";
+import { ChoiceList } from "@/components/agent/ChoiceList";
+import { SummaryPanel } from "@/components/agent/SummaryPanel";
+
+type IntentOf<T extends UiIntent["type"]> = Extract<UiIntent, { type: T }>;
+
+type Registry = {
+  [T in UiIntent["type"]]: ComponentType<{
+    intent: IntentOf<T>;
+    onReply: (payload: unknown) => void;
+  }>;
+};
+
+export const registry: Registry = {
+  confirmation: ConfirmationCard,
+  choice: ChoiceList,
+  summary: SummaryPanel,
+};
+```
+
+Because the registry type is exhaustive over `UiIntent["type"]`, adding a new intent to the schema and forgetting to register a component is a **type error**, not a production incident.
+
+Finally the renderer. Its only rule: if I don't recognize it, I don't draw it.
+
+```tsx
+// components/agent/AgentSurface.tsx
+"use client";
+
+import { uiIntentSchema } from "@/lib/agent-ui/schema";
+import { registry } from "@/lib/agent-ui/registry";
+
+type Props = {
+  payload: unknown; // unvalidated JSON straight from the agent
+  onReply: (payload: unknown) => void;
+};
+
+export function AgentSurface({ payload, onReply }: Props) {
+  const parsed = uiIntentSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    // fail closed: nothing renders when validation fails
+    console.error("rejected agent ui intent", parsed.error.issues);
+    return <FallbackNotice />;
+  }
+
+  const intent = parsed.data;
+  const Component = registry[intent.type];
+
+  // Unreachable by the type system, still guarded at runtime.
+  if (!Component) return <FallbackNotice />;
+
+  return <Component intent={intent as never} onReply={onReply} />;
+}
+```
+
+`onReply` is where bidirectionality enters. When the user clicks "Approve" in `ConfirmationCard`, the result travels back to the agent over the same channel and the agent responds with the next intent. You are no longer streaming a render tree one way; you are running a state machine with two participants.
+
+## Second-order benefits worth naming
+
+**Tests become ordinary.** Every payload that satisfies `uiIntentSchema` has a finite shape, so you can snapshot-test each intent variant. You can test the UI without calling the model at all.
+
+**Swapping models doesn't break the UI.** The model's only job is emitting schema-valid JSON. Move from one provider to another and the blast radius is generation quality, not markup quirks.
+
+**Audit logs stay human-readable.** What the agent showed a user is recorded as meaningful JSON, not a DOM dump. That matters at 2am during an incident.
+
+**Prompt injection gets a ceiling.** In the worst case, an attacker makes your own components display unwanted copy within your own character limits. They do not reach arbitrary script execution. That is not elimination, but the ceiling on the damage is set by your architecture rather than by your sanitizer.
+
+## Closing
+
+The value of A2UI v0.9 is not that Google shipped more renderers. It is that the industry now has a written standard for where the agent/UI boundary belongs: the agent supplies intent, and your design system retains the exclusive right to render.
+
+The spec is pre-1.0 and still moving. webhani's recommendation is to watch A2UI while putting the three-part structure — **schema-constrained intent, component registry, fail-closed renderer** — into your codebase now. Whichever standard wins, your architecture already fits it.

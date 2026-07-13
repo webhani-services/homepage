@@ -1,0 +1,177 @@
+---
+title: "actions/checkout v7 が pwn request を既定でブロックする — 7月16日のバックポート前にやるべきこと"
+description: "pull_request_target と head SHA の checkout がなぜ危険なのか、actions/checkout v7 が何を止めるのか、そして安全な二段構えのワークフロー分割を YAML 付きで解説します。"
+date: "2026-07-14"
+status: "published"
+tags: ["GitHub Actions", "セキュリティ", "CI/CD", "サプライチェーン", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "actions-checkout-v7-pwn-request-2026"
+---
+
+## 既定値が変わるという話
+
+2026年7月、actions/checkout v7 が GA になりました。目玉は新機能ではなく、既定の拒否です。GitHub の告知によれば、`pull_request_target` や一部の `workflow_run` のような特権コンテキストで、フォーク由来の ref を checkout しようとする典型的な「pwn request」パターンを、v7 はエラーで止めます。さらに 2026年7月16日、この保護は現在サポートされている全メジャーバージョンにバックポートされる予定です。つまり `actions/checkout@v4` のまま何も触っていないリポジトリでも、その日を境に該当ワークフローが落ちます。
+
+落ちる、というのは正しい挙動です。ただし、リリース当日に CI が赤くなって初めて気づくのは最悪のタイミングです。webhani としての推奨は明快で、7月16日より前に自分のワークフローを棚卸ししてください。以下、なぜこのクラスの脆弱性が生まれるのか、何が壊れるのか、どう書き直すのかを順に整理します。
+
+## `pull_request_target` はなぜ存在し、なぜ噛みつくのか
+
+まず前提として、`pull_request` トリガーは非特権です。フォークからの PR で走るジョブには secrets が渡らず、`GITHUB_TOKEN` は読み取り専用に落とされます。これは安全側の設計であり、正しい。
+
+問題は、それでは実務が回らないことです。PR にカバレッジをコメントしたい、ラベルを付けたい、プレビュー環境にデプロイしたい、社内のプライベートレジストリからパッケージを引きたい。どれも書き込み権限か secrets を必要とします。そこで多くのチームが `pull_request_target` に手を伸ばします。このトリガーは PR の内容ではなく **ベースリポジトリの文脈** でワークフローを評価し、secrets も書き込みスコープの `GITHUB_TOKEN` も渡します。
+
+ここが分岐点です。`pull_request_target` は既定でベースブランチを checkout します。だから secrets を持っていても、動くコードはメンテナがレビュー済みのものだけ、という前提が成り立ちます。
+
+そして、その前提を壊す一行があります。
+
+```yaml
+# アンチパターン: これは書かないでください
+name: pr-checks
+on:
+  pull_request_target:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 特権コンテキストで、信頼できないフォークのコードを取ってきている
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - run: npm ci          # postinstall スクリプトが走る
+      - run: npm test        # フォーク側の test スクリプトが走る
+      - run: npm run build   # フォーク側の build 設定が走る
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+「コントリビュータのコードを実際にテストしたいから head を checkout する」。動機は完全に理解できますし、一見なんの変哲もない YAML です。しかし結果として、**外部の誰でも書けるコードが、リポジトリの secrets がスコープに入った状態で実行される** 構成になっています。これが pwn request です。
+
+攻撃者は脆弱性を探す必要すらありません。フォークして PR を出し、`package.json` に `postinstall` を一行足すだけです。`npm ci` がそれを実行します。テストランナー、ビルドスクリプト、`Makefile`、`conftest.py`、pre-commit フック — ワークフローが呼ぶあらゆるエントリポイントがフォーク側の管理下にあります。そこから先は `env` を丸ごと外部に送るだけで、`GITHUB_TOKEN` も、デプロイ用のクラウド認証情報も、Slack の webhook も持っていかれます。実際、この経路での OSS リポジトリ侵害は何年も前から繰り返し起きています。
+
+## 修正が checkout 側に入った理由
+
+この危険な組み合わせは、checkout の実行時点で機械的に判定できます。「特権トリガーである」ことと「参照している ref がフォーク側である」ことは、どちらもランタイムに分かる情報です。だから checkout 自身が拒否できる。
+
+これは設計としてまっとうです。ドキュメントに「pull_request_target では信頼できないコードを実行しないこと」と書いておくアプローチは、10年間うまくいきませんでした。ハードニングのドキュメントを読むのは、そもそもセキュリティに詳しい人だけだからです。スケールするセキュリティ対策は既定値だけです。v7 は、静かに刺さる足元の罠を、うるさく失敗するビルドエラーに変換しました。CI が赤くなるほうが、トークンが流出するよりはるかに安い。
+
+なお GitHub はこれを 2026年の Actions セキュリティロードマップの一部として位置づけており、セルフホストランナーの最低バージョン強制や、CodeQL 2.26.0 での JS/TS 向け AI プロンプトインジェクション検出なども同じ流れにあります。方向性は一貫していて、CI を「なんでも動く箱」から「権限が明示された実行環境」へ寄せていくものです。
+
+## では、フォークのコードをビルドしたいときは
+
+正当なニーズはあります。プレビューデプロイ、ビジュアルリグレッション、カバレッジコメント。いずれもフォークのコードをビルドした結果が必要です。
+
+答えは、**実行と公開を別のワークフローに分ける** ことです。
+
+ステップ1、信頼できないコードのビルドは非特権で行い、成果物だけを artifact に置きます。
+
+```yaml
+# .github/workflows/build.yml
+name: build
+on:
+  pull_request:
+
+permissions:
+  contents: read   # secrets なし、書き込みなし
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7  # PR のマージコミットを checkout（既定）
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - run: npm ci
+      - run: npm test -- --coverage
+
+      - name: Save results
+        run: |
+          mkdir -p results
+          cp coverage/coverage-summary.json results/
+          echo "${{ github.event.number }}" > results/pr-number.txt
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: pr-results
+          path: results/
+```
+
+このジョブは何が実行されても構いません。secrets を持っておらず、トークンは読み取り専用だからです。攻撃者が奪えるものが存在しない。
+
+ステップ2、特権が必要な「公開」だけを `workflow_run` で受けます。
+
+```yaml
+# .github/workflows/publish.yml
+name: publish-results
+on:
+  workflow_run:
+    workflows: ["build"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  comment:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      # フォークのコードは checkout しない。artifact だけを取る。
+      - uses: actions/download-artifact@v6
+        with:
+          name: pr-results
+          path: results
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require("fs");
+            const pr = Number(fs.readFileSync("results/pr-number.txt", "utf8").trim());
+            const cov = JSON.parse(fs.readFileSync("results/coverage-summary.json", "utf8"));
+            const pct = cov.total.lines.pct;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr,
+              body: `Line coverage: ${pct}%`,
+            });
+```
+
+肝は、特権ジョブが **一行もフォークのコードを実行していない** ことです。checkout せず、`npm ci` も走らせず、データだけを読みます。artifact の中身は依然として信頼できない入力なので、シェルに直接展開せずパースして扱う。上の例で PR 番号を `Number()` に通しているのはそのためです。
+
+合わせて次の3点も入れてください。ジョブごとに最小権限の `permissions:` を明示すること。サードパーティの action はタグではなくコミット SHA でピン留めすること。デプロイ用の認証情報に触るジョブは、required reviewers を設定した environment の下に置くこと。
+
+## 7月16日までにやること
+
+まず、対象ワークフローを洗い出します。手元にクローンがあるなら:
+
+```bash
+grep -rlZ 'pull_request_target' .github/workflows \
+  | xargs -0 grep -l 'pull_request.head'
+```
+
+組織全体を横断するなら、GitHub の code search 経由が早いです:
+
+```bash
+gh api -X GET search/code \
+  -f q='org:YOUR_ORG path:.github/workflows pull_request_target head.sha' \
+  --jq '.items[] | "\(.repository.full_name)  \(.path)"'
+```
+
+`head.ref` や `merge_commit_sha` を使っている亜種、`workflow_run` から head SHA を引いているパターンも同様に危険なので、ヒットしたリポジトリは目視で確認してください。
+
+webhani の推奨はシンプルです。バックポートに壊してもらうのではなく、自分で先に見つけてください。リリース中に CI が落ちると、原因の切り分けに時間を取られ、最悪「とりあえず checkout をダウングレードして通す」という判断に流れます。それは 2026年に最もやってはいけない対応です。今週の1時間の棚卸しで済みます。
+
+そしてもう一つ。この監査で見つかった `pull_request_target` は、たいてい「他にやり方を知らなかったから」書かれています。上の二段構えを社内のワークフローテンプレートとして持っておけば、次に同じ要件が出てきたときに、誰もあの一行を書かずに済みます。
