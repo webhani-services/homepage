@@ -1,0 +1,171 @@
+---
+title: "CloudNativePG 1.30: the DatabaseRole CRD finally puts your DB users in git"
+description: "A PostgreSQL role becomes a first-class Kubernetes object with its own RBAC and reclaim policy — and clientCertificate removes the password from the system entirely. Migration path and YAML included."
+date: "2026-07-15"
+status: "published"
+tags: ["PostgreSQL", "Kubernetes", "GitOps", "Security", "CloudNativePG"]
+thumbnail: ""
+author: "webhani"
+slug: "cloudnativepg-1-30-databaserole-gitops-2026"
+---
+
+## The last imperative thing in your stack
+
+Deployments, Services, Ingresses — all of them are YAML in git. If someone runs `kubectl edit` on one, ArgoCD notices the drift and reverts it. That discipline took a decade to build and it works.
+
+Now recall how the database user for your production application was created. Someone shelled into `psql` during the initial build-out, typed `CREATE ROLE`, pasted the password into a Secret, and nobody has touched it since. The rotation log stops in 2023. The single most sensitive object in the stack is the one thing that is still managed by hand.
+
+CloudNativePG 1.30, released in July 2026, addresses this directly with the `DatabaseRole` CRD.
+
+## Why the inline stanza ran out of road
+
+CloudNativePG already had declarative roles. You put a stanza in the `Cluster` under `.spec.managed.roles` and the operator reconciles it.
+
+```yaml
+# Before 1.30: roles live inside the Cluster manifest
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: app-db
+spec:
+  instances: 3
+  storage:
+    size: 50Gi
+  managed:
+    roles:
+      - name: orders_api
+        ensure: present
+        login: true
+        passwordSecret:
+          name: orders-api-password
+      - name: billing_api
+        ensure: present
+        login: true
+        passwordSecret:
+          name: billing-api-password
+      - name: analytics_ro
+        ensure: present
+        login: true
+        connectionLimit: 5
+```
+
+This works, and it is declarative. It also has two structural problems.
+
+The first is **ownership**. The `Cluster` manifest belongs to the platform team or the DBA. The role `orders_api` belongs, in every meaningful sense, to the team writing the orders service. Every time that team wants a higher connection limit or a new role, they open a PR against someone else's repository, against a manifest someone else is on call for. The platform team becomes a permanent reviewer of changes it has no opinion about.
+
+The second is **RBAC granularity**. Kubernetes RBAC operates on resources, not on array elements inside a resource. There is no way to express "you may edit this one entry of `.spec.managed.roles` and nothing else." If you want to delegate role management, you have to grant update on `Cluster` — which is also update on `instances`, `storage`, and `backup`. So most teams don't delegate at all.
+
+The inline stanza was a design that only holds at a scale where the owner of the Cluster and the consumer of the role are the same person.
+
+## Roles as standalone objects
+
+The 1.30 answer is to lift the role out of the Cluster and make it an object in its own right.
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: DatabaseRole
+metadata:
+  name: orders-api
+  namespace: orders
+spec:
+  cluster:
+    name: app-db
+  name: orders_api
+  ensure: present
+  login: true
+  connectionLimit: 20
+  databaseRoleReclaimPolicy: retain
+  clientCertificate:
+    enabled: true
+```
+
+That reshapes the whole conversation.
+
+The object has its own lifecycle. It has its own `status`, so you can see whether reconciliation succeeded, and why it didn't. Most importantly it has **its own RBAC surface**. You can grant the orders team permissions on `DatabaseRole` and nothing else. They manage their role from their namespace, in their repository, with their own review process. They never touch the `Cluster`.
+
+Look closely at `databaseRoleReclaimPolicy`. With `retain`, deleting the Kubernetes object leaves the actual PostgreSQL role in place. That reads like a footnote and behaves like a seatbelt. Namespace cleanup, a Helm release uninstall, an ArgoCD prune after a bad refactor — there are a surprising number of paths by which "I meant to delete a Kubernetes object" turns into "I dropped a production role." `retain` closes them. The obvious split is `retain` in production, `delete` in dev and preview environments.
+
+Migration, incidentally, is anticlimactic: you move the stanza's fields into a `DatabaseRole` spec. That's most of it.
+
+## Passwordless auth is the real prize
+
+When you do use a password, CloudNativePG manages it through a versioned Kubernetes Secret and encodes it with SCRAM-SHA-256 operator-side before it ever reaches PostgreSQL. That's a correct implementation — no plaintext on the wire, none in the server logs.
+
+It does not fix the underlying problem with passwords. The password is in a Secret, which is in etcd, which is also in your CI system, and in someone's local `.env`, and in a Slack thread from three years ago. The set of places it might leak from only ever grows.
+
+That is what the `clientCertificate` block is for. Enable it and the operator issues a TLS client certificate signed by the cluster's client CA, renews it, and stores it in a Secret named after the DatabaseRole with a `-client-cert` suffix. Disable the feature or delete the resource and the Secret is cleaned up.
+
+The credential you cannot leak is the one that does not exist.
+
+On the PostgreSQL side, `pg_hba` uses the `cert` method and verifies that the certificate's CN matches the role name. On the client side you connect with `sslmode=verify-full`. Do not skip that. `verify-ca` only proves the server certificate was signed by a CA you trust; it does not prove the server is the host you meant to reach. Only `verify-full` gives you anything against a man in the middle.
+
+From Node.js with `pg`:
+
+```javascript
+// Secret "orders-api-client-cert" mounted at /etc/pg-cert,
+// the cluster CA at /etc/pg-ca
+import fs from "node:fs";
+import { Pool } from "pg";
+
+const pool = new Pool({
+  host: "app-db-rw.database.svc.cluster.local",
+  port: 5432,
+  database: "orders",
+  user: "orders_api", // there is no password field
+  ssl: {
+    ca: fs.readFileSync("/etc/pg-ca/ca.crt"),
+    cert: fs.readFileSync("/etc/pg-cert/tls.crt"),
+    key: fs.readFileSync("/etc/pg-cert/tls.key"),
+    rejectUnauthorized: true,
+    servername: "app-db-rw.database.svc.cluster.local",
+  },
+});
+```
+
+The pod side is an ordinary Secret volume:
+
+```yaml
+spec:
+  containers:
+    - name: api
+      image: registry.example.com/orders-api:1.4.2
+      volumeMounts:
+        - name: pg-client-cert
+          mountPath: /etc/pg-cert
+          readOnly: true
+        - name: pg-ca
+          mountPath: /etc/pg-ca
+          readOnly: true
+  volumes:
+    - name: pg-client-cert
+      secret:
+        secretName: orders-api-client-cert
+        defaultMode: 0400
+    - name: pg-ca
+      secret:
+        secretName: app-db-ca
+        defaultMode: 0444
+```
+
+One honest note about rotation. The operator renewing the certificate does not mean your running process picks it up. kubelet will refresh the file in the Secret volume, but whatever you read with `readFileSync` at boot is still sitting in memory. Existing connections survive; new ones fail the moment the old key stops being accepted. Decide up front which way you handle this — either watch the cert expiry and roll the deployment, or watch the file and rebuild the pool. "The operator rotates it, so we're fine" is the belief that produces an outage on renewal day.
+
+## Migrating, and a note on patch levels
+
+If you are on the inline stanza today, here is a sane order of operations.
+
+Upgrade the operator to 1.30. Then pick exactly one role and extract it — not all of them at once. Apply the `DatabaseRole` with `ensure: present` and `retain`, confirm `status` looks the way you expect, and only then remove the stanza from the `Cluster`. Do it in the other order and you get a window where the role is managed by nothing at all.
+
+Cutting over to certificate auth deserves an even slower walk. Enabling `clientCertificate` does not disable password auth. While `pg_hba` still permits both, switch the application to certificate connections, watch it stay healthy, and then remove password auth. Every step of that sequence is reversible.
+
+Finally, an operational note that is independent of 1.30: CloudNativePG 1.29.1 and 1.28.3 patched CVE-2026-44477 (Critical, CVSS 9.4) in the metrics exporter, along with a data-safety bug in the failover path. Even if you are not upgrading to 1.30 this quarter, checking your patch level is worth doing today.
+
+## Takeaways
+
+- If you have ever wanted to hand role ownership to application teams, `DatabaseRole` is the feature you were waiting for. RBAC granularity finally matches org structure.
+- Set `databaseRoleReclaimPolicy: retain` on every production role. The accidental `kubectl delete` is not hypothetical.
+- `clientCertificate` is the headline. Removing the password beats endlessly improving how you rotate it.
+- Certificate auth without `sslmode=verify-full` and a proper `pg_hba` `cert` entry is half a control.
+- How your application picks up a renewed certificate is your design problem, not the operator's.
+- Check your patch level against CVE-2026-44477. That one is today's work, regardless of 1.30.
+
+Database credentials stayed imperative because there was no good tool for making them otherwise. As of 1.30, that excuse is gone.

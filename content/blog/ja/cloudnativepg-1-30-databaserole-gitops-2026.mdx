@@ -1,0 +1,171 @@
+---
+title: "CloudNativePG 1.30 の DatabaseRole — DB ユーザーがようやく Git に載る"
+description: "PostgreSQL のロールを独立した Kubernetes オブジェクトにする DatabaseRole CRD と、パスワードそのものを消す clientCertificate。inline stanza からの移行と運用上の注意点を YAML 付きで整理します。"
+date: "2026-07-15"
+status: "published"
+tags: ["PostgreSQL", "Kubernetes", "GitOps", "セキュリティ", "CloudNativePG"]
+thumbnail: ""
+author: "webhani"
+slug: "cloudnativepg-1-30-databaserole-gitops-2026"
+---
+
+## スタックの中で唯一 declarative でないもの
+
+Deployment も Service も Ingress も、いまや git にある YAML です。誰かが手で `kubectl edit` した瞬間に ArgoCD が差分を検出し、元に戻します。それがこの10年で我々が手に入れた規律です。
+
+そのうえで、本番の DB ユーザーはどう作られているか思い出してください。おそらく初期構築時に誰かが `psql` に入って `CREATE ROLE` を打ち、パスワードは Secret に貼り付けられ、以降誰も触っていません。ローテーションの記録は 2023年で止まっている。アプリケーションの認証情報という、スタックの中で最も機密性が高いオブジェクトだけが、唯一 imperative なまま取り残されています。
+
+2026年7月にリリースされた CloudNativePG 1.30 は、ここに正面から手を入れました。`DatabaseRole` CRD の導入です。
+
+## inline stanza の限界
+
+CloudNativePG にはこれまでも declarative なロール管理がありました。`Cluster` の `.spec.managed.roles` に stanza を書けば、operator が reconcile してくれます。
+
+```yaml
+# 1.30 以前: Cluster マニフェストの中に同居させる
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: app-db
+spec:
+  instances: 3
+  storage:
+    size: 50Gi
+  managed:
+    roles:
+      - name: orders_api
+        ensure: present
+        login: true
+        passwordSecret:
+          name: orders-api-password
+      - name: billing_api
+        ensure: present
+        login: true
+        passwordSecret:
+          name: billing-api-password
+      - name: analytics_ro
+        ensure: present
+        login: true
+        connectionLimit: 5
+```
+
+動きます。宣言的ではあります。しかし、この形には構造的な問題が二つあります。
+
+一つ目は**所有権**です。`Cluster` マニフェストを持っているのはプラットフォームチーム、あるいは DBA です。一方で `orders_api` というロールを本当に必要としているのは、注文サービスを書いているチームです。彼らが接続上限を変えたい、あるいは新しいロールを足したいと思うたびに、他人のリポジトリの、他人が責任を持っている `Cluster` マニフェストに PR を出さなければなりません。プラットフォームチームは、本質的にどうでもいい変更のレビュワーとして永久に指名されます。
+
+二つ目は **RBAC の粒度**です。Kubernetes の RBAC はリソース単位でしか切れません。「`Cluster` の `.spec.managed.roles` 配列のうち、この要素だけ編集してよい」という権限は存在しないのです。ロール管理を委譲したければ `Cluster` の update 権限を渡すしかなく、それは `instances` も `storage` も `backup` も触れる権限を渡すことを意味します。だから多くの現場では、そもそも委譲を諦めます。
+
+つまり inline stanza は、チームが一つで、`Cluster` の所有者とロールの利用者が同一人物である規模でしか成立しない設計でした。
+
+## ロールを独立したオブジェクトにする
+
+1.30 の答えはシンプルです。ロールを `Cluster` から取り出し、それ自体を Kubernetes オブジェクトにします。
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: DatabaseRole
+metadata:
+  name: orders-api
+  namespace: orders
+spec:
+  cluster:
+    name: app-db
+  name: orders_api
+  ensure: present
+  login: true
+  connectionLimit: 20
+  databaseRoleReclaimPolicy: retain
+  clientCertificate:
+    enabled: true
+```
+
+これだけで、話がまるごと変わります。
+
+このオブジェクトは自分の lifecycle を持ちます。自分の `status` を持ち、reconcile の結果 —— 適用されたのか、失敗したのか、なぜ失敗したのか —— がそこに書かれます。そして何より、**自分の RBAC を持ちます**。`DatabaseRole` に対する権限だけを注文チームの ServiceAccount に渡すことができます。彼らは自分の namespace で、自分のリポジトリにあるマニフェストで、自分のロールを管理します。`Cluster` には一切触れません。
+
+`databaseRoleReclaimPolicy` にも注目してください。`retain` を指定すると、Kubernetes 側の `DatabaseRole` オブジェクトが削除されても、PostgreSQL 側の実ロールは残ります。これは細かい仕様に見えて、実運用ではかなり効きます。namespace の掃除、Helm release の削除、ArgoCD の prune —— 「Kubernetes オブジェクトを消すつもり」の操作が「本番の DB ロールを DROP する」に化ける経路は、驚くほどたくさんあります。`retain` はその経路を塞ぎます。本番は `retain`、開発環境やプレビュー環境は `delete`、というのが素直な使い分けでしょう。
+
+なお、移行そのものは拍子抜けするほど簡単です。`.spec.managed.roles` の要素を、そのまま `DatabaseRole` の `spec` に移すだけです。
+
+## 本命はパスワードを消すこと
+
+パスワードを使う場合、CloudNativePG は versioned な Kubernetes Secret としてそれを管理し、operator 側で SCRAM-SHA-256 にエンコードしてから PostgreSQL に渡します。平文が PostgreSQL のログや wire に流れない、という点で真っ当な実装です。
+
+しかしこれは、パスワードという仕組みそのものの問題を解決しません。パスワードは Secret にあり、Secret は etcd にあり、CI にもあり、誰かのローカルの `.env` にもあり、3年前の Slack のスレッドにもあります。漏洩経路は増える一方で、減ることはありません。
+
+`clientCertificate` ブロックの意味はここにあります。有効にすると、operator は Cluster の client CA が署名した TLS クライアント証明書を生成し、DatabaseRole 名に `-client-cert` を付けた名前の Secret に格納します。更新も operator がやります。無効化するか `DatabaseRole` を削除すれば、Secret も片付けられます。
+
+つまり、**漏れないのは存在しない認証情報だけ**、という当たり前の結論に到達します。パスワードがない以上、パスワードを流出させることはできません。
+
+PostgreSQL 側では `pg_hba` が `cert` メソッドを要求し、証明書の CN がロール名と一致することを検証します。クライアント側は `sslmode=verify-full` で接続します。ここは省略しないでください。`verify-ca` はサーバー証明書が信頼された CA によって署名されていることしか確認せず、そのサーバーが本当に自分の接続したいホストかは見ません。`verify-full` にして初めて、中間者に対する保証になります。
+
+Node.js の `pg` から使うなら、こうなります。
+
+```javascript
+// Secret "orders-api-client-cert" を /etc/pg-cert に、
+// Cluster の CA を /etc/pg-ca にマウントしておく
+import fs from "node:fs";
+import { Pool } from "pg";
+
+const pool = new Pool({
+  host: "app-db-rw.database.svc.cluster.local",
+  port: 5432,
+  database: "orders",
+  user: "orders_api", // パスワードのフィールドは存在しない
+  ssl: {
+    ca: fs.readFileSync("/etc/pg-ca/ca.crt"),
+    cert: fs.readFileSync("/etc/pg-cert/tls.crt"),
+    key: fs.readFileSync("/etc/pg-cert/tls.key"),
+    rejectUnauthorized: true,
+    servername: "app-db-rw.database.svc.cluster.local",
+  },
+});
+```
+
+Pod 側のマウントは通常の Secret volume です。
+
+```yaml
+spec:
+  containers:
+    - name: api
+      image: registry.example.com/orders-api:1.4.2
+      volumeMounts:
+        - name: pg-client-cert
+          mountPath: /etc/pg-cert
+          readOnly: true
+        - name: pg-ca
+          mountPath: /etc/pg-ca
+          readOnly: true
+  volumes:
+    - name: pg-client-cert
+      secret:
+        secretName: orders-api-client-cert
+        defaultMode: 0400
+    - name: pg-ca
+      secret:
+        secretName: app-db-ca
+        defaultMode: 0444
+```
+
+ローテーションについて一点だけ現実的な話をします。operator が証明書を更新しても、すでに起動している Pod のプロセスがそれを自動で読み直すわけではありません。Secret volume の中身は kubelet が更新しますが、`readFileSync` した内容はメモリに残ったままです。既存の接続は切れませんが、新しい接続を張るときに古い鍵を使えば当然失敗します。長期的には証明書の期限を監視してローリング再起動をかける、あるいはアプリケーション側でファイルを watch して pool を作り直す —— どちらかを最初から設計に入れておいてください。「証明書は勝手に更新されるから安心」で止まると、有効期限の日にまとめて痛い目を見ます。
+
+## 移行と、パッチレベルの話
+
+いま inline stanza を使っているチームへの現実的な手順は次の通りです。
+
+まず operator を 1.30 に上げます。次に、ロールを一つだけ選んで `DatabaseRole` に切り出します。いきなり全部やらないでください。`ensure: present` のまま `retain` を付けて適用し、`status` が期待通りになることを確認してから、`Cluster` 側の該当 stanza を削除します。順序が逆だと、一瞬だけどのオブジェクトからも管理されないロールが生まれます。
+
+証明書認証への切り替えは、さらに慎重に段階を踏みます。`clientCertificate` を有効にしても、既存のパスワード認証がその場で無効になるわけではありません。`pg_hba` が両方を許している間に、アプリケーション側を証明書接続に切り替え、接続が安定していることを確認し、それからパスワード認証を落とす。この順番なら、どの時点でもロールバックできます。
+
+最後に運用上の注意を一つ。CloudNativePG 1.29.1 / 1.28.3 で、metrics exporter の CVE-2026-44477(Critical、CVSS 9.4)が修正されています。同じリリースで failover 経路のデータ安全性に関わる不具合も直っています。1.30 への移行を検討していない環境であっても、パッチレベルの確認だけは今日やっておく価値があります。
+
+## 実務的なまとめ
+
+- ロールの所有権をアプリケーションチームに渡したいなら、`DatabaseRole` は待っていた機能です。RBAC を切れる粒度が、組織構造に初めて追いつきました。
+- 本番のロールには `databaseRoleReclaimPolicy: retain` を必ず付けてください。`kubectl delete` の事故は必ず起きます。
+- `clientCertificate` が本命です。パスワードのローテーション運用を延々と改善するより、パスワードを消すほうが早い。
+- ただし `sslmode=verify-full` と `pg_hba` の `cert` 設定を省略すると、証明書認証の意味は半減します。
+- 証明書の更新をアプリケーションがどう拾うかは、自分で設計する必要があります。ここを operator に任せきりにはできません。
+- CVE-2026-44477 のパッチレベルを確認してください。1.30 の話とは独立に、今日やるべきことです。
+
+DB の認証情報がスタックの中で最後の imperative な領域だったのは、単に道具がなかったからです。1.30 でその言い訳はなくなりました。

@@ -1,0 +1,147 @@
+---
+title: "Bun Is Being Rewritten from Zig to Rust — How to Read a Mid-Life Runtime Rewrite"
+description: "Bun's creator published the rationale for moving from Zig to Rust, and v1.3.14 shipped the same week. Here is how to evaluate a runtime for production without leaning on benchmarks — and where Bun actually earns a place today."
+date: "2026-07-15"
+status: "published"
+tags: ["Bun", "Rust", "JavaScript", "CI/CD", "Developer Tooling"]
+thumbnail: ""
+author: "webhani"
+slug: "bun-zig-to-rust-rewrite-runtime-adoption-2026"
+---
+
+## A runtime changing its implementation language
+
+On July 8, 2026, Jarred Sumner published a detailed account of why and how Bun is being rewritten from Zig to Rust. The same week, Bun v1.3.14 shipped: 92 issues fixed, a built-in image processing API (`Bun.Image`), roughly 7x faster warm installs via an isolated linker backed by a global store, experimental HTTP/2 and HTTP/3 clients for `fetch()`, HTTP/3 (QUIC) support in `Bun.serve()`, a rewritten `fs.watch()` on Linux and macOS, plus FreeBSD and Android builds.
+
+Do not read those as two separate items. A runtime that already runs production traffic announcing that it is swapping out its implementation language is a structural signal, not a release note. It is not a reason to panic, and it is not a reason to rush adoption. It is a reason to be precise about what you are actually depending on.
+
+## What a rewrite buys, and what it costs
+
+Zig was not an unreasonable choice. Its C interop is straightforward, its comptime story is genuinely powerful, and it is a pleasant language for writing the low layers of a runtime — custom allocators, an event loop, a tight embedding of JavaScriptCore. The tool fit the job.
+
+The counterweight is that Zig is still pre-1.0. The language and standard library move between versions, and tracking that churn is a recurring cost unrelated to shipping product features. The ecosystem is small: TLS, compression, HTTP/2, QUIC, image codecs — precisely the areas where you want to borrow a hardened implementation rather than write one — have few things to borrow. And the hiring pool of people who can write Zig *and* work inside a JS runtime is thin.
+
+Rust inverts each of those. Memory safety becomes a compiler guarantee rather than a review discipline. crates.io has battle-tested implementations of TLS, QUIC, and image processing already carrying production load elsewhere. The hiring pool is an order of magnitude larger. For software where a single use-after-free is a vulnerability for every downstream user, moving that class of bug into the type system is worth real money.
+
+Now the honest counterpoint. A rewrite is a multi-quarter tax on feature velocity, and it replaces code that has already been beaten on in production with code that has not. The old implementation's behavior under edge cases — header handling, allocation patterns, timing — lives in the code, not in a spec document. Rewrites generate fresh regressions in areas that were previously settled. Staged migration makes that manageable; it does not make it zero. "Rust makes it safer" is true. "It was rewritten in Rust, so it is stable now" is not.
+
+## Evaluating a runtime without benchmarks
+
+Bun conversations collapse into speed almost immediately. In our experience, benchmarks have almost never been the deciding factor in a production runtime choice. Three things are:
+
+**Node compatibility surface.** Compatibility is not a boolean, it is an area. What matters is the specific set of APIs your application actually touches: which `node:crypto` functions, whether you use `worker_threads`, whether your ORM pulls a native addon, whether your APM hooks `AsyncLocalStorage`. There is exactly one reliable way to measure this, and it is running your own test suite on the runtime. Your code has the answer; someone else's benchmark does not.
+
+**Security patch cadence.** A runtime is your attack surface. What is the demonstrated time from CVE disclosure to a shipped fix? How many major versions are supported concurrently? Is there a functioning vulnerability disclosure process? Node.js has an LTS policy and a boring, predictable security release rhythm. Boring and predictable is the feature. A young runtime may not have earned that predictability yet, and you should check rather than assume.
+
+**What happens when you hit a bug nobody has hit before.** This is the one people skip. On Node, your weird behavior is usually already answered by fifteen years of issues and Stack Overflow. On a newer runtime, you can be the first person to hit it. Your options are then: build a minimal reproduction and file an issue, patch it yourself, or drop the feature. Whether you have an escape hatch — and how expensive it is — decides whether the runtime is production-viable for you.
+
+A language rewrite touches all three. During the transition, patch effort is split across two implementations, and the bug you hit may be a new one that never existed before.
+
+## Where Bun genuinely earns its place today
+
+In our experience the most defensible place to put Bun is CI, and the reason is not raw speed — it is that install cost compounds across every pipeline run. Install happens on every push, every PR, every retry. If twenty PRs a day each trigger a few runs, shaving an install adds up to hundreds of saved installs a month. That is a real, boring, measurable win.
+
+The interesting part of v1.3.14 here is not the 7x number, it is the mechanism: an isolated linker with a global store. Package contents live once in a machine-wide store, and each project's `node_modules` is composed of links into it, so warm installs stop re-extracting the same tarballs. pnpm demonstrated the same idea earlier, and it also cuts disk usage. The structure is more useful for predicting your own results than the headline multiple is.
+
+Scripts and internal tooling are the other safe entry point, along with test running. Failures there are immediate, local, and cheap.
+
+The production HTTP serving path deserves more caution, because failures there are quiet. Header edge cases, connection lifetime, backpressure, signal handling on shutdown — these differences do not announce themselves; they show up as a slow leak at 3 a.m. The API itself is clean:
+
+```ts
+// server.ts — plain Web-standard Request / Response
+const server = Bun.serve({
+  port: Number(process.env.PORT ?? 3000),
+
+  async fetch(req) {
+    const url = new URL(req.url);
+
+    if (url.pathname === "/healthz") {
+      return new Response("ok", { status: 200 });
+    }
+
+    return Response.json({ path: url.pathname });
+  },
+
+  error(err) {
+    console.error(err);
+    return new Response("internal error", { status: 500 });
+  },
+});
+
+console.log(`listening on :${server.port}`);
+```
+
+The shape matters more than the runtime. Because the handler takes a `Request` and returns a `Response`, your business logic can stay in plain functions that any Web-standard runtime can drive. Keep runtime-specific API calls confined to the entry file. That is not defensive pessimism about Bun; it is the same discipline that lets you move off any runtime.
+
+And the HTTP/3 client and QUIC serving are labeled experimental by the project itself. Experimental means "sometimes it works." It does not mean "put your production traffic on it."
+
+## The wider pattern, and the risk it introduces
+
+TypeScript 7 went GA the same day, with a compiler rewritten in Go. Rolldown is Rust. Biome is Rust. The JavaScript toolchain is steadily migrating out of JavaScript and into systems languages, for the obvious reason.
+
+The risk that follows is not about any individual tool's quality. It is that the *nature* of your dependency changed. Your build now depends on native binaries you cannot patch in a pinch. When a JS-implemented tool misbehaved on a Friday afternoon, you could edit one line inside `node_modules` and ship. With a prebuilt native binary, that option is gone — you are forking a repo and setting up a cross-compilation toolchain instead.
+
+The mitigation is unglamorous: pin exact versions, commit lockfiles, and keep a fallback path alive in CI.
+
+```yaml
+# .github/workflows/ci.yml
+name: ci
+on: [push, pull_request]
+
+jobs:
+  test-bun:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"   # exact pin, not a range
+
+      - run: bun install --frozen-lockfile
+      - run: bun test
+
+  # Second path so a Bun-side regression never blocks the release
+  test-node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - run: npm ci
+      - run: npm test
+```
+
+Running both looks wasteful until the morning it pays. If `test-bun` goes red and `test-node` stays green, you know within seconds that the problem is the runtime, not your code, and the release still goes out. If both are red, it is your code. Buying a few minutes of triage certainty costs a few minutes of CI, which is a trade that always wins.
+
+Keep `package.json` runtime-agnostic for the same reason:
+
+```json
+{
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "test": "vitest run",
+    "test:bun": "bun test",
+    "lint": "biome check ."
+  },
+  "packageManager": "npm@10.9.0",
+  "engines": {
+    "node": ">=22"
+  }
+}
+```
+
+The point is that `test` does not hardwire a Bun-specific runner. If you want Bun's runner, give it its own script. If you decide tomorrow to stop using Bun, you delete one line rather than untangling your CI.
+
+## Takeaways
+
+- A language rewrite is a sound long-term investment and a short-term tax at the same time. Read it as "this will be better in a year," not "this is stable today."
+- Evaluate a runtime on Node compatibility surface, security patch cadence, and your escape hatch when you hit an unknown bug — not on someone else's benchmark. The best test is your own test suite.
+- **Adopt Bun here:** CI installs and test runs, dev scripts, internal tooling. Install cost compounds, and failures are immediate and visible.
+- **Not here, yet:** the production HTTP serving path, and anything the project itself labels experimental — HTTP/3 and QUIC included. Re-evaluate once the rewrite settles.
+- Pin native toolchains to exact versions and keep a fallback lane in CI. As more of your build becomes binaries you cannot patch, the ability to roll back is the only insurance you have.

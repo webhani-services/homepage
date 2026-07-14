@@ -1,0 +1,147 @@
+---
+title: "Bun이 Zig에서 Rust로 다시 쓰이고 있습니다 — Runtime 언어 교체를 읽는 법"
+description: "2026년 7월, Bun 제작자가 Zig에서 Rust로의 재작성 배경을 공개했고 v1.3.14도 함께 나왔습니다. Benchmark가 아니라 호환성, Security Patch 주기, 탈출 경로로 Runtime을 평가하는 관점을 정리합니다."
+date: "2026-07-15"
+status: "published"
+tags: ["Bun", "Rust", "JavaScript", "CI/CD", "개발 도구"]
+thumbnail: ""
+author: "webhani"
+slug: "bun-zig-to-rust-rewrite-runtime-adoption-2026"
+---
+
+## Runtime이 중간에 구현 언어를 바꾼다는 것
+
+2026년 7월 8일, Bun의 제작자 Jarred Sumner가 Bun을 Zig에서 Rust로 재작성하는 이유와 방식을 상세히 공개했습니다. 같은 주에 v1.3.14도 나왔습니다. 92건의 issue 수정에 더해 내장 Image 처리 API인 `Bun.Image`, Global Store를 사용하는 isolated linker 기반의 warm install 속도 개선(공식 수치로 약 7배), `fetch()`용 실험적 HTTP/2 · HTTP/3 Client, `Bun.serve()`의 HTTP/3(QUIC) 지원, Linux와 macOS의 `fs.watch()` 재작성, 그리고 FreeBSD · Android Build까지 포함되었습니다.
+
+이 둘을 따로 읽으면 안 됩니다. 이미 Production Traffic을 받고 있는 Runtime이 구현 언어를 갈아엎겠다고 선언한 것은 Release Note의 한 줄이 아니라 Project 구조에 대한 신호입니다. 서둘러 갈아탈 이유도, 서둘러 버릴 이유도 아닙니다. 다만 우리가 무엇에 의존하고 있는지 정확히 아는 계기는 됩니다.
+
+## 재작성이 사는 것, 그리고 치르는 값
+
+Zig 선택 자체는 당시 기준으로 불합리하지 않았습니다. C 상호운용이 깔끔하고 comptime이 강력해서, Custom Allocator와 Event Loop를 직접 짜고 JavaScriptCore를 밀착 embedding하는 Runtime의 저수준 작업에 실제로 잘 맞습니다.
+
+문제는 Zig이 아직 1.0에 도달하지 않았다는 점입니다. 언어 사양과 Standard Library가 Version마다 움직이고, 그 추종 비용은 제품 기능 개발과 무관하게 계속 발생합니다. Ecosystem도 작습니다. TLS, 압축, HTTP/2, QUIC, Image Codec처럼 "검증된 구현을 빌려 오고 싶은" 영역에서 빌릴 곳이 거의 없습니다. 채용 측면에서도 Zig을 쓰면서 JS Runtime 내부를 만질 수 있는 사람은 세계적으로 매우 얇은 층입니다.
+
+Rust로 옮기면 이 모든 항목이 그대로 뒤집힙니다. Memory Safety가 Review 규율이 아니라 Compiler 보증이 되고, crates.io에는 TLS도 QUIC도 Image Codec도 이미 다른 곳에서 Production 부하를 받고 있는 구현이 있습니다. 채용 모수도 자릿수가 다릅니다. use-after-free 하나가 모든 사용자에게 취약점이 되는 종류의 Software에서, 그 버그 계열을 Type System 안으로 밀어 넣을 수 있다는 건 실제로 돈이 되는 이야기입니다.
+
+솔직한 반대편도 적어 둡니다. 재작성은 여러 분기에 걸친 기능 개발 속도에 대한 세금입니다. 그리고 이미 실전에서 두들겨 맞아 버그가 빠질 만큼 빠진 코드를, 아직 두들겨 맞지 않은 코드로 교체하는 행위이기도 합니다. 예전 구현이 암묵적으로 갖고 있던 Edge Case 동작, 성능 특성, 메모리 사용 방식은 사양서가 아니라 코드 안에 있습니다. 재작성은 반드시 새로운 Regression을 만듭니다. 단계적으로 진행하면 관리 가능하지만 0이 되지는 않습니다. "Rust라서 더 안전해진다"는 맞고, "Rust로 다시 썼으니 오늘부터 안정적이다"는 틀립니다.
+
+## Benchmark 없이 Runtime을 평가하는 법
+
+Bun 이야기는 거의 언제나 속도로 수렴합니다. 하지만 저희 경험상 Production Runtime 선택에서 Benchmark가 결정타였던 적은 거의 없습니다. 실제로 결정하는 건 세 가지입니다.
+
+**Node 호환의 표면적.** 호환성은 0 또는 1이 아니라 넓이입니다. 중요한 건 여러분의 Application이 실제로 밟는 API 조합입니다. `node:crypto`의 어떤 함수를 쓰는지, `worker_threads`를 쓰는지, ORM이 Native Addon을 끌고 오는지, APM이 `AsyncLocalStorage`에 걸려 있는지. 이걸 재는 신뢰할 만한 방법은 하나뿐입니다. 여러분의 Test Suite를 그 Runtime에서 돌려 보는 것입니다. 답은 남의 Benchmark가 아니라 여러분 코드가 갖고 있습니다.
+
+**Security Patch 공급 주기.** Runtime은 그 자체가 공격면입니다. CVE 공개부터 수정 Release까지 실제로 걸린 시간, 동시에 지원되는 Major Version 수, 취약점 신고 창구가 작동하는지. Node.js에는 LTS 정책과 지루하리만치 예측 가능한 Security Release 리듬이 있고, 그 지루함이 곧 기능입니다. 젊은 Runtime에 같은 예측 가능성을 기대하기엔 이를 수 있고, 가정하지 말고 확인해야 합니다.
+
+**아무도 밟지 않은 버그를 처음 밟았을 때 벌어지는 일.** 이게 가장 자주 건너뛰는 항목입니다. Node에서 이상한 동작을 만나면 대개 15년치 issue와 Stack Overflow가 먼저 답을 갖고 있습니다. 새 Runtime에서는 여러분이 첫 번째 사람이 될 수 있습니다. 그때 선택지는 최소 재현을 만들어 issue를 올리고 기다리거나, 직접 Patch하거나, 그 기능을 포기하는 것입니다. 이 탈출 경로가 있는지, 얼마나 비싼지가 Production 채택 가능 여부를 가릅니다.
+
+언어 재작성은 이 세 가지 모두에 영향을 줍니다. 전환기에는 Patch 노력이 두 구현으로 나뉘고, 여러분이 밟는 버그는 예전에는 존재하지 않던 새 버그일 수도 있습니다.
+
+## 오늘 Bun이 정당하게 자리를 갖는 곳
+
+저희 경험상 Bun의 가치가 가장 확실한 곳은 CI입니다. 이유는 속도 자체가 아니라 install 비용이 **모든 Pipeline 실행마다 곱해지기** 때문입니다. install은 모든 push, 모든 PR, 모든 재시도에서 반드시 돌아갑니다. 하루에 PR 20개가 각각 몇 번씩 CI를 돌린다면, install 한 번의 단축은 한 달이면 수백 번어치가 됩니다.
+
+v1.3.14에서 흥미로운 부분은 "7배"라는 숫자가 아니라 Global Store를 쓰는 isolated linker라는 구조입니다. Package 실체를 Machine 단위 공유 Store에 한 번만 두고, 각 Project의 `node_modules`는 그곳으로의 Link로 구성합니다. 같은 tarball을 반복해서 풀지 않으니 warm install이 빨라지고 Disk 사용량도 줄어듭니다. pnpm이 먼저 보여 준 방향이기도 합니다. 자기 환경에서의 결과를 예측하는 데는 숫자보다 구조가 훨씬 유용합니다.
+
+Script 실행과 사내 Tooling, 그리고 Test 실행도 안전한 진입점입니다. 셋 다 실패가 즉시, 그것도 Local에서 보이기 때문입니다.
+
+반면 Production HTTP Serving 경로는 조금 더 신중해도 됩니다. 여기서 깨지면 조용하게 깨집니다. 특정 Header 처리, Connection 수명, Backpressure, 종료 시 Signal Handling 같은 차이는 스스로를 알리지 않고 새벽 3시에 누수로 나타납니다. API 자체는 깔끔합니다.
+
+```ts
+// server.ts — Web 표준 Request / Response에 그대로 올라탄 형태
+const server = Bun.serve({
+  port: Number(process.env.PORT ?? 3000),
+
+  async fetch(req) {
+    const url = new URL(req.url);
+
+    if (url.pathname === "/healthz") {
+      return new Response("ok", { status: 200 });
+    }
+
+    return Response.json({ path: url.pathname });
+  },
+
+  error(err) {
+    console.error(err);
+    return new Response("internal error", { status: 500 });
+  },
+});
+
+console.log(`listening on :${server.port}`);
+```
+
+Runtime보다 형태가 중요합니다. Handler가 `Request`를 받아 `Response`를 돌려주는 구조라면, Business Logic을 순수 함수로 떼어 놓는 한 Web 표준을 따르는 어떤 Runtime에서도 Core는 그대로 돕니다. Runtime 고유 API 호출은 진입 File 하나에 가둬 두십시오. Bun을 못 믿어서가 아니라, 어떤 Runtime에서든 빠져나올 수 있게 해 주는 같은 규율입니다.
+
+그리고 HTTP/3 Client와 QUIC Serving에는 Project가 직접 experimental이라고 적어 두었습니다. experimental은 "될 때도 있다"는 뜻입니다. Production Traffic을 얹으라는 뜻이 아닙니다.
+
+## 더 큰 흐름과 그것이 만드는 Risk
+
+같은 날 TypeScript 7이 GA 되었습니다. Compiler는 Go로 재작성되었습니다. Rolldown은 Rust, Biome도 Rust입니다. JS Toolchain은 JavaScript로 쓰이기를 그만두고 System 언어로 이주하는 중입니다.
+
+여기서 오는 Risk는 개별 도구의 품질이 아니라 의존의 성격이 바뀌었다는 점입니다. 여러분의 Build는 이제 **급할 때 직접 Patch할 수 없는 Native Binary**에 의존하기 시작했습니다. JS로 구현된 도구가 금요일 오후에 말썽을 부리면 `node_modules` 안의 한 줄을 고쳐서 넘길 수 있었습니다. Prebuilt Binary에서는 그 선택지가 사라집니다. Repository를 fork하고 Cross-compile 환경을 갖추는 이야기가 됩니다.
+
+대응은 화려하지 않지만 유효합니다. Version을 정확히 Pin하고, Lockfile을 Commit하고, CI에 Fallback 경로를 살려 두는 것입니다.
+
+```yaml
+# .github/workflows/ci.yml
+name: ci
+on: [push, pull_request]
+
+jobs:
+  test-bun:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"   # 범위가 아니라 정확한 Pin
+
+      - run: bun install --frozen-lockfile
+      - run: bun test
+
+  # Bun 쪽 Regression이 Release를 막지 않도록 두 번째 경로를 남긴다
+  test-node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - run: npm ci
+      - run: npm test
+```
+
+둘 다 돌리는 게 낭비처럼 보이지만, 보험입니다. `test-bun`이 빨갛고 `test-node`가 초록이면 문제는 Runtime 쪽이라는 걸 몇 초 만에 알 수 있고, 그날 Release는 그대로 나갑니다. 둘 다 빨갛다면 그건 여러분 코드입니다. 원인 분리에 확신을 얻는 대가가 CI 몇 분이라면, 언제나 이기는 거래입니다.
+
+`package.json`도 같은 이유로 Runtime에 묶이지 않게 씁니다.
+
+```json
+{
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "test": "vitest run",
+    "test:bun": "bun test",
+    "lint": "biome check ."
+  },
+  "packageManager": "npm@10.9.0",
+  "engines": {
+    "node": ">=22"
+  }
+}
+```
+
+핵심은 `test`를 Bun 전용 Runner에 직접 묶지 않는 것입니다. Bun Runner를 쓰고 싶다면 `test:bun`을 따로 두십시오. 이렇게 해 두면 내일 Bun을 그만 쓰기로 결정해도 지울 건 한 줄입니다.
+
+## 정리
+
+- 구현 언어 재작성은 건전한 장기 투자인 동시에 단기적으로는 기능 속도와 Regression에 대한 세금입니다. "Rust가 되었으니 안정적이다"가 아니라 "안정되기까지 시간이 걸린다"로 읽으십시오.
+- Runtime 평가는 Benchmark가 아니라 Node 호환 표면적, Security Patch 실제 공급 속도, 미지의 버그에 막혔을 때의 탈출 경로로 합니다. 가장 좋은 Test는 여러분의 Test Suite입니다.
+- **Bun을 넣을 곳:** CI의 install과 Test 실행, 개발용 Script와 사내 Tooling. 효과가 곱해지고 실패가 즉시 보입니다.
+- **아직 넣지 않을 곳:** Production HTTP Serving 경로, 그리고 Project가 직접 experimental이라고 표시한 HTTP/3 · QUIC. 재작성이 한 단락 마무리된 뒤 다시 평가해도 늦지 않습니다.
+- Native Toolchain은 정확한 Version으로 Pin하고 CI에 Fallback 경로를 남기십시오. 직접 Patch할 수 없는 의존이 늘어나는 만큼, 되돌릴 수 있다는 사실이 유일한 보험입니다.
