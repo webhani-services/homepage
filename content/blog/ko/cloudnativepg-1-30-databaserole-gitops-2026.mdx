@@ -1,0 +1,171 @@
+---
+title: "CloudNativePG 1.30의 DatabaseRole — DB User가 드디어 Git으로 들어옵니다"
+description: "PostgreSQL Role을 독립된 Kubernetes Object로 만드는 DatabaseRole CRD와, Password 자체를 없애는 clientCertificate. inline stanza에서의 Migration 경로와 운영 주의점을 YAML과 함께 정리합니다."
+date: "2026-07-15"
+status: "published"
+tags: ["PostgreSQL", "Kubernetes", "GitOps", "보안", "CloudNativePG"]
+thumbnail: ""
+author: "webhani"
+slug: "cloudnativepg-1-30-databaserole-gitops-2026"
+---
+
+## Stack에서 유일하게 declarative하지 않은 것
+
+Deployment도 Service도 Ingress도 이제 전부 Git 안의 YAML입니다. 누군가 손으로 `kubectl edit`를 하면 ArgoCD가 Drift를 감지하고 되돌립니다. 지난 10년간 확보한 규율입니다.
+
+그 상태에서, 운영 DB User가 어떻게 만들어졌는지 떠올려 보시기 바랍니다. 초기 구축 때 누군가 `psql`에 들어가 `CREATE ROLE`을 쳤고, Password는 Secret에 붙여넣어졌으며, 그 뒤로 아무도 건드리지 않았습니다. Rotation 기록은 2023년에서 멈춰 있습니다. Stack 전체에서 가장 민감한 Object 하나만 여전히 imperative하게 남아 있는 셈입니다.
+
+2026년 7월에 나온 CloudNativePG 1.30은 여기를 정면으로 건드립니다. `DatabaseRole` CRD의 도입입니다.
+
+## inline stanza가 한계에 부딪힌 이유
+
+CloudNativePG에는 이전에도 declarative한 Role 관리가 있었습니다. `Cluster`의 `.spec.managed.roles`에 stanza를 쓰면 Operator가 Reconcile 해줍니다.
+
+```yaml
+# 1.30 이전: Role이 Cluster Manifest 안에 동거합니다
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: app-db
+spec:
+  instances: 3
+  storage:
+    size: 50Gi
+  managed:
+    roles:
+      - name: orders_api
+        ensure: present
+        login: true
+        passwordSecret:
+          name: orders-api-password
+      - name: billing_api
+        ensure: present
+        login: true
+        passwordSecret:
+          name: billing-api-password
+      - name: analytics_ro
+        ensure: present
+        login: true
+        connectionLimit: 5
+```
+
+동작합니다. Declarative하기도 합니다. 다만 구조적인 문제가 두 가지 있습니다.
+
+첫째는 **소유권**입니다. `Cluster` Manifest는 Platform 팀 또는 DBA의 것입니다. 반면 `orders_api`라는 Role을 실제로 필요로 하는 쪽은 주문 Service를 만드는 팀입니다. 그 팀이 Connection Limit을 올리고 싶거나 Role을 하나 더 추가하고 싶을 때마다, 남의 Repository에 있는, 남이 On-call을 서는 `Cluster` Manifest에 PR을 올려야 합니다. Platform 팀은 아무 의견도 없는 변경의 영구 Reviewer가 됩니다.
+
+둘째는 **RBAC 입도**입니다. Kubernetes RBAC은 Resource 단위로만 끊깁니다. "`.spec.managed.roles` 배열 중 이 항목만 수정해도 좋다"는 권한은 표현할 방법이 없습니다. Role 관리를 위임하려면 `Cluster`의 update 권한을 줘야 하고, 그건 `instances`도 `storage`도 `backup`도 만질 수 있는 권한을 준다는 뜻입니다. 그래서 대부분의 현장은 위임 자체를 포기합니다.
+
+inline stanza는 결국 Cluster의 소유자와 Role의 사용자가 같은 사람인 규모에서만 성립하는 설계였습니다.
+
+## Role을 독립 Object로 꺼내기
+
+1.30의 답은 단순합니다. Role을 Cluster에서 꺼내 그 자체를 하나의 Object로 만듭니다.
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: DatabaseRole
+metadata:
+  name: orders-api
+  namespace: orders
+spec:
+  cluster:
+    name: app-db
+  name: orders_api
+  ensure: present
+  login: true
+  connectionLimit: 20
+  databaseRoleReclaimPolicy: retain
+  clientCertificate:
+    enabled: true
+```
+
+이것만으로 이야기가 통째로 바뀝니다.
+
+이 Object는 자기 Lifecycle을 가집니다. 자기 `status`를 가지므로 Reconcile이 성공했는지, 실패했다면 왜 실패했는지가 거기 남습니다. 그리고 무엇보다 **자기 RBAC 면을 가집니다.** 주문 팀의 ServiceAccount에 `DatabaseRole`에 대한 권한만 정확히 줄 수 있습니다. 그들은 자기 Namespace에서, 자기 Repository의 Manifest로, 자기 Review Process를 거쳐 Role을 관리합니다. `Cluster`는 손도 대지 않습니다.
+
+`databaseRoleReclaimPolicy`도 주목할 만합니다. `retain`을 주면 Kubernetes의 `DatabaseRole` Object를 지워도 PostgreSQL 쪽 실제 Role은 남습니다. 각주처럼 보이지만 실제로는 안전벨트처럼 동작합니다. Namespace 정리, Helm Release 삭제, Refactoring 후의 ArgoCD prune — "Kubernetes Object를 지우려던 것"이 "운영 Role을 DROP 하는 것"으로 둔갑하는 경로는 놀랄 만큼 많습니다. `retain`은 그 경로를 막습니다. 운영은 `retain`, 개발·Preview 환경은 `delete`가 무난한 분리입니다.
+
+참고로 Migration 자체는 허무할 정도로 간단합니다. stanza의 Field들을 `DatabaseRole`의 `spec`으로 옮기면 대부분 끝납니다.
+
+## 본론은 Password를 없애는 것
+
+Password를 쓰는 경우, CloudNativePG는 그것을 Versioned Kubernetes Secret으로 관리하고, Operator 쪽에서 SCRAM-SHA-256으로 Encoding한 뒤 PostgreSQL로 보냅니다. 평문이 Wire에도 Server Log에도 남지 않는, 제대로 된 구현입니다.
+
+그러나 이것이 Password라는 방식 자체의 문제를 해결하지는 않습니다. Password는 Secret에 있고, Secret은 etcd에 있고, CI System에도 있고, 누군가의 로컬 `.env`에도 있고, 3년 전 Slack Thread에도 있습니다. 유출 경로의 집합은 늘어나기만 할 뿐 줄지 않습니다.
+
+`clientCertificate` Block이 있는 이유가 여기 있습니다. 활성화하면 Operator가 Cluster의 Client CA로 서명한 TLS Client 인증서를 발급하고, 갱신하고, DatabaseRole 이름 뒤에 `-client-cert`를 붙인 Secret에 저장합니다. 기능을 끄거나 Resource를 지우면 그 Secret도 정리됩니다.
+
+결국 **유출될 수 없는 Credential은 존재하지 않는 Credential뿐**이라는 당연한 결론에 도달합니다.
+
+PostgreSQL 쪽에서는 `pg_hba`가 `cert` Method를 쓰고 인증서의 CN이 Role 이름과 일치하는지 검증합니다. Client 쪽은 `sslmode=verify-full`로 접속합니다. 이 부분을 생략하지 마시기 바랍니다. `verify-ca`는 Server 인증서가 신뢰하는 CA의 서명을 받았다는 것만 증명할 뿐, 그 Server가 내가 접속하려던 Host인지는 증명하지 않습니다. `verify-full`이어야 비로소 중간자에 대한 보증이 됩니다.
+
+Node.js의 `pg`에서 쓰면 이렇게 됩니다.
+
+```javascript
+// Secret "orders-api-client-cert"를 /etc/pg-cert에,
+// Cluster CA를 /etc/pg-ca에 Mount한 상태
+import fs from "node:fs";
+import { Pool } from "pg";
+
+const pool = new Pool({
+  host: "app-db-rw.database.svc.cluster.local",
+  port: 5432,
+  database: "orders",
+  user: "orders_api", // password Field 자체가 없습니다
+  ssl: {
+    ca: fs.readFileSync("/etc/pg-ca/ca.crt"),
+    cert: fs.readFileSync("/etc/pg-cert/tls.crt"),
+    key: fs.readFileSync("/etc/pg-cert/tls.key"),
+    rejectUnauthorized: true,
+    servername: "app-db-rw.database.svc.cluster.local",
+  },
+});
+```
+
+Pod 쪽은 평범한 Secret Volume입니다.
+
+```yaml
+spec:
+  containers:
+    - name: api
+      image: registry.example.com/orders-api:1.4.2
+      volumeMounts:
+        - name: pg-client-cert
+          mountPath: /etc/pg-cert
+          readOnly: true
+        - name: pg-ca
+          mountPath: /etc/pg-ca
+          readOnly: true
+  volumes:
+    - name: pg-client-cert
+      secret:
+        secretName: orders-api-client-cert
+        defaultMode: 0400
+    - name: pg-ca
+      secret:
+        secretName: app-db-ca
+        defaultMode: 0444
+```
+
+Rotation에 대해 솔직한 이야기를 하나 덧붙입니다. Operator가 인증서를 갱신한다고 해서 이미 떠 있는 Process가 그것을 알아서 다시 읽지는 않습니다. Secret Volume의 파일은 kubelet이 갱신하지만, 기동 시점에 `readFileSync`로 읽어 메모리에 올린 값은 그대로 남아 있습니다. 기존 Connection은 살아 있고, 새 Connection이 옛 Key로 나가는 순간 실패합니다. 인증서 만료를 감시해 Rolling Restart를 걸든, Application이 파일을 Watch해서 Pool을 다시 만들든, 둘 중 하나를 처음부터 설계에 넣으시기 바랍니다. "Operator가 알아서 갱신하니 괜찮다"는 믿음이 갱신일의 장애를 만듭니다.
+
+## Migration과 Patch Level 이야기
+
+지금 inline stanza를 쓰고 있는 팀을 위한 현실적인 순서는 이렇습니다.
+
+Operator를 1.30으로 올립니다. 그다음 Role을 딱 하나만 골라 분리합니다. 전부 한 번에 하지 마시기 바랍니다. `ensure: present`와 `retain`을 붙여 `DatabaseRole`을 적용하고, `status`가 기대대로 나오는지 확인한 뒤에야 `Cluster` 쪽 stanza를 제거합니다. 순서를 반대로 하면 어떤 Object에도 관리되지 않는 Role이 잠깐 생깁니다.
+
+인증서 인증으로의 전환은 더 천천히 갑니다. `clientCertificate`를 켠다고 기존 Password 인증이 즉시 무효화되지는 않습니다. `pg_hba`가 양쪽을 모두 허용하는 동안 Application을 인증서 접속으로 바꾸고, 안정적으로 붙는지 지켜본 뒤, 그때 Password 인증을 내립니다. 이 순서면 어느 시점에서든 Rollback이 가능합니다.
+
+마지막으로 1.30과는 별개인 운영 공지 하나. CloudNativePG 1.29.1 / 1.28.3에서 Metrics Exporter의 CVE-2026-44477(Critical, CVSS 9.4)이 수정되었고, 같은 Release에서 Failover 경로의 Data 안전성 관련 버그도 함께 고쳐졌습니다. 이번 분기에 1.30으로 올릴 계획이 없더라도, Patch Level 확인만큼은 오늘 해둘 가치가 있습니다.
+
+## 실무적인 정리
+
+- Role 소유권을 Application 팀에 넘기고 싶었다면 `DatabaseRole`이 기다리던 기능입니다. RBAC을 끊을 수 있는 입도가 드디어 조직 구조를 따라잡았습니다.
+- 운영 Role에는 반드시 `databaseRoleReclaimPolicy: retain`을 붙이시기 바랍니다. 실수로 `kubectl delete` 하는 일은 가정이 아니라 예정입니다.
+- 핵심은 `clientCertificate`입니다. Password Rotation 운영을 끝없이 개선하는 것보다 Password를 없애는 쪽이 빠릅니다.
+- 단, `sslmode=verify-full`과 `pg_hba`의 `cert` 설정을 빼먹으면 인증서 인증은 반쪽짜리 통제가 됩니다.
+- 갱신된 인증서를 Application이 어떻게 집어 올릴지는 Operator가 아니라 여러분이 설계해야 할 문제입니다.
+- CVE-2026-44477에 대한 Patch Level을 확인하시기 바랍니다. 1.30과 무관하게 오늘 할 일입니다.
+
+DB Credential이 Stack의 마지막 imperative 영역으로 남아 있던 이유는 단지 마땅한 도구가 없었기 때문입니다. 1.30부터는 그 변명이 사라졌습니다.
