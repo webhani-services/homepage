@@ -1,0 +1,100 @@
+---
+title: "'보이지 않는 Kubernetes' — Karpenter·kro·Cedar가 옮기는 운영의 무게 중심"
+description: "KubeCon EU 2026에서 AWS가 내건 'Invisible Kubernetes' 사상을 Karpenter·kro·Cedar 세 구현으로 풀어봅니다. 복잡함을 없애는 게 아니라 어디로 옮길지, webhani의 운영 시각으로 정리합니다."
+date: "2026-07-16"
+status: "published"
+tags: ["kubernetes", "aws", "devops", "cloud", "platform-engineering"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-invisible-kubernetes-karpenter-kro-cedar-2026"
+---
+
+## "Kubernetes를 보이지 않게 한다"는 방향성
+
+KubeCon + CloudNativeCon Europe 2026(암스테르담)에서 AWS의 Amazon EKS Team은 "From Complexity to Clarity: Engineering an Invisible Kubernetes"라는 제목의 발표를 했습니다. 요지는 명확합니다. Kubernetes는 성숙했지만 그 복잡함이 App 개발자의 인지 부하가 되어 있다. 그러니 복잡함을 없애는 대신, 개발자에게서 "보이지 않는" 곳으로 옮기자는 발상입니다.
+
+이 방향성을 떠받치는 것으로 이름이 오른 것이 Karpenter, kro, Cedar라는 세 CNCF 계열 Project입니다. 모두 AWS 발이지만 Community 주도로 성장해 왔습니다. webhani는 Client의 Kubernetes 기반 운영을 지원하면서 "어떤 복잡함을 누구에게서 감출까"라는 설계 판단이 해마다 중요해진다고 느낍니다. 이 글에서는 세 가지를, 운영의 무게 중심을 어떻게 옮기는가라는 관점으로 풀어봅니다.
+
+## Karpenter: Node 관리를 "선언"에서 "Just-in-Time"으로
+
+Karpenter는 Node의 Lifecycle 관리, 특히 Autoscaling을 담당합니다. 기존 Cluster Autoscaler는 미리 정의한 Node Group 범위 안에서 Scale했습니다. Karpenter의 핵심은 Pod의 요구에 맞춰 필요한 Node를 실시간으로 Provisioning한다는 점입니다. 개발자는 Node Group 설계에서 벗어납니다.
+
+```yaml
+# Karpenter NodePool: 어떤 Node를 허용할지 선언하고,
+# 실제 기동은 수요에 따라 Karpenter가 판단한다
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["arm64", "amd64"]
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
+```
+
+`consolidationPolicy`를 통해 사용되지 않는 Node를 자동으로 접어 Cost를 낮춥니다. 여기서 "감춰지는 복잡함"은 Capacity Planning 그 자체입니다. 운영자는 허용 조건만 선언하고, 언제 몇 대를 띄울지는 위임합니다.
+
+## kro: 여러 Resource를 하나의 API로 묶기
+
+kro(Kubernetes Resource Orchestrator)는 여러 Kubernetes Resource를 묶어 독자적인 고수준 API로 공개하는 구조입니다. App 개발자에게 Deployment, Service, Ingress, HPA를 개별로 쓰게 하지 않고 "Web App"이라는 추상 하나를 넘깁니다. 뒤편의 여러 Resource는 kro가 전개합니다.
+
+```yaml
+# ResourceGraphDefinition: 개발자에게는 단순한 입력만 보이고,
+# 내부에서 Deployment/Service 등을 합성한다 (개념 예)
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: webapp
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: WebApp
+    spec:
+      image: string
+      replicas: integer | default=2
+  # resources: 위 spec을 바탕으로 Deployment / Service / Ingress 생성
+```
+
+이것은 Platform Engineering의 핵심 Pattern입니다. 운영 Team이 "Golden Path"를 ResourceGraphDefinition으로 정의하고, 개발자는 그 범위에서 안전하게 Self-service화합니다. GitOps와 결합하면 Infra와 App 구성이 Version 관리되어 감사·재현이 가능해집니다.
+
+## Cedar: 인가를 "Code화된 방침"으로 바꾸기
+
+Cedar는 AWS가 Open Source화한 인가 Policy 언어와 평가 Engine입니다. 누가 무엇에 접근할 수 있는지를 문맥을 고려한 세밀한 Rule로 기술하고, 자동으로 검증·감사할 수 있습니다. Kubernetes의 Cluster 간·Service 간에서 Zero Trust를 현실적으로 운영하기 위한 토대가 됩니다.
+
+```text
+// Cedar Policy 예: Production namespace 쓰기는
+// On-call 담당이면서 사내 Network에서만 허용
+permit(
+  principal in Role::"platform-engineer",
+  action == Action::"k8s:write",
+  resource in Namespace::"production"
+) when {
+  principal.oncall == true &&
+  context.source_network == "corp-vpn"
+};
+```
+
+RBAC가 "Role에 권한을 묶는" 정적인 구조인 데 반해, Cedar는 시각·Network·상태 같은 문맥을 조건에 넣을 수 있습니다. 인가의 복잡함을 흩어진 설정이 아니라 한 곳의 Policy로 표현할 수 있는 것이 강점입니다.
+
+## webhani의 시각: 복잡함은 "지우는 게 아니라 옮기는 것"
+
+세 Project에 공통된 것은 복잡함을 지워 없애는 것이 아니라 적절한 담당자에게 옮기는 발상입니다. Capacity Planning은 Karpenter로, 구성 조립은 kro(=Platform Team)로, 인가 판단은 Cedar Policy로. 개발자의 시야에서는 복잡함이 "보이지 않게" 되지만, 사라진 것은 아닙니다.
+
+이 점은 도입 판단에서 중요합니다. 추상을 한 겹 씌운다는 것은, 그 추상을 유지·보수할 책임이 Platform Team에 집약된다는 뜻입니다. 소규모이면서 Kubernetes 활용이 얕은 조직에서는 추상화 Cost가 편익을 웃돌 수도 있습니다. 반대로 여러 Team이 같은 기반을 공유하고 Golden Path 표준화가 과제인 조직에서는 이들 Tool이 효과를 냅니다.
+
+또한 AWS는 2026년에 CNCF에 300만 달러의 Cloud Credit을 출연하겠다고 밝히며, 이들 upstream Project가 특정 Vendor에 갇히지 않도록 자금 면에서도 뒷받침하고 있습니다. Tool을 고를 때는 EKS 전제 기능과 이식 가능한 OSS 기능을 구분해 두면 향후 이전 여지를 남길 수 있습니다.
+
+## 정리
+
+"Invisible Kubernetes"는 Kubernetes를 단순화하는 것이 아니라 복잡함의 담당자를 재배치하는 설계 사상입니다. Karpenter는 Capacity를, kro는 구성을, Cedar는 인가를 각각 개발자의 시야에서 넘겨받습니다.
+
+webhani로서는 이들을 "도입하면 편해지는 마법"이 아니라 "복잡함을 집약하는 의사결정"으로 다룰 것을 권합니다. 집약처인 Platform Team의 운영 역량이 뒤따라야 비로소 개발자에게 Kubernetes는 정말로 보이지 않게 됩니다. 우선 Karpenter로 Node 운영 자동화부터 시작하고, 표준화 필요성이 분명해진 단계에서 kro와 Cedar로 넓히는 것이 무리 없는 경로일 것입니다.
