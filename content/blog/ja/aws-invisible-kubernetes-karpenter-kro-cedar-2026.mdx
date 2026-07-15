@@ -1,0 +1,100 @@
+---
+title: "「見えない Kubernetes」——Karpenter・kro・Cedar が変える運用の重心"
+description: "KubeCon EU 2026 で AWS が掲げた『Invisible Kubernetes』の思想を、Karpenter・kro・Cedar という3つの実装から読み解きます。複雑さをどこに隠すべきか、webhani の運用視点で整理します。"
+date: "2026-07-16"
+status: "published"
+tags: ["kubernetes", "aws", "devops", "cloud", "platform-engineering"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-invisible-kubernetes-karpenter-kro-cedar-2026"
+---
+
+## 「Kubernetes を見えなくする」という方向性
+
+KubeCon + CloudNativeCon Europe 2026（アムステルダム）で、AWS の Amazon EKS チームは "From Complexity to Clarity: Engineering an Invisible Kubernetes" と題した講演を行った。要旨は明快だ。Kubernetes は成熟した一方で、その複雑さがアプリ開発者の認知負荷になっている。ならば複雑さをなくすのではなく、開発者から「見えない」場所へ移そう、という発想である。
+
+この方向性を支えるとして名前が挙がったのが、Karpenter、kro、Cedar という3つの CNCF 系プロジェクトだ。いずれも AWS 発だが、コミュニティ主導で育ってきた。webhani ではクライアントの Kubernetes 基盤運用を支援する中で、「どの複雑さを誰から隠すか」という設計判断が年々重要になっていると感じている。本稿ではこの3つを、運用の重心をどう動かすかという視点で読み解く。
+
+## Karpenter：ノード管理を「宣言」から「ジャストインタイム」へ
+
+Karpenter はノードのライフサイクル管理、とりわけオートスケーリングを担う。従来の Cluster Autoscaler は、あらかじめ定義したノードグループの範囲でスケールした。Karpenter の要点は、Pod の要求に応じて必要なノードを実時間でプロビジョニングする点にある。開発者はノードグループの設計から解放される。
+
+```yaml
+# Karpenter の NodePool: どんなノードを許容するかを宣言し、
+# 実際の起動は需要に応じて Karpenter が判断する
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["arm64", "amd64"]
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
+```
+
+`consolidationPolicy` によって、使われていないノードを自動で畳んでコストを下げる。ここで「隠される複雑さ」はキャパシティプランニングそのものだ。運用者は許容条件だけを宣言し、いつ何台立てるかは委ねる。
+
+## kro：複数リソースを1つの API にまとめる
+
+kro（Kubernetes Resource Orchestrator）は、複数の Kubernetes リソースを束ねて、独自の高レベル API として公開する仕組みだ。アプリ開発者に Deployment、Service、Ingress、HPA を個別に書かせるのではなく、「Web アプリ」という抽象を一つ渡す。裏側の複数リソースは kro が展開する。
+
+```yaml
+# ResourceGraphDefinition: 開発者には単純な入力だけを見せ、
+# 内部で Deployment/Service などを合成する（概念例）
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: webapp
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: WebApp
+    spec:
+      image: string
+      replicas: integer | default=2
+  # resources: 上記 spec を元に Deployment / Service / Ingress を生成
+```
+
+これはプラットフォームエンジニアリングの中核パターンだ。運用チームが「ゴールデンパス」を ResourceGraphDefinition として定義し、開発者はその範囲で安全に自己サービス化する。GitOps と組み合わせれば、インフラとアプリの構成がバージョン管理され、監査・再現が可能になる。
+
+## Cedar：認可を「コード化された方針」に変える
+
+Cedar は AWS がオープンソース化した認可ポリシー言語と評価エンジンだ。誰が何にアクセスできるかを、文脈を考慮した細粒度のルールとして記述し、自動で検証・監査できる。Kubernetes のクラスタ間・サービス間でゼロトラストを現実的に運用するための土台になる。
+
+```text
+// Cedar ポリシーの例：本番 namespace への書き込みは
+// オンコール担当かつ社内ネットワークからのみ許可
+permit(
+  principal in Role::"platform-engineer",
+  action == Action::"k8s:write",
+  resource in Namespace::"production"
+) when {
+  principal.oncall == true &&
+  context.source_network == "corp-vpn"
+};
+```
+
+RBAC が「ロールに権限を束ねる」静的な仕組みなのに対し、Cedar は時刻・ネットワーク・状態といった文脈を条件に組み込める。認可の複雑さを、散在した設定ではなく一箇所のポリシーとして表現できるのが強みだ。
+
+## webhani の視点：複雑さは「消せない、移すもの」
+
+3つのプロジェクトに共通するのは、複雑さを消し去るのではなく、適切な担い手へ移す発想だ。キャパシティプランニングは Karpenter へ、構成の組み立ては kro（=プラットフォームチーム）へ、認可判断は Cedar のポリシーへ。開発者の視界からは複雑さが「見えなく」なるが、消えたわけではない。
+
+この点は導入判断で重要になる。抽象を一枚かぶせるということは、その抽象を保守する責任がプラットフォームチームに集約されるということだ。小規模で Kubernetes の利用が薄い組織では、抽象化のコストが便益を上回ることもある。逆に、複数チームが同じ基盤を共有し、ゴールデンパスの標準化が課題になっている組織では、これらのツールは効いてくる。
+
+なお AWS は 2026 年に CNCF へ 300 万ドルのクラウドクレジットを拠出すると表明しており、これらの upstream プロジェクトが特定ベンダーに閉じないよう資金面でも支えている。ツール選定にあたっては、EKS 前提の機能とポータブルな OSS 機能を区別しておくと、将来の移行余地を残せる。
+
+## まとめ
+
+「Invisible Kubernetes」は、Kubernetes を単純化するのではなく、複雑さの担い手を再配置する設計思想だ。Karpenter はキャパシティを、kro は構成を、Cedar は認可を、それぞれ開発者の視界から引き取る。
+
+webhani としては、これらを「導入すれば楽になる魔法」ではなく「複雑さを集約する意思決定」として扱うことを勧める。集約先であるプラットフォームチームの運用力が伴って初めて、開発者にとっての Kubernetes は本当に見えなくなる。まずは Karpenter によるノード運用の自動化から始め、標準化の必要性が明確になった段階で kro と Cedar に広げるのが、無理のない道筋だろう。
