@@ -1,0 +1,71 @@
+---
+title: "MySQL 9.3 Innovation Release: Expanded JavaScript Stored Routines and an Easy-to-Miss Downgrade Trap"
+description: "MySQL 9.3 Innovation Release strengthens JavaScript stored routines and the optimizer, but also removes downgrades between Innovation series releases. webhani breaks down what to watch for in your upgrade rollout."
+date: "2026-07-17"
+status: "published"
+tags: ["mysql", "database", "devops", "sql", "backend"]
+thumbnail: ""
+author: "webhani"
+slug: "mysql-93-innovation-release-2026"
+---
+
+## Stepping back from the PostgreSQL-only conversation
+
+Database discussion over the past few years has leaned heavily toward PostgreSQL's new features — async I/O, UUIDv7, OAuth authentication support, and so on. And to be fair, PostgreSQL is genuinely at the center of the conversation when it comes to extensibility and the pace of modern feature additions. But plenty of organizations still run on MySQL as an existing asset, and writing it off as "PostgreSQL or nothing" without tracking its own evolution doesn't match reality on the ground.
+
+MySQL 9.3, an Innovation Release, isn't flashy, but it includes changes that matter in practice — expanded JavaScript stored routines and optimizer improvements. It also includes an operational gotcha that's easy to miss. We want to break this release down from a practical standpoint.
+
+## Expanded JavaScript stored routines
+
+MySQL relatively recently introduced the ability to write stored procedures and functions in JavaScript. 9.3 extends this further, adding full support for the DECIMAL type inside JavaScript routines — removing one barrier for handling precision-sensitive logic, like monetary calculations, in JavaScript routines.
+
+On top of that, `ALTER PROCEDURE` / `ALTER FUNCTION` now accept a `USING` clause, letting you add, replace, or remove libraries imported by a JavaScript stored routine without rebuilding the routine itself. `CREATE LIBRARY` also gained a `COMMENT` clause, visible in the output of `SHOW CREATE LIBRARY` and `SHOW LIBRARY STATUS`.
+
+```sql
+-- Swapping out a library a JavaScript routine depends on
+ALTER PROCEDURE calculate_tax
+  USING REPLACE LIBRARY tax_rules_v1 WITH tax_rules_v2;
+
+-- Adding a comment to a library so its purpose stays traceable later
+CREATE LIBRARY tax_rules_v2
+  LANGUAGE JAVASCRIPT
+  COMMENT 'Tax calculation logic for the 2026 revision'
+  AS $$
+    export function calc(amount) { /* ... */ }
+  $$;
+```
+
+Making library management easier to version-control is a quiet but meaningful improvement for organizations that push part of their business logic down into the database layer.
+
+## Optimizer improvements: broader subquery handling
+
+9.3 extends the `subquery_to_derived` optimization to cover all quantified comparison operators — `>ANY`, `>=ANY`, `<ANY`, `<=ANY`, `>ALL`, `>=ALL`, `<ALL`, `<=ALL`, `=ANY`, `<>ALL`. The transformation is now also supported in the `SELECT` clause, not just `WHERE`.
+
+```sql
+-- A subquery using a quantified comparison
+-- In 9.3, this pattern can now be eligible for derived-table transformation
+SELECT product_id, price
+FROM products
+WHERE price >ALL (
+  SELECT price FROM products WHERE category = 'discontinued'
+);
+```
+
+This kind of transformation means the query planner can more readily pick a more efficient join strategy, like a hash join. Worth noting for operational cost: you might see execution plans improve on an upgrade alone, with no query rewrite required.
+
+## The easy-to-miss trap: no downgrades within the Innovation series
+
+The most operationally significant change in this release isn't a feature addition — it's a constraint. Starting with MySQL 9.3, it's no longer possible to downgrade between individual Innovation series releases, even within the same series.
+
+Some teams have likely relied on rolling back to a previous version when a staging issue surfaces. From 9.3 onward, that option is effectively gone. Taking a snapshot before upgrading and rethinking your rollout plan around the assumption that you can't roll back become mandatory practices.
+
+## Our recommendations
+
+- **Make full backups on staging mandatory before touching production**: with downgrades off the table, an "apply first, roll back if there's an issue" workflow no longer works.
+- **Audit your library management if you're using JavaScript stored routines**: the `USING` clause makes it possible to swap libraries explicitly — a good moment to move toward managing routine dependencies explicitly rather than implicitly.
+- **Check execution plans for queries with complex existing subqueries**: the `subquery_to_derived` expansion could change `EXPLAIN` output for some queries. Verify your key queries for performance regressions after upgrading.
+- **Revisit your Innovation vs. LTS release strategy**: whether you want to chase the latest features or prioritize stability should determine how closely you track the Innovation series going forward.
+
+## Takeaways
+
+MySQL 9.3 is a genuinely useful update — better usability for JavaScript stored routines, and quiet but real optimizer improvements. But the removal of downgrades between Innovation series releases changes the assumptions your upgrade process relies on. Rather than getting distracted by the flashy new features, revisiting your rollout plan and backup posture first is the safer way to bring this release in.

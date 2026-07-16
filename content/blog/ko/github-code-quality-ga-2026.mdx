@@ -1,0 +1,66 @@
+---
+title: "GitHub Code Quality GA 전환: PR을 막는 품질 Gate, 도입 전에 무엇을 점검해야 하나"
+description: "2026년 7월 20일, GitHub Code Quality가 Public Preview에서 정식 제공(GA)으로 전환되며 유료화와 함께 PR Merge를 막는 품질 Gate가 본격 가동됩니다. webhani가 도입 전 점검 항목을 정리합니다."
+date: "2026-07-17"
+status: "published"
+tags: ["github", "ci-cd", "devops", "code-quality", "developer-tooling"]
+thumbnail: ""
+author: "webhani"
+slug: "github-code-quality-ga-2026"
+---
+
+## Dashboard에서 "강제력"을 가진 장치로
+
+Code 품질 시각화 Tool은 예전부터 다수 존재했습니다. CodeQL Scan 결과를 확인하고 Coverage Graph를 보는 것 — 여기까지는 어디까지나 "참고 정보"에 머무는 경우가 많았습니다. 개발자가 무시하려면 무시할 수 있는, Dashboard 수준의 기능이었기 때문입니다.
+
+2026년 7월 20일, GitHub Code Quality가 Public Preview에서 정식 제공(GA)으로 전환됩니다. 이 변화에서 중요한 것은 신규 기능 추가 자체보다, **Maintainability·Reliability·Coverage 기준을 밑도는 PR의 Merge를 실제로 차단할 수 있는** 품질 Gate가 유료 정식 기능으로 편입된다는 점입니다. Dashboard였던 장치가 강제력을 가진 Gate로 바뀝니다. webhani가 이 전환이 현장에 미치는 영향을 정리해보겠습니다.
+
+## GA로 무엇이 바뀌나
+
+GitHub Code Quality는 GitHub Enterprise Cloud와 GitHub Team Plan에서 이용 가능하며, GitHub Enterprise Server에서는 제공되지 않습니다. GA 이후 과금 체계는 Active Committer 단위의 월간 License로, 다음 기능을 포함합니다.
+
+- Maintainability·Reliability·Coverage 기반 **PR Merge 차단 품질 Gate**
+- Ruleset과의 통합, Organization 전체 배포
+- CodeQL 기반 결정론적 분석 (GitHub Actions 상에서 실행)
+- AI를 활용한 탐지 지원과 Copilot Autofix 생성 (별도 종량 과금)
+
+주목할 점은 AI 관련 기능이 종량 과금으로 별도 분리되어 있다는 것입니다. 품질 Gate 자체의 License 비용에 더해, AI 탐지 지원과 자동 수정 제안을 많이 쓸수록 과금이 누적되는 구조입니다.
+
+```yaml
+# Ruleset에 Code Quality Status Check를 Merge 조건으로 넣는 예시
+name: main branch protection
+target: branch
+enforcement: active
+rules:
+  - type: required_status_checks
+    parameters:
+      required_status_checks:
+        - context: "code-quality/maintainability"
+        - context: "code-quality/reliability"
+        - context: "code-quality/coverage"
+```
+
+## 왜 "도입 전 점검"이 필요한가
+
+품질 Gate가 실제로 PR을 차단하는 만큼, 도입 설계를 잘못하면 개발 속도 자체가 멈출 수 있습니다. webhani가 Client에게 권장하는 점검 항목은 다음과 같습니다.
+
+- **기존 Codebase의 현재 상태를 먼저 측정한다**: Gate를 활성화하기 전, 우선 측정 전용 Mode로 Baseline을 파악합니다. 곧바로 Threshold로 차단을 시작하면 기존 기술 부채가 많은 대형 Repository에서는 PR이 전혀 Merge되지 않는 위험이 있습니다.
+- **Threshold를 Repository별로 조정한다**: 신규 Project와 장기 운영 중인 Legacy Code는 요구되는 Maintainability·Coverage 수준이 다릅니다. 전사 일괄 Threshold는 현실적이지 않은 경우가 많습니다.
+- **AI 종량 과금의 상한을 확인한다**: Copilot Autofix의 자동 생성은 편리하지만, 기존 지적 사항 다수에 대해 일괄로 수정 제안을 돌리면 예상외의 과금이 발생할 수 있습니다. 단계적 활성화를 검토해야 합니다.
+- **Committer 수 기반 과금 Model을 조직 구조에 비추어 시산한다**: 외주나 단기 계약 개발자가 많은 조직이라면 Active Committer 수 변동을 고려한 비용 시산이 필요합니다.
+
+## 개발 Flow에 대한 실무적 영향
+
+품질 Gate가 작동하는 가장 큰 의의는 Code Review 부하 분산에 있습니다. 지금까지 사람 Reviewer가 지적하던 Maintainability나 중복 Code 문제를 기계적 Check로 PR 입구에서 걸러낼 수 있게 되면, Reviewer는 설계 판단이나 Business Logic의 타당성처럼 사람만이 판단할 수 있는 영역에 더 집중할 수 있습니다.
+
+반면 Threshold 설계를 잘못한 Gate는 "Reviewer의 대체"가 아니라 "개발의 병목"이 됩니다. 특히 전환기의 Legacy Codebase에서는 단계적인 Threshold 상향 Roadmap을 사전에 준비해 두는 것이 필수입니다.
+
+## webhani의 견해
+
+GitHub Code Quality의 GA 전환은 Code 품질 관리가 "있으면 편한 기능"에서 "조직의 Governance 기반"으로 격상되는 전환점이라고 봅니다. 특히 PR 기반 개발 Flow를 가진 조직에게는, Merge 시점에 품질 기준을 강제할 수 있는 장치가 Review Process 표준화로 직결됩니다.
+
+다만 유료화 시점이기도 한 만큼, 기존 CI Pipeline에 CodeQL이나 다른 정적 분석 Tool을 이미 편입한 조직이라면 기능 중복이 없는지, 비용 대비 효과가 맞는지를 개별적으로 따져봐야 합니다. webhani는 GA 전환 전 측정 단계부터 함께하며 Threshold 설계와 Rollout 계획 수립을 지원하는 것을 권장합니다.
+
+## 정리
+
+2026년 7월 20일 GA 전환으로 GitHub Code Quality는 Dashboard에서 실제로 PR을 차단하는 강제력 있는 장치로 바뀝니다. 도입 자체는 개발 Flow의 품질을 끌어올릴 좋은 기회이지만, Threshold 설계를 잘못하면 개발 속도 저하라는 대가를 치르게 됩니다. 기존 Codebase 측정, 단계적 Threshold 설정, AI 종량 과금 견적 — 이 세 가지를 활성화 전에 마쳐두는 것이 순조로운 전환의 핵심입니다.

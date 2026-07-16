@@ -1,0 +1,71 @@
+---
+title: "MySQL 9.3 Innovation Release：JavaScript ストアドルーチンの拡張と、見落としがちな「降格不可」の罠"
+description: "MySQL 9.3 Innovation Release で JavaScript ストアドルーチンや Optimizer が強化された一方、Innovation シリーズ間のダウングレードが不可になりました。webhani がアップグレード運用の注意点を整理します。"
+date: "2026-07-17"
+status: "published"
+tags: ["mysql", "database", "devops", "sql", "backend"]
+thumbnail: ""
+author: "webhani"
+slug: "mysql-93-innovation-release-2026"
+---
+
+## PostgreSQL 一辺倒の議論から一歩引いて
+
+ここ数年、この分野の議論は PostgreSQL の新機能——非同期 I/O、UUIDv7、OAuth 認証対応など——に偏りがちだった。実際、拡張性やモダンな機能追加のスピード感では PostgreSQL が話題の中心にあるのは間違いない。ただ、既存資産として MySQL を使い続けている組織も多く、その進化を追わずに「PostgreSQL 一択」と結論づけるのは現場感覚とずれている。
+
+MySQL 9.3（Innovation Release）は派手さこそないものの、JavaScript ストアドルーチンの拡張や Optimizer の改善など、実務に効く変更を含んでいる。一方で見落とされがちな運用上の注意点も存在する。webhani として、この Innovation Release を実務目線で整理したい。
+
+## JavaScript ストアドルーチンの拡張
+
+MySQL は比較的最近、JavaScript でストアドプロシージャ・ファンクションを記述できる機能を導入した。9.3 ではこの機能がさらに拡張され、JavaScript ルーチン内で DECIMAL 型を完全にサポートするようになった。金額計算のような精度が重要な処理を JavaScript ルーチンで扱う際の障壁が一つ減ったことになる。
+
+さらに、`ALTER PROCEDURE` / `ALTER FUNCTION` に `USING` 句が追加され、JavaScript ストアドルーチンがインポートするライブラリの追加・置換・削除を、ルーチン自体を作り直さずに行えるようになった。`CREATE LIBRARY` にも `COMMENT` 句が加わり、`SHOW CREATE LIBRARY` や `SHOW LIBRARY STATUS` の出力でその内容を確認できる。
+
+```sql
+-- JavaScript ルーチンが依存するライブラリを差し替える例
+ALTER PROCEDURE calculate_tax
+  USING REPLACE LIBRARY tax_rules_v1 WITH tax_rules_v2;
+
+-- ライブラリにコメントを付与し、後から用途を追跡しやすくする
+CREATE LIBRARY tax_rules_v2
+  LANGUAGE JAVASCRIPT
+  COMMENT '2026年度改正版の税率計算ロジック'
+  AS $$
+    export function calc(amount) { /* ... */ }
+  $$;
+```
+
+ライブラリ管理がバージョン管理しやすくなった点は、ビジネスロジックの一部をデータベース層に寄せている組織にとって地味だが重要な改善だ。
+
+## Optimizer の改善：サブクエリの扱いが広がる
+
+9.3 では `subquery_to_derived` という最適化が拡張され、`>ANY` `>=ANY` `<ANY` `<=ANY`、`>ALL` `>=ALL` `<ALL` `<=ALL`、`=ANY` `<>ALL` といった量化比較演算子すべてに対応するようになった。加えて、この変換が `SELECT` 句や `WHERE` 句でも使えるようになっている。
+
+```sql
+-- 量化比較を含むサブクエリの例
+-- 9.3 では、この形のクエリも derived table への変換対象になり得る
+SELECT product_id, price
+FROM products
+WHERE price >ALL (
+  SELECT price FROM products WHERE category = 'discontinued'
+);
+```
+
+こうした変換は、実行計画がハッシュジョインなどより効率的な結合方式を選びやすくなることを意味する。既存クエリを書き換えなくても、アップグレードだけで実行計画が改善される可能性がある点は、運用コストの観点で見逃せない。
+
+## 見落としがちな罠：Innovation シリーズ間のダウングレード不可
+
+今回の変更でもっとも実務的に注意すべきなのは、機能追加ではなく制約の追加だ。MySQL 9.3 以降、Innovation シリーズの個別リリース間でのダウングレードが、同一シリーズ内であっても不可能になった。
+
+これまで検証環境で問題が見つかった際、前バージョンに戻して切り戻すという運用を取っていたチームもあるはずだ。9.3 以降はこの選択肢が事実上失われる。アップグレード前のスナップショット取得や、切り戻し不能を前提としたロールアウト計画の見直しが必須になる。
+
+## webhani としての推奨事項
+
+- **本番反映前にステージング環境でのフルバックアップを必須化する**: ダウングレード不可という制約がある以上、「まず適用して問題があれば戻す」という運用は通用しない。
+- **JavaScript ストアドルーチンを使っている場合はライブラリ管理を棚卸しする**: `USING` 句によるライブラリ差し替えが可能になったことで、ルーチンの依存関係を明示的に管理する運用へ移行する好機でもある。
+- **既存の複雑なサブクエリを含むクエリの実行計画を確認する**: `subquery_to_derived` の拡張により、`EXPLAIN` の結果が変わるクエリが出てくる可能性がある。パフォーマンス回帰がないか、アップグレード後に主要クエリを確認しておきたい。
+- **Innovation Release と LTS の運用方針を再確認する**: 最新機能を追いたいのか、安定性を優先するのか、組織の方針に応じて Innovation シリーズへの追従ペースを決めておくべきだ。
+
+## まとめ
+
+MySQL 9.3 は、JavaScript ストアドルーチンの実用性向上と Optimizer の地道な改善を含む、実務に効くアップデートだ。ただし、Innovation シリーズ間でダウングレードができなくなったという制約は、アップグレード運用の前提を変える。派手な新機能に目を奪われず、ロールアウト計画とバックアップ体制を先に見直すことが、このリリースを安全に取り込む第一歩になる。
