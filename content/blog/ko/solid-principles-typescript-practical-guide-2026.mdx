@@ -1,0 +1,193 @@
+---
+title: "지금 다시 짚어보는 SOLID 원칙: TypeScript로 배우는 실전 가이드"
+description: "SOLID는 '면접용 암기 사항'으로 취급되곤 하지만, 성장 중인 TypeScript Codebase에서는 지금도 실제 설계 문제를 짚어냅니다. 5가지 원칙을 Before/After Refactoring 예시와 함께 정리합니다."
+date: "2026-07-18"
+status: "published"
+tags: ["SOLID", "Design Patterns", "TypeScript", "Software Architecture", "Code Quality"]
+thumbnail: ""
+author: "webhani"
+slug: "solid-principles-typescript-practical-guide-2026"
+---
+
+## Code 양이 늘어나는 지금이야말로 SOLID가 필요한 이유
+
+AI Coding Assistant가 일상적인 Boilerplate 상당수를 생성하게 되면서, 일반적인 TypeScript Codebase에 유입되는 Code 양은 늘어난 반면 한 줄당 인간이 투입하는 Review 시간은 줄어들었습니다. 이 조합 때문에 구조적인 규율은 오히려 더 중요해졌습니다. SOLID는 면접을 위해 암기하는 Checklist가 아니라, 눈앞의 Code를 팀원이 작성했든 AI가 생성했든 상관없이 알아볼 수 있어야 하는 '자주 반복되는 실패 패턴' 모음입니다.
+
+저희가 여러 Client Codebase를 살펴보며 반복적으로 마주치는 위반 패턴은 누가(무엇이) 작성했는지와 무관하게 동일한 5가지로 수렴합니다. 각 원칙을 문제의 형태와 구체적인 Refactoring 예시로 살펴보겠습니다.
+
+## Single Responsibility Principle: 변경 이유는 하나로
+
+전형적인 징후는 작게 시작한 Service Class가 PR을 거듭할수록 책임을 하나씩 흡수하는 패턴입니다.
+
+```typescript
+// Before: OrderService가 영속화·가격 계산·알림을 모두 알고 있다
+class OrderService {
+  async placeOrder(order: Order) {
+    const total = order.items.reduce((sum, i) => sum + i.price * i.qty, 0);
+    const tax = total * 0.1;
+    await db.orders.insert({ ...order, total: total + tax });
+    await emailClient.send(order.customerEmail, "Order confirmed");
+    await analytics.track("order_placed", { orderId: order.id });
+  }
+}
+```
+
+세율 계산, 이메일 문구, Analytics Event 중 무엇이 바뀌어도 같은 Class를 건드리게 됩니다. "관련 있어 보이는 Method"가 아니라 "변경 이유"를 기준으로 분리합니다.
+
+```typescript
+class PricingCalculator {
+  calculateTotal(order: Order): number { /* ... */ }
+}
+
+class OrderRepository {
+  async save(order: Order): Promise<void> { /* ... */ }
+}
+
+class OrderService {
+  constructor(
+    private pricing: PricingCalculator,
+    private repo: OrderRepository,
+    private notifier: OrderNotifier
+  ) {}
+
+  async placeOrder(order: Order) {
+    const total = this.pricing.calculateTotal(order);
+    await this.repo.save({ ...order, total });
+    await this.notifier.orderPlaced(order);
+  }
+}
+```
+
+이제 가격 규칙 변경이 알림 흐름을 실수로 망가뜨리지 않습니다.
+
+## Open/Closed Principle: 수정 없이 확장하기
+
+결제나 배송 관련 Code에서 가장 흔하게 보이는 Open/Closed 위반은, 새 연동처가 추가될 때마다 늘어나는 `if/else` 체인입니다.
+
+```typescript
+// Before: Provider를 추가할 때마다 이 함수를 다시 수정해야 한다
+function calculateShipping(provider: string, weight: number): number {
+  if (provider === "fedex") return weight * 2.5;
+  if (provider === "ups") return weight * 2.3;
+  if (provider === "dhl") return weight * 2.8;
+  throw new Error("Unknown provider");
+}
+```
+
+Strategy Map을 쓰면 기존 함수를 "수정에는 닫히고 확장에는 열린" 상태로 유지할 수 있습니다.
+
+```typescript
+interface ShippingStrategy {
+  calculate(weight: number): number;
+}
+
+const shippingStrategies: Record<string, ShippingStrategy> = {
+  fedex: { calculate: (w) => w * 2.5 },
+  ups: { calculate: (w) => w * 2.3 },
+  dhl: { calculate: (w) => w * 2.8 },
+};
+
+function calculateShipping(provider: string, weight: number): number {
+  const strategy = shippingStrategies[provider];
+  if (!strategy) throw new Error("Unknown provider");
+  return strategy.calculate(weight);
+}
+```
+
+새 배송업체를 추가하는 작업이, 검증된 기존 Logic에 대한 수정이 아니라 새 항목 추가만으로 끝납니다.
+
+## Liskov Substitution Principle: Subtype은 계약을 지켜야 한다
+
+이 원칙은 TypeScript의 구조적 타입 시스템으로는 잡아낼 수 없다는 점에서 까다롭습니다. Compile은 통과하지만 Runtime에 깨집니다.
+
+```typescript
+class Rectangle {
+  constructor(protected width: number, protected height: number) {}
+  setWidth(w: number) { this.width = w; }
+  setHeight(h: number) { this.height = h; }
+  area() { return this.width * this.height; }
+}
+
+// 자연스러워 보이지만 계약을 조용히 깨고 있다
+class Square extends Rectangle {
+  setWidth(w: number) { this.width = w; this.height = w; }
+  setHeight(h: number) { this.width = h; this.height = h; }
+}
+
+function testArea(r: Rectangle) {
+  r.setWidth(5);
+  r.setHeight(4);
+  console.assert(r.area() === 20); // Square에서는 실패한다
+}
+```
+
+Subtype이 두 필드를 동기화하기 위해 모든 Setter를 Override해야 한다면, 이는 기반 Class의 동작 관점에서 진짜 Subtype이 아니라 기반 Class의 Interface를 빌린 별개의 개념입니다. 이럴 때는 상속으로 모델링하는 것을 멈추고, 독립적인 구현을 가진 공통 Interface로 전환하는 것이 적절한 해법입니다.
+
+## Interface Segregation Principle: 쓰지 않는 Method를 강요하지 않기
+
+비대해진 Interface는 구현체가 불필요한 Code를 작성하거나 `NotImplementedError`를 던지게 만듭니다. 이는 Interface가 너무 많은 책임을 지고 있다는 강한 신호입니다.
+
+```typescript
+// Before: 모든 Worker가 모든 기능을 구현해야 한다
+interface Worker {
+  code(): void;
+  attendMeeting(): void;
+  fileTaxes(): void;
+}
+
+class RobotWorker implements Worker {
+  code() { /* ... */ }
+  attendMeeting() { throw new Error("Robots don't attend meetings"); }
+  fileTaxes() { throw new Error("Not applicable"); }
+}
+```
+
+기능별로 분리하고 해당하는 것만 구현하도록 합니다.
+
+```typescript
+interface Codeable { code(): void; }
+interface MeetingAttendee { attendMeeting(): void; }
+
+class RobotWorker implements Codeable {
+  code() { /* ... */ }
+}
+```
+
+## Dependency Inversion Principle: 구체 Class가 아닌 추상에 의존하기
+
+마지막 원칙은 나머지 4가지를 실제로 테스트 가능하게 만드는 토대입니다. 의존성을 스스로 Instance화하는 Service는 실제 Instance를 띄우지 않고서는 Unit Test할 수 없습니다.
+
+```typescript
+// Before: 구체적인 Postgres Client에 직접 의존한다
+class UserService {
+  private db = new PostgresClient(connectionString);
+  async getUser(id: string) {
+    return this.db.query("SELECT * FROM users WHERE id = $1", [id]);
+  }
+}
+
+// After: 추상에 의존하고, 경계에서 주입한다
+interface UserRepository {
+  findById(id: string): Promise<User | null>;
+}
+
+class UserService {
+  constructor(private repo: UserRepository) {}
+  async getUser(id: string) {
+    return this.repo.findById(id);
+  }
+}
+```
+
+이제 `UserService`는 In-Memory Fake로 Test할 수 있고, Database를 교체해도 Business Logic은 영향받지 않습니다.
+
+## webhani의 권장 사항
+
+- **SOLID는 Code Review의 관점으로 활용하고, 전면 Rewrite의 의무로 삼지 않는다**: 안정적으로 운영 중인 Codebase에 5가지 원칙을 한 번에 모두 적용하려 하면 해소하는 위험보다 새로 만드는 위험이 더 커집니다. 이미 손대고 있는 파일부터 단계적으로 적용하세요.
+- **AI가 생성한 Code도 동일한 기준으로 검토한다**: 생성된 Code는 "이 기능을 동작시켜라"라는 Prompt의 범위 안에서 작성되는 경우가 많아, Single Responsibility와 Open/Closed 위반을 가장 자주 재현하는 경향이 있습니다.
+- **Test Suite가 얇다면 Dependency Inversion을 최우선으로 한다**: 레버리지가 가장 큰 원칙입니다. Test하기 어려운 Code는 대부분 다른 무엇보다 먼저 Dependency Inversion 문제를 안고 있습니다.
+- **구현체가 하나뿐인데 무리하게 Interface를 만들지 않는다**: Interface Segregation과 Dependency Inversion은 수단이지, 모든 Class에 강제해야 하는 요건이 아닙니다.
+
+## 정리
+
+SOLID 자체는 달라지지 않았지만, 그것이 작동하는 맥락은 달라졌습니다 — 더 많은 Code가 더 빠르게 작성되고, 한 줄 한 줄에 대한 인간의 주의는 줄어들고 있습니다. 이 5가지 원칙이 여전히 유효한 이유는 그것이 교조적이어서가 아니라, 생성된 것이든 직접 작성한 것이든 실제 Production Codebase에서 반복적으로 마주치는 구체적인 실패 양상 각각에 대응하기 때문입니다. 구조적 문제가 쌓이기 전에 짚어내는 신뢰할 수 있는 방법으로서 지금도 가치가 있습니다.

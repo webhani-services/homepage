@@ -1,0 +1,135 @@
+---
+title: "Vitest 4 + Playwright: Why This Pairing Became the Default JS Testing Stack"
+description: "Vitest has overtaken Jest for unit testing and Playwright has overtaken Cypress for E2E. We look at why this specific pairing won, and how to structure a project around it without overlap or gaps."
+date: "2026-07-18"
+status: "published"
+tags: ["Testing", "Vitest", "Playwright", "TypeScript", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "vitest-4-playwright-testing-stack-2026"
+---
+
+## The stack question keeps coming up in client kickoffs
+
+When we start a new TypeScript project with a client, "what testing stack should we use" used to have several defensible answers. That's narrowed. Vitest is now the default choice for unit and integration tests in new Vite-based and Next.js projects, and Playwright is the default for end-to-end. Not because of hype — because the two tools solve genuinely different problems and stopped stepping on each other's toes.
+
+We want to walk through why this specific pairing works, where the boundary between them should sit, and a project layout that avoids the most common mistake: duplicating coverage across both layers.
+
+## Why Vitest displaced Jest for unit tests
+
+Jest was the default for years because there wasn't a strong Vite-native alternative. Vitest closes that gap directly — it reuses your existing `vite.config.ts`, so there's no separate transform pipeline to maintain, and it runs tests in an isolated worker pool by default.
+
+```typescript
+// vitest.config.ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    environment: "jsdom",
+    globals: true,
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "html"],
+      thresholds: { lines: 80, functions: 80 },
+    },
+  },
+});
+```
+
+```typescript
+import { describe, it, expect, vi } from "vitest";
+import { calculateDiscount } from "./pricing";
+
+describe("calculateDiscount", () => {
+  it("applies a 10% discount for orders over $100", () => {
+    expect(calculateDiscount(150)).toBe(135);
+  });
+
+  it("does not discount orders under the threshold", () => {
+    expect(calculateDiscount(50)).toBe(50);
+  });
+});
+```
+
+The API is close enough to Jest that migration is mostly mechanical — `jest.fn()` becomes `vi.fn()`, `jest.mock()` becomes `vi.mock()`. The real gain is speed: shared config, native ESM, and no separate Babel transform step for TypeScript.
+
+## Why Playwright displaced Cypress for E2E
+
+Playwright's advantage is architectural, not incidental. It drives the browser out-of-process via the DevTools/WebDriver-style protocol rather than running inside the page, which removes an entire class of Cypress limitations around cross-origin navigation and multi-tab flows.
+
+```typescript
+import { test, expect } from "@playwright/test";
+
+test("user can complete checkout", async ({ page }) => {
+  await page.goto("/cart");
+  await page.getByRole("button", { name: "Checkout" }).click();
+  await page.getByLabel("Card number").fill("4242424242424242");
+  await page.getByRole("button", { name: "Pay" }).click();
+
+  await expect(page.getByText("Order confirmed")).toBeVisible();
+});
+```
+
+Built-in parallelism across workers, native support for Chromium, Firefox, and WebKit in one config, and auto-waiting that reduces flaky `sleep()`-driven tests are the practical reasons teams migrate, not just npm download counts.
+
+```typescript
+// playwright.config.ts
+import { defineConfig, devices } from "@playwright/test";
+
+export default defineConfig({
+  fullyParallel: true,
+  retries: process.env.CI ? 2 : 0,
+  projects: [
+    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+    { name: "webkit", use: { ...devices["Desktop Safari"] } },
+  ],
+});
+```
+
+## Drawing the line: what belongs where
+
+The mistake we see most often isn't picking the wrong tool — it's not deciding where the boundary sits, which leads to E2E suites re-testing logic that unit tests already cover, and unit test suites mocking so much that they stop testing anything real.
+
+A boundary that's worked well across our projects:
+
+- **Vitest**: business logic, utility functions, React component behavior with Testing Library, API route handlers in isolation with mocked dependencies.
+- **Playwright**: multi-step user flows that cross page boundaries, auth-gated routes, anything involving real network requests or third-party redirects (payment providers, OAuth).
+
+If a test needs a real browser to be meaningful, it belongs in Playwright. If it doesn't, keeping it in Vitest makes the suite faster and the failure messages more specific.
+
+## CI structure that keeps feedback fast
+
+Running the full Playwright suite on every commit is usually a mistake — it's slower and it's the wrong signal for a syntax error in a utility function. We typically split CI into two jobs:
+
+```yaml
+# .github/workflows/test.yml
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: npm ci
+      - run: npx vitest run --coverage
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v5
+      - run: npm ci
+      - run: npx playwright install --with-deps
+      - run: npx playwright test
+```
+
+Unit tests run first and fail fast; E2E only runs once the cheaper signal has passed, which keeps average PR feedback time down without skipping coverage.
+
+## Our recommendations
+
+- **Migrate incrementally, not all at once.** Vitest's Jest-compatible API means you can run both test runners side by side during a migration window rather than blocking on a full rewrite.
+- **Set coverage thresholds on Vitest, not Playwright.** Coverage percentage on E2E tests is a misleading metric — a single flow can "cover" a lot of lines without meaningfully testing behavior.
+- **Keep Playwright suites under version control for flakiness, actively.** Auto-waiting reduces flakiness significantly but doesn't eliminate it; track flaky tests and fix or quarantine them rather than letting `retries` mask the problem indefinitely.
+- **Don't skip component testing.** Playwright Component Testing and Vitest's browser mode both exist, but for most teams, Testing Library on top of Vitest remains the simpler default for component-level behavior.
+
+## Takeaways
+
+The convergence on Vitest + Playwright isn't a fad — it reflects the two tools finally having a clean division of labor instead of overlapping feature sets fighting for the same test cases. For new TypeScript projects, this pairing is a safe default. For existing Jest/Cypress projects, the migration path is incremental enough that "we'll do it eventually" is a reasonable near-term answer, as long as new tests are written against the new stack going forward.
