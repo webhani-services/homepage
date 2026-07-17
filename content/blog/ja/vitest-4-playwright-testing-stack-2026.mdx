@@ -1,0 +1,135 @@
+---
+title: "Vitest 4 + Playwright：この組み合わせがデフォルトの JS Testing Stack になった理由"
+description: "Unit Testing では Vitest が Jest を、E2E Testing では Playwright が Cypress を上回りました。なぜこの組み合わせが定着したのか、境界の引き方を含めて実践的に整理します。"
+date: "2026-07-18"
+status: "published"
+tags: ["Testing", "Vitest", "Playwright", "TypeScript", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "vitest-4-playwright-testing-stack-2026"
+---
+
+## Client との Kickoff で毎回出てくる Stack 選定の話
+
+新しい TypeScript Project を Client と立ち上げる際、「Testing Stack は何を使うか」という質問には以前はいくつも妥当な答えがありました。今はその選択肢が絞られています。新規の Vite ベース・Next.js Project では Unit Testing / Integration Testing に Vitest、E2E Testing に Playwright を使うのがデフォルトになりました。話題性だけの理由ではなく、この2つのツールが解決している問題領域が本質的に異なり、互いの守備範囲を侵さなくなったからです。
+
+なぜこの組み合わせが機能するのか、どこに境界線を引くべきか、そして最もよくある失敗——両レイヤーでカバレッジが重複してしまうこと——を避ける Project 構成を見ていきます。
+
+## Vitest が Unit Test で Jest に取って代わった理由
+
+Jest が長年デフォルトだったのは、Vite Native な有力な代替が存在しなかったからです。Vitest はそのギャップを直接埋めます。既存の `vite.config.ts` をそのまま再利用できるため、別の Transform Pipeline を維持する必要がなく、デフォルトで独立した Worker Pool 上でテストを実行します。
+
+```typescript
+// vitest.config.ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    environment: "jsdom",
+    globals: true,
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "html"],
+      thresholds: { lines: 80, functions: 80 },
+    },
+  },
+});
+```
+
+```typescript
+import { describe, it, expect, vi } from "vitest";
+import { calculateDiscount } from "./pricing";
+
+describe("calculateDiscount", () => {
+  it("applies a 10% discount for orders over $100", () => {
+    expect(calculateDiscount(150)).toBe(135);
+  });
+
+  it("does not discount orders under the threshold", () => {
+    expect(calculateDiscount(50)).toBe(50);
+  });
+});
+```
+
+API は Jest とほぼ互換なので、移行はほぼ機械的な作業で済みます——`jest.fn()` は `vi.fn()` に、`jest.mock()` は `vi.mock()` に置き換わるだけです。本当の利得は速度面にあります。Config を共有でき、Native ESM に対応し、TypeScript のために別途 Babel Transform Step を挟む必要がありません。
+
+## Playwright が E2E で Cypress に取って代わった理由
+
+Playwright の優位性は付随的なものではなく、Architecture そのものに起因します。Page 内で動くのではなく、DevTools/WebDriver 系の Protocol を介して Out-of-Process で Browser を操作するため、Cypress が抱えていた Cross-Origin Navigation や Multi-Tab Flow まわりの制約が丸ごとなくなります。
+
+```typescript
+import { test, expect } from "@playwright/test";
+
+test("user can complete checkout", async ({ page }) => {
+  await page.goto("/cart");
+  await page.getByRole("button", { name: "Checkout" }).click();
+  await page.getByLabel("Card number").fill("4242424242424242");
+  await page.getByRole("button", { name: "Pay" }).click();
+
+  await expect(page.getByText("Order confirmed")).toBeVisible();
+});
+```
+
+Worker 間の Built-in Parallelism、Chromium・Firefox・WebKit を1つの Config でまとめて扱える点、そして `sleep()` 頼みの Flaky Test を減らす Auto-Waiting——チームが移行する理由は npm Download 数ではなく、こうした実務上のメリットです。
+
+```typescript
+// playwright.config.ts
+import { defineConfig, devices } from "@playwright/test";
+
+export default defineConfig({
+  fullyParallel: true,
+  retries: process.env.CI ? 2 : 0,
+  projects: [
+    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+    { name: "webkit", use: { ...devices["Desktop Safari"] } },
+  ],
+});
+```
+
+## 境界線をどこに引くか
+
+私たちが最もよく見る失敗は、ツール選定を間違えることではなく、境界線を決めていないことです。その結果、E2E Suite が Unit Test ですでにカバー済みのロジックを再テストしたり、Unit Test Suite が Mock だらけになって実質何もテストしなくなったりします。
+
+これまでの Project でうまく機能してきた境界の引き方は次の通りです。
+
+- **Vitest**: Business Logic、Utility 関数、Testing Library を使った React Component の振る舞い、依存を Mock 化した状態での API Route Handler の単体検証。
+- **Playwright**: Page をまたぐ複数ステップの User Flow、認証が必要な Route、実際の Network Request や外部 Redirect を伴うもの（決済 Provider や OAuth など）。
+
+Test が意味を持つために実際の Browser が必要なら Playwright に置く。そうでなければ Vitest に留めておく方が、Suite 全体が速くなり、失敗メッセージも具体的になります。
+
+## Feedback を速く保つ CI 構成
+
+すべての Commit で Playwright Suite をフルで走らせるのは、多くの場合得策ではありません。実行が遅いだけでなく、Utility 関数の Syntax Error に対しては不適切な Signal です。私たちは通常 CI を2つの Job に分けています。
+
+```yaml
+# .github/workflows/test.yml
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: npm ci
+      - run: npx vitest run --coverage
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v5
+      - run: npm ci
+      - run: npx playwright install --with-deps
+      - run: npx playwright test
+```
+
+Unit Test を先に実行して素早く失敗を検知し、E2E は安価な Signal をパスした後にのみ実行することで、Coverage を犠牲にせず PR の平均 Feedback 時間を抑えられます。
+
+## webhani としての推奨事項
+
+- **一気にではなく段階的に移行する**: Vitest の API は Jest 互換性が高いため、全面書き換えを待たずに、移行期間中は両方の Test Runner を並行稼働させることができます。
+- **Coverage の閾値は Vitest 側に設定し、Playwright には設定しない**: E2E Test の Coverage 率は誤解を招きやすい指標です。1本の Flow が多くの行を「通過」していても、振る舞いを意味のある形でテストしているとは限りません。
+- **Playwright Suite の Flakiness を能動的に管理する**: Auto-Waiting は Flakiness を大きく減らしますが、ゼロにはしません。Flaky な Test は追跡し、`retries` に任せて問題を無期限に覆い隠すのではなく、修正または隔離してください。
+- **Component Testing を省略しない**: Playwright Component Testing や Vitest の Browser Mode も存在しますが、多くのチームにとっては Vitest 上の Testing Library が Component レベルの振る舞いを検証するシンプルなデフォルトであり続けています。
+
+## まとめ
+
+Vitest + Playwright への収束は一時的な流行ではなく、機能が重複して同じ Test Case を奪い合っていた状態から、2つのツールがようやくきれいな役割分担にたどり着いたことの表れです。新規の TypeScript Project にとって、この組み合わせは安全なデフォルトです。既存の Jest / Cypress Project にとっても、移行パスは十分段階的なので、新規に書く Test から新 Stack に合わせていく形であれば「いずれ移行する」という判断は現実的な選択肢と言えます。

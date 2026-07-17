@@ -1,0 +1,193 @@
+---
+title: "今こそ見直したい SOLID 原則：TypeScript で学ぶ実践ガイド"
+description: "SOLID は「面接対策の暗記事項」として扱われがちですが、成長中の TypeScript コードベースでは今も実際の設計問題を見つけ出してくれます。5つの原則を Before/After のリファクタリング例とともに解説します。"
+date: "2026-07-18"
+status: "published"
+tags: ["SOLID", "Design Patterns", "TypeScript", "Software Architecture", "Code Quality"]
+thumbnail: ""
+author: "webhani"
+slug: "solid-principles-typescript-practical-guide-2026"
+---
+
+## コード量が増える今だからこそ SOLID が効く
+
+AI Coding Assistant が日常的な Boilerplate の多くを生成するようになった結果、一般的な TypeScript Codebase に流れ込むコード量は増える一方で、1行あたりにかけられる人間のレビュー時間は減っています。この組み合わせだからこそ、構造的な規律の重要性はむしろ高まっています。SOLID は面接で暗記する Checklist ではなく、目の前のコードがチームメンバーによるものか AI によって生成されたものかを問わず、認識できるようになっておくべき「よくある失敗パターン」の集合です。
+
+私たちがクライアントの Codebase を見ていて繰り返し目にする違反パターンは、誰が（何が）書いたかに関わらず同じ5種類に集約されます。それぞれの原則について、問題の形と具体的なリファクタリング例を見ていきましょう。
+
+## 単一責任の原則：変更理由は1つに
+
+典型的な兆候は、小さく始まったはずの Service Class が、PR を重ねるたびに責任を吸収していくパターンです。
+
+```typescript
+// Before: OrderService が永続化・価格計算・通知すべてを知っている
+class OrderService {
+  async placeOrder(order: Order) {
+    const total = order.items.reduce((sum, i) => sum + i.price * i.qty, 0);
+    const tax = total * 0.1;
+    await db.orders.insert({ ...order, total: total + tax });
+    await emailClient.send(order.customerEmail, "Order confirmed");
+    await analytics.track("order_placed", { orderId: order.id });
+  }
+}
+```
+
+税率計算・メール文面・Analytics Event のどれを変更しても、同じ Class に手を入れることになります。「関連していそうなメソッド」ではなく「変更理由」で分割します。
+
+```typescript
+class PricingCalculator {
+  calculateTotal(order: Order): number { /* ... */ }
+}
+
+class OrderRepository {
+  async save(order: Order): Promise<void> { /* ... */ }
+}
+
+class OrderService {
+  constructor(
+    private pricing: PricingCalculator,
+    private repo: OrderRepository,
+    private notifier: OrderNotifier
+  ) {}
+
+  async placeOrder(order: Order) {
+    const total = this.pricing.calculateTotal(order);
+    await this.repo.save({ ...order, total });
+    await this.notifier.orderPlaced(order);
+  }
+}
+```
+
+これで価格ルールの変更が通知処理を誤って壊すことはなくなります。
+
+## Open/Closed 原則：修正せずに拡張する
+
+決済や配送関連のコードで最も頻繁に見かける Open/Closed 違反は、新しい連携先を追加するたびに増殖する `if/else` チェーンです。
+
+```typescript
+// Before: Provider を追加するたびにこの関数を編集する必要がある
+function calculateShipping(provider: string, weight: number): number {
+  if (provider === "fedex") return weight * 2.5;
+  if (provider === "ups") return weight * 2.3;
+  if (provider === "dhl") return weight * 2.8;
+  throw new Error("Unknown provider");
+}
+```
+
+Strategy Map を使えば、既存関数を「修正に閉じ」ながら「拡張には開いた」状態にできます。
+
+```typescript
+interface ShippingStrategy {
+  calculate(weight: number): number;
+}
+
+const shippingStrategies: Record<string, ShippingStrategy> = {
+  fedex: { calculate: (w) => w * 2.5 },
+  ups: { calculate: (w) => w * 2.3 },
+  dhl: { calculate: (w) => w * 2.8 },
+};
+
+function calculateShipping(provider: string, weight: number): number {
+  const strategy = shippingStrategies[provider];
+  if (!strategy) throw new Error("Unknown provider");
+  return strategy.calculate(weight);
+}
+```
+
+新しい配送業者の追加は、テスト済みの既存ロジックへの差分ではなく、新しいエントリの追加だけで済みます。
+
+## リスコフの置換原則：サブタイプは契約を守る
+
+これは TypeScript の構造的型付けでは検出できないため厄介です。コンパイルは通り、実行時に壊れます。
+
+```typescript
+class Rectangle {
+  constructor(protected width: number, protected height: number) {}
+  setWidth(w: number) { this.width = w; }
+  setHeight(h: number) { this.height = h; }
+  area() { return this.width * this.height; }
+}
+
+// 一見自然だが、契約を静かに破っている
+class Square extends Rectangle {
+  setWidth(w: number) { this.width = w; this.height = w; }
+  setHeight(h: number) { this.width = h; this.height = h; }
+}
+
+function testArea(r: Rectangle) {
+  r.setWidth(5);
+  r.setHeight(4);
+  console.assert(r.area() === 20); // Square では失敗する
+}
+```
+
+サブタイプが2つのフィールドを同期させるためにすべての Setter をオーバーライドしなければならないなら、それは基底クラスの振る舞い上のサブタイプではなく、基底クラスの Interface を借りた別概念です。この場合、継承としてモデル化するのをやめ、独立した実装を持つ共通 Interface に切り替えるのが適切な解決策です。
+
+## インターフェース分離の原則：使わないメソッドを強制しない
+
+肥大化した Interface は、実装者に不要なコードを書かせたり `NotImplementedError` を投げさせたりします。これは Interface が責任を持ちすぎているという強いシグナルです。
+
+```typescript
+// Before: すべての Worker がすべての機能を実装しなければならない
+interface Worker {
+  code(): void;
+  attendMeeting(): void;
+  fileTaxes(): void;
+}
+
+class RobotWorker implements Worker {
+  code() { /* ... */ }
+  attendMeeting() { throw new Error("Robots don't attend meetings"); }
+  fileTaxes() { throw new Error("Not applicable"); }
+}
+```
+
+機能ごとに分割し、該当するものだけを実装するようにします。
+
+```typescript
+interface Codeable { code(): void; }
+interface MeetingAttendee { attendMeeting(): void; }
+
+class RobotWorker implements Codeable {
+  code() { /* ... */ }
+}
+```
+
+## 依存性逆転の原則：抽象に依存し、具象クラスに依存しない
+
+最後の原則は、他の4つを実際にテスト可能にする土台です。依存関係を自前でインスタンス化する Service は、本物を起動しない限り Unit Test できません。
+
+```typescript
+// Before: 具象の Postgres Client に直接依存している
+class UserService {
+  private db = new PostgresClient(connectionString);
+  async getUser(id: string) {
+    return this.db.query("SELECT * FROM users WHERE id = $1", [id]);
+  }
+}
+
+// After: 抽象に依存し、境界で注入する
+interface UserRepository {
+  findById(id: string): Promise<User | null>;
+}
+
+class UserService {
+  constructor(private repo: UserRepository) {}
+  async getUser(id: string) {
+    return this.repo.findById(id);
+  }
+}
+```
+
+これで `UserService` は In-Memory の Fake で Test でき、Database の切り替えも Business Logic に影響しません。
+
+## webhani としての推奨事項
+
+- **SOLID は Code Review の視点として使い、リライトの義務にはしない**: 安定稼働中の Codebase に5原則すべてを一度に適用しようとすると、解消するリスクより増えるリスクの方が大きくなります。すでに手を入れているファイルから段階的に適用しましょう。
+- **AI が生成したコードにも同じ厳しさで臨む**: 生成コードは「この機能を動かす」というプロンプトのスコープで書かれることが多いため、単一責任・Open/Closed 違反を最も再現しやすい傾向があります。
+- **Test Suite が薄いなら依存性逆転を最優先にする**: レバレッジが最も大きい原則です。テストしにくいコードは、たいてい何よりもまず依存性逆転の問題を抱えています。
+- **実装が1つしかない場合に無理に Interface を作らない**: Interface Segregation と依存性逆転は手段であって、すべての Class に適用すべき要件ではありません。
+
+## まとめ
+
+SOLID そのものは変わっていませんが、それが機能する文脈は変わりました——より多くのコードがより速く書かれ、1行ごとの人間の注意は減っています。この5原則が今も有効なのは教条だからではなく、生成されたものであれ手書きであれ、本番 Codebase で繰り返し目にする具体的な失敗モードそれぞれに対応しているからです。構造的な問題が積み重なる前に見つけるための信頼できる手段として、今も価値を持っています。
