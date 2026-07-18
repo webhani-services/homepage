@@ -1,0 +1,84 @@
+---
+title: "Native OpenTelemetry Metrics in Amazon CloudWatch: A Practical Guide to PromQL Queries"
+description: "Amazon CloudWatch now ingests OpenTelemetry metrics natively and supports PromQL queries. Here's how to wire up a collector, what to watch for with cardinality-based pricing, and when it makes sense alongside an existing Prometheus stack."
+date: "2026-07-19"
+status: "published"
+tags: ["AWS", "CloudWatch", "OpenTelemetry", "Observability", "PromQL"]
+thumbnail: ""
+author: "webhani"
+slug: "cloudwatch-opentelemetry-metrics-promql-2026"
+---
+
+Amazon CloudWatch now natively ingests metrics over the OpenTelemetry Protocol (OTLP). It launched in public preview in April 2026 and reached general availability in June. Previously, getting OpenTelemetry-instrumented metrics into CloudWatch meant running a conversion layer through something like ADOT (AWS Distro for OpenTelemetry). That extra hop is now optional. This post covers what changed and how to think about adopting it.
+
+## What's actually new
+
+CloudWatch's metrics format used to be proprietary, so OpenTelemetry-based instrumentation required a translation step before it landed in CloudWatch. With native support, metrics instrumented via OTLP go straight in — no conversion layer required.
+
+Alongside that, a few other pieces shipped:
+
+- **PromQL querying** through a new console experience called Query Studio, for exploring metrics and building dashboards
+- **A high-cardinality metrics store** supporting up to 150 labels per metric
+- **Unified viewing with AWS vended metrics** — over 70 AWS services' existing metrics sit alongside your custom OpenTelemetry metrics in the same view
+- **Per-GB ingestion pricing** with 15 months of retention included
+
+## Wiring a collector to CloudWatch
+
+If you already run an OpenTelemetry Collector pipeline, adding CloudWatch as a destination is mostly an exporter config change.
+
+```yaml
+# otel-collector-config.yaml (excerpt)
+exporters:
+  otlphttp/cloudwatch:
+    endpoint: "https://otel.monitoring.<region>.amazonaws.com"
+    auth:
+      authenticator: sigv4auth
+
+extensions:
+  sigv4auth:
+    region: "<region>"
+    service: "aps" # signing for the CloudWatch OTLP endpoint
+
+service:
+  extensions: [sigv4auth]
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/cloudwatch]
+```
+
+Authentication runs through IAM SigV4 signing, which means you can manage access with the same IAM policies you already use elsewhere in AWS — no separate API key to rotate and secure.
+
+## Where PromQL actually helps
+
+Because Query Studio speaks PromQL, alert rules and dashboard queries you already maintain in a Prometheus/Grafana setup carry over almost unchanged.
+
+```promql
+# error rate over the last 5 minutes (illustrative)
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+  /
+sum(rate(http_requests_total[5m]))
+```
+
+For teams already running self-managed Prometheus, that compatibility is the real draw. That said, deciding to fully replace an existing Prometheus setup deserves caution — if you depend on surrounding tooling like Alertmanager, migration cost isn't just about query compatibility.
+
+## Cardinality and cost design
+
+The high-cardinality metrics store is convenient, but label count and time-series count drive the bill directly. Instrumenting too liberally toward that 150-label ceiling can produce cost surprises you didn't plan for. Before rolling this out broadly:
+
+- Sort out which labels are genuinely required per metric versus which were added for one-off debugging
+- Check for high-cardinality values like user IDs or request IDs leaking into labels
+- Re-run your cost estimate against post-GA pricing — preview usage was free, GA usage isn't
+
+## webhani's take
+
+For teams already running Prometheus + Grafana, the realistic starting point isn't "migrate" — it's "run both side by side."
+
+1. **Pilot OTLP-to-CloudWatch on a new service or module first**, so you can evaluate it without touching your existing monitoring stack.
+2. **Roll it out more broadly where the unified view actually pays off** — cross-service incident investigation is a strong candidate, since AWS vended metrics and your own metrics sit in one place.
+3. **Review your cardinality design before instrumenting, not after.** Trimming labels later means re-instrumenting, and that's expensive.
+
+Regional availability is still limited, so confirm your target systems actually sit in a supported region before committing.
+
+webhani helps teams design and migrate observability infrastructure on AWS. If you're weighing a staged migration off a self-managed Prometheus setup, reach out.

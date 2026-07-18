@@ -1,0 +1,84 @@
+---
+title: "Amazon CloudWatch の Native OpenTelemetry Metrics で PromQL を使う"
+description: "Amazon CloudWatch が Native 対応した OpenTelemetry Metrics と PromQL Query の実務での使いどころを整理します。自前 Prometheus 運用からの移行判断や、Cardinality に伴うコスト設計まで解説します。"
+date: "2026-07-19"
+status: "published"
+tags: ["AWS", "CloudWatch", "OpenTelemetry", "監視", "PromQL"]
+thumbnail: ""
+author: "webhani"
+slug: "cloudwatch-opentelemetry-metrics-promql-2026"
+---
+
+Amazon CloudWatch が OpenTelemetry Protocol（OTLP）による Metrics の Native 取り込みに対応しました。2026年4月に Public Preview として発表され、6月には General Availability に到達しています。これまで CloudWatch に OpenTelemetry の Metrics を送るには変換 Layer や追加の Agent が必要でしたが、今回の対応でその手間がなくなりました。本記事では、何が変わったのかと、実務での導入判断のポイントを整理します。
+
+## 何が変わったのか
+
+これまでの CloudWatch は独自の Metrics 形式が前提で、OpenTelemetry ベースの計装を使う場合は ADOT（AWS Distro for OpenTelemetry）などを介して形式変換する必要がありました。今回の Native 対応により、OTLP で計装した Metrics をそのまま CloudWatch に送信でき、変換 Layer が不要になります。
+
+合わせて次の機能が追加されています。
+
+- **PromQL による Query**: Query Studio という新しい Console 画面で PromQL を直接書いて Metrics を探索・Dashboard 化できる
+- **High Cardinality 対応**: 1 Metrics あたり最大 150 個の Label をサポートする専用 Metrics Store
+- **AWS Vended Metrics との統合**: 70 以上の AWS Service が提供する既存 Metrics と、自前の OpenTelemetry Metrics を同じ画面で横断的に見られる
+- **課金体系**: GB 単位の取り込み Pricing で、15 か月分の保持期間が含まれる
+
+## OTel Collector からの送信例
+
+既存の OpenTelemetry Collector Pipeline があれば、Exporter の設定を変更するだけで CloudWatch への送信を追加できます。
+
+```yaml
+# otel-collector-config.yaml（抜粋）
+exporters:
+  otlphttp/cloudwatch:
+    endpoint: "https://otel.monitoring.<region>.amazonaws.com"
+    auth:
+      authenticator: sigv4auth
+
+extensions:
+  sigv4auth:
+    region: "<region>"
+    service: "aps" # CloudWatch OTLP エンドポイント向けの署名
+
+service:
+  extensions: [sigv4auth]
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/cloudwatch]
+```
+
+認証には IAM の SigV4 署名を使うため、既存の AWS 権限管理の枠組みでそのまま Access 制御ができる点が実務上のメリットです。API Key の別管理が不要になります。
+
+## PromQL の実務的な使いどころ
+
+Query Studio で PromQL を書けるようになったことで、すでに Prometheus / Grafana で運用している Alert Rule や Dashboard の Query をほぼそのまま CloudWatch 側でも再利用できます。
+
+```promql
+# 直近5分間の Error Rate（概念例）
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+  /
+sum(rate(http_requests_total[5m]))
+```
+
+自前で Prometheus を運用している Team にとっては、この互換性が最大の魅力です。ただし、既存の Prometheus 環境を完全に置き換えるかどうかは慎重に判断すべきです。特に Alertmanager のような周辺 Ecosystem に依存している場合、移行コストが Query の互換性だけでは測れません。
+
+## Cardinality とコスト設計
+
+High Cardinality Metrics Store は便利な反面、Label 数と Time Series 数が課金に直結する設計です。150 Label という上限に近づくような計装をむやみに広げると、想定外のコスト増につながります。導入時には次を確認しておくべきです。
+
+- 各 Metrics にどの Label が必須で、どれが Debug 用の一時的なものかを整理する
+- User ID や Request ID のような高 Cardinality な値を Label に含めていないか確認する
+- Preview 期間中は無料でも、GA 後の課金体系でコスト試算をやり直す
+
+## webhani の視点
+
+自前で Prometheus + Grafana を運用しているチームにとって、今回の CloudWatch Native OpenTelemetry Metrics は「移行」ではなく「併用」から検討するのが現実的です。
+
+1. まず **新規の Service やモジュール単位で CloudWatch への OTLP 送信を試す**。既存の監視基盤を壊さずに評価できる
+2. AWS Vended Metrics と自前 Metrics を **一画面で横断できるメリットが大きい領域**（マルチ Service 障害調査など）から本格導入する
+3. **Cardinality 設計のレビューを Pipeline 導入時点で必ず行う**。後から Label を絞るのは計装のやり直しになりコストが高い
+
+対応 Region はまだ限定的なため、対象システムが対応 Region 内にあるかも事前に確認してください。
+
+webhani では AWS を中心とした監視基盤の設計・移行を支援しています。既存の Prometheus 運用からの段階的な移行を検討している場合はご相談ください。
