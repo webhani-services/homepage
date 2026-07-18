@@ -1,0 +1,78 @@
+---
+title: "Migrating to Grafana's Kubernetes Monitoring Helm Chart v4: The List-to-Map Rewrite"
+description: "Grafana Labs' k8s-monitoring-helm chart v4 is its biggest update yet. Here's why destinations and collectors moved from lists to maps, what telemetryServices changes, and how to migrate safely under GitOps."
+date: "2026-07-19"
+status: "published"
+tags: ["Kubernetes", "Grafana", "Helm", "Observability", "GitOps"]
+thumbnail: ""
+author: "webhani"
+slug: "grafana-kubernetes-monitoring-helm-chart-v4-2026"
+---
+
+Grafana Labs shipped v4 of its `k8s-monitoring-helm` chart — the standard way to ship metrics, logs, traces, and profiles from a Kubernetes cluster into Grafana Cloud or a self-hosted Grafana stack. Grafana Labs describes it as the biggest update the chart has ever received, representing roughly six months of work. This isn't a feature bump; it's a structural fix for configuration problems that surfaced at scale. Here's what changed and what to watch for during migration.
+
+## The list-to-map rewrite
+
+The most consequential change in v4 is that `destinations` and `collectors` moved from lists to maps — objects keyed by name.
+
+```yaml
+# v3 (list format)
+destinations:
+  - name: grafana-cloud-metrics
+    type: prometheus
+    url: https://prometheus-example.grafana.net/api/prom/push
+  - name: grafana-cloud-logs
+    type: loki
+    url: https://logs-example.grafana.net/loki/api/v1/push
+```
+
+```yaml
+# v4 (map format)
+destinations:
+  grafana-cloud-metrics:
+    type: prometheus
+    url: https://prometheus-example.grafana.net/api/prom/push
+  grafana-cloud-logs:
+    type: loki
+    url: https://logs-example.grafana.net/loki/api/v1/push
+```
+
+List-based config is order-dependent, and an unintended addition further down the list could silently break an existing entry. That's an especially nasty failure mode in GitOps pipelines — Argo CD, Terraform, Flux — where `values.yaml` is often generated or merged mechanically. Because maps reference entries by name, ordering stops mattering, and references become stable.
+
+## telemetryServices: no more surprise duplicate deployments
+
+In v3, backing components like Node Exporter and kube-state-metrics could get deployed implicitly through a combination of flags, sometimes resulting in unintended duplicate deployments. v4 makes this explicit via a `telemetryServices` key.
+
+```yaml
+# v4: explicitly declare which components are enabled
+telemetryServices:
+  nodeExporter:
+    enabled: true
+  kubeStateMetrics:
+    enabled: true
+```
+
+Being able to see exactly what's running just by reading `values.yaml` is a modest but real improvement in operational transparency.
+
+## Split metrics features and a changed log pipeline
+
+Cluster metrics are now split into three independent features: `clusterMetrics`, `hostMetrics`, and `costMetrics`. You can enable exactly what you need, which helps control both ingestion cost and the load on Alloy.
+
+The log pipeline also changed — instead of bulk label allocation, it now requires explicit label promotion. That reduces Alloy's memory footprint, particularly noticeable at larger scale.
+
+## How to approach the migration
+
+Grafana Labs provides a migration tool that converts a v3 `values.yaml` into a v4-compatible one. That said, a mechanical conversion alone doesn't guarantee a safe migration. We recommend this sequence:
+
+1. **Validate on a staging cluster first.** Don't apply a converted v4 `values.yaml` directly to production.
+2. **Review the migration tool's output by hand**, specifically checking for missing explicit declarations under `telemetryServices`.
+3. **Confirm existing dashboards and alert rules still reference the metrics you expect.** With metrics features now split apart, something that was collected implicitly before may now be disabled.
+4. **If you run this through GitOps, expect diffs to look different** under the map format, and adjust your review process expectations accordingly.
+
+## webhani's take
+
+This release is less about new capability and more about a rebuild toward a structure that's harder to break silently. Teams that auto-generate or merge `values.yaml` through GitOps stand to benefit the most from moving off the list format's failure modes.
+
+That said, the breaking-change surface is wide enough that upgrading from v3 shouldn't be treated as a routine minor-version bump — plan it as its own migration effort. Newly split features like cost metrics are easy to miss enabling, and the failure mode is quiet: numbers you used to see simply stop showing up. Put that explicitly on your migration checklist rather than assuming it carries over.
+
+webhani helps teams design Kubernetes monitoring infrastructure and manage Helm chart major-version migrations as part of broader operational improvements. Reach out if you're reviewing your current monitoring setup.

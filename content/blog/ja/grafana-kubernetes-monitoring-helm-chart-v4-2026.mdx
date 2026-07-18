@@ -1,0 +1,78 @@
+---
+title: "Grafana Kubernetes Monitoring Helm Chart v4 移行ガイド — List から Map への構造変更"
+description: "Grafana の k8s-monitoring-helm Chart v4 は史上最大級のアップデートです。Destination / Collector が List から Map 形式に変わった背景と、GitOps 運用での移行時の注意点を整理します。"
+date: "2026-07-19"
+status: "published"
+tags: ["Kubernetes", "Grafana", "Helm", "監視", "GitOps"]
+thumbnail: ""
+author: "webhani"
+slug: "grafana-kubernetes-monitoring-helm-chart-v4-2026"
+---
+
+Grafana Labs が公開している `k8s-monitoring-helm` Chart の v4 が公開されました。Metrics・Log・Trace・Profile を Kubernetes Cluster から Grafana Cloud（あるいは自前の Grafana 環境）へ送る定番 Chart で、今回の v4 は約半年をかけた、これまでで最大規模の Update と説明されています。単なる機能追加ではなく、大規模運用で顕在化していた設定上の問題を構造的に解決する内容です。本記事では主要な変更点と、移行時に押さえるべきポイントを整理します。
+
+## List から Map への構造変更
+
+v4 で最も影響が大きいのは、`destinations` と `collectors` の定義が List から Map（名前をキーとした Object）に変わったことです。
+
+```yaml
+# v3（List 形式）
+destinations:
+  - name: grafana-cloud-metrics
+    type: prometheus
+    url: https://prometheus-example.grafana.net/api/prom/push
+  - name: grafana-cloud-logs
+    type: loki
+    url: https://logs-example.grafana.net/loki/api/v1/push
+```
+
+```yaml
+# v4（Map 形式）
+destinations:
+  grafana-cloud-metrics:
+    type: prometheus
+    url: https://prometheus-example.grafana.net/api/prom/push
+  grafana-cloud-logs:
+    type: loki
+    url: https://logs-example.grafana.net/loki/api/v1/push
+```
+
+List 形式では、順序への依存や、意図しない要素追加によって既存の設定が静かに壊れることがありました。特に Argo CD や Terraform、Flux などの GitOps Pipeline で `values.yaml` を機械的に生成・Merge している場合、この「気づきにくい壊れ方」がインシデントの温床になっていました。Map 形式では名前をキーとした参照になるため、順序に依存しない安定した参照が可能になります。
+
+## telemetryServices — 重複デプロイの防止
+
+v3 では Node Exporter や kube-state-metrics のような周辺 Component が、複数の設定 Flag の組み合わせによって暗黙的にデプロイされることがあり、意図せず重複してデプロイされるケースがありました。v4 では `telemetryServices` という Key で明示的に指定する方式に変わっています。
+
+```yaml
+# v4: 明示的に有効化する Component を指定
+telemetryServices:
+  nodeExporter:
+    enabled: true
+  kubeStateMetrics:
+    enabled: true
+```
+
+「何が動いているか」が `values.yaml` を見るだけで分かるようになる点は、運用の透明性という意味で地味ながら重要な改善です。
+
+## Metrics 機能の分離とログ Pipeline の変更
+
+v4 では Cluster Metrics が `clusterMetrics` / `hostMetrics` / `costMetrics` の3つの独立した機能に分割されました。必要な Metrics だけを個別に有効化できるため、不要な収集によるコストや Alloy の負荷を抑えやすくなっています。
+
+さらに Log Pipeline では、これまでの一括的な Label 付与から、明示的な Label Promotion を要求する方式に変わりました。これにより Alloy のメモリ使用量が抑えられます。
+
+## 移行時の進め方
+
+Grafana Labs は v3 の `values.yaml` を v4 互換の形式に変換する Migration Tool を提供しています。とはいえ、機械的な変換だけで安全に移行できるとは限りません。webhani では次の手順を推奨しています。
+
+1. **Staging Cluster で先に検証する**。本番 Cluster にいきなり v4 の `values.yaml` を適用しない
+2. Migration Tool の出力を **手動でレビューし、特に `telemetryServices` の明示指定漏れがないか確認する**
+3. 移行後、既存の **Dashboard・Alert Rule が期待通りの Metrics を参照できているか確認する**。Metrics 機能の分離により、これまで暗黙的に収集されていた Metrics が無効化されている可能性がある
+4. GitOps Pipeline を使っている場合は、**Map 形式への変更で Diff の見え方が変わる**ため、Review Process 側の想定も更新しておく
+
+## webhani の視点
+
+今回の v4 は、機能追加よりも「壊れにくい構造への作り直し」に主眼が置かれています。特に GitOps で `values.yaml` を自動生成・Merge している Team ほど、List 形式に起因する静かな設定崩れの恩恵を受けやすいはずです。
+
+一方で、Breaking Change の範囲が広いため、v3 からのアップグレードは Minor Version の延長として扱わず、独立した Migration 作業として計画することをお勧めします。特に Cost Metrics のような新しい分離 Feature は、有効化を忘れると「これまで見えていた数字が見えなくなる」形で気づかれることが多く、移行 Checklist に明示的に含めておくべきです。
+
+webhani では Kubernetes Cluster の監視基盤設計や、Helm Chart の Major Version 移行を含む運用改善を支援しています。既存の監視構成の見直しを検討している場合はご相談ください。
