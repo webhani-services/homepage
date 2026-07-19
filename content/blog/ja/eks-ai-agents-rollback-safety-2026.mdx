@@ -1,0 +1,196 @@
+---
+title: "Amazon EKS の AI エージェント自動修復と版戻しで、Kubernetes 運用の安全性を高める"
+description: "AI エージェントによる EKS クラスタの自動診断・修復機能と、7 日以内の version rollback サポートの使い分けを整理します。人間の承認ゲートの配置と governance の考え方も合わせて解説します。"
+date: "2026-07-20"
+status: "published"
+tags: ["AWS", "EKS", "Kubernetes", "DevOps", "AI Agents"]
+thumbnail: ""
+author: "webhani"
+slug: "eks-ai-agents-rollback-safety-2026"
+---
+
+Kubernetes 運用の課題は、cluster の状態変化を継続的に監視し、トラブルを迅速に検出・対応することにあります。AWS が 2026 年 7 月に提供し始めた二つの機能――AI エージェントによる自動修復（self-healing）と、EKS cluster の version rollback サポート――は、この負担を軽減する仕組みです。ただし、特に AI による自動修復は、人間の承認ゲートをどこに配置するかという governance の問題が不可欠です。本記事では、二つの機能の動作原理、実装時の考慮点、そして webhani の立場から見た operational safety の設計方針を整理します。
+
+## Amazon EKS の AI エージェント：自動診断と修復の仕組み
+
+EKS cluster で Pod が CrashLoopBackOff に陥ったり、Worker Node がメモリ不足で Ready でなくなったりした場合、従来は運用チームが alert を受けて手作業で対応していました。新しい AI エージェント機能は、cluster event を監視し、問題の根本原因を特定し、修復案を提案（またはこれを自動実行）します。
+
+エージェントは以下の流れで動作します。
+
+1. **診断フェーズ**：cluster の event、metrics、describe 情報から問題を収集
+2. **推論フェーズ**：LLM が根本原因を推定（例：image pull backoff の場合、registry credential の欠落 or image tag の誤記）
+3. **提案フェーズ**：remediation step を提示（例：ImagePullSecret の追加、deployment の再適用）
+4. **実行フェーズ**（設定時）：承認ゲートなしに自動修復を実行、またはユーザーの明示的な承認を待機
+
+EKS console 上で `enableAIRemediationAgent` という flag を true に設定すると、cluster に付属する IAM role に AmazonEKSAIRemediationAgentPolicy という managed policy が自動 attach されます。ただし、このままでは agent が too broad な権限を持つため、実際の production 環境では custom policy で限定する必要があります。
+
+```
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DiagnoseClusterState",
+      "Effect": "Allow",
+      "Action": [
+        "eks:DescribeCluster",
+        "eks:ListNodegroups",
+        "eks:DescribeNodegroup",
+        "ec2:DescribeInstances",
+        "ec2:DescribeSecurityGroups",
+        "cloudwatch:GetMetricStatistics"
+      ],
+      "Resource": [
+        "arn:aws:eks:ap-northeast-1:123456789012:cluster/prod-cluster"
+      ]
+    },
+    {
+      "Sid": "AutoRemediateReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "logs:GetLogEvents",
+        "logs:DescribeLogStreams"
+      ],
+      "Resource": [
+        "arn:aws:logs:ap-northeast-1:123456789012:log-group:/aws/eks/prod-cluster/*"
+      ]
+    },
+    {
+      "Sid": "ApplyRemediations",
+      "Effect": "Allow",
+      "Action": [
+        "eks-auth:AssumeRoleForPodIdentity"
+      ],
+      "Resource": [
+        "arn:aws:iam::123456789012:role/eks-ai-remediation-role"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-northeast-1"
+        }
+      }
+    }
+  ]
+}
+```
+
+この policy では、remediation を実行するために別途 IAM role を assume する仕組みにしています。これにより、実際の kubectl apply や secret 更新は、より限定的な権限を持つ role 配下でのみ実行される構造です。
+
+## 承認ゲートの配置戦略
+
+webhani が consulting で関わる cluster では、以下の三段階の承認モデルを推奨しています。
+
+**Level 1：Automatic（自動修復）**
+- 症状：Pod の graceful restart
+- 原因：一時的なネットワーク断や OOM でない Pod eviction
+- 修復内容：Pod の強制削除（kubelet が新しい Pod を起動）
+- ゲート不要な理由：数分以内に復帰でき、business impact が最小限
+
+**Level 2：Approval Required（承認待ち）**
+- 症状：deployment の replica 調整、SecurityGroup rule 追加
+- 原因：リソース不足、network policy の過度な制限
+- 修復内容：HPA の min replica 引き上げ、node group の scale up
+- ゲート必須な理由：cost implication、cluster 全体への波及効果
+
+**Level 3：Manual Intervention（手作業）**
+- 症状：control plane の health 低下、etcd storage の逼迫
+- 原因：plan mismatch、破壊的な upgrade attempt
+- 修復内容：cluster upgrade の rollback、PV の resize
+- ゲート必須な理由：blast radius が大きく、取り消し困難
+
+承認ゲートが必要な修復については、EKS console もしくは AWS API 経由で review → 承認 workflow を実装します。
+
+```bash
+# 承認待ち中の remediation 一覧を確認
+aws eks list-ai-remediation-suggestions \
+  --cluster-name prod-cluster \
+  --region ap-northeast-1 \
+  --query 'suggestions[?status==`PENDING_APPROVAL`]'
+
+# 特定の remediation を承認
+aws eks approve-ai-remediation-suggestion \
+  --cluster-name prod-cluster \
+  --remediation-id suggestion-abc123 \
+  --region ap-northeast-1
+```
+
+approval workflow を fully automated にしたい場合、Lambda で CloudWatch Events をトリガーし、auto-approve 条件（例：cost tag が "ephemeral" の deployment など）を定義することも可能です。ただし webhani の経験では、最初は manual approval のみとし、3 ヶ月間の統計から「false positive がない修復タイプ」のみを段階的に自動化するアプローチが安全です。
+
+## Kubernetes Version Rollback：cluster upgrade の安全弁
+
+EKS cluster の Kubernetes version upgrade は、一度実行すると 7 日間の rollback window が自動で開かれます。この window 内であれば、upgrade を reverse する操作が提供され、full cluster rebuild なしに旧 version に戻せます。
+
+従来は upgrade failed 時に cluster 全体の destruction と recreation が必要でした。2026 年の rollback 機能により、以下のような場面で時間を短縮できます。
+
+- 新 version で未検出の incompatibility が production で発覚
+- upgrade 後の workload が specific version の bug に hit
+- networking change（例：CNI update）が environmental issue を引き起こす
+
+rollback は以下の flow で実行します。
+
+```bash
+# 1. upgrade 状態を確認
+aws eks describe-cluster \
+  --name prod-cluster \
+  --query 'cluster.{Version:version,Status:status}' \
+  --region ap-northeast-1
+
+# 2. upgrade 前後で利用可能な version を確認
+aws eks describe-cluster \
+  --name prod-cluster \
+  --query 'cluster.platformVersion' \
+  --region ap-northeast-1
+
+# 3. 7 日以内であれば rollback を実行
+aws eks rollback-cluster-version \
+  --cluster-name prod-cluster \
+  --region ap-northeast-1
+```
+
+rollback は control plane と data plane を sequential に reverse するため、notification を cluster users に送信し、workload の temporarily disruption を事前に周知することが重要です。typical duration は 15 ～ 30 分です。
+
+## Operational Governance：自動修復と人間の監視のバランス
+
+webhani が infrastructure consulting を行う中で認識していることは、AI による自動修復と人間による verification のバランスが、production safety を左右するということです。以下の三点を設計段階で整理する必要があります。
+
+**1. Blast Radius の明示**
+
+修復が影響を及ぼす範囲を明確にします。例えば、SecurityGroup rule を自動追加する修復は、cluster 全体の egress に影響するため、audit trail の記録と事後の security team による review を mandatory にします。
+
+**2. Audit Trail と Reversibility**
+
+すべての自動修復は CloudTrail に記録されるべきです。加えて、修復が reversible であるかを判定します。Pod restart は reversible ですが、PVC の delete は often irreversible です。irreversible な操作は Level 3（manual intervention）に分類します。
+
+**3. Cost と Performance への影響評価**
+
+node group の autoscale や resource request の自動調整は、cluster の monthly cost に直結します。修復案の実行前に cost estimation を LLM に generate させ、上限金額を超える場合は必ず human approval を要求する conditional logic を組み込みます。
+
+## 実装時の Best Practices
+
+### AI Agent と Rollback を併用するクラスタ設計
+
+- **staging cluster** では AI agent の自動修復を full enable にし、false positive rate を測定する期間を設ける
+- **production cluster** では Level 2（approval required）以上をデフォルト設定とし、6 ヶ月後の統計から safe な修復のみ Level 1 に promote
+- **disaster recovery** を意識し、rollback window（7 日）内に確認テストを完了できるスケジュールを定める
+
+### CloudWatch Alarms との連携
+
+AI agent の remediation attempt が頻繁に行われるケースは、cluster の root issue（例：insufficient resource allocation）の signal です。このような場合、auto-remediate ではなく alert を escalate し、architecture review を trigger する logic を組み込みます。
+
+```bash
+# remediation attempt の increase を検出する metric
+aws cloudwatch put-metric-alarm \
+  --alarm-name eks-high-remediation-rate \
+  --metric-name RemediationAttemptCount \
+  --namespace AWS/EKS \
+  --statistic Sum \
+  --period 3600 \
+  --threshold 10 \
+  --comparison-operator GreaterThanThreshold \
+  --alarm-actions arn:aws:sns:ap-northeast-1:123456789012:ops-team
+```
+
+## まとめ
+
+Amazon EKS の AI agent 機能と version rollback support は、Kubernetes 運用の defensive layer を強化します。ただし「AI が自動修復する = 完全に信頼できる」というのは誤解です。webhani の経験では、self-healing を安全に導入するには、人間の governance ——具体的には approval gate の段階的な configuration と audit trail の継続的な review—— が不可欠です。
+
+新しい機能を採用する際は、必ず staging 環境で false positive と false negative の rate を測定し、business に acceptable な threshold を定めてから production に promote することを推奨します。
