@@ -1,0 +1,156 @@
+---
+title: "CI パイプラインにおける実規模 PostgreSQL データベースの thin clone テスト"
+description: "Copy-on-write thin cloning を使用して、GitHub Actions 内で秒単位の本番規模データベース複製を実現し、現実的な query plan での migration・integration テストを効率化する手法を解説します。"
+date: "2026-07-20"
+status: "published"
+tags: ["PostgreSQL", "Testing", "CI/CD", "GitHub Actions", "Database"]
+thumbnail: ""
+author: "webhani"
+slug: "postgres-thin-clone-ci-testing-2026"
+---
+
+CI パイプラインでのデータベーステストには古くからのジレンマがあります。シード済みの小さなフィクスチャデータベースを使えば実行は高速ですが、本番環境の query plan や index の挙動を完全には再現できません。一方で本番スナップショスト全体を復元すれば現実的なデータ分布が得られる代わり、毎回の復元に数分〜数十分を要し、CI の総実行時間が膨張します。
+
+Copy-on-write thin cloning はこのジレンマを実質的に解決する技術パターンです。本記事では、GitHub Actions との統合例を示しながら、この手法がなぜ migration テストと integration テストの質を改善するのかを整理します。
+
+## フィクスチャだけでは見逃すもの
+
+一般的な小規模フィクスチャテストの限界を具体的に見てみましょう。例えば、次のようなシナリオです。
+
+```sql
+-- 本番環境では users テーブルが 5000 万行
+-- 通常の SELECT には問題がないが、
+-- ある index の削除判定が誤っていた場合、
+-- シーディングされた 100 行のテストでは絶対に検出されない
+
+-- 本番での query plan（フルスキャン検出可能）
+EXPLAIN ANALYZE SELECT * FROM users WHERE region = ? AND status = ? AND created_at > ?;
+```
+
+フィクスチャデータベースでは、このような「スケール固有」の問題が隠れたままになります。また migration 実行時のロック時間、テーブルスキャンの遅延、connection pool の消費パターンなども、小規模データでは異なる挙動を示します。
+
+本番スナップショストから復元すれば確実ですが、300 GB のデータベースをテストのたびに復元していては、CI 時間は実用的ではなくなります。
+
+## Thin cloning の仕組みと利点
+
+Copy-on-write thin cloning は、基盤ブロックストレージの機能を活用します。大まかには次のようなメカニズムです。
+
+1. **初期スナップショスト**: 本番データベースの読み取り専用スナップショスト（メタデータ）を作成。この時点では物理的な複製は行われない。
+2. **分岐**: CI ジョブが本スナップショストから「クローン」を生成。新しいクローンは元のスナップショストのデータブロックを参照。
+3. **Copy-on-Write**: クローンがデータを書き込むときだけ、影響範囲のブロックを複製し、新しいコピーに変更を加える。読み込み専用のブロックは共有のままで、メモリとストレージを節約。
+4. **破棄**: CI ジョブ終了後、クローンを削除。元のスナップショストは影響を受けない。
+
+このパターンにより、本番規模の SQL database を数秒で個別にプロビジョニングできます。migration の実行、integration テストのデータ準備、複数の並行テストジョブが全て独立した環境を得られます。
+
+## GitHub Actions での実装例
+
+以下は、thin cloning を使用した実用的な GitHub Actions ワークフローの例です。実際の環境に合わせてカスタマイズしてください。
+
+```yaml
+name: Database Migration & Integration Tests
+
+on:
+  pull_request:
+    paths:
+      - 'migrations/**'
+      - 'src/db/**'
+      - '.github/workflows/ci-db.yml'
+
+jobs:
+  test-with-thin-clone:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install psycopg2-binary alembic pytest
+
+      - name: Provision thin-cloned database
+        env:
+          DB_SNAPSHOT_ID: ${{ secrets.PROD_DB_SNAPSHOT_ID }}
+          CLONE_ID: ci-test-${{ github.run_id }}-${{ github.run_attempt }}
+          DB_HOST: postgres.internal.example.com
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          # psql を使用してスナップショストからクローンを生成
+          # （実際の CLI は使用する clone engine に依存）
+          psql -h "$DB_HOST" -U postgres <<EOF
+          SELECT create_thin_clone(
+            snapshot_id => '$DB_SNAPSHOT_ID',
+            clone_id => '$CLONE_ID'
+          );
+          EOF
+          # クローンの接続情報を環境変数に設定
+          echo "TEST_DB_HOST=$(echo $CLONE_ID | sed 's/-/./g').postgres.internal.example.com" >> $GITHUB_ENV
+
+      - name: Run database migrations
+        env:
+          SQLALCHEMY_DATABASE_URL: postgresql://postgres:${{ secrets.DB_PASSWORD }}@${{ env.TEST_DB_HOST }}/postgres
+        run: |
+          alembic upgrade head
+
+      - name: Run integration tests
+        env:
+          SQLALCHEMY_DATABASE_URL: postgresql://postgres:${{ secrets.DB_PASSWORD }}@${{ env.TEST_DB_HOST }}/postgres
+        run: |
+          pytest tests/integration/ -v --tb=short
+
+      - name: Clean up thin clone
+        if: always()
+        env:
+          DB_HOST: postgres.internal.example.com
+          CLONE_ID: ci-test-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          psql -h "$DB_HOST" -U postgres <<EOF
+          SELECT drop_thin_clone(
+            clone_id => '$CLONE_ID'
+          );
+          EOF
+```
+
+このワークフローは：
+
+- **プロビジョニング**: スナップショストから seconds で クローン生成
+- **独立性**: 各 CI ジョブが独自の書き込み可能なデータベース環境を得る
+- **クリーンアップ**: テスト終了後に自動破棄
+
+複数の並行ジョブが同じスナップショストから独立したクローンを派生させられるため、CI の総実行時間が格段に短縮されます。
+
+## 実運用での検討事項
+
+### PII マスキングと本番データの取り扱い
+
+本番スナップショストをそのまま CI に使用する場合、顧客メールアドレスや個人情報がテストログに露出するリスクがあります。対策は二つあります。
+
+1. **事前マスキング**: 本番スナップショストを作成する際に、PII カラムを hash または anonymize する。スナップショストは一度作成したら再利用できるため、マスキング処理は初回のみ。
+2. **環境分離**: 開発環境用の本番規模ダミーデータベーススナップショストを用意。顧客データの代わりに生成データを使用。
+
+webhani では、本番データへの直接アクセスを避けるため、後者のアプローチを推奨しています。テストの信頼性は本番規模のデータ分布にあり、実際の顧客データの詳細内容には依存しません。
+
+### コストと実行時間のバランス
+
+Thin cloning はストレージコストと実行時間を劇的に改善しますが、導入前には次の点を確認してください。
+
+- **ストレージ容量**: スナップショストと各テストの delta 書き込み分が必要。100 GB スナップショストで 50 個の並行 clone が各 1 GB delta を書き込むなら、150 GB のストレージが一時的に必要。
+- **スナップショスト更新頻度**: 本番スキーマが頻繁に変わる場合、スナップショストも定期更新が必要。週 1 回程度が実用的。
+- **回収**: 古いクローンが残存しないよう、CI システムのクリーンアップロジックを確実に実装すること。
+
+小規模チームでフィクスチャテストが十分に機能している場合は、導入コストが見合わないかもしれません。導入価値が高いのは、次のような組織です。
+
+- migration テストの失敗が本番に影響したことがある
+- integration テスト失敗による本番検出が定期的に発生している
+- データ規模が GB オーダー以上で増加傾向にある
+
+## まとめ
+
+Copy-on-write thin cloning は、CI パイプラインでの database テスト品質と実行速度の両立を可能にする実用的なパターンです。本番規模のデータを秒単位でプロビジョニングでき、各テストジョブが独立した環境を保証します。
+
+フィクスチャだけでは見逃すスケール依存の bugs を早期に検出でき、migration 実行時のロックタイムアウトなども CI 段階で検証できます。
+
+導入には初期投資が必要ですが、database 関連の本番インシデント削減、developer の confidence 向上、そして CI 実行時間の最適化という複数の効果が期待できます。webhani の多くのプロジェクトでも段階的に導入を進めています。
