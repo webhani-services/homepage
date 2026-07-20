@@ -1,0 +1,84 @@
+---
+title: "actions/checkout v7, 기본값부터 안전하게 — pull_request_target Workflow 재점검이 필요합니다"
+description: "GitHub Actions의 actions/checkout v7은 pull_request_target에서 Fork PR의 위험한 취득을 기본값으로 거부합니다. 안전한 CI/CD Workflow 작성법을 정리합니다."
+date: "2026-07-21"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "보안", "DevOps", "공급망 보안"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-checkout-v7-secure-by-default"
+---
+
+## checkout v7의 변경 사항
+
+GitHub는 2026년 7월 `actions/checkout` v7을 출시했습니다. 가장 큰 변화는 `pull_request_target`이나 `workflow_run` Event로 실행된 Workflow가 Fork PR의 Head(Fork Repository 쪽의 최신 Commit)를 가져오려 할 때, 기본값으로 실패하도록 바뀐 점입니다.
+
+이 변경의 배경에는 2026년 7월 14일 발생한 AsyncAPI 공격이 있습니다. Microsoft Threat Intelligence의 분석 결과, 이 공격이 `pull_request_target`을 이용한 "pwn request" 패턴에서 비롯된 것으로 확인되었습니다. GitHub는 동일한 유형의 공격을 구조적으로 막기 위해 checkout Action 단에서 기본 동작 자체를 안전한 방향으로 바꾸는 대응을 택했습니다.
+
+비슷한 시기에 Self-hosted Runner의 최소 Version 강제도 재개되어, 2026년 7월과 9월에 강제 시행 기한이 설정되었습니다. CI/CD의 안전성을 Tool 쪽 판단에만 맡기지 않고 운영 차원에서도 조이는 흐름이 뚜렷해지고 있습니다.
+
+## pwn request란 무엇인가
+
+`pull_request_target` Event는 `pull_request` Event와 달리 Base Repository의 권한(Secret 접근 포함)으로 Workflow를 실행합니다. Fork에서 온 PR에 대해서도 Review용 Comment 작성이나 Deploy 준비를 하고 싶을 때 유용한 설계입니다.
+
+하지만 이 Workflow가 부주의하게 Fork 쪽 코드를 Checkout해서 실행해버리면, 공격자는 PR 내용에 악성 코드를 심기만 해도 Base Repository의 권한과 Secret을 이용해 해당 코드를 실행시킬 수 있습니다. 이것이 "pwn request"라고 불리는 공격 패턴입니다.
+
+위험한 구성의 전형적인 예는 다음과 같은 Workflow입니다.
+
+```yaml
+on: pull_request_target
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: npm install && npm test  # 이 시점에 Fork 쪽 코드가 권한을 가진 채 실행됨
+```
+
+`ref`에 Fork PR의 Head SHA를 지정해 Checkout한 뒤 `npm install`이나 `npm test`처럼 Repository 내 Script를 실행하면, Fork 쪽이 심어둔 `package.json`의 Script나 Test 코드가 Base Repository의 권한으로 실행됩니다.
+
+## v7이 기본값으로 거부하는 방식
+
+`actions/checkout@v7`은 `pull_request_target` 또는 `workflow_run` Context에서 Fork PR의 Head를 가져오려 하면 기본값으로 실패합니다. 지금까지 동작하던 Workflow가 Upgrade 이후 의도치 않게 멈추는 경우가 생길 수 있으므로, 영향 범위를 사전에 확인해야 합니다.
+
+정당한 이유로 Fork 쪽 코드를 다뤄야 한다면, 권한을 분리한 Job으로 나누는 것이 안전한 설계입니다.
+
+```yaml
+name: pr-comment
+on: pull_request_target
+
+permissions:
+  pull-requests: write  # Secret 접근 권한은 부여하지 않음
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7  # Base Branch만 Checkout
+      - run: echo "PR 내용은 GitHub API 정보만으로 판단"
+```
+
+핵심은 "Fork 쪽 코드를 실행해야 하는 Job"과 "Base Repository 권한으로 Secret을 다루는 Job"을 애초에 같은 Workflow·같은 Job에 섞지 않는 것입니다. Test 실행이 필요하다면 `pull_request` Event를 쓰고, 권한이 필요한 처리(Deploy 준비나 Comment 작성)는 API 정보만으로 완결시키는 분리가 기본이 됩니다.
+
+## webhani가 고객사에 권장하는 점검 순서
+
+CI/CD Security Review를 진행할 때 webhani는 다음 순서로 Workflow를 점검합니다.
+
+1. `pull_request_target`과 `workflow_run`을 사용하는 Workflow를 전체 Repository에서 찾아냅니다
+2. 그중 Fork PR의 코드를 Checkout하는 Workflow를 식별합니다
+3. Checkout 이후 Build·Test·Script 실행이 이어지는 것을 최우선으로 재검토합니다
+4. 필요한 권한을 `permissions`로 명시적으로 최소화하고, Secret이 필요한 처리는 별도 Job으로 분리합니다
+5. `actions/checkout`을 포함한 주요 Action의 Version을 고정하고 정기 업데이트 흐름을 마련합니다
+
+Self-hosted Runner를 사용하는 팀은 2026년 7월·9월 강제 시행 기한을 고려해 Runner Version 관리도 함께 점검해야 합니다.
+
+## 마무리
+
+`actions/checkout` v7의 기본값 변경은 편의성과 맞바꿔 간과되기 쉬웠던 구성상의 허점을 Tool 쪽에서 막는 움직임입니다. 다만 기본값이 안전해졌다고 해서 기존 Workflow 설계를 점검하지 않아도 되는 것은 아닙니다. 오히려 이번 기회에 `pull_request_target`을 사용하는 Workflow의 권한 설계를 전수 점검하는 것이 좋습니다. webhani는 CI/CD Security Review를 일회성이 아닌 지속적인 운영의 일부로 고객사에 제안합니다.
+
+---
+
+*참고: [GitHub Actions Gets Secure-by-Default CI/CD (techtimes.com)](https://www.techtimes.com/articles/321003/20260720/github-actions-gets-secure-default-ci-cd-backport-shuts-pwn-request-window.htm), [GitHub Actions Gets Serious About Self-Hosted Runner Versions (devops.com)](https://devops.com/github-actions-gets-serious-about-self-hosted-runner-versions/)*

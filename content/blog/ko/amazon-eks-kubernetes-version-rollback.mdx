@@ -1,0 +1,59 @@
+---
+title: "Amazon EKS Kubernetes Version Rollback 지원 — Cluster Upgrade Risk 관리를 다시 봅니다"
+description: "Amazon EKS가 7일 이내 Cluster Upgrade를 되돌릴 수 있는 Rollback 기능을 지원합니다. Upgrade 운영의 안전 설계를 webhani의 관점으로 정리합니다."
+date: "2026-07-21"
+status: "published"
+tags: ["AWS", "Kubernetes", "EKS", "클라우드 인프라", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "amazon-eks-kubernetes-version-rollback"
+---
+
+## EKS Upgrade의 "되돌릴 수 없다"는 문제
+
+Amazon EKS가 Cluster Version Upgrade를 7일 이내라면 되돌릴 수 있는 Rollback 기능을 지원합니다. 지금까지 EKS의 Minor Version Upgrade는 실패했을 때 Cluster를 처음부터 다시 구성해야 하는 경우가 많아, 프로덕션을 운영하는 팀 입장에서는 심리적 부담이 큰 작업이었습니다.
+
+비슷한 시기에 AWS와 SUSE는 Argo CD, AWS Controllers for Kubernetes(ACK)와의 Open Source 연동을 포함한 EKS Capabilities를 발표하며 Workload Orchestration과 Kubernetes Resource 구성의 효율화를 진행하고 있습니다. 또한 Control Plane Traffic을 고객 자신의 VPC를 통해 Routing할 수 있는 "customer-routed control plane egress"도 도입되었습니다.
+
+이런 변화들은 모두 Kubernetes를 "운영하는 것" 자체의 복잡도를 줄이고, 운영 Risk의 일부를 AWS 쪽으로 이전하는 방향의 진화입니다. 이번 글에서는 Rollback 기능에 초점을 맞춰 Upgrade 운영이 어떻게 달라지는지 정리합니다.
+
+## Upgrade가 왜 부담스러운 작업인가
+
+Kubernetes의 Minor Version Upgrade는 단순한 Version 번호 변경이 아닙니다.
+
+- Deprecated API가 제거되면서 기존 Manifest가 동작하지 않게 되는 경우가 있습니다
+- Control Plane과 Node 간의 Version 차이가 예상치 못한 동작을 일으킬 수 있습니다
+- CNI, CSI Driver, Ingress Controller 등 Add-on의 호환성을 개별적으로 확인해야 합니다
+
+지금까지는 Upgrade 이후 문제가 발견되면, 프로덕션에서 급하게 원인을 조사하고 수정하거나, 최악의 경우 이전 Version으로 Cluster를 새로 만들어 Workload를 이관해야 했습니다. 둘 다 시간 압박이 큰 작업입니다.
+
+## Rollback 기능이 가져오는 변화
+
+7일 이내라면 Upgrade를 취소할 수 있다는 여유는 운영 팀의 의사결정을 바꿉니다. 기존에는 "Upgrade해도 문제없다는 것을 사전에 완전히 확인한 뒤에야 프로덕션에 적용한다"는, 다소 과도하게 신중한 운영이 될 수밖에 없었습니다. Rollback 여유가 생기면서 다음과 같은 단계적 검증 프로세스가 현실적인 선택지가 됩니다.
+
+```text
+Day 0    : 프로덕션 Cluster Upgrade
+Day 0-1  : 주요 Workload의 Health Check와 Metric 모니터링 강화
+Day 1-3  : 일부 Traffic으로 Canary 방식 실제 동작 관찰
+Day 3-7  : 문제없으면 확정, 문제가 있으면 여유 기간 내 Rollback
+```
+
+다만 Rollback이 가능하다고 해서 사전 검증을 생략해도 된다는 뜻은 아닙니다. Rollback은 "보험"이지 "사전 검증의 대체재"가 아니라는 점은 명확히 구분해야 합니다. Stateful Workload나 Upgrade 중 적용된 Schema 변경·Data Migration이 있다면, Control Plane은 되돌려도 Data는 되돌아가지 않을 수 있습니다.
+
+## 실무 Checklist
+
+webhani가 고객사의 Kubernetes 운영을 지원할 때 Upgrade 전에 확인하는 항목은 다음과 같습니다.
+
+1. **Deprecated·제거된 API 전수 조사**: `kubectl`의 Deprecation Warning과 AWS가 제공하는 사전 점검 도구로 영향받는 Manifest를 찾아냅니다
+2. **Add-on 호환성 확인**: CNI, CSI Driver, Ingress Controller 등 EKS 관리 범위 밖의 Component는 개별적으로 Version 호환성을 확인합니다
+3. **Rollback 불가능한 변경 분리**: Database Schema 변경이나 하위 호환성이 없는 API 변경은 Kubernetes Version Upgrade와 별도 시점에 적용합니다
+4. **모니터링·Alert 사전 준비**: Upgrade 직후 이상을 조기에 감지할 수 있도록 주요 Metric의 Alert 임계값을 미리 재검토합니다
+5. **Rollback 유예 기간 내 담당 명확화**: 7일 동안 누가 이상 여부를 판단하고 Rollback 의사결정을 내릴지 팀 내에서 명확히 정해둡니다
+
+## 마무리
+
+EKS의 Rollback 기능은 Kubernetes Upgrade라는, 되돌리기 어려웠던 작업에 안전망을 더한 것입니다. 다만 이 안전망은 어디까지나 "예상치 못한 문제가 발생했을 때의 보험"이며, 사전 검증이나 변경 분리 설계를 소홀히 해도 되는 이유가 되지는 않습니다. webhani는 클라우드 인프라 운영 지원에서, 이런 신규 기능을 전제로 한 Upgrade 운영 Process 설계를 고객사에 제안합니다.
+
+---
+
+*참고: [AWS Weekly Roundup: Claude Sonnet 5 on AWS, Amazon WorkSpaces for AI agents, AWS service availability updates, and more (aws.amazon.com)](https://aws.amazon.com/blogs/aws/aws-weekly-roundup-claude-sonnet-5-on-aws-amazon-workspaces-for-ai-agents-aws-service-availability-updates-and-more-july-6-2026/), [AWS and SUSE push Kubernetes reinvention (sdxcentral.com)](https://www.sdxcentral.com/news/aws-and-suse-push-kubernetes-reinvention/)*
