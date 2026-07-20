@@ -1,0 +1,84 @@
+---
+title: "actions/checkout v7 Is Secure by Default — Time to Re-audit Your pull_request_target Workflows"
+description: "GitHub Actions' actions/checkout v7 now refuses, by default, to fetch a fork PR's head in pull_request_target workflows. Here's what the pwn request pattern is and how to write safer CI/CD."
+date: "2026-07-21"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "Security", "DevOps", "Supply Chain"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-checkout-v7-secure-by-default"
+---
+
+## What changed in checkout v7
+
+In July 2026, GitHub shipped v7 of `actions/checkout`. The headline change: a workflow triggered by `pull_request_target` or `workflow_run` now fails by default when it tries to fetch the head of a fork's pull request — that is, the latest commit sitting on the contributor's fork rather than the base repository.
+
+The trigger for this was the July 14, 2026 attack on AsyncAPI. Microsoft Threat Intelligence traced the incident to a `pull_request_target` pwn request pattern. GitHub responded by pushing the safe default down into the checkout action itself, rather than relying solely on workflow authors to get the configuration right.
+
+Around the same window, GitHub also resumed minimum version enforcement for self-hosted runners, with enforcement deadlines in July and September 2026. Together, these moves signal a shift toward hardening CI/CD defaults rather than leaving the burden entirely on individual repo maintainers.
+
+## What a pwn request actually is
+
+Unlike `pull_request`, the `pull_request_target` event runs with the base repository's permissions — including access to its secrets. This is genuinely useful when you want to comment on or prepare a deployment for a PR coming from a fork.
+
+The danger appears when that workflow checks out and executes code from the fork itself. An attacker only needs to plant malicious code in their PR; if the workflow checks it out and runs it, that code executes with the base repository's permissions and secrets. That's the pwn request pattern.
+
+A typical vulnerable configuration looks like this:
+
+```yaml
+on: pull_request_target
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: npm install && npm test  # fork-controlled code now runs with base-repo permissions
+```
+
+Checking out the fork's head SHA and then running repository scripts like `npm install` or `npm test` means any script the fork author placed in `package.json`, or in the test suite itself, executes with the base repository's privileges.
+
+## How v7's default rejection works
+
+`actions/checkout@v7` fails by default when it detects a `pull_request_target` or `workflow_run` context attempting to fetch a fork PR's head. Workflows that previously "worked" this way may break silently after the upgrade, so it's worth auditing affected workflows before rolling this out broadly.
+
+If you have a legitimate need to inspect fork-submitted code, the safer pattern is to split the job so that secret-bearing permissions and fork-code execution never sit in the same job:
+
+```yaml
+name: pr-comment
+on: pull_request_target
+
+permissions:
+  pull-requests: write  # no secret access granted here
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7  # checks out the base branch only
+      - run: echo "Evaluate the PR using GitHub API metadata only"
+```
+
+The principle: don't mix "a job that needs to run fork-submitted code" with "a job that holds base-repository secrets" in the same workflow or job. If you need to run tests against fork code, use the plain `pull_request` event; if you need privileged actions (deployment prep, commenting), do it using API metadata alone, without ever executing the fork's code.
+
+## How we audit this for clients
+
+When we run a CI/CD security review, we work through workflows in this order:
+
+1. Enumerate every workflow across the org that uses `pull_request_target` or `workflow_run`
+2. Identify which of those check out code from the fork PR's head
+3. Prioritize any workflow that runs a build, test, or script step after that checkout
+4. Explicitly minimize `permissions` and split any secret-dependent step into a separate job
+5. Pin versions of core actions like `actions/checkout` and set up a routine update cadence
+
+Teams running self-hosted runners should also review runner version management in parallel, given the July and September 2026 enforcement deadlines.
+
+## Takeaway
+
+The default change in `actions/checkout` v7 closes a gap that was too easy to overlook in the name of convenience. But a safer default doesn't mean you can skip auditing existing workflows — if anything, it's a good prompt to re-audit the permission design of every `pull_request_target` workflow you have. We recommend treating CI/CD security review as an ongoing part of operations, not a one-time exercise.
+
+---
+
+*Sources: [GitHub Actions Gets Secure-by-Default CI/CD (techtimes.com)](https://www.techtimes.com/articles/321003/20260720/github-actions-gets-secure-default-ci-cd-backport-shuts-pwn-request-window.htm), [GitHub Actions Gets Serious About Self-Hosted Runner Versions (devops.com)](https://devops.com/github-actions-gets-serious-about-self-hosted-runner-versions/)*

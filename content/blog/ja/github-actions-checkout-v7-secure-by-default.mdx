@@ -1,0 +1,84 @@
+---
+title: "actions/checkout v7がデフォルトで安全に — pwn requestを防ぐCI/CD設計を見直す"
+description: "GitHub Actionsのactions/checkout v7は、pull_request_targetでのフォークPRの危険な取得をデフォルトで拒否します。CI/CDワークフローの安全な書き方を整理します。"
+date: "2026-07-21"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "セキュリティ", "DevOps", "サプライチェーン"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-checkout-v7-secure-by-default"
+---
+
+## checkout v7の変更点
+
+GitHubは2026年7月、`actions/checkout`のv7をリリースしました。最大の変更は、`pull_request_target`や`workflow_run`イベントで起動したワークフローが、フォーク元PRのヘッド（フォークしたリポジトリ側の最新コミット）を取得しようとした場合に、デフォルトで失敗するようになったことです。
+
+この変更の背景には、2026年7月14日に発生したAsyncAPIへの攻撃があります。Microsoft Threat Intelligenceの分析により、この攻撃が`pull_request_target`を利用した「pwn request」パターンに起因することが確認されました。GitHubは同種の攻撃を構造的に防ぐため、checkoutアクション側でデフォルト動作を安全側に倒す対応を取りました。
+
+同時期には、セルフホストランナーの最小バージョン強制も再開されており、2026年7月と9月に強制の期限が設定されています。CI/CDの安全性を、ツール側の判断に委ねず運用でも締める流れが明確になっています。
+
+## pwn requestとは何か
+
+`pull_request_target`イベントは、`pull_request`イベントと違い、ベースリポジトリの権限（シークレットへのアクセスを含む）でワークフローを実行します。これは、フォークからのPRに対してもレビュー用のコメント投稿やデプロイ準備を行いたい場合に便利な設計です。
+
+しかし、このワークフローが不用意にフォーク側のコードをチェックアウトして実行してしまうと、攻撃者はPRの中身に悪意あるコードを仕込むだけで、ベースリポジトリの権限とシークレットを使ってそのコードを実行させられます。これが「pwn request」と呼ばれる攻撃パターンです。
+
+危険な構成の典型例は次のようなワークフローです。
+
+```yaml
+on: pull_request_target
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: npm install && npm test  # ここでフォーク側のコードが権限付きで実行される
+```
+
+`ref`にフォークPRのヘッドSHAを指定してチェックアウトし、その後に`npm install`や`npm test`のようにリポジトリ内のスクリプトを実行してしまうと、フォーク側が仕込んだ`package.json`のスクリプトやテストコードが、ベースリポジトリの権限で走ります。
+
+## v7がデフォルトで拒否する仕組み
+
+`actions/checkout@v7`は、`pull_request_target`または`workflow_run`のコンテキストで、フォークPRのヘッドを取得しようとするとデフォルトで失敗します。これまで動いていたワークフローが、アップグレード後に意図せず止まるケースが出てくるため、影響範囲の事前確認が必要です。
+
+もし正当な理由があってフォーク側のコードを扱う必要がある場合は、権限を絞ったジョブに分離するのが安全な設計です。
+
+```yaml
+name: pr-comment
+on: pull_request_target
+
+permissions:
+  pull-requests: write  # シークレットへのアクセスは持たせない
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7  # ベースブランチのみをチェックアウト
+      - run: echo "PRの内容はGitHub APIの情報だけで判断する"
+```
+
+ポイントは、「フォーク側のコードを実行する必要があるジョブ」と「ベースリポジトリの権限でシークレットを扱うジョブ」を、そもそも同じワークフロー・同じジョブに混在させないことです。テストの実行が必要なら`pull_request`イベントを使い、権限が必要な処理（デプロイ準備やコメント投稿）はAPI経由の情報だけで完結させる、という分離が基本になります。
+
+## Webhaniが顧客に推奨する棚卸し手順
+
+CI/CDのセキュリティレビューを行う際、Webhaniでは次の順序でワークフローを点検しています。
+
+1. `pull_request_target`と`workflow_run`を使っているワークフローを全リポジトリで洗い出す
+2. その中で、フォークPRのコードをチェックアウトしているものを特定する
+3. チェックアウト後にビルド・テスト・スクリプト実行が続くものを最優先で見直す
+4. 必要な権限を`permissions`で明示的に最小化し、シークレットが必要な処理は別ジョブに分離する
+5. `actions/checkout`を含む主要アクションのバージョンを固定し、定期的な更新フローを整える
+
+セルフホストランナーを使っているチームは、2026年7月・9月の強制期限も踏まえてランナーのバージョン管理を並行して見直す必要があります。
+
+## まとめ
+
+`actions/checkout` v7のデフォルト変更は、便利さと引き換えに見過ごされがちだった構成上の隙を、ツール側から塞ぐ動きです。とはいえ、デフォルトが安全になったからといって、既存ワークフローの設計を点検しなくてよい理由にはなりません。むしろこのタイミングは、`pull_request_target`を使うワークフローの権限設計を棚卸しする良い機会です。Webhaniでは、CI/CDのセキュリティレビューを継続的な運用の一部として顧客に提案しています。
+
+---
+
+*参考: [GitHub Actions Gets Secure-by-Default CI/CD (techtimes.com)](https://www.techtimes.com/articles/321003/20260720/github-actions-gets-secure-default-ci-cd-backport-shuts-pwn-request-window.htm), [GitHub Actions Gets Serious About Self-Hosted Runner Versions (devops.com)](https://devops.com/github-actions-gets-serious-about-self-hosted-runner-versions/)*
