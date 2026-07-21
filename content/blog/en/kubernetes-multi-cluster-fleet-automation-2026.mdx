@@ -1,0 +1,96 @@
+---
+title: "Scaling to 1,300+ Kubernetes Clusters: Lessons from LY Corporation's Fleet Automation"
+description: "LY Corporation grew from 5 to over 1,300 Kubernetes clusters on private infrastructure with full automation, according to a CNCF case study published ahead of KubeCon + CloudNativeCon Japan 2026. Here's what the fleet-automation patterns behind that number look like — and when smaller teams actually need them."
+date: "2026-07-22"
+status: "published"
+tags: ["Kubernetes", "Platform Engineering", "GitOps", "Cloud Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-multi-cluster-fleet-automation-2026"
+---
+
+Ahead of KubeCon + CloudNativeCon Japan 2026 (July 28–30, Yokohama), CNCF published a case study on LY Corporation — the company behind LINE and Yahoo! Japan — describing how it scaled from 5 to over 1,300 Kubernetes clusters on private infrastructure with full automation. The number itself isn't the interesting part. What's worth studying is the shift in operating model that has to happen somewhere between "we run a few clusters by hand" and "we run over a thousand," because most platform teams will cross a smaller version of that same threshold long before they need anywhere near 1,300.
+
+## Why More Clusters, Not One Bigger One
+
+The instinct when facing this kind of scale is often "why not one large multi-tenant cluster?" A few structural reasons push large organizations toward many smaller clusters instead:
+
+- **Blast radius isolation.** A control-plane incident, a bad CRD, or a runaway controller in one cluster doesn't take down every team's workloads.
+- **Team and business-unit boundaries.** Clusters map cleanly to ownership boundaries — quota, RBAC, and network policy per cluster are simpler to reason about than per-namespace equivalents at large scale.
+- **Data residency and compliance.** Private infrastructure spanning regions or regulatory boundaries often requires physically or logically separate clusters, not just separate namespaces.
+
+Once you accept "many clusters" as the target shape, the problem stops being about Kubernetes primitives and becomes an operations problem: how do you provision, configure, and keep a thousand clusters consistent without a thousand people doing it by hand?
+
+## The Three Layers of Fleet Automation
+
+**1. Cluster lifecycle automation.** Manually running `eksctl create cluster` or clicking through a console doesn't scale past a handful of clusters. The pattern that does is treating cluster creation itself as a reconciled resource — declare the cluster spec in Git, and a controller (Cluster API, or a custom operator built on similar principles) provisions, upgrades, and decommissions it to match.
+
+```yaml
+# cluster.yaml — declarative cluster spec, reconciled by a controller
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: tenant-payments-jp-east
+  labels:
+    team: payments
+    region: jp-east
+    tier: production
+spec:
+  clusterNetwork:
+    services:
+      cidrBlocks: ["10.96.0.0/12"]
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: VSphereCluster
+    name: tenant-payments-jp-east
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: tenant-payments-jp-east-control-plane
+```
+
+A new tenant cluster becomes a pull request, not a ticket queued behind a platform team's availability.
+
+**2. Fleet-wide policy enforcement.** With a thousand clusters, "make sure every cluster has network policies, resource quotas, and image provenance checks" cannot be a per-cluster manual task. Policy-as-code tools like Kyverno or OPA Gatekeeper, applied through the same GitOps pipeline that provisions the cluster, keep every cluster in the fleet compliant with the same baseline without a human touching each one.
+
+```yaml
+# ClusterPolicy applied fleet-wide via GitOps
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-image-signature
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: verify-image-signature
+      match:
+        resources:
+          kinds: ["Pod"]
+      verifyImages:
+        - imageReferences: ["registry.internal.example.com/*"]
+          attestors:
+            - entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      ...
+                      -----END PUBLIC KEY-----
+```
+
+**3. Aggregated observability.** A thousand isolated Prometheus instances with no shared query layer means an incident that spans multiple clusters is invisible until someone manually correlates dashboards. Fleet-scale operations need a federated metrics backend — Thanos or Grafana Mimir sitting on top of per-cluster Prometheus instances — so a single query can answer "which clusters are affected" instead of a human checking a thousand of them one at a time.
+
+## Where the Threshold Actually Is
+
+Most teams reading this don't operate anywhere near 1,300 clusters and never will — but the point where manual cluster management stops working arrives much earlier than people expect, often somewhere around 10–15 clusters. That's the point where:
+
+- Cluster configuration starts drifting because updates are applied by hand, inconsistently, across environments.
+- No one can answer "which clusters are running policy version X" without checking each one.
+- Provisioning a new cluster for a new team or environment takes days of coordinated manual work instead of a merged PR.
+
+If your team recognizes any of those symptoms, the LY Corporation case study is a useful reference not because you need their scale, but because the same three layers — declarative cluster lifecycle, GitOps-driven policy, federated observability — are the fix at 15 clusters just as much as at 1,300. The investment is the same shape; only the payoff timeline changes.
+
+## Takeaways
+
+- Multi-cluster is usually a deliberate isolation choice, not a limitation of Kubernetes itself — plan around ownership and blast-radius boundaries rather than fighting them.
+- Treat cluster creation as a GitOps-reconciled resource as soon as manual provisioning starts feeling repetitive, not after it's already unmanageable.
+- Fleet-wide policy and federated observability are the two things that quietly become impossible past a dozen clusters if you haven't automated them — build both before you need them, not after an incident forces the question.

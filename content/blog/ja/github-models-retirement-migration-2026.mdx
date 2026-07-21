@@ -1,0 +1,95 @@
+---
+title: "GitHub Models が完全終了へ — 2026年7月30日までに済ませておく移行チェックリスト"
+description: "GitHub に統合されていた無料の Model Catalog・Playground・Inference API「GitHub Models」が 2026年7月30日に完全終了します。何が壊れるか、どこに移行すべきか、そして Vendor の Preview Catalog に依存することの教訓を整理します。"
+date: "2026-07-22"
+status: "published"
+tags: ["GitHub", "AI", "LLM", "DevOps", "Migration"]
+thumbnail: ""
+author: "webhani"
+slug: "github-models-retirement-migration-2026"
+---
+
+GitHub は 2026年7月1日、GitHub 上に統合されていた Model Catalog・Playground・Inference API・BYOK（Bring Your Own Key）機能を持つ「GitHub Models」を 7月30日に完全終了すると発表しました。7月16日と23日には既に予告済みの Brownout（一時停止）が実施されており、終了後の挙動を先取りで確認できた Team も多いはずです。30日を過ぎればどの Customer に対しても復旧はなく、これは本番運用中の利用でも例外ではありません。
+
+「無料枠だし、別途 Billing Account を作らずに済むし、既存の PAT がそのまま使える」という理由だけで CI の一部やプロトタイプ、社内ツールを GitHub Models に向けていた Team は、このチェックリストを確認してください。
+
+## 実際に何が壊れるか
+
+GitHub Models が提供していたのは主に次の三つです。
+
+1. **Inference API**（`models.github.ai` / `models.inference.ai.azure.com` の Endpoint）を GitHub Personal Access Token で直接呼び出す方式
+2. Provider の Account を用意せずに素早く Prompt を試せる **Playground**
+3. Request 自体は GitHub の Endpoint に届きつつ、支払いは自分が用意した Key に対して行われる **BYOK Routing**
+
+これは GitHub Copilot とは別の製品です。Copilot の IDE 連携や Chat、Agent Mode には影響がありません。今回終了するのは、GitHub が Platform 上に追加していた独立の Model Catalog と API に限られます。連携先が Copilot だけであれば、対応は不要です。
+
+## Step 1: 依存箇所を洗い出す
+
+移行先を選ぶ前に、現状どこが依存しているかを把握します。
+
+```bash
+# Repository 全体から GitHub Models の Endpoint を検索
+grep -rn "models.github.ai\|models.inference.ai.azure.com" .
+grep -rln "GITHUB_MODELS\|GH_MODELS_TOKEN" .
+
+# GitHub Actions の Workflow を個別に確認
+grep -rn "models.github.ai" .github/workflows/
+```
+
+見落としやすいのは、PR の要約を自動生成する GitHub Actions の Step、ハッカソン用に誰かが組んだ Next.js の API Route、`scripts/` 配下でリリースノートを生成しているスクリプトなどです。GitHub Models は「無料で認証済み」という手軽さゆえに、こうした目に見えにくい箇所で使われがちなので、一通り確認しておく価値があります。
+
+## Step 2: 移行先を決める
+
+Microsoft の公式案内では **Azure AI Foundry** への移行が推奨されています。すでに Azure / GitHub の Ecosystem 内で運用しており、Billing や Quota を一元管理したい場合はこれが最も近い代替先です。ただし GitHub PAT ではなく Entra ID や API Key による別途の認証と、独立した Azure Subscription が必要になるため、Model Catalog 自体は似ていても Setup にはそれなりの時間を見込んでください。
+
+Azure に依存していない大半の Team にとっては、Model Provider に直接接続するほうがシンプルで、仲介レイヤーなしに料金体系や Rate Limit を自分で管理できます。
+
+```typescript
+// Before: GitHub Models の Inference Endpoint
+const response = await fetch(
+  "https://models.github.ai/inference/chat/completions",
+  {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-5",
+      messages: [{ role: "user", content: prompt }],
+    }),
+  }
+);
+
+// After: Anthropic API への直接呼び出し
+import Anthropic from "@anthropic-ai/sdk";
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+const message = await anthropic.messages.create({
+  model: "claude-sonnet-5",
+  max_tokens: 1024,
+  messages: [{ role: "user", content: prompt }],
+});
+```
+
+すでに Vercel AI SDK を使っているプロジェクトであれば、変更範囲はさらに小さくなります。`generateText()` や `streamText()` の呼び出し部分は一切変えず、Provider 文字列を差し替えるだけです。
+
+```typescript
+import { generateText } from "ai";
+
+// これまでは自前の fetch Wrapper 経由で GitHub Models にルーティングしていた
+// 今後は AI SDK 経由で Provider に直接接続する
+const { text } = await generateText({
+  model: "anthropic/claude-sonnet-5",
+  prompt,
+});
+```
+
+## Step 3: 30日を迎える前に CI を直す
+
+最もリスクが高いのは `.github/workflows/*.yml` 内の呼び出し箇所です。ここが壊れると、Feature 単体ではなく Merge Queue 全体が静かに止まります。Secret 名を更新し（`GITHUB_TOKEN` は他の Provider の認証には使えません）、新しい Provider の API Key を Repository または Organization の Secret として追加し、切り替え日を迎える前に一度テスト用の PR で Workflow を流しておきましょう。7月30日の本番停止で初めて「必須の Status Check が解決できない Endpoint に依存していた」と気づくのは避けたいところです。
+
+## より大きな教訓
+
+今回は緩やかな Deprecation ではなく、6月に新規受付終了を発表し、7月末までに全 Customer への提供を終える、というかなり短い期間での終了でした。無料かつ明確に Preview と位置づけられていた製品としては妥当な期間ですが、Vendor がまとめて提供する Bundled / Promotional な AI 機能に依存する際の教訓として一般化できます。自社の Pipeline のどの部分が、自分たちで Roadmap を管理できない Catalog の上に乗っているかを把握し、本番で本当に重要な処理には Provider への直接連携や Vercel AI Gateway のような Routing Layer を優先すべきです。移行作業自体は数時間で終わることが多い一方、それを Deploy 障害の最中に初めて知るのは避けたい事態です。
