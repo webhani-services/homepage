@@ -1,0 +1,96 @@
+---
+title: "Kubernetes Cluster 1,300超え運用に学ぶ — LY Corporation の Fleet 自動化"
+description: "LY Corporation は自社の Private Infrastructure 上で Kubernetes Cluster を5個から1,300個超へ、完全自動化で拡大しました。KubeCon + CloudNativeCon Japan 2026 を前に CNCF が公開した Case Study をもとに、その規模を支える Fleet 自動化のパターンと、実は小規模な Team にも当てはまる閾値を整理します。"
+date: "2026-07-22"
+status: "published"
+tags: ["Kubernetes", "Platform Engineering", "GitOps", "Cloud Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-multi-cluster-fleet-automation-2026"
+---
+
+KubeCon + CloudNativeCon Japan 2026（7月28〜30日、横浜）を前に、CNCF は LINE と Yahoo! JAPAN を運営する LY Corporation の Case Study を公開しました。内容は、Private Infrastructure 上で Kubernetes Cluster を5個から1,300個超へ、完全自動化のもとで拡大したというものです。数字そのものより注目すべきは、「手作業で数個の Cluster を運用する」から「1,000個超を運用する」までのどこかで必ず必要になる運用モデルの転換です。多くの Platform Team は 1,300 という規模には到達しなくても、その縮小版の閾値には遠からず直面します。
+
+## なぜ一つの大きな Cluster ではなく、多数の Cluster なのか
+
+この規模の課題に直面したとき、「巨大な Multi-tenant Cluster を一つ作ればよいのでは」という発想が浮かびがちです。しかし大規模な組織が多数の小さな Cluster を選ぶ構造的な理由がいくつかあります。
+
+- **障害範囲の分離。** ある Cluster の Control Plane 障害や不具合のある CRD、暴走した Controller が、他の Team のワークロードすべてを巻き込むことがありません。
+- **Team・事業部の境界。** Cluster は所有権の境界にそのまま対応させやすく、Cluster 単位の Quota・RBAC・Network Policy は、大規模になるほど Namespace 単位の等価物より扱いやすくなります。
+- **Data Residency と Compliance。** Region や規制の境界をまたぐ Private Infrastructure では、Namespace の分離だけでなく物理的・論理的に独立した Cluster が求められる場合があります。
+
+「多数の Cluster」を前提に据えた時点で、課題は Kubernetes の Primitive の話ではなく Operation の話に変わります。すなわち、1,000個の Cluster を1,000人の手作業に頼らず、Provision・設定・整合性維持する方法をどう構築するか、という問題です。
+
+## Fleet 自動化を支える3つの層
+
+**1. Cluster Lifecycle の自動化。** `eksctl create cluster` を手で叩いたり Console をクリックしたりする運用は、Cluster 数が数個を超えたあたりで破綻します。代わりに機能するパターンは、Cluster の作成そのものを Reconcile 対象の Resource として扱うことです。Git に Cluster の Spec を宣言し、Cluster API（あるいは同様の思想で作られた Custom Operator）がその状態に合わせて Provision・Upgrade・廃棄を行います。
+
+```yaml
+# cluster.yaml — Controller によって Reconcile される宣言的な Cluster Spec
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: tenant-payments-jp-east
+  labels:
+    team: payments
+    region: jp-east
+    tier: production
+spec:
+  clusterNetwork:
+    services:
+      cidrBlocks: ["10.96.0.0/12"]
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: VSphereCluster
+    name: tenant-payments-jp-east
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: tenant-payments-jp-east-control-plane
+```
+
+新しい Tenant 用 Cluster は、Platform Team の空き時間待ちの Ticket ではなく、一つの Pull Request になります。
+
+**2. Fleet 全体への Policy 適用。** Cluster が1,000個ある状況で「すべての Cluster に Network Policy・Resource Quota・Image の来歴検証が入っていることを保証する」を Cluster ごとの手作業にすることはできません。Kyverno や OPA Gatekeeper のような Policy as Code を、Cluster を Provision するのと同じ GitOps Pipeline を通して適用すれば、誰も一つ一つ手を触れることなく、Fleet 全体を同じ Baseline に保てます。
+
+```yaml
+# GitOps 経由で Fleet 全体に適用される ClusterPolicy
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-image-signature
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: verify-image-signature
+      match:
+        resources:
+          kinds: ["Pod"]
+      verifyImages:
+        - imageReferences: ["registry.internal.example.com/*"]
+          attestors:
+            - entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      ...
+                      -----END PUBLIC KEY-----
+```
+
+**3. 横断的な Observability の集約。** 共有の Query Layer を持たない孤立した Prometheus が1,000個あるだけでは、複数 Cluster にまたがる障害を人手で Dashboard を突き合わせるまで発見できません。Fleet 規模の運用には、各 Cluster の Prometheus の上に Thanos や Grafana Mimir のような Federated Metrics Backend を置き、「どの Cluster が影響を受けているか」を1回の Query で答えられる状態が必要です。1,000個を人手で一つずつ確認するのとは根本的に違います。
+
+## 実際の閾値はどこにあるか
+
+この記事を読んでいる大半の Team は 1,300 Cluster という規模には近づかず、今後もそうならないでしょう。しかし手動での Cluster 管理が破綻し始める地点は、思っているよりずっと早く訪れます。目安としては10〜15 Cluster あたりです。この段階で次のような症状が出始めます。
+
+- 更新が手作業で、環境ごとにばらばらに適用されるため、Cluster の設定が徐々に Drift していく。
+- 「Policy Version X が適用されている Cluster はどれか」に、一つずつ確認しない限り誰も答えられない。
+- 新しい Team や環境向けの Cluster を用意するのに、Merge 済みの PR ではなく数日がかりの手動調整が必要になる。
+
+これらの兆候に心当たりがあるなら、LY Corporation の Case Study は「同じ規模を目指すため」ではなく、「宣言的な Cluster Lifecycle・GitOps 駆動の Policy・Federated Observability という3層は、1,300 Cluster であろうと15 Cluster であろうと同じ解決策になる」という点で参考になります。投資の形は変わらず、変わるのは回収までの時間軸だけです。
+
+## まとめ
+
+- Multi-cluster は多くの場合 Kubernetes 自体の制約ではなく、意図的な分離の選択です。所有権と障害範囲の境界に逆らうのではなく、それに沿って設計してください。
+- 手動での Provision が「またこれか」と感じ始めた時点で、すでに手に負えなくなってからではなく、その時点で Cluster 作成を GitOps で Reconcile される Resource として扱い始めてください。
+- Fleet 全体への Policy 適用と Federated Observability は、自動化していないと十数個の Cluster を超えたあたりで静かに不可能になる二つの要素です。障害が起きてから慌てて構築するのではなく、必要になる前に両方を用意しておいてください。

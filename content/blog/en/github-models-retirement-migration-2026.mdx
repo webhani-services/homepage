@@ -1,0 +1,95 @@
+---
+title: "GitHub Models Is Shutting Down: A Migration Playbook for July 30, 2026"
+description: "GitHub Models — the free model catalog, playground, and inference API built into GitHub — retires fully on July 30, 2026. Here's what breaks, where to move, and the broader lesson about building on vendor preview catalogs."
+date: "2026-07-22"
+status: "published"
+tags: ["GitHub", "AI", "LLM", "DevOps", "Migration"]
+thumbnail: ""
+author: "webhani"
+slug: "github-models-retirement-migration-2026"
+---
+
+GitHub announced on July 1, 2026 that GitHub Models — the model catalog, playground, inference API, and bring-your-own-key (BYOK) support it had folded into GitHub itself — will be fully retired on July 30, 2026. Two scheduled brownouts on July 16 and July 23 have already given teams a preview of what the outage looks like. After the 30th, none of it comes back, for any customer, including those with active production usage.
+
+If your team ever pointed a CI step, a prototype, or a low-stakes internal tool at GitHub Models because it was the path of least resistance — free tier, no separate billing account, same PAT you already had — this post is your checklist.
+
+## What Actually Breaks
+
+GitHub Models exposed three things people built on:
+
+1. **The inference API** (`models.github.ai` / `models.inference.ai.azure.com` endpoints) called directly with a GitHub personal access token.
+2. **The playground**, used for quick prompt testing without wiring up a provider account.
+3. **BYOK routing**, where a request landed on GitHub's endpoint but billed against a key you supplied.
+
+None of this is the same product as GitHub Copilot. Copilot's IDE integration, chat, and agent mode are unaffected — this is specifically about the standalone Models catalog and API that GitHub added on top of its platform. If your integration only ever went through Copilot, you have nothing to do here.
+
+## Step 1: Find Every Call Site
+
+Before picking a replacement, find out what actually depends on this today:
+
+```bash
+# Search your org's repos for GitHub Models endpoints
+grep -rn "models.github.ai\|models.inference.ai.azure.com" .
+grep -rln "GITHUB_MODELS\|GH_MODELS_TOKEN" .
+
+# Check GitHub Actions workflows specifically
+grep -rn "models.github.ai" .github/workflows/
+```
+
+Common hiding places: a GitHub Actions step that runs an LLM-based PR summarizer, a demo Next.js API route someone wired up for a hackathon, or a script under `scripts/` that generates release notes. Audit all of them — GitHub Models being "free and already authenticated" made it an easy default for exactly this kind of low-visibility usage.
+
+## Step 2: Pick a Replacement
+
+Microsoft's official guidance points teams toward **Azure AI Foundry**, which is the closest like-for-like replacement if you were already inside the Azure/GitHub ecosystem and want managed billing and quota controls. It requires a separate Azure subscription and different auth (Entra ID or API keys instead of a GitHub PAT), so budget time for that setup even though the model catalog itself is similar.
+
+For most teams outside an existing Azure commitment, going directly to the model provider is simpler and gives you pricing and rate-limit control without an intermediary:
+
+```typescript
+// Before: GitHub Models inference endpoint
+const response = await fetch(
+  "https://models.github.ai/inference/chat/completions",
+  {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-5",
+      messages: [{ role: "user", content: prompt }],
+    }),
+  }
+);
+
+// After: direct Anthropic API call
+import Anthropic from "@anthropic-ai/sdk";
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+const message = await anthropic.messages.create({
+  model: "claude-sonnet-5",
+  max_tokens: 1024,
+  messages: [{ role: "user", content: prompt }],
+});
+```
+
+If your project already uses the Vercel AI SDK, the swap is even smaller — you're only changing which provider string you pass in, and your `generateText()` / `streamText()` call sites don't change at all:
+
+```typescript
+import { generateText } from "ai";
+
+// Was routed through GitHub Models via a custom fetch wrapper.
+// Now points straight at the provider through the AI SDK.
+const { text } = await generateText({
+  model: "anthropic/claude-sonnet-5",
+  prompt,
+});
+```
+
+## Step 3: Fix CI Before the 30th
+
+The riskiest call sites are the ones in `.github/workflows/*.yml` that silently break a merge queue rather than a feature. Update the secret name (`GITHUB_TOKEN` won't authenticate anywhere else), add the new provider's API key as a repo or org secret, and re-run the workflow once against a test PR before the cutover date. Don't wait for the July 30 hard stop to find out a required status check depends on an endpoint that no longer resolves.
+
+## The Broader Lesson
+
+This wasn't a slow-fade deprecation — announced closed-to-new-customers in June, retired to everyone by end of July. That's a reasonable timeline for a free, clearly-labeled preview product, but it's a useful reminder for anything your team builds on top of a vendor's bundled or promotional AI offering: know which pieces of your pipeline sit on a catalog you don't control the roadmap for, and prefer direct provider integration (or a routing layer like the Vercel AI Gateway) for anything that actually matters to production. The migration itself is usually a few hours of work. Finding out about it during a broken deploy is not.
