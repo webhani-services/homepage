@@ -1,0 +1,167 @@
+---
+title: "Tekton이 CNCF Incubation 달성: Kubernetes 네이티브 CI/CD의 성숙"
+description: "Tekton의 CNCF Incubation 수용은 Kubernetes 기반 Pipeline-as-Code의 성숙한 거버넌스와 생태계 지원을 의미합니다. 플랫폼 팀에게 미치는 영향과 Tekton의 네이티브 K8s 모델이 기존 CI를 능가하는 시기를 살펴봅니다."
+date: "2026-07-23"
+status: "published"
+tags: ["Kubernetes", "CI/CD", "Tekton", "CNCF", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "tekton-cncf-incubation-cicd-2026"
+---
+
+2026년 7월, CNCF 기술 감독 위원회는 Tekton을 Incubation 상태로 승인하는 투표를 진행했습니다. 이것이 큰 뉴스는 아닙니다. Tekton은 이미 주요 클라우드 제공자에서 2년 전부터 프로덕션 준비가 되어 있었습니다. 하지만 이것은 거버넌스 마일스톤입니다. 프로젝트가 한 가지 임계값을 넘었음을 의미합니다. 명확한 범위, 중립적인 관리, 입증된 채택, 장기 유지 보수에 대한 명시적 약속이 확립된 프로젝트입니다.
+
+Kubernetes를 운영 중인 플랫폼 팀에게 이 발표가 중요한 이유는 도구 선택의 불확실성이 제거되기 때문입니다. 2026년에 CI/CD 전략을 평가 중인 팀에게는 기존 외부 CI(GitHub Actions, GitLab CI, CircleCI)의 의미 있는 대안이 명확해집니다. 특히 Kubernetes와 GitOps에 이미 투자한 조직에서는 진지한 검토 가치가 있습니다.
+
+## CNCF Incubation 상태가 실제로 의미하는 것
+
+CNCF 프로젝트는 3단계를 거쳐 진화합니다. Sandbox(초기 탐색), Incubation(입증된 실행 가능성, 안정적 거버넌스), Graduated(광범위한 채택, 안정적 API, 상용 지원 생태계). Tekton의 Incubation 이전은 "코드가 갑자기 안정화되었다"는 판정이 아닙니다. 이미 안정적이었습니다. 이것은 거버넌스 선언문입니다.
+
+**얻게 되는 것:**
+- 명확한 거버넌스 구조: Tekton은 투명한 Technical Steering Committee 아래 운영되며 의사 결정 프로세스가 문서화되어 있습니다.
+- 중립적 벤더 관리: 프로젝트는 단일 회사의 소유가 아니며 정관에 명시적인 벤더 중립성이 있습니다.
+- 형식적 호환성 약속: API는 버전 관리되며 중단적 변경에는 지원 중단 기간과 통신 계획이 필요합니다.
+- 생태계 검증: Incubation 프로젝트는 다른 CNCF 프로젝트와의 채택 및 통합을 입증해야 합니다.
+
+**의미하지 않는 것:**
+- 코드가 2개월 전보다 갑자기 더 안전하거나 성능이 좋아지지 않았습니다.
+- Tekton이 CI/CD의 "최고" 솔루션이라는 판정이 아닙니다. 단지 CNCF가 거버넌스에 공동 투자할 만큼 충분히 확립되었다는 선언일 뿐입니다.
+- 채택이 자동적이거나 필수가 아니며, 여전히 팀의 평가 선택 사항입니다.
+
+조달 및 보안 팀에게 Incubation 상태는 의미가 있습니다. 단일 벤더가 관심을 잃어도 프로젝트가 사라지지 않을 것이라는 신호입니다.
+
+## Tekton의 Kubernetes 네이티브 모델이 이해할 가치가 있는 이유
+
+Tekton과 기존 CI 시스템(GitHub Actions, GitLab CI, Jenkins)의 철학적 차이는 Architecture에 있습니다. 기존 시스템은 Agent 기반입니다. CI Server(GitHub, GitLab 또는 Jenkins Controller)가 Event를 수신하고 Runner/Agent에 작업을 발송하며 흐름을 조정합니다.
+
+Tekton은 이를 역전시킵니다. Pipeline, Task, Step은 Kubernetes Custom Resource로 정의됩니다(YAML Manifest). CI/CD 로직은 Workload와 동일한 Cluster에 존재하며 이미 Application 배포에 사용하는 동일한 Resource Control(RBAC, Namespace, Resource Quota, Network Policy)을 받습니다.
+
+최소 Tekton Task는 다음과 같습니다:
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-and-push
+spec:
+  params:
+    - name: image-repo
+      type: string
+  steps:
+    - name: build
+      image: gcr.io/kaniko-project/executor:latest
+      args:
+        - --destination=$(params.image-repo)
+        - --dockerfile=./Dockerfile
+        - --context=dir://$(workspaces.source.path)
+    - name: scan
+      image: aquasec/trivy:latest
+      args:
+        - image
+        - --exit-code=0
+        - $(params.image-repo)
+```
+
+Pipeline은 Task를 연결합니다:
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: deploy-app
+spec:
+  tasks:
+    - name: git-clone
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: shared-storage
+    - name: build-image
+      runAfter:
+        - git-clone
+      taskRef:
+        name: build-and-push
+      workspaces:
+        - name: source
+          workspace: shared-storage
+    - name: deploy
+      runAfter:
+        - build-image
+      taskRef:
+        name: deploy-to-cluster
+```
+
+이 Pipeline을 실행하면 Tekton은 PipelineRun Resource를 생성합니다. 각 Task는 Pod가 됩니다. Task 내 각 Step은 해당 Pod의 Container가 됩니다. Log는 Cluster의 표준 Logging System으로 흐릅니다. Success/Failure는 Kubernetes Event입니다.
+
+이 모델은 실제 결과를 가져옵니다:
+
+**장점: Resource 인식 스케줄링.** CI/CD Pipeline은 Application과 동일한 Resource 제약을 받습니다. Cluster가 CPU 제약이 있으면 CI 작업도 Workload를 조절하는 동일 Scheduler에 의해 제한됩니다.
+
+**장점: 통합된 Policy.** Network Policy, RBAC, Secrets 관리 — Application에 사용하는 모든 Infrastructure-as-Code 패턴이 CI/CD Pipeline 정의 및 실행 Context에 적용됩니다.
+
+**장점: GitOps 친화적.** Pipeline 정의는 Git에 존재하며 Application Code와 동일한 Pull Request 리뷰, Audit Trail, Deployment Workflow의 대상입니다. ArgoCD 같은 도구가 Application Manifest처럼 Pipeline 정의를 조정할 수 있습니다.
+
+**트레이드오프: 운영 복잡성.** CI/CD 요구가 단순하면(Build Step, Test Step, Registry Push) GitHub Actions이 더 간단합니다. Tekton은 Kubernetes Primitive를 이해해야 합니다. Storage를 어디에 마운트할지, Secrets를 어떻게 주입할지, Pipeline을 실행하는 Service Account의 RBAC 권한.
+
+**트레이드오프: 생태계 성숙도.** GitHub Actions은 거대한 Pre-built Action 라이브러리를 보유합니다. Tekton은 성장 중인 Task Catalog를 가지고 있지만 규모가 작습니다. 더 많은 Custom Task YAML을 작성하게 됩니다.
+
+## Tekton이 효과적인 경우(그리고 그렇지 않은 경우)
+
+**Tekton을 권장:**
+
+1. **Kubernetes와 GitOps를 이미 운영 중이다.** Deployment 전략이 ArgoCD나 Flux로 Git Repo의 Manifest를 조정 중이면 Tekton Pipeline 정의가 그 Workflow에 자연스럽게 적응합니다.
+
+2. **Workload가 복잡한 Resource 요구 사항이나 Multi-tenancy 제약을 가진다.** CI 작업을 Namespace별로 Rate 제한하거나, Team별 Resource Quota를 강제하거나, 정확히 어떤 Identity가 어떤 Pipeline Step을 실행하는지 감사해야 하면, Tekton의 RBAC 및 Namespace 모델이 외부 CI보다 더 적합합니다.
+
+3. **전체 Infrastructure Stack(App, Pipeline, Deployment Logic)을 Version Control과 Audit Trail로 Git에 유지하길 원한다.** Tekton은 이를 권장합니다. 외부 CI 시스템은 종종 별도의 병렬 Configuration Management를 요구합니다.
+
+4. **Platform Engineering Team이 Kubernetes Infrastructure를 소유하고 있다.** etcd 운영, Operator Upgrade 관리, kubelet Tuning을 하는 사람들이 있으면 Tekton의 Operational Surface 추가는 자연스러운 확장입니다.
+
+**GitHub Actions 또는 GitLab CI에 머물러야 할 경우:**
+
+1. **Team이 작거나 CI 요구가 간단하다.** YAML에 `run: npm test`를 작성하고 작동하는 편의성은 비할 데가 없습니다. 단순 Workflow에 대한 GitHub Actions의 UX는 정말 좋습니다.
+
+2. **Kubernetes를 운영하지 않거나 Kubernetes가 Deployment Target일 뿐이다.** Kubernetes *로* 배포하지만 Cluster를 운영하거나 구성하지 않으면 외부 CI가 올바른 도구입니다.
+
+3. **SaaS Platform과의 Out-of-the-box 통합이 필요하다.** GitHub Actions은 GitHub의 Native 기능(Branch Protection, Status Check)과 완벽하게 통합됩니다. Tekton은 이러한 통합을 구축해야 합니다.
+
+4. **Team이 이미 GitHub 또는 GitLab Workflow에 내재되어 있다.** CI 시스템 전환은 Process와 Cognitive Cost입니다. 현재 System이 작동하면 전환 동기가 강력해야 합니다.
+
+## Tekton + ArgoCD: 2026년의 일반적인 패턴
+
+emerging Deployment 패턴은 Tekton(CI) + ArgoCD(CD)를 결합합니다:
+
+- **Tekton**은 Pull Request나 Commit으로 Trigger된 Build, Test, Image Push Pipeline을 실행합니다.
+- **ArgoCD**는 "Deployment Configuration" Git Repo를 감시합니다. 새 Image가 Build되면 Tekton Task나 외부 Automation이 Deployment Repo의 Image Tag를 업데이트합니다.
+- **ArgoCD**가 변경을 감지하고 업데이트된 Manifest를 Target Cluster에 동기화합니다.
+
+이 관심의 분리(한 쪽 Git Repo에 CI, 다른 쪽에 Deployment Config)는 성숙한 GitOps 패턴입니다. Tekton은 Cluster 외부의 별도 CI 시스템 없이 이를 가능하게 합니다.
+
+## 실질적 Migration: Tekton 시작하기
+
+조직이 Tekton을 고려 중이라면 Low-Risk Entry Point는:
+
+1. **비중요 Cluster에 Tekton 배포.** Staging이나 Development Cluster는 Production에 영향 없이 Task와 Pipeline YAML에 익숙해질 좋은 장소입니다.
+
+2. **한 번에 하나의 Pipeline 마이그레이션.** Simple Build-and-Test Flow(Git Clone, Image Build, Registry Push)에서 시작합니다. 첫 번째 Pipeline에서는 복잡한 Orchestration이나 외부 통합을 피하세요.
+
+3. **Tekton CLI나 Dashboard로 Pipeline 실행을 관찰.** Tekton CLI(`tkn`)와 Optional Dashboard는 Pipeline 실행, Log, Status 가시성을 제공하며, 이는 GitHub Actions에서 보는 것과 유사합니다.
+
+4. **기존 Notification System과 통합.** Script나 Tekton Trigger로 Pipeline 상태를 Slack, PagerDuty, Incident System에 게시하여 Team이 실패를 확인할 수 있게 하세요.
+
+5. **Storage 문제 계획.** Tekton Pipeline은 PersistentVolumeClaim(Workspace) 또는 Image Layer를 사용해 Task 간 데이터를 자주 공유합니다. Scale에서 Build를 실행하기 전에 Storage 전략(Dev: Local Volume, Prod: S3 같은 Cloud Storage)을 결정하세요.
+
+## webhani의 관점
+
+Kubernetes와 GitOps를 Operational Model로 Commitment한 Client에게 Tekton을 권장해왔습니다. 다음에 투자했으면 적합성이 강합니다:
+
+- Kubernetes 운영을 소유하는 Platform Team.
+- Application 배포용 GitOps Tooling(ArgoCD 또는 Flux).
+- Operational 도구를 줄이려는 명확한 욕구(관리할 System이 적고, 유지할 Integration이 적음).
+
+Kubernetes 여정의 초기 단계인 Team이거나 Kubernetes를 주로 Deployment Target로 실행하는 경우는 여전히 GitHub Actions나 GitLab CI를 권장합니다. Cognitive Load가 낮고 Kubernetes Primitive에 깊이 정통하지 않은 Team의 UX가 더 좋습니다.
+
+Tekton의 Incubation 상태는 채택을 막던 주요 위험을 제거했습니다. 프로젝트의 장기 Viability와 Governance에 대한 우려는 이제 해결되었습니다. 남은 것은 모든 도구 선택의 실질적 트레이드오프입니다. Operational 복잡성, 생태계 성숙도, Integration Effort, Team 친숙도.
+
+2026년 이후, Kubernetes 위에 Platform을 구축하고 CI/CD를 Bolt-on 외부 System이 아닌 Platform의 Native 부분으로 원한다면, Tekton의 성숙도와 거버넌스는 이제 진지한 평가를 정당화할 만큼 확립되었습니다.
