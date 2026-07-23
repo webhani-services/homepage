@@ -1,0 +1,94 @@
+---
+title: "Tailwind CSS 4.3: Scrollbar Utilities, Compound Variants, and a Public Class-Sorting API"
+description: "Tailwind CSS 4.3 (July 2026) adds native scrollbar and zoom utilities, stacked/compound @variant syntax, and a public sorting API in the Prettier plugin. Practical notes on what changes and how to use each one."
+date: "2026-07-24"
+status: "published"
+tags: ["Tailwind CSS", "CSS", "Web Development", "Frontend", "DaisyUI"]
+thumbnail: ""
+author: "webhani"
+slug: "tailwind-css-4-3-scrollbar-variant-utilities-2026"
+---
+
+## A quiet but useful point release
+
+Tailwind CSS 4.3 landed in July 2026 (patched up to 4.3.3 by July 16), and it's the kind of release that doesn't make headlines but removes small, recurring pieces of custom CSS from real projects. Three changes stand out: native scrollbar utilities, a more expressive `@variant` syntax for combining conditions, and a public API in the Prettier plugin for programmatic class sorting. None of these are flashy, but each replaces a workaround most Tailwind codebases already have.
+
+This project runs Tailwind CSS 4 with DaisyUI 5, so we went through the changelog with an eye toward what's directly usable here.
+
+## Scrollbar, zoom, and tab-size utilities
+
+Before 4.3, styling a scrollbar in Tailwind meant dropping into arbitrary CSS or a plugin — there was no first-party utility for it. 4.3 adds a full scrollbar utility set:
+
+```html
+<div class="scrollbar-thin scrollbar-thumb-amber-500 scrollbar-track-transparent overflow-y-auto">
+  <!-- long content -->
+</div>
+```
+
+`scrollbar-{auto,thin,none}` controls the scrollbar's presence and width, and `scrollbar-thumb-*` / `scrollbar-track-*` accept the same color scale as every other Tailwind color utility — so `scrollbar-thumb-amber-500` fits directly into a design system built on the amber palette without a separate CSS variable. `scrollbar-gutter-*` reserves space for the scrollbar so content doesn't shift when it appears, which matters for any layout with dynamic overflow (a chat panel, a code block, a dropdown list).
+
+Zoom (`zoom-*`) and tab-size (`tab-*`) utilities round out the release. Tab-size is a small but real win for anyone rendering code blocks or `<pre>` content through Tailwind classes instead of a separate stylesheet.
+
+## Stacked and compound `@variant`
+
+The bigger change for anyone writing custom CSS alongside Tailwind is what happened to `@variant`. Previously, combining two conditions inside a `@variant` block required nesting:
+
+```css
+/* before 4.3 */
+.card {
+  @variant hover {
+    @variant focus {
+      outline: 2px solid theme(colors.amber.500);
+    }
+  }
+}
+```
+
+4.3 adds both stacked and compound forms directly:
+
+```css
+/* stacked — both conditions must hold, same as the nested version above */
+.card {
+  @variant hover:focus {
+    outline: 2px solid theme(colors.amber.500);
+  }
+}
+
+/* compound — either condition applies the rule */
+.card {
+  @variant hover, focus {
+    outline: 2px solid theme(colors.amber.500);
+  }
+}
+```
+
+The distinction matters: `hover:focus` requires both states simultaneously (the same semantics as chaining variants in a class list, `hover:focus:outline-2`), while `hover, focus` applies the rule if either is true — previously this meant writing the rule twice or reaching for a Sass-style mixin. For a component library with a handful of interactive states (buttons, nav items, form fields), this cuts a real amount of duplication out of custom CSS files.
+
+## A public API for class sorting
+
+The Prettier plugin now exports a `/sorter` subpath with a programmatic API for Tailwind's class-ordering logic — the same logic that runs when you save a file and your classes get reordered into Tailwind's canonical order.
+
+```js
+import { sortClasses } from "prettier-plugin-tailwindcss/sorter";
+
+const sorted = sortClasses("p-4 flex bg-amber-500 hover:bg-amber-600 items-center");
+// => "flex items-center bg-amber-500 p-4 hover:bg-amber-600"
+```
+
+This matters more than it sounds like. Before this API was public, any tool that wanted Tailwind-consistent class ordering — a custom lint rule, a codemod, a component generator — had to either shell out to Prettier or reimplement the ordering heuristic. Now it's an importable function. `eslint-plugin-tailwindcss` reportedly already uses the same logic to clean up arbitrary-value classes more reliably, and it's a reasonable building block for any internal tooling that generates or normalizes className strings (a scaffolding CLI, for instance).
+
+## What we'd actually change in a project using this stack
+
+For a Next.js + Tailwind + DaisyUI setup like this one:
+
+1. **Swap any custom scrollbar CSS for the new utilities.** If you have a `.scrollbar-hide` or similar utility class defined by hand somewhere in `globals.css`, it can likely be deleted in favor of `scrollbar-none`.
+2. **Use compound `@variant` for shared interactive states instead of duplicating rules.** Anywhere a hover and a focus state apply the same styling — which is common for accessible interactive elements — `@variant hover, focus { ... }` is shorter and harder to let drift out of sync than two separate declarations.
+3. **Consider the sorter API for anything that generates className strings programmatically.** If you have a component generator or a design-token pipeline that outputs Tailwind classes, importing the same ordering logic Prettier uses keeps generated code visually consistent with hand-written code, instead of inventing a separate convention.
+
+## Takeaways
+
+None of 4.3's changes require a migration — they're additive, and the existing utility classes and `@apply` patterns keep working. The value is in what you get to delete: hand-rolled scrollbar CSS, nested `@variant` blocks, and one-off class-sorting scripts. For a project already committed to Tailwind, upgrading is low-risk and gives you a slightly smaller CSS surface to maintain.
+
+---
+
+*References: [Tailwind CSS Releases & Latest Updates — releases.sh](https://releases.sh/tailwind-css), [Tailwind CSS Blog](https://tailwindcss.com/blog), [Tailwind CSS v4.0 - what's new and how to upgrade — fireup.pro](https://fireup.pro/news/tailwind-css-v4-0-released-lightning-fast-builds-advanced-features-and-simplified-setup)*

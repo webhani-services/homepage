@@ -1,0 +1,64 @@
+---
+title: "AWS CloudFormation Express Mode — IaCのFeedback Loopを速くする（AI Agentも含めて）"
+description: "AWS新機能のCloudFormation Express Modeは、Resourceが完全に安定するのを待たず、設定が適用された時点でSuccessを返すことで、Deployment確認時間を最大4倍短縮します。このTrade-offの意味と、実際にいつ使うべきかを整理します。"
+date: "2026-07-24"
+status: "published"
+tags: ["AWS", "CloudFormation", "Infrastructure as Code", "DevOps", "Cloud"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-cloudformation-express-mode-2026"
+---
+
+## Releaseではなく反復のために作られたDeployment Mode
+
+AWSは2026年6月末、CloudFormation Express Modeを発表しました。これは特定のPain Pointを狙ったものです。「Resourceの設定が完了した」状態と「CloudFormationがそのResourceの完全な安定を確認し終えた」状態のGapは、反復的なInfrastructure変更において最も時間のかかる部分になりがちです。標準のCloudFormation Deploymentは、Successを報告する前に長めのStabilization Check——Load Balancerが Health Checkを通過しているか、Databaseが接続を受け付けているか、ECS ServiceがSteady Stateに達しているか——を待ちます。Express Modeでは、CloudFormationがResourceの設定自体が適用されたことを確認した時点で完了とみなされ、AWSによれば反復的なWorkflowにおいてDeployment時間を最大4倍短縮できるとしています。CloudFormationとCDKの両方で全Commercial Regionで利用でき、追加費用もかかりません。
+
+AWSはAI Agent WorkflowをTarget Use Caseとして明示的に挙げており、この位置づけは単なるMarketingとしてではなく、Infrastructure Toolingにおける「十分な速さ」の意味の実質的な変化として受け止める価値があります。
+
+## Stabilization Waitが存在する理由——そしてそれを省くことの本当のTrade-off
+
+標準ModeのStabilization Checkは官僚的なOverheadではありません。「作成済み」とResourceが報告することと、そのResourceが実際にTrafficを処理できる状態であることは、異なる状態だからこそ存在します。RDS Instanceは存在していても初期化中である場合があります。ECS ServiceはTask定義が更新されても、古いTaskのDrain中である場合があります。Stabilizationを待つことこそが、CloudFormationが意味のある「完了」を示す方法です。
+
+Express Modeの前提は、反復的なDevelopment中は、すべての変更ごとにその保証が必要なわけではない、というものです。必要なのは、設定が受理されたことを知り、Resource識別子を取得して次のStepに進むことです。AWSは、これがDevelopmentの反復、個々のComponentのTest、そして下流のStackがARNやEndpointの参照だけを必要とし、Trafficの準備完了の証明を必要としないDependent Stack Deploymentに適していると明示しています。
+
+```bash
+# 標準Deploy — 完全なStabilizationを待つ
+aws cloudformation deploy \
+  --template-file template.yaml \
+  --stack-name my-service-dev
+
+# Express Mode — 設定の適用が確認され次第返る
+aws cloudformation deploy \
+  --template-file template.yaml \
+  --stack-name my-service-dev \
+  --deployment-mode EXPRESS
+```
+
+これは開発Loopにおいては正当なTrade-offですが、Healthに基づいてGatingしている本番Rolloutにとっては危険なものです。押さえておくべき違いは、Express Modeが伝えるのは「望ましい設定が受理された」ことであって、「システムが健全である」ことではない、という点です。
+
+## 実際に効果を発揮する場面
+
+**AI Agent駆動のInfrastructure変更**：CDK Stackを反復するAgent——IAM Policyの調整、環境変数の追加、新しいQueueの配線——は、速いConfirm/Failのloopから大きな恩恵を受けます。試行ごとの変更で完全なStabilizationを数分待つようでは、Agent駆動のInfra作業は実用的になりません。速い「設定受理」Signalがあれば、Codeを反復するのと同じ感覚でInfraを反復できます。
+
+**Dependent Stackの連鎖**：Stack BがStack Aの出力（VPC ID、Security Group ARNなど）を必要としてDeployを開始する場合、Stack Aの実際のTraffic Readinessは、Stack Bをunblockする上では無関係です。Express Modeは正確性を変えることなく、識別子をより速く取得させてくれます。
+
+**LocalとCIのDevelopment環境**：1時間で破棄される使い捨てのDev環境やPreview環境は、実Trafficを処理する本番Stackと同じStabilization保証を必要としません。Express Modeは、速いCreate-Test-Destroyサイクルに自然に馴染みます。
+
+**あえて使わない場面**：本番ReleaseをGatingするDeployment、実際のHealth Checkが重要な変更（古いTaskがDrainする前に、新しいTask定義がALB Health Checkを通過できることを証明する必要がある場合）、あるいは「Deploymentの成功」がTraffic昇格のSignalとして使われるPipeline Stage。これらでは、標準ModeのStabilization Waitが実質的な仕事をしています——速度のためにそれを最適化して削るべきではありません。
+
+## Deployment Pipelineへの組み込み方
+
+このFeatureを採用するチームに勧めたいPatternは、内側のLoopにはExpress Mode、外側のGateには標準Modeを使うというものです。
+
+1. **LocalとPR Preview環境**：デフォルトでExpress Mode。数時間しか存在しないものにとっては、Stabilization保証よりも速いFeedbackの方が重要です。
+2. **Staging Deploy**：標準Mode。Stagingは、Stabilization Checkでしか表面化しない類の問題（永遠にPassしないHealth Check、Rollback Loopに陥ったService）を捕まえるために存在します。
+3. **本番**：例外なく常に標準Mode。実Trafficを受ける前にRolloutが実際に健全であることを示すSignalは、4倍の高速化と引き換えにする価値がありません。
+4. **Agent駆動のIaC作業に限っては**：SandboxまたはUse-and-discard AccountではExpress Modeをデフォルトにし、「設定受理」をAgentが次のStepに進むための十分なSignalとして扱います。共有環境に到達する前には、人間がReviewする別の標準Mode Deployを挟みます。
+
+## まとめ
+
+Express Modeは、Infrastructure Toolingが実際の反復のあり方——`cdk deploy`を打って待つ人間だけでなく、Agentによって駆動される反復も含めて——に追いついてきた良い例です。Feature自体はSimpleですが、その周りの判断は簡単ではありません。速度と引き換えに何の保証（完全なStabilization）を手放しているのかを正確に理解し、そのTrade-offを、部分的にしかStabilizeしていないResourceが実害を及ぼし得ない環境に限定しておくことが重要です。
+
+---
+
+*参考: [Accelerate your infrastructure deployments by up to 4x with AWS CloudFormation Express mode — AWS News Blog](https://aws.amazon.com/blogs/aws/accelerate-your-infrastructure-deployments-by-up-to-4x-with-aws-cloudformation-express-mode/), [How CloudFormation express mode accelerates your development cycle — AWS DevOps Blog](https://aws.amazon.com/blogs/devops/how-cloudformation-express-mode-accelerates-your-development-cycle/), [AWS CloudFormation and CDK express mode speeds up infrastructure deployments by up to 4x — AWS What's New](https://aws.amazon.com/about-aws/whats-new/2026/06/aws-cloudformation-cdk/)*

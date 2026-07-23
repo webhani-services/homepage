@@ -1,0 +1,94 @@
+---
+title: "Tailwind CSS 4.3 — Scrollbar Utility, 복합 Variant, 공개된 Class 정렬 API"
+description: "2026년 7월 출시된 Tailwind CSS 4.3은 Native Scrollbar·Zoom Utility, Stacked/Compound 형태의 @variant 문법, 그리고 Prettier Plugin의 공개 Class 정렬 API를 추가했습니다. 무엇이 바뀌었고 어떻게 쓰면 되는지 실무 관점에서 정리합니다."
+date: "2026-07-24"
+status: "published"
+tags: ["Tailwind CSS", "CSS", "Web 개발", "Frontend", "DaisyUI"]
+thumbnail: ""
+author: "webhani"
+slug: "tailwind-css-4-3-scrollbar-variant-utilities-2026"
+---
+
+## 조용하지만 실무에 유용한 Point Release
+
+2026년 7월, Tailwind CSS 4.3이 출시되었고(7월 16일 기준 4.3.3까지 Patch 진행) 헤드라인을 장식할 만큼 화려하지는 않지만, 실제 Project에 남아 있던 자잘한 자체 CSS를 걷어낼 수 있는 종류의 Release입니다. 눈에 띄는 변화는 세 가지입니다. Native Scrollbar Utility, 여러 조건을 조합하기 위한 더 표현력 있는 `@variant` 문법, 그리고 Prettier Plugin에 공개된 Class 정렬 API. 모두 화려하지는 않지만, Tailwind를 쓰는 Codebase가 이미 어떤 형태로든 우회하고 있던 부분을 대체합니다.
+
+이 Project는 Tailwind CSS 4와 DaisyUI 5를 함께 쓰고 있어서, 우리 Stack에서 바로 쓸 수 있는 부분을 중심으로 Changelog를 살펴봤습니다.
+
+## Scrollbar, Zoom, Tab-size Utility
+
+4.3 이전에는 Tailwind에서 Scrollbar를 Styling하려면 임의의 CSS나 Plugin에 의존해야 했습니다. First-party Utility가 없었기 때문입니다. 4.3에서는 Scrollbar Utility 세트가 통째로 추가되었습니다.
+
+```html
+<div class="scrollbar-thin scrollbar-thumb-amber-500 scrollbar-track-transparent overflow-y-auto">
+  <!-- 긴 Content -->
+</div>
+```
+
+`scrollbar-{auto,thin,none}`은 Scrollbar의 유무와 두께를 제어하고, `scrollbar-thumb-*`, `scrollbar-track-*`는 다른 Tailwind Color Utility와 동일한 Color Scale을 받습니다. 즉 `scrollbar-thumb-amber-500`은 Amber Palette를 기반으로 한 Design System에 별도의 CSS 변수 없이 바로 들어맞습니다. `scrollbar-gutter-*`는 Scrollbar가 나타나도 Content가 밀리지 않도록 미리 공간을 확보해두는 Utility로, Overflow가 동적으로 발생하는 Layout(Chat Panel, Code Block, Dropdown List 등)에서 유효합니다.
+
+Zoom(`zoom-*`)과 Tab-size(`tab-*`) Utility도 이번 Release에 함께 포함되었습니다. Tab-size는 작지만 실질적인 이득으로, Code Block이나 `<pre>` Content를 별도 Stylesheet 대신 Tailwind Class로 렌더링하는 사람에게 유용합니다.
+
+## Stacked와 Compound `@variant`
+
+자체 CSS를 Tailwind와 함께 작성하는 사람에게 더 큰 변화는 `@variant`의 동작 방식입니다. 이전에는 `@variant` Block 안에서 두 조건을 조합하려면 중첩(Nesting)이 필요했습니다.
+
+```css
+/* 4.3 이전 */
+.card {
+  @variant hover {
+    @variant focus {
+      outline: 2px solid theme(colors.amber.500);
+    }
+  }
+}
+```
+
+4.3에서는 Stacked와 Compound 두 형태를 직접 쓸 수 있습니다.
+
+```css
+/* Stacked — 위 중첩 버전과 동일한 의미. 두 조건이 동시에 성립해야 함 */
+.card {
+  @variant hover:focus {
+    outline: 2px solid theme(colors.amber.500);
+  }
+}
+
+/* Compound — 둘 중 하나만 성립해도 Rule이 적용됨 */
+.card {
+  @variant hover, focus {
+    outline: 2px solid theme(colors.amber.500);
+  }
+}
+```
+
+이 차이는 중요합니다. `hover:focus`는 두 State가 동시에 필요합니다(Class List에서 Variant를 이어 쓰는 `hover:focus:outline-2`와 같은 의미입니다). 반면 `hover, focus`는 둘 중 하나만 참이면 Rule이 적용됩니다. 이전에는 이를 구현하려면 Rule을 두 번 쓰거나 Sass 식 Mixin에 의존해야 했습니다. Button, Nav Item, Form Field처럼 몇 가지 Interactive State를 가진 Component Library라면, 이 변화는 자체 CSS의 중복을 실질적으로 줄여줍니다.
+
+## Class 정렬 공개 API
+
+Prettier Plugin은 이제 Tailwind의 Class 순서 Logic — File을 저장할 때 Class가 Tailwind의 표준 순서로 재배열되는 바로 그 Logic — 을 `/sorter` Subpath를 통해 Programmatic API로 공개합니다.
+
+```js
+import { sortClasses } from "prettier-plugin-tailwindcss/sorter";
+
+const sorted = sortClasses("p-4 flex bg-amber-500 hover:bg-amber-600 items-center");
+// => "flex items-center bg-amber-500 p-4 hover:bg-amber-600"
+```
+
+이는 보기보다 의미가 큽니다. 이 API가 공개되기 전에는, Tailwind와 일관된 Class 순서를 필요로 하는 Tool — Custom Lint Rule, Codemod, Component Generator 등 — 이 Prettier를 외부 실행하거나 정렬 Heuristic을 직접 재구현해야 했습니다. 이제는 Import 가능한 함수로 쓸 수 있습니다. `eslint-plugin-tailwindcss`는 이미 같은 Logic을 이용해 임의값(Arbitrary Value) Class를 더 확실하게 정리한다고 알려져 있습니다. ClassName 문자열을 생성·정규화하는 사내 Tool(Scaffolding CLI 등)에도 합리적인 Building Block이 됩니다.
+
+## 이 Stack을 쓰는 Project에서 실제로 바꿀 부분
+
+이 Project처럼 Next.js + Tailwind + DaisyUI 구성이라면 다음을 검토할 만합니다.
+
+1. **자체 Scrollbar CSS를 새 Utility로 교체합니다**: `globals.css` 어딘가에 손으로 만든 `.scrollbar-hide` 같은 Class가 정의되어 있다면, `scrollbar-none`으로 대체하고 삭제할 수 있을 가능성이 높습니다.
+2. **공유되는 Interactive State에는 Rule 중복 대신 Compound `@variant`를 사용합니다**: Hover와 Focus 모두에 같은 Styling을 적용하는 곳(접근성을 고려한 Interactive Element에서 흔한 Pattern)에서는 `@variant hover, focus { ... }`가 더 짧고, 두 Declaration이 서로 어긋날 위험도 줄여줍니다.
+3. **ClassName 문자열을 Programmatic하게 생성하는 곳에서는 Sorter API 사용을 검토합니다**: Component Generator나 Design Token Pipeline이 Tailwind Class를 출력한다면, Prettier와 동일한 정렬 Logic을 Import함으로써 별도의 규칙을 새로 만들지 않고도 생성된 Code와 손으로 작성한 Code의 시각적 일관성을 유지할 수 있습니다.
+
+## 정리
+
+4.3의 어떤 변경도 Migration을 요구하지 않습니다 — 모두 추가적인 변화이며, 기존 Utility Class와 `@apply` Pattern은 그대로 동작합니다. 가치는 오히려 "삭제할 수 있는 것"에 있습니다. 손으로 만든 Scrollbar CSS, 중첩된 `@variant` Block, 임시방편으로 만든 Class 정렬 Script. 이미 Tailwind를 채택한 Project라면 Upgrade는 Risk가 낮고, 유지해야 할 CSS Surface를 조금 더 줄여줍니다.
+
+---
+
+*참고: [Tailwind CSS Releases & Latest Updates — releases.sh](https://releases.sh/tailwind-css), [Tailwind CSS Blog](https://tailwindcss.com/blog), [Tailwind CSS v4.0 - what's new and how to upgrade — fireup.pro](https://fireup.pro/news/tailwind-css-v4-0-released-lightning-fast-builds-advanced-features-and-simplified-setup)*
