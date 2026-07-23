@@ -1,0 +1,94 @@
+---
+title: "Tailwind CSS 4.3 — Scrollbar Utility・複合Variant・公開されたClass並び替えAPI"
+description: "2026年7月のTailwind CSS 4.3は、Native Scrollbar・Zoom Utility、Stacked/Compound形式の@variant構文、そしてPrettier PluginのClass並び替え公開APIを追加しました。それぞれ何が変わり、どう使うかを実務目線で整理します。"
+date: "2026-07-24"
+status: "published"
+tags: ["Tailwind CSS", "CSS", "Web開発", "Frontend", "DaisyUI"]
+thumbnail: ""
+author: "webhani"
+slug: "tailwind-css-4-3-scrollbar-variant-utilities-2026"
+---
+
+## 地味だが実務に効くPoint Release
+
+2026年7月、Tailwind CSS 4.3がリリースされ（7月16日時点で4.3.3までPatchが進行）、見出しを飾るような派手さはないものの、実際のProjectに残っていた小さな自前CSSを削れる類のReleaseです。注目すべきは3点：Native Scrollbar Utility、複数条件を組み合わせるための表現力を増した`@variant`構文、そしてPrettier Pluginで公開されたClass並び替えの公開API。どれも地味ですが、Tailwindを使うCodebaseがすでに何らかの形で回避策を持っている部分を置き換えます。
+
+このProjectはTailwind CSS 4 + DaisyUI 5を使っているため、ここでは自分たちのStackで直接使える部分を中心にChangelogを見ていきます。
+
+## Scrollbar・Zoom・Tab-size Utility
+
+4.3以前、TailwindでScrollbarをStylingするには、任意のCSSかPluginに頼るしかありませんでした。First-party Utilityは存在しなかったのです。4.3では、Scrollbar Utilityが一式追加されました。
+
+```html
+<div class="scrollbar-thin scrollbar-thumb-amber-500 scrollbar-track-transparent overflow-y-auto">
+  <!-- 長いContent -->
+</div>
+```
+
+`scrollbar-{auto,thin,none}`はScrollbarの有無と太さを制御し、`scrollbar-thumb-*`・`scrollbar-track-*`は他のTailwind Color Utilityと同じColor Scaleを受け取ります。つまり`scrollbar-thumb-amber-500`は、Amber Paletteを基盤とするDesign Systemに、別途CSS変数を用意することなくそのまま組み込めます。`scrollbar-gutter-*`はScrollbarが現れてもContentがずれないようスペースを事前確保するもので、動的にOverflowが発生するLayout（Chat Panel、Code Block、Dropdown Listなど）で効いてきます。
+
+Zoom（`zoom-*`）とTab-size（`tab-*`）UtilityもこのReleaseに含まれます。Tab-sizeは小粒ながら、Code BlockやTailwind Class経由で`<pre>` Contentを描画している人には実用的な追加です。
+
+## StackedとCompoundの`@variant`
+
+自前のCSSをTailwindと併用する人にとって、より大きな変更は`@variant`の扱いです。従来、`@variant`Block内で2つの条件を組み合わせるにはNestingが必要でした。
+
+```css
+/* 4.3以前 */
+.card {
+  @variant hover {
+    @variant focus {
+      outline: 2px solid theme(colors.amber.500);
+    }
+  }
+}
+```
+
+4.3では、StackedとCompoundの両形式が直接使えるようになりました。
+
+```css
+/* Stacked — 上のNested版と同じ意味。両方の条件が同時に必要 */
+.card {
+  @variant hover:focus {
+    outline: 2px solid theme(colors.amber.500);
+  }
+}
+
+/* Compound — どちらかの条件が成立すればRuleが適用される */
+.card {
+  @variant hover, focus {
+    outline: 2px solid theme(colors.amber.500);
+  }
+}
+```
+
+この違いは重要です。`hover:focus`は両方のState を同時に要求します（Class ListでVariantを連結する`hover:focus:outline-2`と同じ意味論）。一方`hover, focus`はどちらかが真であればRuleを適用します——以前はこれを実現するにはRuleを2回書くか、Sass風のMixinに頼るしかありませんでした。ButtonやNav Item、Form Fieldなど、いくつかのInteractive Stateを持つComponent Libraryにとって、これは自前CSSの重複を確実に減らします。
+
+## Class並び替えの公開API
+
+Prettier Pluginは、TailwindのClass順序ロジック——Fileを保存した際にClassがTailwindの正規順序に並び替えられるあのロジック——をProgrammatic APIとして`/sorter` Subpathで公開するようになりました。
+
+```js
+import { sortClasses } from "prettier-plugin-tailwindcss/sorter";
+
+const sorted = sortClasses("p-4 flex bg-amber-500 hover:bg-amber-600 items-center");
+// => "flex items-center bg-amber-500 p-4 hover:bg-amber-600"
+```
+
+これは見た目以上に意味があります。このAPIが公開される前は、Tailwindと整合したClass順序を必要とするTool——Custom Lint Rule、Codemod、Component Generatorなど——は、Prettierを外部実行するか、並び替えのHeuristicを自前で再実装するしかありませんでした。今ではImport可能な関数として使えます。`eslint-plugin-tailwindcss`はすでに同じロジックを使い、任意値(Arbitrary Value)のClassをより確実にCleanupするようになったと報告されています。ClassName文字列を生成・正規化する社内Tool（Scaffolding CLIなど）にとっても妥当なBuilding Blockです。
+
+## このStackを使うProjectで実際に変える点
+
+このProjectのようなNext.js + Tailwind + DaisyUI構成であれば、次を検討します。
+
+1. **自前のScrollbar CSSを新しいUtilityに置き換える**：`globals.css`のどこかに手書きの`.scrollbar-hide`のようなClassが定義されているなら、`scrollbar-none`に置き換えて削除できる可能性が高いです。
+2. **共有Interactive StateにはRule重複ではなくCompound `@variant`を使う**：HoverとFocusの両方に同じStylingを適用する箇所（Accessible な Interactive Elementでよくあるパターン）では、`@variant hover, focus { ... }`の方が短く、2つのDeclarationが乖離するリスクも減らせます。
+3. **ClassName文字列をProgrammaticに生成する箇所ではSorter APIの利用を検討する**：Component GeneratorやDesign Token PipelineがTailwind Classを出力しているなら、Prettierと同じ並び替えロジックをImportすることで、生成Codeと手書きCodeの見た目の一貫性を、独自の規約を作らずに保てます。
+
+## まとめ
+
+4.3のいずれの変更もMigrationを必要としません——すべて追加的なもので、既存のUtility Classや`@apply`Patternはそのまま動作します。価値があるのは「削除できるもの」の方です。手作りのScrollbar CSS、NestされたVariant Block、その場しのぎのClass並び替えScript。すでにTailwindを採用しているProjectにとって、UpgradeはRiskが低く、維持すべきCSSのSurfaceをわずかに小さくしてくれます。
+
+---
+
+*参考: [Tailwind CSS Releases & Latest Updates — releases.sh](https://releases.sh/tailwind-css), [Tailwind CSS Blog](https://tailwindcss.com/blog), [Tailwind CSS v4.0 - what's new and how to upgrade — fireup.pro](https://fireup.pro/news/tailwind-css-v4-0-released-lightning-fast-builds-advanced-features-and-simplified-setup)*
