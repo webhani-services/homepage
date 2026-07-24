@@ -1,0 +1,50 @@
+---
+title: "GitHub の新しい Copilot Impact Dashboard：AI Coding の ROI を推測で語らないために"
+description: "GitHub が今週、Enterprise 管理者向けに Copilot Metrics Impact Dashboard を追加しました。Seat 稼働率のような表面的な指標から一歩進み、何を計測すべきかを整理します。"
+date: "2026-07-25"
+status: "published"
+tags: ["GitHub Copilot", "DevOps", "Engineering Metrics", "AI Coding Assistant"]
+thumbnail: ""
+author: "webhani"
+slug: "github-copilot-metrics-impact-dashboard-2026"
+---
+
+GitHub が今週、Enterprise 管理者・Organization Owner 向けに Copilot Metrics Impact Dashboard を追加しました。AI Coding Tool を導入した多くの Team が、これまで推測以上のものでは答えられなかった問い——「これは実際に役立っているのか」——に答えるための機能です。
+
+これまで多くの Organization が手にしていた指標は、Adoption の代理指標にすぎませんでした。Seat の有効化数、Suggestion の表示数、Suggestion の採用数。これらは「使われているかどうか」は教えてくれますが、「Team が実際に速く出荷できているか」「Code の品質は保たれているか」「Tool が Developer に、十分読み込んでいない Suggestion をもっともらしいという理由だけで受け入れさせていないか」までは教えてくれません。「利用状況」ではなく「Impact」に焦点を当てた Dashboard が出てきたこと自体、具体的な Chart の中身を見る前から、計測対象の捉え方として意味のある変化です。
+
+## なぜ利用状況の指標は的外れになりやすいか
+
+特に採用率は、誰も意図せずとも Game されやすい指標です。時間に追われている Developer が、十分読み込まずに Suggestion を多く受け入れれば、その人は Copilot の「重度で成功した」利用者として現れます。一方で慎重に読んで半分は却下する Developer より、実際には信頼性の低い Code を生んでいる可能性があってもです。もし人事評価や Team 比較の一部に採用率を紐づけてしまえば、AI の出力をとりあえず通してしまう Incentive を静かに作ってしまいます。
+
+これは解決可能な問題ですが、Activity ではなく Outcome を測る必要があります。GitHub の新しい Dashboard はその方向に進んでいるとされていますが、どの指標が表示されるか以上に、「Impact」が何を意味するのかを Organization 自身が事前に決めておくことの方が重要です。
+
+## どの Dashboard を使うにせよ追うべき Outcome 指標
+
+- **PR Cycle Time**——Diff の相当部分が AI 支援によるものかどうかで分けて見ます。AI 支援 PR の Cycle Time が Baseline に対して改善していないなら、その Tool は自分たちの Codebase では謳われているほどの速度向上をもたらしていないことになります。
+- **Revert・Hotfix 率**——AI 支援 PR とそれ以外を比較します。ここが、速く出荷できているように見えて実は Revert が増えているという問題を、静かに浮かび上がらせる指標です。
+- **Review Comment の密度。** AI 支援 PR で手動 PR より指摘のやり取りが多いなら、生成された Code が一見完成しているようでも、実際にはより多くの人手による修正を必要としているサインです。
+- **Test Coverage の変化。** Coding Agent は一見完成している Code を作るのが得意です。それが十分な Test Coverage を伴って出荷されたかどうかは、別途明示的に確認すべき問いです。
+
+組み込みの Dashboard を使わない場合でも、`gh` CLI と PR の Label でこれらは追えます。
+
+```bash
+# Open 時点で AI 支援 PR に Label を付け、後で Cycle Time を比較する
+gh pr list --state merged --label "ai-assisted" \
+  --json number,createdAt,mergedAt \
+  --jq '.[] | (((.mergedAt | fromdateiso8601) - (.createdAt | fromdateiso8601)) / 3600)' \
+  | awk '{ sum += $1; n++ } END { print "avg hours to merge:", sum/n }'
+```
+
+このように PR を分類して AI 非支援の Baseline と比較すれば、組み込み Dashboard が Plan の都合で使えない場合でも、近い Signal を得られます。
+
+## 導入する Client への推奨事項
+
+- **Org 全体で Dashboard を有効化する前に、Outcome 指標を2〜3個決めておく**こと。何を「良い」とするかの定義がないまま数字だけ揃えても、後付けの Story づくりにしかなりません。
+- **採用率を個人の人事評価に紐づけない**こと。これは Tool への関与度を測るものであって Code 品質の指標ではなく、評価軸にすると前述の「とりあえず通す」Incentive を生みます。
+- **Sprint 単位ではなく月単位でレビューする**こと。個々の PR 単位では Cycle Time も Revert 率もノイズが大きく、Signal は数週間単位でしか見えてきません。
+- **Org 全体ではなく Team・Codebase 領域ごとに分けて見る**こと。Test Coverage が低い既存 Service と、しっかり Test された新規 Service とでは AI 支援の結果が異なり、平均すると有用な情報が消えてしまいます。
+
+## まとめ
+
+Dashboard の価値は、それがどんな問いに向けられているか次第です。GitHub が Impact 系の指標を製品に組み込んだこと自体は、業界が AI Coding Tool 導入の「Seat 有効化数だけ見る」段階を抜けつつある良い兆候です。ただ、数字が単なる Activity 演出以上の意味を持つためには、Organization が「Impact とは何か」を先に決めておく必要があります。

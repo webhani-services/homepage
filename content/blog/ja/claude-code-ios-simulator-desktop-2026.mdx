@@ -1,0 +1,68 @@
+---
+title: "Claude Code Desktop が iOS Simulator に対応：Agentic Coding がついに Native Mobile へ"
+description: "Claude Code Desktop が iOS Simulator を直接操作できるようになりました。Web 開発では当たり前になっていた「自己検証ループ」が Mobile 開発にも広がってきています。"
+date: "2026-07-25"
+status: "published"
+tags: ["Claude Code", "AI Coding Assistant", "iOS", "Mobile Development", "Agentic AI"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-ios-simulator-desktop-2026"
+---
+
+Anthropic が今週、Claude Code Desktop に iOS Simulator 対応を Public Beta として追加しました。Mac 上で iPhone App の Build・実行・Test・Debug を、Agent の作業フローから離れずに行えるようになります。地味な機能追加に見えますが、実は結構大きな Gap を埋めるものです。この1年で成熟してきた Agentic Coding の多くは Web や Backend 向けの検証ループ——コードを直して、Server を立てて、Endpoint を叩いて、Log を読む——を前提にしていました。Mobile 開発はそもそもループの形が違うので、Agent がこれまで自力で回せなかった領域です。
+
+## なぜ Mobile のループは自動化しにくかったのか
+
+Web 中心の Coding Agent は比較的安く自己検証できます。Dev Server を起動して HTTP Request を投げ、Response を見るか Browser の Screenshot を撮ればいい。Native Mobile 開発はそう簡単には圧縮できません。SwiftUI の Layout 修正を確認するには、App を Build して Simulator を起動し、Launch して Console 出力を読むか、実際の画面を見る必要があります。これまでは Developer が Terminal から Xcode に切り替えて手動で確認していた工程です。
+
+Claude Code Desktop に Simulator 対応が組み込まれたことで、このループを Agent 自身が回せるようになりました。
+
+```bash
+# Agent が裏側で実質的に自動化している内容
+xcrun simctl boot "iPhone 17"
+xcodebuild -scheme MyApp -destination "platform=iOS Simulator,name=iPhone 17" build
+xcrun simctl launch booted com.example.myapp
+xcrun simctl io booted screenshot after-fix.png
+```
+
+「小さい画面だと Submit Button が Keyboard の下に隠れる」といった Bug Report があれば、Agent が修正を加え、Rebuild して Simulator を起動し、Screenshot を撮って期待する Layout と比較する——という一連の流れを自分で完結できます。Web 開発ですでに定着している「完了と言う前に検証する」という規律が、Native App にも広がってきた形です。
+
+## 実際のループのイメージ
+
+Layout に問題がある SwiftUI の View を例に見てみます。
+
+```swift
+struct CheckoutView: View {
+    var body: some View {
+        VStack {
+            Spacer()
+            TextField("Card number", text: $cardNumber)
+            Button("Submit") { submit() }
+        }
+        .padding()
+        // 抜けている: .ignoresSafeArea(.keyboard, edges: .bottom)
+        // か ScrollView での Wrap ——Spacer が Content を
+        // Keyboard の下に押し込んでしまう
+    }
+}
+```
+
+以前はこの手の Bug を見つけるために、Developer が実際に App を動かして Keyboard を表示させ、目視で重なりに気づく必要がありました。今は Bug の説明を渡すだけで、Agent が Layout を直し、Rebuild して Keyboard 表示中の Simulator を Screenshot するところまで一気にこなせます。
+
+## まだ Beta であること、監督を残すべき部分
+
+Team に導入する前に、いくつか意識しておきたい点があります。
+
+- **Local に完全な Xcode 環境が必要**です。軽量な統合ではなく、Developer が普段使うのと同じ Toolchain を Agent が操作するため、Build 時間や Simulator 起動時間は変わりません。
+- **Simulator は実機ではありません。** Camera Access、Push 通知の配信、性能特性は実機と異なります。Simulator での検証は「速い一次確認」であって、Release 前の実機 Test の代わりにはなりません。
+- **破壊的な Simulator 操作には確認 Gate を設けるべき**です。Simulator の状態 Reset や Derived Data の削除、App Container の消去などは、他の Agentic Coding Workflow で `rm -rf` を Gate するのと同じ発想で、明示的な確認を挟んでおく方が安全です。
+
+## webhani としての推奨事項
+
+- **まずは検証ループに Scope を絞る**こと。Simulator 上で目視確認できる Bug 修正や UI 調整から始め、Code Signing・Provisioning・Release Build は当面 Agent に任せない方がよいでしょう。
+- **Simulator の Screenshot は「証拠」であって「正しさの証明」ではない**と捉えること。Layout が意図通り描画されたことは確認できますが、実機での Test や Accessibility 確認の代わりにはなりません。
+- **既存の CI を置き換えるのではなく併用する**こと。Simulator ループは開発中の高速な Iteration には有効ですが、Release Gate の判断材料は実機・Cloud Simulator の Test Matrix に置いておくべきです。
+
+## まとめ
+
+この機能追加自体よりも、それが示す方向性の方が重要です。Agentic Web 開発で定着した「自分の作業を検証してから完了と言う」というループが、これまで手動での切り替えを必要としていた領域にも少しずつ広がってきています。Native iOS App を開発している Team は、まず限定的な UI Bug 修正で試してみて、Release Build に近い作業は様子を見てから任せるのがよいでしょう。

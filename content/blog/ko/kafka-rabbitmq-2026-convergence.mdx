@@ -1,0 +1,60 @@
+---
+title: "Kafka와 RabbitMQ, 2026년 기능이 가까워지다 — 그래도 어떻게 골라야 할까"
+description: "Kafka 4.0은 ZooKeeper를 완전히 제거했고 RabbitMQ 4.1은 Streams를 강화했습니다. 두 Message Broker가 서로의 강점을 흡수하는 지금, 실무에서는 어떤 기준으로 선택해야 할지 정리합니다."
+date: "2026-07-25"
+status: "published"
+tags: ["Kafka", "RabbitMQ", "Message Queue", "Backend Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "kafka-rabbitmq-2026-convergence"
+---
+
+Kafka와 RabbitMQ는 오랫동안 서로 다른 질문에 대한 답이었습니다. Kafka는 Consumer가 Replay하는 고Throughput Event Log, RabbitMQ는 Message 단위 Ack을 동반한 유연한 Routing이었죠. 두 Project 모두 올해 Major Release를 냈는데, 그 방향이 흥미롭습니다. 서로 상대방의 전유물이었던 기능을 흡수하고 있습니다.
+
+Kafka 4.0은 KRaft를 유일한 합의 Mechanism으로 만들면서 ZooKeeper를 Deployment에서 완전히 제거했습니다. RabbitMQ 4.1은 Native Streams로 Log 성격을 더 강화했고 Quorum Queue Throughput도 의미 있게 개선했습니다. 둘 중 하나가 다른 하나로 바뀐 것은 아니지만, Spec상의 격차는 확실히 줄었습니다. "다들 쓰니까 Kafka로 가면 된다"거나 "RabbitMQ가 더 단순하니 일단 이걸로 시작하자" 같은 예전 기본 선택은 예전만큼 강한 근거가 아니게 되었습니다. 실제 요구사항을 기준으로 다시 따져볼 가치가 생긴 셈입니다.
+
+## 실제로 무엇이 바뀌었나
+
+**ZooKeeper 없는 Kafka**는 운영 부담을 한 Category 통째로 줄여줍니다. Broker Cluster와 별도로 ZK Ensemble을 준비하고 감시하고 Version을 맞춰야 하는 부담이 사라졌습니다. Kafka의 운영 무게 때문에 망설였던 Team이라면, 그 우려가 그대로 적용되지 않는 Version입니다.
+
+**RabbitMQ Streams**는 기존 Queue에 더해 Log 형태의 추상을 RabbitMQ에 가져다줍니다. Consumer가 파괴적으로 소비하는 것만이 아니라 Offset부터 Replay할 수 있게 되었습니다. Quorum Queue Throughput 개선과 맞물려, 지속적인 Throughput 측면에서 Kafka와의 격차가 상당히 줄었습니다(완전히 메워진 것은 아닙니다).
+
+```javascript
+// RabbitMQ Streams Consumer — Offset 기반 Replay 가능
+const client = await connect({ hostname: "localhost" });
+const consumer = await client.declareConsumer(
+  { stream: "orders-events", offset: Offset.first() },
+  (message) => {
+    console.log("replayed event:", message.content.toString());
+  }
+);
+```
+
+```javascript
+// Idempotence를 활성화한 Kafka Producer
+const producer = kafka.producer({ idempotent: true, maxInFlightRequests: 5 });
+await producer.send({
+  topic: "orders-events",
+  messages: [{ key: orderId, value: JSON.stringify(orderPayload) }],
+});
+```
+
+두 Code 모두 각 Project의 공식 Client API를 그대로 사용합니다. 여기서 중요한 건 Code 모양이 비슷하다는 게 아니라, Replay나 (거의) Exactly-Once에 가까운 전달 같은 개념이 이제 예전에는 차별점이었던 반대편에서도 쓸 수 있게 되었다는 점입니다.
+
+## 그래도 남아 있는 본질적인 차이
+
+기능이 가까워졌다고 선택이 쉬워진 건 아닙니다. 판단 기준이 "누가 Streaming Replay를 지원하는가"에서, 수렴되지 않은 부분으로 옮겨갔을 뿐입니다.
+
+- **순수 Throughput 상한.** Kafka의 Log 구조 기반 설계는 Streams 유무와 무관하게 지속적인 고Volume Event 수집에서 여전히 RabbitMQ보다 높은 상한을 가집니다. Clickstream이나 IoT 규모 Telemetry를 다룬다면 RabbitMQ의 개선된 하한보다 Kafka의 상한이 더 중요합니다.
+- **Routing 복잡도.** RabbitMQ의 Exchange/Binding Model은 Fan-out, Topic 기반 Routing, RPC 방식의 Request/Reply Pattern을 Kafka의 Partition + Consumer Group Model보다 자연스럽게 처리합니다. 내용에 따라 서로 다른 Queue로 분기해야 하는 Architecture라면 RabbitMQ Model이 여전히 더 잘 맞습니다.
+- **Message 단위 Ack 제어.** RabbitMQ의 Ack/Nack/Requeue Model은 Message마다 세밀한 제어가 가능하지만, Kafka의 Offset Commit은 Consumer Group 단위로 동작합니다. 특정 Message만 골라서 Retry하거나 Dead-Letter로 보내야 하는 Workload는 대개 RabbitMQ Model에 더 자연스럽게 맞습니다.
+
+## Client에게 전하는 내용
+
+- **기능 수렴이라는 Headline만 보고 시스템을 바꾸지 마세요.** Routing 요구사항에 이미 RabbitMQ가 맞고 있다면, Native Streams가 추가됐다고 해서 Kafka의 Throughput 상한이 갑자기 여러분의 Workload에 관련성이 생기는 건 아닙니다. 기존 Broker에 Replay 기능이 더해졌을 뿐입니다.
+- **운영 숙련도를 무겁게 고려하세요.** ZooKeeper 없는 Kafka는 확실히 운영하기 쉬워졌지만, 이미 한쪽 System에 익숙한 Team에게 전환 비용은 기능 목록과는 별개로 실재합니다.
+- **Peak Throughput 숫자가 아니라 Consumer 형태에 맞추세요.** 초당 1만 건 수준이면서 복잡한 Message 단위 Routing이 필요한 System에는, 초당 100만 건을 가정한 Kafka 구성보다 RabbitMQ가 더 적합한 경우가 많습니다.
+
+## 정리
+
+두 Ecosystem이 서로의 기능을 흡수하는 것은 이미 한쪽에 Commit한 Team에게는 좋은 소식입니다. Migration 없이 다룰 수 있는 범위가 넓어지니까요. 다만 갈아타는 이유로는 보이는 것만큼 강력하지 않습니다. 근본적인 Architecture 성향(Log냐 Queue냐)은 사라지지 않았고, 좁혀진 건 기능 목록의 차이뿐이기 때문입니다. 올해 어느 쪽이 더 화려한 Release Note를 냈는지가 아니라, 각자의 Routing 형태와 Throughput 상한을 기준으로 선택하는 것이 확실합니다.
