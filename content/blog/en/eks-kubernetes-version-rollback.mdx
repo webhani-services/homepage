@@ -1,0 +1,101 @@
+---
+title: "EKS Version Rollback: Turning Kubernetes Upgrades Into a Reversible Decision"
+description: "Amazon EKS now lets you roll back a cluster's Kubernetes version within 7 days without rebuilding it. Here's what that actually changes about upgrade strategy, and what it doesn't fix."
+date: "2026-07-26"
+status: "published"
+tags: ["AWS", "EKS", "Kubernetes", "Cloud Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "eks-kubernetes-version-rollback"
+---
+
+## The upgrade that you couldn't take back
+
+Anyone who has run an EKS cluster past its first birthday knows the feeling: the current Kubernetes minor version is approaching end of support, the upgrade has been postponed twice already, and now it has to happen this quarter whether the team is ready or not. Historically, once you moved a cluster's control plane forward, there was no supported way back. If something broke two weeks later — a workload that depended on a deprecated API, an operator that silently stopped reconciling, a webhook that started rejecting valid objects — the only paths forward were forward: patch around the problem, or rebuild a cluster at the old version and migrate everything back.
+
+Amazon EKS now supports rolling a cluster's Kubernetes version back within a 7-day window, without a rebuild. That is a meaningful shift in the risk profile of an operation most teams have treated as one of the scariest items on their infrastructure calendar. It's worth being precise about what actually gets safer, and what still doesn't.
+
+## Why upgrades were high-risk in the first place
+
+Three separate failure modes stack on top of each other during a Kubernetes upgrade, and a rollback capability only addresses one of them cleanly.
+
+**Control-plane API deprecation and removal.** Every Kubernetes minor version can remove APIs that were deprecated in earlier releases. `PodSecurityPolicy` is the famous example, but every version has its own list — batch/v1beta1 CronJobs, older Ingress API groups, and so on. If a Helm chart, an in-house controller, or a third-party operator issues calls against a removed API group, it doesn't fail gracefully; it fails outright, often only when that specific code path is exercised.
+
+**CRD and webhook compatibility.** Custom Resource Definitions and their validating/mutating webhooks are versioned independently of the cluster itself. An upgrade can shift how the API server serializes or converts custom resources between CRD versions, and admission webhooks written against an older API server behavior can start rejecting objects they used to accept — or worse, silently letting through objects they should reject. This class of failure is the hardest to catch in a staging environment, because it depends on the exact combination of CRD versions, webhook configurations, and object shapes actually in use.
+
+**Data-plane drift.** Node components (kubelet, container runtime, CNI, CSI drivers) upgrade on a slightly different cadence than the control plane, and workloads that assume specific kubelet behavior (eviction thresholds, cgroup driver, device plugin APIs) can start behaving differently even when nothing in the workload's own manifest changed.
+
+Put together, these three failure modes explain why "wait until forced" became a rational strategy for many teams: an upgrade you don't perform can't break anything, and an upgrade you do perform is a one-way door.
+
+## What a 7-day reversible window actually changes
+
+A rollback window doesn't eliminate any of the three failure modes above. What it changes is the cost of discovering them.
+
+Before: discovering a control-plane incompatibility three days after an upgrade meant an incident response process that started with "how do we get back to a known-good state," and the honest answer was often "rebuild and migrate," measured in days.
+
+After: the same discovery triggers a rollback that is measured in minutes to an hour, using the same cluster identity, the same node groups (where compatible), and none of the state-migration risk of a rebuild.
+
+That cost reduction changes the incentive structure for upgrade cadence in a concrete way. Teams that previously batched upgrades — skipping a minor version, upgrading two versions at once to reduce the total number of "risky events" per year — now have less reason to do that. Upgrading one minor version at a time, more frequently, with a real rollback safety net, is lower total risk than upgrading two versions at once with no safety net. It also reduces the specific failure pattern where a cluster sits two or three minor versions behind support, accumulates a large deprecation gap, and then has to clear all of it in a single forced upgrade under EOL pressure — which is exactly when teams have the least slack to absorb a bad surprise.
+
+For clusters running production inference workloads — and per the CNCF's 2025 Annual Cloud Native Survey, a majority of Kubernetes users in production are now running GenAI workloads on it — this matters more than it used to. A model-serving deployment that goes into CrashLoopBackOff because a mutating webhook started rejecting its pod spec is a different kind of incident than a stateless web service doing the same thing; it usually means an outage for whatever product feature depends on that inference path, discovered by users before it's discovered by dashboards.
+
+## What rollback does not fix
+
+This is the part worth being blunt about with clients, because "we have a rollback button now" invites treating upgrades as low-risk in a way that isn't quite true.
+
+A version rollback reverses the *control plane version*. It does not reverse:
+
+- **Data written in a new format.** If any component started persisting state (etcd-backed CRs, config data, cache entries) using a schema or API version only understood by the new control plane, rolling the control plane back doesn't retroactively convert that data. Anything reading it post-rollback may still choke on it.
+- **Applied CRD changes.** If you applied a new CRD schema as part of the upgrade — even one bundled with an operator update — that schema change is a cluster-state change independent of the control plane version. Rolling back the control plane doesn't roll back the CRD.
+- **Node-level changes that already propagated.** If node group AMIs, kubelet versions, or CNI/CSI driver versions were bumped as part of the same change window and workloads already adapted to (or broke against) the new behavior, a control-plane rollback doesn't touch that layer.
+- **External side effects.** Anything a controller did against an external system (cloud resources created, DNS records written, IAM policies attached) during the window it was misbehaving stays done.
+
+In short: rollback is a safety net for the control-plane compatibility class of failure, not a general undo button for the upgrade.
+
+## A practical runbook
+
+This is roughly the sequence we recommend to clients running EKS in production, adjusted to the reversible-rollback reality rather than the old "one shot, be paranoid" model.
+
+**1. Pre-upgrade compatibility scan.** Before touching anything, check what's actually calling deprecated or removed APIs. A quick way to get a first pass, using only standard `kubectl`:
+
+```bash
+#!/usr/bin/env bash
+# pre-upgrade-api-check.sh
+# Illustrative check: list custom resources and workloads that may be
+# affected by API removals in the target Kubernetes version.
+
+TARGET_VERSION="1.31"
+
+echo "== CRDs currently installed =="
+kubectl get crds -o custom-columns=NAME:.metadata.name,VERSION:.spec.versions[*].name
+
+echo "== Admission webhooks that will run during upgrade traffic =="
+kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations \
+  -o custom-columns=NAME:.metadata.name,FAILURE_POLICY:.webhooks[*].failurePolicy
+
+echo "== Workloads referencing deprecated API groups (manual review) =="
+kubectl get all --all-namespaces -o json \
+  | jq -r '.items[] | select(.apiVersion | test("v1beta1|extensions/")) | "\(.metadata.namespace)/\(.kind)/\(.metadata.name): \(.apiVersion)"'
+
+echo "Cross-check the above against the AWS EKS deprecation notes for target version ${TARGET_VERSION} before proceeding."
+```
+
+This isn't exhaustive — it's a starting filter to catch the obvious cases before you rely on a staging cluster and the AWS release notes for the rest.
+
+**2. Stage the upgrade on a non-production cluster with production-representative CRDs and webhooks**, not just production-representative workload count.
+
+**3. Snapshot what "known good" means before upgrading** — record current CRD versions, webhook configurations, and node group AMI versions, so a rollback decision can be made against a clear before/after diff rather than guesswork.
+
+**4. Upgrade the control plane, then hold.** Don't immediately cascade the node group upgrade. Watch control-plane-dependent behavior (admission, API responses, controller reconciliation) for a defined observation window before touching data-plane components.
+
+**5. Define the rollback trigger conditions in advance**, not during the incident. E.g., "any workload in CrashLoopBackOff attributable to admission rejection, any controller reconciliation error rate above baseline for 15 minutes, any customer-facing latency regression above X%."
+
+**6. Treat CRD and node-level changes as separate, non-reversible steps.** Sequence them after the control-plane observation window, not bundled into the same change.
+
+## Takeaways
+
+The 7-day rollback window is a genuine reduction in upgrade risk, and it should shift most teams toward smaller, more frequent upgrades rather than large deferred ones. But it's a safety net for one specific failure class — control-plane version incompatibility — not a substitute for pre-upgrade compatibility checks, staged rollout, or careful sequencing of CRD and node-level changes. Build the runbook around what rollback actually covers, and keep treating data migrations and CRD schema changes as the one-way doors they still are.
+
+---
+
+*References: AWS's EKS release notes; the CNCF 2025 Annual Cloud Native Survey.*

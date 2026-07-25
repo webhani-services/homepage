@@ -1,0 +1,103 @@
+---
+title: "EKSのVersion Rollback — Kubernetes Upgradeを「後戻りできる判断」に変える"
+description: "Amazon EKSがCluster再構築なしで7日以内のKubernetes Version Rollbackに対応しました。Upgrade戦略にとって何が変わり、何が変わらないのかを整理します。"
+date: "2026-07-26"
+status: "published"
+tags: ["AWS", "EKS", "Kubernetes", "Cloud Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "eks-kubernetes-version-rollback"
+---
+
+## 「戻れないUpgrade」だった時代
+
+EKS Clusterを1年以上運用しているチームなら、あの感覚に覚えがあるはずです。使っているKubernetesのMinor Versionがそろそろサポート終了(EOL)を迎える。Upgradeはすでに2回先送りにしている。そして今Quarter中に、準備ができていようがいまいがやるしかない、という状況です。
+
+これまで、一度Control PlaneのVersionを進めてしまうと、公式にサポートされた戻し方はありませんでした。2週間後に何か壊れても——Deprecateされた APIに依存していたWorkload、いつの間にか Reconcile が止まっていた Operator、正常な Object を弾き始めた Webhook——選べる道は前に進むことだけでした。問題箇所を回避する Patch を当てるか、旧Versionで新しくClusterを構築して丸ごと移行し直すか、のどちらかです。
+
+Amazon EKSは今回、Cluster再構築なしで、Kubernetes Versionを7日以内にRollbackできる機能をサポートしました。多くのチームがInfrastructure Calendarの中で最も緊張する作業のひとつと捉えてきたOperationのRisk構造が、これで実質的に変わります。ただし、何が本当に安全になり、何がそうでないままなのかは、丁寧に区別しておく価値があります。
+
+## そもそもUpgradeがHigh Riskだった理由
+
+Kubernetes Upgradeでは、性質の異なる3つのFailure Modeが積み重なります。そしてRollback機能がきれいに解決するのは、そのうちのひとつだけです。
+
+**Control PlaneのAPI Deprecation・削除。** どのMinor Versionでも、以前のReleaseでDeprecate扱いになっていたAPIが削除される可能性があります。`PodSecurityPolicy`が有名な例ですが、Version ごとに固有のリストがあり、batch/v1beta1のCronJobや古いIngress API Groupなども対象になり得ます。Helm ChartやIn-house Controller、サードパーティのOperatorが削除済みのAPI Groupを呼び出していた場合、Gracefulには失敗せず、そのCode Pathが実際に実行されたタイミングで初めて表面化することが多いです。
+
+**CRDとWebhookの互換性。** Custom Resource Definitionとそれに紐づくValidating/Mutating Webhookは、Cluster本体とは別にVersion管理されています。UpgradeによってAPI ServerがCustom ResourceをSerialize・変換する挙動が変わることがあり、古いAPI Serverの挙動を前提に書かれたAdmission Webhookが、これまで通していたObjectを弾き始めたり——逆に、弾くべきObjectを通してしまったりします。このタイプのFailureはStaging環境で最も検知しづらいものです。実際に使われているCRD Version・Webhook設定・Objectの形の組み合わせ次第で挙動が変わるためです。
+
+**Data Planeのずれ。** Node側のComponent(kubelet、Container Runtime、CNI、CSI Driver)はControl Planeとは少しずれたペースでUpgradeされ、kubeletの特定の挙動(Eviction Threshold、cgroup Driver、Device Plugin API)を前提にしたWorkloadは、自身のManifestが何も変わっていなくても挙動が変わることがあります。
+
+この3つを合わせると、「強制されるまで待つ」が多くのチームにとって合理的な戦略になっていた理由が見えてきます。実行しないUpgradeは何も壊しませんが、実行したUpgradeは一方通行のDoorだったからです。
+
+## 7日間のRollback Windowが実際に変えるもの
+
+Rollback Windowは、上記3つのFailure Modeそのものを消すわけではありません。変わるのは、それを発見したときのコストです。
+
+以前は、Upgradeの3日後にControl Planeの非互換に気づいた場合、「既知の正常状態にどう戻すか」から始めるIncident Responseになり、正直なところ「再構築して移行する」が現実的な答えで、それは日単位の時間がかかりました。
+
+今は、同じ発見がRollbackを引き起こし、同じCluster Identity・(互換性がある範囲で)同じNode Groupを使い、再構築のようなState移行Riskを伴わずに、数分から1時間程度で完了します。
+
+このコスト低下は、Upgrade頻度に対するIncentive構造を具体的に変えます。以前は「年間のRisk事象を減らす」ためにMinor Versionをスキップし、2つ分まとめてUpgradeするチームもありました。今はそうする理由が薄れます。実効性のあるRollbackという安全網がある状態で、Minor Versionを1つずつ、より高い頻度でUpgradeする方が、安全網なしで2つ分を一気にUpgradeするより総Riskは低くなります。また、Clusterがサポート対象より2〜3 Minor Version遅れた状態で放置され、Deprecation Gapが積み上がり、EOLの圧力の下で一気に全部を解消しなければならない——チームが不意打ちを吸収する余裕が最も少ないタイミングで起きがちなパターン——も減らせます。
+
+本番でInference Workloadを動かしているClusterにとって、これは以前より重要な意味を持ちます。CNCFの2025 Annual Cloud Native Surveyによれば、本番でKubernetesを使うユーザーの多くがすでにGenAI Workloadをその上で動かしています。Mutating WebhookがPod SpecをRejectし始めてModel-serving DeploymentがCrashLoopBackOffに陥るのは、同じことがStatelessなWeb Serviceで起きるのとは意味が違います。多くの場合、そのInference Pathに依存するProduct機能の停止を意味し、しかもDashboardより先にUserに気づかれることが多いです。
+
+## Rollbackが解決しないこと
+
+ここは顧客に対してもはっきり伝えるべき部分です。「Rollback Boltonができた」という事実は、Upgradeを実態以上にLow Riskだと錯覚させかねません。
+
+Version RollbackはあくまでControl Planeの Versionを戻すものです。次のものは戻りません。
+
+- **新しいFormatで書かれたData。** 何らかのComponentが、新しいControl Planeでしか理解できないSchemaやAPI Versionでetcd上のCR・設定・Cache等を永続化し始めていた場合、Control Planeを戻しても、そのDataは遡って変換されません。Rollback後にそれを読むComponentは、引き続きつまずく可能性があります。
+- **適用済みのCRD変更。** UpgradeのタイミングでOperator UpdateとBundleされた新しいCRD Schemaを適用していた場合、それはControl Plane Versionとは独立したCluster State変更です。Control PlaneをRollbackしても、CRDは戻りません。
+- **すでに伝播したNode側の変更。** 同じ変更WindowでNode GroupのAMIやkubelet Version、CNI/CSI Driver Versionを上げてしまい、Workloadがすでに新しい挙動に適応(あるいはそれで壊れて)いた場合、Control PlaneのRollbackはそのLayerには触れません。
+- **外部への副作用。** 誤動作していた期間にControllerが外部Systemに対して行ったこと(Cloud Resourceの作成、DNS Recordの書き込み、IAM Policyの付与など)は、そのまま残ります。
+
+要するに、RollbackはControl Planeの互換性というFailure Classに対する安全網であって、Upgrade全体に対する汎用のUndo Boltonではありません。
+
+## 実務向けRunbook
+
+以下は、Reversible Rollbackが前提になった今の現実に合わせて、Webhaniが顧客のEKS運用に対して推奨している一連の流れです。旧来の「一発勝負だから慎重に」というModelとは前提が違います。
+
+**1. Upgrade前のCompatibility Scan。** 何かを触る前に、実際に削除・DeprecateされたAPIを呼んでいるものを洗い出します。標準の`kubectl`だけでも、次のようなScriptで一次チェックができます。
+
+```bash
+#!/usr/bin/env bash
+# pre-upgrade-api-check.sh
+# 例示用チェック: 対象Kubernetes VersionでのAPI削除の影響を受けそうな
+# Custom ResourceとWorkloadを一覧化する。
+
+TARGET_VERSION="1.31"
+
+echo "== 現在installされているCRD =="
+kubectl get crds -o custom-columns=NAME:.metadata.name,VERSION:.spec.versions[*].name
+
+echo "== Upgrade中のTrafficに関わるAdmission Webhook =="
+kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations \
+  -o custom-columns=NAME:.metadata.name,FAILURE_POLICY:.webhooks[*].failurePolicy
+
+echo "== Deprecateされた API Groupを参照しているWorkload(要目視確認) =="
+kubectl get all --all-namespaces -o json \
+  | jq -r '.items[] | select(.apiVersion | test("v1beta1|extensions/")) | "\(.metadata.namespace)/\(.kind)/\(.metadata.name): \(.apiVersion)"'
+
+echo "上記の結果を、対象Version ${TARGET_VERSION} のAWS EKS Deprecation Notesと突き合わせてから先に進んでください。"
+```
+
+これで網羅できるわけではありません。明らかなケースを先に潰すためのFilterであり、残りはStaging ClusterとAWSのRelease Notesで確認します。
+
+**2. Staging Clusterで、本番相当のCRDとWebhookを使ってUpgradeを試す。** 本番相当のWorkload数だけでは不十分です。
+
+**3. Upgrade前に「既知の正常状態」をSnapshotとして記録する。** 現在のCRD Version、Webhook設定、Node GroupのAMI Versionを記録しておくと、Rollback判断を勘ではなく明確なBefore/After Diffに基づいて行えます。
+
+**4. Control PlaneをUpgradeしたら、いったん止める。** Node Group Upgradeをすぐに連鎖させないこと。Control Plane依存の挙動(Admission、API応答、Controllerの Reconcile)を、決めておいたObservation Windowの間観察してから、Data Plane側のComponentに手をつけます。
+
+**5. Rollbackを判断するTrigger条件を事前に定義しておく。** Incident発生中に決めるのではありません。例えば「Admission Rejectionが原因と考えられるCrashLoopBackOffが1件でも発生」「Controller Reconcile Error RateがBaselineを15分以上上回る」「Customer向けLatencyがX%以上悪化」など。
+
+**6. CRDとNodeレベルの変更は、独立した・Rollback不可のStepとして扱う。** Control PlaneのObservation Windowの後にSequenceし、同じ変更にBundleしないこと。
+
+## まとめ
+
+7日間のRollback Windowは、Upgradeに伴うRiskを実質的に下げるものであり、多くのチームにとって「まとめて先送り」から「小さく頻繁に」への移行を後押しするはずです。ただし、それはControl Plane VersionのIncompatibilityという特定のFailure Classに対する安全網であって、Upgrade前のCompatibility Check・Staged Rollout・CRDやNodeレベルの変更を慎重にSequenceすることの代わりにはなりません。RunbookはRollbackが実際にカバーする範囲を基準に組み立て、Data MigrationとCRD Schema変更は今も一方通行のDoorであるという前提を崩さないことが重要です。
+
+---
+
+*参考: AWSのEKS Release Notes、CNCFの2025 Annual Cloud Native Survey*
