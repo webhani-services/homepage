@@ -1,0 +1,83 @@
+---
+title: "AWS Graviton5 탑재 C9g Instance 출시 — 마이그레이션할 가치가 있을까"
+description: "AWS가 Graviton5 기반 EC2 C9g·C9gd Instance를 발표했습니다. Compute 성능이 최대 25% 향상된다고 하는데, 마이그레이션을 판단하는 기준을 정리합니다."
+date: "2026-07-27"
+status: "published"
+tags: ["AWS", "클라우드 인프라", "Graviton", "EC2", "비용 최적화"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-graviton5-c9g-instances-2026"
+---
+
+## 무엇이 발표되었나
+
+AWS가 5세대 Arm 기반 Processor인 Graviton5를 탑재한 새로운 EC2 Instance Family, C9g와 C9gd를 발표했습니다. AWS에 따르면 새 Instance는 기존 Graviton4 계열 Instance 대비 Compute 성능이 최대 25% 향상되고, Cache는 5배 커졌으며, Memory는 현재 클라우드에서 제공되는 Processor Instance 중 가장 빠르다고 합니다. "d"가 붙은 Variant(C9gd)는 Instance Store를 가진 Instance에 대한 AWS의 기존 명명 관례에 따라 로컬 NVMe Storage를 탑재합니다.
+
+C Family는 Compute 최적화형으로, Batch 처리, Media Encoding, 고처리량 Web·API 계층, Gaming Server, 과학 계산 Simulation이 전형적인 적용 대상입니다. Workload가 Memory나 I/O가 아니라 CPU-bound일수록, 세대 교체의 효과가 청구 금액에 더 빨리 나타나는 Instance Family입니다.
+
+## Spec 표보다 중요한 것
+
+Graviton 세대 업데이트 발표는 매번 비슷하게 들립니다 — "더 빠르고, 더 저렴하고, 더 효율적으로." 흘려듣기 쉬운 문구지만, 마이그레이션 판단에서 실제로 중요한 수치는 Vendor 측 Benchmark가 아니라 자사 Workload에서의 실제 가격 대비 성능입니다. Compute 25% 향상은 현재 세대에서 실제로 Compute-bound인 Workload가 아니라면 그대로 비용 절감으로 이어지지 않습니다. Network I/O나 Disk가 병목이라면 순수 Compute 성능을 아무리 늘려도 얻는 것은 미미합니다.
+
+또 하나 진지하게 받아들여야 할 부분은 "가장 빠른 Memory", "Cache 5배"라는 주장입니다. 특히 큰 Cache는, 이전 세대 Cache에 온전히 들어가지 않던 큰 Working Set을 가진 Workload — In-memory 데이터 처리, 일부 Search Indexing, JIT 비중이 큰 Runtime 등 — 에서 불균형적으로 크게 효과를 발휘하는 경향이 있습니다. 현재 사용 중인 C Family Instance가 Profiling에서 높은 Cache Miss율을 보인다면, Compute 수치와는 별개로 이 세대를 별도로 Benchmark해볼 가치가 있습니다.
+
+## 무작정 옮기지 말고 Checklist로 판단합니다
+
+이미 x86에서 이전 세대 Graviton으로 한 번 마이그레이션을 마쳤다면, 새 Graviton 세대로의 이동은 대체로 낮은 Risk입니다. Arm64 호환 작업이 이미 끝나 있기 때문입니다. 이번이 처음으로 Arm64로 옮기는 경우라면 그만큼 시간을 확보해야 합니다. 실무적인 절차는 다음과 같습니다.
+
+1. **전체 의존성 Tree에 대해 Arm64 호환성을 확인합니다.** Application 코드뿐 아니라 Native Module, Base Image, Vendor된 Binary까지 Arm64 Build가 필요합니다.
+2. **Multi-architecture Image를 Build합니다.** 평가 기간 동안 같은 Pipeline을 두 Architecture 모두에 대해 실행할 수 있도록 합니다.
+3. **실제 Workload로 Benchmark합니다.** 범용 CPU Benchmark보다 실제 Traffic 패턴을 재현한 Load Test가 훨씬 유용한 정보를 줍니다.
+4. **점진적으로 Rollout합니다.** 기존 Auto Scaling Group 아래에서, 요청당 비용과 p99 Latency를 현재 Fleet과 나란히 모니터링합니다.
+
+```dockerfile
+# 현재 Fleet과 Graviton5 평가 Fleet 모두를
+# 같은 Dockerfile로 대상하는 Multi-arch Build
+FROM --platform=$BUILDPLATFORM node:22-slim AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:22-slim
+WORKDIR /app
+COPY --from=build /app ./
+CMD ["node", "dist/server.js"]
+```
+
+```bash
+# 두 Architecture용으로 한 번에 Build 및 Push
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t your-registry/your-app:eval \
+  --push .
+```
+
+```hcl
+# Terraform: C9g 위에 작은 평가 Fleet을
+# 기존 Production Instance Type과 나란히 구성
+resource "aws_instance" "graviton5_eval" {
+  count         = 2
+  ami           = data.aws_ami.arm64_app.id
+  instance_type = "c9g.xlarge"
+  subnet_id     = var.private_subnet_id
+
+  tags = {
+    Name    = "app-graviton5-eval"
+    Purpose = "c9g-benchmark"
+  }
+}
+```
+
+## 절감 효과는 실제로 어디서 나오나
+
+Graviton 세대 Upgrade의 현실적인 결과는 "전부가 25% 빨라진다"인 경우는 거의 없습니다. 실제로는, 원래 Compute-bound였던 일부 Service는 처리량당 비용이 확실히 저렴해지고, 다른 곳이 병목이었던 Service는 거의 변화가 없는 쪽에 가깝습니다. 이는 실망스러운 결과가 아니라 유용한 정보입니다. Fleet 전체를 일괄적으로 Lift-and-shift하는 대신, 어떤 Service가 Compute-bound이고 마이그레이션할 가치가 있는지 가려내는 비용 최적화 방식이, 투입한 Engineering 시간 대비 더 나은 결과를 만드는 경향이 있습니다.
+
+## 정리
+
+Graviton5 탑재 C9g·C9gd Instance는 EC2에서 Compute-bound Workload를 운영하고 있다면, 특히 이미 이전 세대 Graviton을 쓰고 있어 마이그레이션 비용이 거의 없는 경우 Benchmark해볼 가치가 있습니다. 발표된 성능 수치는 곧바로 마이그레이션할 이유가 아니라 우선 Test해볼 이유로 받아들이세요. 실제 절감 효과는 현재 병목이 어디에 있느냐에 전적으로 달려 있습니다. Webhani는 Instance Family 변경을 제안하기 전에, 이런 Workload 단위의 비용·성능 감사를 클라우드 인프라 Review의 일환으로 정기적으로 수행합니다.
+
+---
+
+*참고: [AWS Weekly Roundup (AWS News Blog)](https://aws.amazon.com/blogs/aws/aws-weekly-roundup-claude-sonnet-5-on-aws-amazon-workspaces-for-ai-agents-aws-service-availability-updates-and-more-july-6-2026/), [AWS News Blog](https://aws.amazon.com/blogs/aws/)*
