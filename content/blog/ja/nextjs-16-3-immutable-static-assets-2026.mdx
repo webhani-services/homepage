@@ -1,0 +1,75 @@
+---
+title: "Next.js 16.3でoutputHashSaltとImmutable Static Assetsが安定化 — 知っておきたいCacheの武器"
+description: "Next.js 16.3のcanary buildで、outputHashSaltとImmutable Static Assets設定がExperimentalから外れました。それぞれ何を制御し、Deploy Pipelineのどこで効いてくるのかを解説します。"
+date: "2026-07-27"
+status: "published"
+tags: ["Next.js", "Web開発", "キャッシュ", "パフォーマンス", "CDN"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-3-immutable-static-assets-2026"
+---
+
+## 2つの小さな設定、1つの実務的な武器
+
+先日のNext.js 16.3のcanary buildで、Experimental Flagの裏に隠れていた2つの設定オプション、`outputHashSalt`とImmutable Static Assetsの出力が安定版になりました。目立つ機能ではありません。新しいUIも新しいAPI Routeの種類も増えていません。しかし、どちらもProductionでNext.jsを運用していれば必ずいつか直面する問題 — Build出力のCache Invalidation — に直接効いてきます。
+
+## それぞれ何をするのか
+
+Next.jsはJS Chunk、CSS、その他のBuild出力をContent Hash付きのファイル名でBuildします。これによって長期間の積極的なCacheが安全になります。内容が変われば必ずファイル名も変わるため、Far-futureな`Cache-Control`ヘッダーが古いコンテンツを返すことはありません。
+
+**`outputHashSalt`** は、そのContent Hashの元になる値をシードとして与えられるようにします。実質的には、アプリケーションコードを1行も変えずに、Rebuildをまたいで新しいAsset Hashの集合を強制的に生成する手段が手に入ります。狭いユースケースに聞こえますが、次のような状況で効いてきます。
+
+- Cache関連のIncidentのあと、無関係なコード変更をわざわざ入れずに、CDN全体とすべてのClientのBrowser Cacheに対してCache Invalidationを強制したい場合。
+- 同じCommitをCanaryとStableの2つの環境で動かしていて、共有CDN Cache上でAsset Hashが衝突しないよう、意図的に差異を持たせたい場合。
+
+**Immutable Static Assets** は、今回安定版になった機能で、条件を満たすBuild出力に対して「このファイルは絶対に変わらないので、再検証をやめてよい」というCache Semanticsを付与できます。Next.jsが元々生成しているHashベースのファイル名と組み合わせることで、これはかなり安全なデフォルトになります。内容が変わればどのみち新しいファイル名になるため、BrowserやCDNは条件付きリクエスト（`If-None-Match`、304のRound Trip）をこれらのAssetについて丸ごとスキップできます。
+
+## 設定方法
+
+```ts
+// next.config.ts
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  outputHashSalt: process.env.BUILD_HASH_SALT ?? "default",
+  experimental: {
+    // 最近安定化したばかりのため、正確なFlag名は
+    // 導入しているVersionの最新Documentで確認してください
+    immutableStaticAssets: true,
+  },
+};
+
+export default nextConfig;
+```
+
+重要なのは`BUILD_HASH_SALT`をどこから持ってくるかです。これは各Build Serverが勝手に生成する値ではなく、Deploy Pipeline側で管理する値として扱ってください。
+
+```yaml
+# .github/workflows/deploy.yml（抜粋）
+- name: Build
+  env:
+    BUILD_HASH_SALT: ${{ github.sha }}
+  run: npm run build
+```
+
+Commit SHAをSaltとして使うと、同じReleaseをBuildするすべてのInstanceで一貫した値になりつつ、新しいCommitが入るたびに自動的に変わるという、まさに欲しい性質が得られます。
+
+## この設定が生みかねない落とし穴
+
+`outputHashSalt`をBuild呼び出しごとに変動する値 — Timestampや、Build時にランダム生成される値など、Releaseに紐づいていない何か — に設定してしまうと、微妙なRollout Bugを持ち込むことになります。Load Balancer配下で「同じ」Releaseをbuildしているはずの複数Instanceが、それぞれ異なるAsset Hashを生成してしまうのです。Instance AからHTML Shellを読み込み、その後Instance Bのhashでしか存在しないChunkをリクエストしたClientは、Session途中で404を受け取ります。多くの場合、原因が分かりにくい「Chunkの読み込みに失敗しました」というエラーとして、一見ランダムなタイミングで表面化します。
+
+これ自体は新しい失敗パターンではありません。Rolling Deploy中のAsset Hash不一致は、このConfig Option以前から存在する問題です。ただし`outputHashSalt`は、Saltの値を意図的に固定していないと、この問題を誤って持ち込みやすくします。対策はシンプルで、Commit SHA、Release Tag、そのArtifactに紐づくCI Build IDなど、同じReleaseのすべてのBuildで一致する値からSaltを導出し、Multi-instance Build時にFrameworkのデフォルト任せにせず明示的に渡すことです。
+
+## どこで効果を発揮するか
+
+- **CDNのコストとLatency**：再検証のRound Tripが減ることで、Origin Requestが減り、リピート訪問者の体感読み込み速度もわずかながら確実に向上します。
+- **Incident対応**：無関係なコード変更を必要とせず、Pipeline変数経由でクリーンなCache Bustを強制できることは、Cache関連Incident発生時に手元にあると本当に助かる小さなToolです。
+- **Multi-environment Build**：同じCommitからCanaryとStableの両Trackを運用しているTeamは、偶発的な差異に頼るのではなく、Asset Hashを意図的に分けられます。
+
+## まとめ
+
+これらの設定はどちらもアプリケーションコードの書き方を変えません。だからこそ見落とされやすいのですが、Cacheの正しさは、Incident対応その場しのぎのWorkaroundよりも、小さく理解しやすいConfig Leverの方が勝る領域の一つです。Next.js 16.3のcanaryに乗っている、あるいはUpgrade計画を立てているなら、Incidentが起きてから慌てるのではなく、今のうちに`outputHashSalt`をCI Pipelineに配線しておく価値があります。Webhaniでは、Cache設定をProductionトラブルの後付けではなく、Deploy Pipelineレビューの一部として扱っています。
+
+---
+
+*参考: [Next.js — Vercel — releases.sh](https://releases.sh/vercel/next-js), [Next.js 16.3: Instant Navigations (Next.js Blog)](https://nextjs.org/blog/next-16-3-instant-navigations)*
