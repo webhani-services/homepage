@@ -1,0 +1,145 @@
+---
+title: "npm v12의 Install Script 차단 기본값 설정 — 실제 마이그레이션 가이드"
+description: "npm v12(2026년 7월)가 Install Script를 기본값으로 차단합니다. npm 역사상 가장 큰 보안 재설계입니다. 어떤 의존성이 Script를 필요로 하는지, 안전하게 Allowlist를 설정하는 방법, CI 파이프라인에서 무엇이 깨지는지 실무 관점에서 정리합니다."
+date: "2026-07-28"
+status: "published"
+tags: ["npm", "Supply Chain Security", "Node.js", "DevOps", "보안"]
+thumbnail: ""
+author: "webhani"
+slug: "npm-v12-install-scripts-default-2026"
+---
+
+## 모든 Node.js 프로젝트의 설치 프로세스를 바꾸는 기본값 보안 결정
+
+2026년 7월, npm v12가 출시되었습니다. npm 팀은 이를 "npm 역사상(약 16년간) 가장 큰 보안 재설계"라고 설명합니다. 변경 내용은 개념적으로는 단순합니다. 기본적으로 npm은 이제 Lifecycle Script(`postinstall`, `preinstall`, `prepare` 등)의 실행을 차단합니다. Git 의존성과 임의의 원격 소스도 마찬가지로 차단됩니다. 플래그 설정 불필요, 점진적 롤아웃도 없습니다. 팀이 npm을 업그레이드한 순간 모든 Node.js 프로젝트에 영향을 주는 Breaking Change입니다.
+
+이 배경은 이론적 우려가 아니라 실제 공격입니다. 2026년 3월부터 7월 사이 npm Supply Chain 공격이 급증했습니다. Axios와 Mastra AI 같은 높은 profile을 가진 Package가 침해되었고, postinstall Hook을 통한 악성 코드 실행이 확인되었습니다. 7월 14일만 해도 Microsoft Threat Intelligence는 @asyncapi npm Organization에 대한 조직적 공격을 공개했습니다. 4개의 Package에 걸친 5개의 악성 Version이 약 90분 이내에 재배포되어 Module Load 시점에 코드를 실행했습니다. 이 취약점 Class는 오래된 것입니다. Decade 이상 동안 `npm install`을 실행하는 것만으로, Dependency Tree의 모든 Package — 개발자가 직접 선택하지 않은 깊은 Transitive Dependency까지 — 가 설치 시 머신에서 임의의 Shell Command를 실행할 수 있었습니다.
+
+npm v12는 이를 "기본값: 거부"의 Security Posture로 변경했습니다. 모든 팀이 지금 같은 질문을 안고 있습니다. 이는 저희가 고객으로부터 자주 받는 질문과 동일합니다. "실제로 어떤 의존성이 이런 Script를 필요로 하는지, 안전하게 Allowlist할 방법은 무엇인지, CI Pipeline 마이그레이션 중 무엇이 깨지는지."
+
+## Install Script를 "정말 필요"와 "실제로는 불필요"로 분류하기
+
+첫 번째 직감은 대개 틀렸습니다. 모든 Package가 Lifecycle Script 재활성화를 필요로 하는 것은 아닙니다. 실제로 대부분의 Package는 이 Script들을 사용하지도 필요로 하지도 않습니다. 흔한 오해는 "npm v12는 많은 Package를 '깨뜨린다'"는 것입니다. 실제로 대부분의 Package는 Install Script를 처음부터 사용하지 않습니다. Script가 정말 필요한 Package는 작은 Category에 국한됩니다. 바로 **Native Code를 Compile하는 Package**입니다.
+
+`sharp`(libvips를 통한 Image Processing), `sqlite3`, `node-gyp` 기반 Module, `canvas` 등은 설치 중 Native Addon을 Build해야 합니다. 그 Compilation은 `postinstall` Script에서 발생합니다. 다른 몇몇 Package는 `prepare` Script를 사용해 TypeScript를 Transpile하거나 Code를 Bundle하지만, 현대 실무에서는 Pre-built Distribution을 배포하는 것이 표준입니다. Package Author가 Build 시 Compilation Step을 강제한다면 좋은 이유가 있습니다 — 거의 항상 Native Binding이거나 Distribution에 구울 수 없는 Runtime 요구사항입니다.
+
+Dependency를 Audit하는 방법은 간단합니다.
+
+1. `npm ls`로 모든 Direct 및 Transitive Dependency를 나열합니다.
+2. 각 Package에 대해 `node_modules/`의 `package.json`을 검사합니다. 특히 `scripts` Section을 봅시다. `postinstall`, `preinstall`, `prepare`, `postuninstall` Entry를 찾습니다.
+3. Application의 Runtime 요구사항과 일치시킵니다. Package가 C++ Extension을 Compile한다면 필요합니다. 단지 Minifier나 Test Setup을 실행한다면 필요 없습니다.
+
+실무적인 출발점: 직접 의존하는 Package(자신의 `package.json`에 있는 것들)를 먼저 Audit합니다. 이들은 의식적으로 선택한 것이고 이해해야 하는 것들입니다. Transitive Dependency는 이차적입니다 — npm v12의 새로운 Allowlist Mechanism이 Scoping을 다룹니다.
+
+## Config: 안전한 Allowlist Pattern
+
+npm v12는 `--allow-scripts` Flag와 `.npmrc`를 통한 Per-Package Allowlist Mechanism을 제공합니다. 다음은 실제 Production Next.js Project용 현실적인 Pattern입니다.
+
+```
+# .npmrc
+# Native Compilation이 필요한 Package만 Script 허용합니다.
+# 주의: Dependency가 Update될 때 이 Whitelist를 지속적으로 유지해야 합니다.
+
+allow-scripts=false
+
+# Image Processing — sharp는 libvips binding을 Compile합니다
+allow-scripts:sharp=true
+
+# Local Dev Database용 SQLite Binding(사용하는 경우)
+allow-scripts:sqlite3=true
+
+# Playwright Browser Automation(Test Suite에 필요한 경우)
+allow-scripts:playwright=true
+
+# Cryptography용 Native Node.js Binding(node-crypto 등 사용 시)
+allow-scripts:node-gyp-less-than-4=true
+
+# Build 가속화용 ESBuild(Native Bundle 사용 시)
+allow-scripts:esbuild=true
+```
+
+중요한 원칙: 정확한 Package와 구체적인 Version(또는 Version Range)을 이름 지정합니다. Scope에 대해 명시적입니다. 모든 Script를 `allow-scripts=true`로 무분별하게 허용하지 마세요. 목적 전체가 무너집니다.
+
+Monorepo나 Multiple Package Manager를 사용하는 Project에서도 이 Pattern은 Scale합니다. Workspace 루트에 `.npmrc` Allowlist를 배치하고, 필요하면 개별 Workspace 루트에도 배치합니다. `npm install --dry-run`을 실행해 Configuration이 정확한지 Test하세요. 이 Command는 실제 실행 전에 npm이 실행할 Script를 보여줍니다.
+
+## Docker Build와 CI/CD에서 무엇이 깨지는가
+
+가장 즉각적인 문제점: Docker입니다. `npm install` 또는 `npm ci`를 사용하는 Dockerfile은 Image가 Script를 필요로 하는Package에 의존하면 기본값으로 조용히 실패합니다.
+
+```dockerfile
+FROM node:22-alpine
+
+WORKDIR /app
+COPY package*.json ./
+
+# 이것은 sharp, esbuild 등의 Script를 차단합니다
+RUN npm ci
+
+COPY . .
+RUN npm run build
+```
+
+Build가 Image Optimization용 `sharp`나 Native Bundle용 `esbuild`에 의존한다면 Image Build는 성공합니다(Error 없음). 하지만 Runtime은 Incomplete입니다. Compiled Native Binding이 빠졌습니다. Failure는 Runtime 또는 Production에서 발견됩니다.
+
+해결책: `.npmrc`를 Docker Context에 추가하거나 Build 시 Config를 전달합니다.
+
+```dockerfile
+FROM node:22-alpine
+
+WORKDIR /app
+
+# Dependency Install 전에 Allowlist를 Copy합니다
+COPY .npmrc ./
+COPY package*.json ./
+
+# npm은 Working Directory의 .npmrc를 존중합니다
+RUN npm ci
+
+COPY . .
+RUN npm run build
+```
+
+GitHub Actions와 유사한 CI System도 동일하게 작동합니다. Workflow가 `npm install` 또는 `npm ci`를 실행한다면 `.npmrc`를 Repo에 추가하고 Checkin되어 있는지 확인합니다. 또는 Runtime에 npm을 Configuration하는 환경 변수를 사용합니다.
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+        env:
+          NPM_CONFIG_ALLOW_SCRIPTS: 'false'
+          NPM_CONFIG_ALLOW_SCRIPTS_SHARP: 'true'
+          NPM_CONFIG_ALLOW_SCRIPTS_ESBUILD: 'true'
+```
+
+참고: GitHub Actions의 Cache는 이미 `.npmrc`를 처리하므로, Commit되어 있으면 명시적인 Allowlist가 자동으로 Pick up됩니다.
+
+## Defense-in-Depth: Install Script를 넘어선 전략
+
+Script 차단은 한 계층입니다. 하지만 npm v12는 더 큰 그림의 일부입니다. 견고한 Supply Chain Posture에는 다음이 포함됩니다.
+
+**Lockfile Integrity.** `package-lock.json`(또는 `pnpm-lock.yaml`, `yarn.lock`)은 Source of Truth입니다. Commit하고, 변경을 주의 깊게 Review하고, CI에서 Lockfile Diff에 대한 자동 Merge는 절대로 하지 마세요. 악의 행위자가 Lockfile을 수정할 수 있다면 모든 공격으로 Pivot할 수 있습니다. Script Block은 관계없어집니다.
+
+**Minimal Transitive Trust.** Dependency가 적을수록 공격 Surface가 작습니다. Package를 추가하기 전에 "정말 필요한가, 아니면 50줄의 Code를 대신 작성할 수 있을까"라고 자문하세요. 큰 Dependency Tree를 가진 Package는 모든 것으로부터의 Risk를 상속합니다. `npm ls`와 `npm audit`는 도움이 되지만, 반응적입니다. Proactive Minimization이 더 강합니다.
+
+**Software Bill of Materials (SBOM).** 규제 산업에 서비스하는 Project나 Compliance가 필요한 경우 SBOM — 모든 Dependency, 버전 및 알려진 취약점 목록의 유지 — 가 표준입니다. `cyclonedx`나 `syft` 같은 Tool은 Lockfile에서 이를 생성합니다. Dependency가 침해되고 SBOM을 가지고 있다면 정확히 어떤 Project가 영향을 받는지 알고 경쟁사보다 빠르게 대응할 수 있습니다.
+
+**Signed Commit과 Verified Publish.** npm Package가 Public이라면 Release에 서명하고 npm이 Signature Verification을 필수로 설정하도록 구성하세요. Ecosystem은 이 분야에서 아직 초기 단계입니다(Adoption은 Public Registry의 약 5%). 하지만 Security를 중시하는 Project에서는 표준이 되어가고 있습니다.
+
+## 정리
+
+- npm v12의 Script 차단은 Default-Deny Security Posture입니다. 대부분의 Package는 Script를 필요로 하지 않으며, Audit이 어떤 Package가 필요한지 보여줍니다.
+- Native Compilation이 필요한 Package(sharp, sqlite3, node-gyp Module)는 `.npmrc`에 명시적인 Allowlist Entry가 필요합니다. 직접 Dependency를 Audit하세요.
+- Docker Build와 CI/CD Pipeline은 Repo에 `.npmrc` Allowlist를 Checkin하거나 환경 변수로 설정해야 합니다. Deploy 전에 `--dry-run`으로 Test하세요.
+- 강력한 Supply Chain Defense에는 Lockfile Integrity, Minimal Dependency Count, 규제 대상 Project의 SBOM, 그리고 (가능하면) Signed Release가 포함됩니다.
+- npm v12로의 마이그레이션은 "All or Nothing"이 아닙니다. Audit, Allowlist, 단계적 Rollout이 가능합니다. Dev Environment → CI → Production 순서로.
+
+---
+
+*참고: npm v12의 2026년 7월 Security 재설계 공지, 2026년 npm Supply Chain 공격(Axios, Mastra AI) 관련 보도, Microsoft Threat Intelligence의 2026년 7월 14일 @asyncapi npm Organization Compromise 공개, 및 npm Security Documentation 모범 사례.*

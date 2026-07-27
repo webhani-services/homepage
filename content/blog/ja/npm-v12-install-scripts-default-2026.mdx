@@ -1,0 +1,145 @@
+---
+title: "npm v12の「ScriptブロックDefault」 — 何が壊れて、何に対応すべきか"
+description: "npm v12（2026年7月リリース）がInstall ScriptをDefaultで無効化します。npm史上最大級のセキュリティ再設計です。実装上の対応方法と、チームの移行戦略を整理します。"
+date: "2026-07-28"
+status: "published"
+tags: ["npm", "Supply Chain Security", "Node.js", "DevOps", "セキュリティ"]
+thumbnail: ""
+author: "webhani"
+slug: "npm-v12-install-scripts-default-2026"
+---
+
+## 全プロジェクトのInstall処理を変える、Defaultレベルのセキュリティ決定
+
+2026年7月、npm v12がリリースされました。npm チームは、これを「npm史上（約16年間）最大級のセキュリティ再設計」と説明しています。変更は概念上はシンプルです。Defaultでは、Lifecycle Scripts（`postinstall`、`preinstall`、`prepare`など）の実行をBlock します。Git依存や任意のRemoteSourceも同様にBlockされます。フラグの設定不要、段階的な展開もなし。これはチームが npm をアップグレードした時点で、すべての Node.js プロジェクトに影響を与えるBreakingChangeです。
+
+この背景は、理論的な懸念ではなく、現実の攻撃です。2026年3月から7月にかけて、npm Supply Chain攻撃が急増しました。Axios、Mastra AIを含む高いProfile を持つPackageが侵害され、PostinstallHookを経由した悪質なCode実行が確認されました。7月14日だけでも、Microsoft Threat Intelligenceは@asyncapi npm Organization に対する組織的な攻撃を開示しました。4つの Package にまたがる5つの悪質なVersion が、約90分以内に再パブリッシュされ、Module Load時にCodeが実行されました。この脆弱性のClassは古いものです。Decade以上の間、`npm install` を実行するだけで、Dependency Tree のあらゆるPackage — 開発者が直接選択しなかった深いTransitive Dependencies さえ — が、Install中のマシン上で任意のShellCommandsを実行できました。
+
+npm v12はこれを「Default: 拒否」の Security Postureに変えました。すべてのチームが今、同じ問いを抱えています。それは私たちが顧客から聞く質問と同じです。「どのDependenciesが実際にこうしたScriptsを必要とするのか、それらを安全にAllowlistするにはどうするか、CI Pipeline の移行中に何が壊れるのか」
+
+## Install Scriptsを「本当に必要」と「実は不要」で分ける
+
+最初の直感は間違っていることが多いです。すべての Package がLifecycle Scriptsの再有効化を必要とするわけではありません。実は、ほとんどのPackageはこれらを使用しても必要でもありません。よくある誤解は、「npm v12は多くのPackageを『壊す』」というものです。実際には、ほとんどのPackageはそもそもInstall Scriptsを使いません。Scriptsが本当に必要なPackageは小さいCategory に限定されます。それは **Native Code をCompile するPackage** です。
+
+`sharp`（libvips経由のImage処理）、`sqlite3`、`node-gyp`ベースのModules、`canvas`などは、Installation中にNative Addon をBuildする必要があります。そのCompilationは `postinstall` Scriptで起こります。他のいくつかのPackageは `prepare` Scriptを使ってTypeScriptをTranspileしたりCodeをBundleしたりしますが、現代的な実践ではPre-BuiltDistributionをShipするのが標準です。Package AuthorがBuild時のCompilationStepを強制している場合、良い理由があります — ほぼ常にNativeBindingか、DistributionにはできないRuntime要件です。
+
+DependenciesをAuditするApproachはシンプルです。
+
+1. `npm ls` ですべてのDirectおよびTransitiveDependenciesをリストします。
+2. 各Packageについて、`node_modules/` のそれぞれの`package.json`を検査します。特に `scripts` Sectionを見てください。`postinstall`、`preinstall`、`prepare`、`postuninstall` Entriesを探します。
+3. アプリケーションのRuntime Needsとの整合性をチェックします。PackageがC++ ExtensionをCompileする場合は必要です。単にMinifierやTest Setupを実行するだけなら、必要ありません。
+
+実践的な出発点: 直接依存する Package（自分自身の`package.json`にあるもの）を最初にAuditします。これらは自分たちが意識的に選んだもので、理解すべきものです。TransitiveDependenciesは二次的です — npm v12の新しいAllowlistMechanismはScopingを扱います。
+
+## Config: 安全なAllowlist Pattern
+
+npm v12は `--allow-scripts` FlagおよびPer-Package AllowlistMechanismを `.npmrc` 経由で提供します。ここに、実際のProduction Next.js ProjectのためのリアリスティックなPatternを示します。
+
+```
+# .npmrc
+# Native Compilationが必要なPackageのみScriptsを許可します。
+# 注意: DependenciesがUpdateされる際、このWhitelistは継続的にMaintainが必要です。
+
+allow-scripts=false
+
+# Image Processing — sharpはlibvips bindingsをCompileします
+allow-scripts:sharp=true
+
+# Local Dev Database用のSQLite bindings（使用する場合）
+allow-scripts:sqlite3=true
+
+# Playwright Browser Automation（Test Suiteが必要な場合）
+allow-scripts:playwright=true
+
+# Cryptography用のNative Node.js bindings（node-cryptoなどを使用する場合）
+allow-scripts:node-gyp-less-than-4=true
+
+# Build Acceleration用のESBuild（Native Bundleを使用する場合）
+allow-scripts:esbuild=true
+```
+
+重要なPrinciple: 正確なPackageと具体的なVersion（またはVersion Range）をName します。Scopeについて明示的に。すべてのScriptsを `allow-scripts=true` で盲目的にAllowしてはいけません。目的全体が崩れます。
+
+MonoreposやMultiple Package Managers を使うProjectでもこのPatternはScaleします。Workspace Rootに `.npmrc` Allowlistを配置し、必要に応じて個々のWorkspace Rootにも配置します。`npm install --dry-run` を実行して、あなたのConfigurationが正しいことをTestしてください。このコマンドは、実際に実行する前に、npm が実行するScriptsを表示します。
+
+## Docker BuildおよびCI/CDで何が壊れるのか
+
+最も即座な痛点: Docker です。`npm install` または `npm ci` を使うDockerfileは、もしImage がScriptを必要とするPackagesに依存している場合、Defaultではサイレントに失敗します。
+
+```dockerfile
+FROM node:22-alpine
+
+WORKDIR /app
+COPY package*.json ./
+
+# これはsharp、esbuildなどのScriptsをBlockします
+RUN npm ci
+
+COPY . .
+RUN npm run build
+```
+
+BuildがImage Optimization用の `sharp` やNativeBundle用の `esbuild` に依存している場合、Image BuildはSucceedします（Errorはなし）。しかし、RuntimeはIncompleteです。CompiledされたNativeBindingsが見つかりません。Failure はRuntimeで、または本番環境で発見されます。
+
+Fix: `.npmrc` をDockerContextに追加するか、Build時にConfigを渡します。
+
+```dockerfile
+FROM node:22-alpine
+
+WORKDIR /app
+
+# DependenciesのInstall前にAllowlistをコピーします
+COPY .npmrc ./
+COPY package*.json ./
+
+# npmはWorking Directoryの.npmrcを尊重します
+RUN npm ci
+
+COPY . .
+RUN npm run build
+```
+
+GitHub Actionsおよび同様のCI Systemsも同じ方法で機能します。WorkflowがInstall時に `npm install` または `npm ci` を実行する場合は、`.npmrc` をRepoに追加し、Checkinされていることを確認します。あるいは、Runtimeに npm をConfiguration する環境変数を使用します。
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+        env:
+          NPM_CONFIG_ALLOW_SCRIPTS: 'false'
+          NPM_CONFIG_ALLOW_SCRIPTS_SHARP: 'true'
+          NPM_CONFIG_ALLOW_SCRIPTS_ESBUILD: 'true'
+```
+
+注意: GitHub ActionsのCacheはすでに `.npmrc` をHandleするため、Commitしていれば明示的なAllowlistが自動的にPickupされます。
+
+## Defense-in-Depth: Install Scripts を超えた戦略
+
+ScriptsをBlockすることは1つのLayerです。しかし、npm v12はより大きなPictureの一部です。堅牢なSupply Chain Postureには以下が含まれます。
+
+**Lockfile Integrity.** `package-lock.json`（または `pnpm-lock.yaml`、`yarn.lock`）はあなたのSource of Truthです。それを Commit し、変更を注意深くReview し、CI の Lockfile Diff に対する自動Mergeは決してしないでください。悪意のある行為者がLockfileを修正できれば、あらゆる攻撃にPivotできます。Script Block は関係なくなります。
+
+**Minimal Transitive Trust.** DependenciesがFewer = 攻撃Surfaceが小さい。Package を追加する前に、「本当に必要なのか、50行のCode を書く代わりにはどうか」と問いかけてください。大きなDependency Treeを持つPackagesは、すべてからのRiskを継承します。`npm ls` や `npm audit` はHelp になりますが、反応的です。Proactive Minimizationの方が強力です。
+
+**Software Bill of Materials (SBOM).** 規制されたIndustriesに対応するProjectやCompliance が必要な場合、SBOM — すべてのDependencies、それらのVersions、および既知の脆弱性のリストの維持が標準です。`cyclonedx` や `syft` のようなToolsはLockfileからこれらを生成します。Dependency が侵害され、SBOMを持っている場合、正確にどのProjectsが影響を受けるかが分かり、競合より速く対応できます。
+
+**Signed CommitsおよびVerified Publishes.** npm Packageが Public の場合は、Releaseに署名し、npm がSignature Verificationを必須に設定します。Ecosystem はこの分野ではまだ早い段階です（Adoption は Public Registry の約5%）。しかし、Security を意識したProjectではStandardになりつつあります。
+
+## まとめ
+
+- npm v12の Script Block はDefault-Deny Security Posture です。ほとんどのPackagesはScriptsを必要とせず、AuditがどのPackageが必要かを示します。
+- Native Compilationを必要とするPackages（sharp、sqlite3、node-gypモジュール）は `.npmrc` に明示的なAllowlistEntry が必要です。直接DependenciesをAuditしましょう。
+- Docker BuildおよびCI/CD PipelinesはRepoに`.npmrc` Allowlistをチェックインするか、Environment Variablesで設定する必要があります。Deploy前に `--dry-run` でTestしてください。
+- 強力なSupply Chain Defense には、Lockfile Integrity、Minimal Dependency Count、規制対象ProjectのSBOM、および（可能であれば）署名されたReleaseが含まれます。
+- npm v12への移行は「All or Nothing」ではありません。Audit、Allowlist、段階的なRollout が可能です。Dev Environment → CI → Production の順で。
+
+---
+
+*参考: npm v12の2026年7月Security再設計のAnnouncement、2026年のnpm Supply Chain攻撃（Axios、Mastra AI）に関する各種報道、Microsoft Threat IntelligenceによるJuly 14, 2026の@asyncapi npm Organization Compromise開示、およびnpm Security Documentationのベストプラクティス。*
