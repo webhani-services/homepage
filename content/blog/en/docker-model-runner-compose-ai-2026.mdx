@@ -1,0 +1,134 @@
+---
+title: "Docker Model Runner + Compose: Local AI Inference as a First-Class Service"
+description: "Docker Compose now runs quantized LLMs natively via the Model Runner, wiring local inference to your app with environment variables. We explore when this replaces a cloud API and when it doesn't."
+date: "2026-07-28"
+status: "published"
+tags: ["Docker", "Local Development", "LLM", "Infrastructure", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-model-runner-compose-ai-2026"
+---
+
+## The premise: batteries included for AI development
+
+For the past two years, Docker Compose has been the default way teams scaffold "app + database + cache + queue" locally. You write a single `docker-compose.yml`, run `docker compose up`, and everything talks to each other without managing ports or networking manually. It's an elegant pattern: the same Compose file that describes your development stack can drift into your CI/testing layer, and from there into minimal documentation about how the stack actually works.
+
+Starting in July 2026 with Docker Compose v2.35 (and Docker Desktop 4.41+), that pattern extends to AI model inference. You can now pull an OCI-packaged, quantized LLM from a registry—just like any other Docker image—and run it locally via Docker's Model Runner, with Compose managing the setup and networking. Your application service gets connection details injected as environment variables, and you call the model the same way you'd call a Redis cache or PostgreSQL database.
+
+This changes the shape of a few development and testing workflows, but not all of them.
+
+## What actually happens when you define a model in Compose
+
+The Compose file gains a top-level `models` element. Here's a concrete example:
+
+```yaml
+version: "3.9"
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      LLM_ENDPOINT: http://llm:8080
+      LLM_API_KEY: ${LLM_API_KEY:-test-key}
+    depends_on:
+      - llm
+    volumes:
+      - ./src:/app/src
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: dev
+    ports:
+      - "5432:5432"
+
+models:
+  llm:
+    image: docker.io/ollama/mistral:7b-q4  # OCI-packaged model
+    gpu: "1"  # Reserve 1 GPU (optional, defaults to CPU)
+```
+
+When you run `docker compose up`, Compose does the following:
+
+1. Pulls the model image (Mistral 7B quantized to 4-bit) just like any other image.
+2. Passes it to the Docker Model Runner, which extracts the model artifacts and boots `llama.cpp` (the default inference engine) with those weights.
+3. Exposes the inference server on an internal network address (in this example, `http://llm:8080`).
+4. Injects environment variables into your app service so it knows where to reach the model.
+
+Your app calls the inference endpoint via HTTP, gets back JSON-formatted completions, and continues. It looks no different from calling an external API—except the model is running on your machine, consuming your GPU (if you have one), and giving you deterministic, offline inference.
+
+## Where this actually saves time: development and integration tests
+
+The value is immediate in two scenarios:
+
+**Local development feedback loops**: If your application makes LLM calls—a chatbot, code-generation feature, content summarization—you can now test the full flow locally without deploying to a cloud LLM API and incurring cost or latency per request. A quantized 7B model runs at single-digit latency on modern hardware. Iterate quickly, inspect the model's output, tweak your prompts, and only move to a cloud flagship model once the flow is locked.
+
+**Integration tests that exercise real LLM behavior**: This is the subtle win. Most teams mock the LLM call in integration tests (`return "mocked response"`), which means you never actually test what happens when the model's output is malformed JSON, or when it refuses the request, or when it produces output that's *syntactically* valid but *semantically* wrong for your application. With a real (quantized) model in Compose, your CI pipeline can spin up "app + database + quantized LLM" and run tests that actually validate your application's error handling against real model behavior. You still use a smaller model than production (7B instead of 70B), so the test pipeline stays fast, but you're testing against actual inference semantics.
+
+Here's a skeleton of how that looks in a CI pipeline:
+
+```yaml
+# .github/workflows/test.yml
+name: Integration Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start services with model
+        run: docker compose -f docker-compose.test.yml up -d
+
+      - name: Wait for LLM to be ready
+        run: |
+          until curl -s http://localhost:8080/health; do
+            sleep 1
+          done
+
+      - name: Run integration tests
+        run: npm run test:integration
+        env:
+          LLM_ENDPOINT: http://localhost:8080
+
+      - name: Cleanup
+        run: docker compose -f docker-compose.test.yml down
+```
+
+The key difference from a mocked test: your test actually gets LLM output, so you're testing the contract between your app and model output, not a string constant you hardcoded in a fixture.
+
+## The honest limitations: when Compose-local inference is the wrong tool
+
+Docker Model Runner + Compose is not a replacement for managed LLM infrastructure. Here's when it's the wrong move:
+
+**Production scale**: A quantized 7B model can handle maybe dozens of requests per second on a single GPU. If you need to serve thousands of concurrent users, you need a model-serving platform (vLLM, Triton, Ollama cluster) or a managed API. Compose is for development and testing, not production load.
+
+**Frontier model capability**: If your application *needs* Claude Opus, GPT-4, or similar, you cannot run it locally (memory/compute prohibitive). A quantized 7B model is weaker on reasoning and instruction-following. You'll evaluate locally with a smaller proxy model, then deploy to the cloud API.
+
+**Multi-region serving**: If latency and compliance require model inference inside regional boundaries or air-gapped networks, that's infrastructure beyond Compose's scope. You're back to self-hosted serving platforms or regional API endpoints.
+
+**Determinism**: A quantized LLM is not perfectly deterministic (temperature/sampling strategies introduce variance). If your tests require exact output matching, you're still mocking or using seeded outputs. Compose-local inference is useful for *semantic* test coverage (does the app handle unexpected output), not *deterministic* test coverage.
+
+## How we advise clients on this pattern
+
+When a client's application makes LLM calls, we now walk through:
+
+1. **Which LLM calls are in the inner loop?** If the app calls an LLM for every user action, production traffic will need a cloud API (cost and scale). If it's a lower-frequency operation (batch processing, background tasks), there's more room for local inference during development.
+
+2. **Can you proxy the test model?** A 7B quantized model often works as a stand-in for integration testing even if production will use a 70B or frontier model. Test the *architecture* (error handling, retry logic, fallback behavior) with a smaller model, then validate on the real model once pre-production.
+
+3. **Do you need to test model-specific behavior?** If your application code is tightly coupled to a particular model's output format or behavior (e.g., "Claude Opus always returns this structure"), you need to test against *that* model specifically. If your app is model-agnostic (uses a common API pattern), a smaller local model works fine for structural tests.
+
+## Takeaways
+
+- Docker Compose now includes native LLM serving via the Model Runner, treating local inference as a first-class service alongside databases and caches.
+- A quantized model in Compose is most valuable for local development feedback loops and integration tests that validate application behavior against *real* (not mocked) model output.
+- This pattern does not replace cloud LLM APIs for production traffic, frontier models, multi-region serving, or deterministic test assertions.
+- Integration test suites that exercise LLM error handling and output variance gain semantic coverage that mocked tests cannot provide.
+- Model selection for Compose (7B quantized proxy vs. production flagship) is a deliberate choice tied to test scope, not a cost-cutting replacement for managed APIs.
+
+*References: Docker's Model Runner General Availability announcement (July 2026), Docker Compose v5.3.0 release notes, llama.cpp inference engine documentation.*

@@ -1,0 +1,136 @@
+---
+title: "Docker Compose で LLM 推論をローカルサービスとして動かす — Model Runner GA の実装的な使い方"
+description: "Docker Compose v2.35 以降、OCI パッケージ化された量子化 LLM を Model Runner で直接動作させられるようになりました。App + Database + Local LLM の組み立てを、Compose の環境変数注入で統一的に管理する方法と、使い分けの実務を整理します。"
+date: "2026-07-28"
+status: "published"
+tags: ["Docker", "ローカル開発", "LLM", "インフラ", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-model-runner-compose-ai-2026"
+---
+
+## Docker Compose の「電池付き」パターンが AI にまで広がった
+
+過去2年間、チームが「App + Database + Cache + Queue」をローカルで立ち上げるときの標準的な方法が Docker Compose です。`docker-compose.yml` を1ファイル書いて `docker compose up` を実行すれば、各サービスが自動でネットワークで繋がり、ポート管理の細々とした手作業から解放されます。シンプルで効果的なパターンです。同じ Compose ファイルが、開発環境から CI/テスト環境を経由して、本番環境の構成に関するドキュメントへと一貫性を持たせています。
+
+2026年7月、Docker Compose v2.35（Docker Desktop 4.41以降）からこのパターンが AI モデル推論にも拡張されました。OCI パッケージ化された量子化 LLM をレジストリから Pull でき、Docker の Model Runner 経由でローカル実行できるようになったのです。つまり Redis や PostgreSQL と同じ要領で、Compose が LLM サーバーをセットアップしてくれて、アプリケーション Service には接続情報が環境変数で自動注入されます。
+
+これは開発フローとテスト戦略の形を変えます。ただし全てのワークフローが変わるわけではありません。
+
+## Compose で LLM を定義すると具体的に何が起きるか
+
+Compose ファイルに新たに `models` という top-level 要素が加わります。具体例を見てみましょう。
+
+```yaml
+version: "3.9"
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      LLM_ENDPOINT: http://llm:8080
+      LLM_API_KEY: ${LLM_API_KEY:-test-key}
+    depends_on:
+      - llm
+    volumes:
+      - ./src:/app/src
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: dev
+    ports:
+      - "5432:5432"
+
+models:
+  llm:
+    image: docker.io/ollama/mistral:7b-q4  # OCI パッケージ化された Model
+    gpu: "1"  # 1つの GPU を割り当て（オプション。デフォルトは CPU）
+```
+
+`docker compose up` を実行すると、以下のことが起きます。
+
+1. Model Image を Pull します（他の Docker Image と同じ）
+2. それを Docker Model Runner に渡し、Model Runner が Model のアーティファクトを抽出して `llama.cpp` をブートストラップします（既定の推論エンジン）
+3. 推論サーバーを内部ネットワークアドレスに公開します（この例では `http://llm:8080`）
+4. App Service に環境変数を注入し、Model への接続情報を提供します
+
+App 側は HTTP 経由で推論エンドポイントを呼び出して JSON 形式の完成度を得ます。外部 API を呼ぶのと変わらないように見えますが、Model がマシン上で動作し、GPU を消費し、オフライン・確定的な推論が得られるという違いがあります。
+
+## 実務上の価値が出るシーン：開発とテスト
+
+このパターンの価値は2つのシーンで明らかになります。
+
+**ローカル開発時の短いフィードバックループ**: アプリケーションが LLM を呼び出す場合（チャットボット、コード生成、テキスト要約など）、クラウド LLM API にデプロイしてコストと遅延を見ながら試すのではなく、ローカルで全フローをテストできるようになります。量子化された 7B Model は最新ハードウェアで1桁の ms レベルで実行できます。素早く反復してアウトプットを確認し、Prompt を調整した上で、本気のクラウド Flagship Model へ移すというフローになります。
+
+**実際の LLM 挙動を検証する Integration Test**: より実感的な利益はこちらです。多くのチームは Integration Test で LLM 呼び出しを Mock します（`return "mocked response"`）。その結果、Model の Output が不正な JSON だったり、Request を Refuse したり、構文的には正しいが Semantically 間違っているような出力が得られたとき、Application がどう対応するかを テストしません。Compose 内に（量子化された）実Model を入れれば、CI Pipeline が「App + Database + 量子化 LLM」を立ち上げ、*実際の*推論 Semantics に対して Application の Error Handling を検証できます。本番では 7B ではなく 70B や Frontier Model を使うにしても、Test 時は小さい Model で高速を保ちながら、実推論に対する Test を書けるということです。
+
+CI Pipeline ではこんな形になります。
+
+```yaml
+# .github/workflows/test.yml
+name: Integration Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Model を含むサービスを起動
+        run: docker compose -f docker-compose.test.yml up -d
+
+      - name: LLM の準備完了を待機
+        run: |
+          until curl -s http://localhost:8080/health; do
+            sleep 1
+          done
+
+      - name: Integration Test を実行
+        run: npm run test:integration
+        env:
+          LLM_ENDPOINT: http://localhost:8080
+
+      - name: クリーンアップ
+        run: docker compose -f docker-compose.test.yml down
+```
+
+Mock Test との本質的な違いは：Test が *実際の* LLM Output を得られるので、Hardcoded Fixture ではなく、Application と Model Output の実質的な Contract を Test することになります。
+
+## 正直な制限：Compose-Local Inference が不適切な場合
+
+Docker Model Runner + Compose は、Managed LLM Infrastructure の代替ではありません。使うべきでない場面は以下の通りです。
+
+**本番 Scale**: 量子化 7B Model は単一 GPU で数十 req/sec 程度しか処理できません。数千の並行ユーザーを捌く必要があれば、Model 推論の Platform（vLLM, Triton, Ollama Cluster）や Managed API が必要です。Compose は開発・テスト用です。
+
+**Frontier Model が必要**: Application が Claude Opus や GPT-4 が「必要」なら、ローカル実行は現実的ではありません（メモリ・計算量の壁）。量子化 7B Model は Reasoning・Instruction Following で劣ります。ローカルで小さい Proxy Model で Evaluation し、本番は Cloud API にデプロイします。
+
+**Multi-Region 配信**: レイテンシーや Compliance で Region 別に Model Inference が必要なら、Compose の範囲外です。Self-hosted 推論 Platform や Regional API Endpoint が必要です。
+
+**出力の確定性**: 量子化 LLM は完全に確定的ではありません（Temperature・Sampling Strategy で変動）。Test で完全一致を求めるなら、Mock か Seed Output です。Compose-Local Inference は *Semantic* Test カバレッジ（予期しない Output に対応できるか）に向いており、*確定的* Test 向けではありません。
+
+## 顧客が LLM Call を含む Application を作るときの相談プロセス
+
+Application が LLM を呼び出す場合、Webhani では次のステップを踏みます。
+
+1. **どの LLM Call がホットパスにあるか？** Application が User Action のたびに LLM を呼び出すなら、本番 Traffic は Cloud API が必要（Cost・Scale 的に）。低頻度な Operation（Batch、Background Task）なら、開発時の Local Inference の余地があります。
+
+2. **Test Model として小さい Model で代用できるか？** 7B 量子化 Model が Integration Test の Proxy として機能することが多いです。架構（Error Handling、Retry Logic、Fallback 動作）を小さい Model で Test し、本番前に Real Model で Validation するという流れです。
+
+3. **Model 固有の振る舞いをテストする必要があるか？** Application Code が特定の Model Output Format に密結合しているなら（例：「Claude Opus は常にこの構造を返す」）、その Model に対して Testing が必要です。Application が Model-Agnostic（共通 API Pattern を使う）なら、Structural Test に小さい Local Model で十分です。
+
+## まとめ
+
+- Docker Compose は Native LLM Serving を Model Runner 経由で実装し、Local Inference を Database・Cache と並ぶ第一級 Service として扱えるようになりました。
+- Compose 内の量子化 Model は、ローカル開発での短いフィードバックループと、**実の**（Mock ではない）Model Output に対する Application Behavior を検証する Integration Test で最大の価値を発揮します。
+- 本番 Traffic・Frontier Model・Multi-Region 配信・確定的な Test Assertion については、Cloud LLM API が引き続き必要です。
+- LLM Error Handling と Output Variance を検証する Integration Test Suite は、Mock では得られない Semantic Coverage を獲得します。
+- Compose の Model 選定（7B 量子化 Proxy vs. 本番 Flagship）は、Cost 削減ではなく、Test Scope に紐づいた意図的な選択です。
+
+---
+
+*参考: Docker Model Runner の General Availability 発表（2026年7月）、Docker Compose v5.3.0 Release Notes、llama.cpp 推論エンジン Documentation*

@@ -1,0 +1,136 @@
+---
+title: "Docker Compose에서 LLM 로컬 추론을 First-Class Service로 다루기"
+description: "Docker Compose v2.35부터 양자화된 LLM을 Model Runner로 직접 구동하고 환경변수로 App에 주입할 수 있습니다. 개발 환경 구축과 Integration Test 통합 방식, 그리고 클라우드 API와의 역할 분담을 정리합니다."
+date: "2026-07-28"
+status: "published"
+tags: ["Docker", "로컬 개발", "LLM", "인프라", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-model-runner-compose-ai-2026"
+---
+
+## Docker Compose의 패턴이 이제 AI 추론까지 커버한다
+
+지난 2년간 팀들이 로컬에서 "App + Database + Cache + Queue"를 구성하는 표준 방식이 Docker Compose 였습니다. `docker-compose.yml` 파일 하나를 쓰고 `docker compose up` 명령 하나면, 모든 서비스가 자동으로 네트워크로 연결되고, 포트 관리 같은 번거로운 작업에서 해방됩니다. 단순하면서 강력한 패턴입니다. 같은 Compose 파일이 개발 환경에서 출발해 CI/테스트 환경을 거쳐 프로덕션 구성 문서까지 일관성을 유지합니다.
+
+2026년 7월부터 Docker Compose v2.35 (Docker Desktop 4.41+)를 사용하면 이 패턴이 AI 모델 추론에도 확장됩니다. OCI 표준으로 패키징된 양자화된 LLM을 레지스트리에서 가져올 수 있고, Docker의 Model Runner로 로컬에서 구동할 수 있습니다. Redis나 PostgreSQL을 다루는 것처럼 LLM 서버를 Compose가 관리해주고, App Service에 연결 정보를 환경변수로 자동 주입합니다.
+
+개발 워크플로우와 테스트 전략의 모양이 바뀝니다. 하지만 모든 워크플로우가 바뀌는 건 아닙니다.
+
+## Compose에서 LLM을 정의하면 구체적으로 어떻게 되나
+
+Compose 파일에 새로운 top-level 요소 `models`가 추가됩니다. 구체적인 예를 봅시다.
+
+```yaml
+version: "3.9"
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      LLM_ENDPOINT: http://llm:8080
+      LLM_API_KEY: ${LLM_API_KEY:-test-key}
+    depends_on:
+      - llm
+    volumes:
+      - ./src:/app/src
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: dev
+    ports:
+      - "5432:5432"
+
+models:
+  llm:
+    image: docker.io/ollama/mistral:7b-q4  # OCI 패키징 Model
+    gpu: "1"  # GPU 1개 할당 (선택사항, 기본값은 CPU)
+```
+
+`docker compose up`을 실행하면 다음이 벌어집니다.
+
+1. Model Image를 Pull합니다 (다른 Docker Image와 동일).
+2. Docker Model Runner에 전달하면 Model Runner가 Model 아티팩트를 추출하고 `llama.cpp`를 부팅합니다 (기본 추론 엔진).
+3. 추론 서버를 내부 네트워크 주소에 노출합니다 (이 예제에서는 `http://llm:8080`).
+4. App Service에 환경변수를 주입하므로 Model 연결 정보를 자동으로 받습니다.
+
+App는 HTTP 경유로 추론 엔드포인트를 호출해 JSON 형태의 응답을 받습니다. 외부 API를 부르는 것처럼 보이지만 Model이 로컬 머신에서 실행되고, 당신의 GPU를 사용하며, Offline과 Deterministic 추론을 제공한다는 차이가 있습니다.
+
+## 실무에서 가치가 나오는 순간: 개발과 테스트
+
+이 패턴의 가치는 두 가지 시나리오에서 명확해집니다.
+
+**로컬 개발 피드백 루프의 단축**: Application이 LLM을 호출하는 경우 (챗봇, 코드 생성, 텍스트 요약 등), 클라우드 LLM API로 배포해서 비용과 레이턴시를 감수하며 시도하는 대신 로컬에서 전체 흐름을 테스트할 수 있습니다. 양자화된 7B Model은 최신 하드웨어에서 1자리 수의 밀리초로 실행됩니다. 빠르게 반복하고 출력을 검토하며 Prompt를 조정한 뒤, 본격 클라우드 Flagship Model로 이동하는 흐름이 됩니다.
+
+**실제 LLM 동작을 검증하는 Integration Test**: 더 실질적인 이점이 여기 있습니다. 대부분 팀은 Integration Test에서 LLM 호출을 Mock 처리합니다 (`return "mocked response"`). 그러면 Model이 부정확한 JSON을 반환하거나 Request를 거절하거나, 구문적으로 올바르지만 Semantically 틀린 출력을 만들었을 때 Application이 어떻게 대응하는지 테스트할 기회가 없습니다. Compose에 (양자화된) 실제 Model을 넣으면 CI 파이프라인이 "App + Database + 양자화 LLM"을 띄워 *실제* 추론 Semantics를 상대로 Application의 Error Handling을 검증할 수 있습니다. 프로덕션에는 7B 아닌 70B나 Frontier Model을 쓰더라도, 테스트 시간을 빠르게 유지하면서 실 추론 Test를 쓸 수 있다는 뜻입니다.
+
+CI 파이프라인의 모습은 이렇습니다.
+
+```yaml
+# .github/workflows/test.yml
+name: Integration Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Model을 포함한 서비스 시작
+        run: docker compose -f docker-compose.test.yml up -d
+
+      - name: LLM 준비 완료 대기
+        run: |
+          until curl -s http://localhost:8080/health; do
+            sleep 1
+          done
+
+      - name: Integration Test 실행
+        run: npm run test:integration
+        env:
+          LLM_ENDPOINT: http://localhost:8080
+
+      - name: 정리
+        run: docker compose -f docker-compose.test.yml down
+```
+
+Mock Test와의 근본적인 차이: Test가 *실제* LLM 출력을 받으므로, 하드코딩된 Fixture가 아니라 Application과 Model 출력의 실질적 Contract를 테스트합니다.
+
+## 정직한 한계: Compose-Local Inference가 맞지 않는 경우
+
+Docker Model Runner + Compose는 Managed LLM Infrastructure의 대체제가 아닙니다. 사용하면 안 되는 경우들은 다음과 같습니다.
+
+**프로덕션 규모**: 양자화된 7B Model은 단일 GPU에서 초당 몇십 개 요청 정도만 처리할 수 있습니다. 수천 명의 동시 사용자를 감당해야 한다면 Model 추론 Platform (vLLM, Triton, Ollama Cluster) 또는 Managed API가 필요합니다. Compose는 개발과 테스트용입니다.
+
+**Frontier Model 필수**: Application이 Claude Opus나 GPT-4를 반드시 써야 한다면 로컬 실행은 현실적이지 않습니다 (메모리·계산량 한계). 양자화된 7B Model은 Reasoning과 Instruction Following에서 부족합니다. 로컬에서 작은 Proxy Model로 Evaluation하고 프로덕션은 Cloud API에 배포합니다.
+
+**다중 지역 배포**: 레이턴시와 Compliance 때문에 지역별로 Model 추론이 필요하다면 Compose 범위를 벗어납니다. Self-hosted 추론 Platform이나 Regional API Endpoint가 필요합니다.
+
+**출력 결정성**: 양자화된 LLM은 완전히 결정적이지 않습니다 (Temperature·Sampling Strategy로 변동). Test에서 정확한 일치를 요구한다면 Mock이나 Seeded Output을 써야 합니다. Compose-Local Inference는 *Semantic* Test 커버리지 (예기치 않은 출력 대응) 용도에 맞지만, *결정적* Test에는 안 맞습니다.
+
+## LLM Call을 포함한 Application을 고객이 만들 때 상담 프로세스
+
+Application이 LLM을 호출할 때 Webhani는 이 절차를 밟습니다.
+
+1. **어느 LLM Call이 Hot Path에 있는가?** User Action마다 LLM을 호출한다면 프로덕션 Traffic은 Cloud API가 필요합니다 (Cost·Scale). 낮은 빈도 Operation (Batch, Background Task)이면 개발 시 로컬 추론 여지가 있습니다.
+
+2. **작은 Model로 Test Model 대역을 할 수 있는가?** 7B 양자화 Model이 Integration Test의 Proxy로 자주 작동합니다. Architecture (Error Handling, Retry Logic, Fallback 동작)를 작은 Model로 Test하고 프로덕션 전에 Real Model로 Validation합니다.
+
+3. **특정 Model 동작을 Test해야 하는가?** Application Code가 특정 Model 출력 형태에 밀접히 결합되어 있다면 (예: "Claude Opus는 항상 이 구조를 반환한다") 그 Model에 대해 Test 해야 합니다. Application이 Model-Agnostic이면 (공통 API 패턴 사용) Structural Test에 작은 로컬 Model이면 충분합니다.
+
+## 정리
+
+- Docker Compose는 Model Runner 경유 Native LLM Serving을 구현하여 로컬 추론을 Database·Cache와 어깨를 나란히 하는 First-Class Service로 다룹니다.
+- Compose 내 양자화 Model은 로컬 개발 피드백 루프 단축과, **실제** (Mock 아닌) Model 출력에 대한 Application 동작 검증 Integration Test에서 최대 가치를 발휘합니다.
+- 프로덕션 Traffic, Frontier Model, 다중 지역 배포, 결정적 Test Assertion은 여전히 Cloud LLM API가 필요합니다.
+- LLM Error Handling과 출력 분산을 검증하는 Integration Test Suite는 Mock Test에서 얻을 수 없는 Semantic Coverage를 확보합니다.
+- Compose의 Model 선택 (7B 양자화 Proxy vs. 프로덕션 Flagship)은 비용 절감이 아니라 Test Scope에 연계된 의도적 결정입니다.
+
+---
+
+*참고: Docker Model Runner General Availability 발표 (2026년 7월), Docker Compose v5.3.0 Release Notes, llama.cpp 추론 엔진 문서.*
