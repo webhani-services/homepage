@@ -1,0 +1,81 @@
+---
+title: "MCP が Stateless に — 2026-07-28 仕様が実際に変えること"
+description: "Model Context Protocol の 2026-07-28 改訂で initialize Handshake と Session ID が廃止され、Stateless な Core へ移行しました。Auth も本格的な OAuth 2.0 / OIDC に寄せられています。何が壊れ、何が楽になるのか、Server 側の移行の考え方を整理します。"
+date: "2026-07-30"
+status: "published"
+tags: ["MCP", "Claude", "AI Agents", "OAuth", "API Design"]
+thumbnail: ""
+author: "webhani"
+slug: "mcp-2026-07-28-stateless-spec-oauth"
+---
+
+## 長生きする Connection から、どこに飛ばしてもよい Request へ
+
+Model Context Protocol は登場して以来、LLM Agent を外部の Tool や Data に接続する際の Default の選択肢になっていて、Claude の Connector Directory だけでも既に950以上の Server が並んでいます。2026-07-28 の改訂は、初期設計以来もっとも大きな Protocol 形状の変更です。従来 MCP Server が前提としていた `initialize` の Handshake と `Mcp-Session-Id` Header を廃止し、どの Request もどの Server Instance に届いてもよい Stateless な Request/Response Model に置き換えました。
+
+MCP Server を実装・運用したことがあるなら、この一文は少し立ち止まって読む価値があります。Stateful な Protocol は、最初の Message を処理した Server Instance が、5番目の Message も処理すると前提しています。Stateless はその逆で、前提もなければ Sticky Session もなく、自分で永続化しない限り Call ごとに共有される In-Memory State は存在しません。これは意図的な Trade-off です。Session Affinity 付きの Load Balancer の裏で長時間稼働する Process 群を固定数維持する必要がなく、他の Stateless な HTTP API と同じように Serverless や Edge Infrastructure 上で Scale できるようにするためのものです。
+
+## 実際に壊れる部分
+
+真っ先に影響を受けるのは、`initialize` の後に Process Local な Map に Auth Context を Cache していたり、複数 Request にまたがって部分的に構築中の Tool Call State を保持していたりする、静かに In-Memory Session State に依存していた Server です。そうした状態は Stateless な Core の下では生き残りません。その「Session」の次の Request が、記憶を持たない別の Instance に届くかもしれないからです。
+
+対応自体は特殊なものではありませんが、実質的な Migration にはなります。
+
+```ts
+// Before: Server ローカルな Session State に依存（Stateless Core 下で壊れる）
+const sessions = new Map<string, { authContext: AuthContext }>();
+
+server.onRequest((req) => {
+  const session = sessions.get(req.sessionId); // Session ID はもう存在しない
+  return handleToolCall(req, session.authContext);
+});
+
+// After: Auth Context を Request ごとに Token から解決、共有 Memory は不要
+server.onRequest(async (req) => {
+  const authContext = await resolveAuthContext(req.headers.authorization);
+  return handleToolCall(req, authContext);
+});
+```
+
+実務上の原則はこうです。Request N+1 に正しく応答するために必要な情報を、Request N を処理した Process だけが持っている状態にしないこと。もし Request をまたいだ State — 複数 Step の Workflow や長時間の Job — が本当に必要なら、仕様側の答えは付け焼き刃の In-Memory Map ではなく、新しい Tasks 拡張です。
+
+## Auth が本格的になった
+
+もう1つの大きな変更は Authorization です。これまでの MCP Auth は、個人が自分の API Key を接続する程度の用途には十分でしたが、Enterprise が実際に Identity をどう管理しているかとはうまく噛み合っていませんでした。2026-07-28 仕様は、MCP の Authorization Flow を本番運用されている OAuth 2.0 / OIDC に揃えました。実務上は、MCP Server が独自の Bridge なしに Okta や Entra ID など、標準に準拠した任意の Identity Provider の裏に置けるようになったということです。
+
+弊社が内部で保守している Server の場合、これは概ね独自の API Key Check を実際の Token 検証 Step に置き換える作業になります。
+
+```ts
+async function resolveAuthContext(authHeader?: string): Promise<AuthContext> {
+  if (!authHeader?.startsWith("Bearer ")) {
+    throw new McpAuthError("missing_token");
+  }
+  const token = authHeader.slice("Bearer ".length);
+  const claims = await verifyJwt(token, { issuer: OIDC_ISSUER, audience: MCP_AUDIENCE });
+  return { userId: claims.sub, scopes: claims.scope?.split(" ") ?? [] };
+}
+```
+
+単独 User だけでなく Team 向けに社内 System の前段に MCP Server を置くつもりだったなら、これは純粋な改善です。独自に実装せずとも、標準的な Token 失効期限、標準的な Scope Check、標準的な Revocation が手に入ります。
+
+## Apps と Tasks — Core に手を入れずに機能を追加する
+
+誰かが新しい機能を欲しがるたびに Base Protocol を肥大化させるのではなく、この仕様は Version 管理された拡張の枠組みを導入しています。まず押さえておくべきは MCP Apps です。これは Server が Client に対して、Text や JSON を返すだけでなく、Form や Picker、小さな Dashboard のような Interactive UI を渡す方法を標準化します。MCP Tasks は長時間かかる非同期の作業を標準化します。Tool Call が Job を起動し、Client が完了を Poll または Subscribe できるようにするもので、Connection を張りっぱなしにしたり Block したりする必要がなくなります。
+
+どちらも同じ理由で重要です。これまで各 Team が独自に、たいていは Custom な Webhook や Side Channel の Polling Loop、あるいは MCP の Tool Call Response に無理やり載せた独自 UI Protocol で間に合わせていたことに、文書化された正式な方法を与えてくれます。
+
+## 既存 Server のための Migration Checklist
+
+既に MCP Server を運用しているなら、2026-07-28 仕様は「そのうち対応する」ではなく、明示的な監査 Pass の対象にする価値があります。
+
+1. **Session State を Grep する。** Session ID をKeyにしたり、複数 Request にまたがって Module Level の変数に保持していたりする箇所を Server 内で探し、Database、Cache、あるいは Token の Claim に移す。
+2. **場当たり的な Auth を OIDC に置き換える。** 現状 固定の API Key を検証しているなら、実際の Identity Provider に対する Token ベースの Auth への移行を計画する。Security Team が真っ先に聞いてくる変更でもある。
+3. **長時間かかる Tool Call を見直す。** これまで数秒以上 Block していた Tool Call は、長時間の HTTP Connection ではなく Tasks 拡張の候補にする。
+4. **実際に Stateless な状態で再テストする。** Session Affinity を無効化した Load Balancer の裏で動かすか、2つの独立した Instance をまたいで動かしてから本番で信頼する。自分でも気づいていなかった State を洗い出す一番早い方法です。
+
+## まとめ
+
+- Stateless Core は単なる Version の上がりではなく、実質的な Architecture の変更です。本番 Server を Upgrade する前に隠れた Session State を監査します。
+- OAuth 2.0 / OIDC 対応は Enterprise Team が優先すべき変更です。社内向け MCP Server を単一 User 以上の規模で安全に運用できるようにするものです。
+- Apps と Tasks は Interactive UI と非同期 Job のための標準的な手段です。独自の回避策を組む前にまずここを確認します。
+- Session Affinity を無効化した状態で明示的に Stateless であることをテストします。ちょっとした手動確認を通ったからといって準拠していると思い込まないことです。
