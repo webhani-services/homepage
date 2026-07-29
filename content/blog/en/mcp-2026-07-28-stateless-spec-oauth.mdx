@@ -1,0 +1,81 @@
+---
+title: "MCP Goes Stateless: What the 2026-07-28 Spec Actually Changes"
+description: "The Model Context Protocol's 2026-07-28 revision drops the initialize handshake and session IDs in favor of a stateless core, and tightens auth to real OAuth 2.0/OIDC. Here's what breaks, what gets easier, and how to plan a server migration."
+date: "2026-07-30"
+status: "published"
+tags: ["MCP", "Claude", "AI Agents", "OAuth", "API Design"]
+thumbnail: ""
+author: "webhani"
+slug: "mcp-2026-07-28-stateless-spec-oauth"
+---
+
+## From a long-lived connection to a request you can route anywhere
+
+The Model Context Protocol has been the default way to wire an LLM agent to external tools and data since it appeared, and Claude's connector directory alone now lists north of 950 servers built against it. The 2026-07-28 revision is the biggest change to the protocol's shape since that early design: it removes the `initialize` handshake and the `Mcp-Session-Id` header that MCP servers used to rely on, and replaces them with a stateless request/response model where any request can land on any server instance.
+
+If you've built or operated an MCP server, that sentence is worth sitting with. A stateful protocol assumes the server instance that handled your first message is the same one handling your fifth. Stateless means the opposite — no assumption, no sticky session, no shared in-memory state between calls unless you put it somewhere durable yourself. That's a deliberate trade: it's what lets a server deploy on serverless or edge infrastructure and scale like any other stateless HTTP API, instead of requiring a fixed pool of long-running processes behind a load balancer with session affinity.
+
+## What actually breaks
+
+The servers that feel this immediately are the ones that quietly leaned on in-memory session state — caching a user's auth context in a process-local map after `initialize`, or holding partially-built tool call state across multiple requests. None of that survives a stateless core, because the next request in that "session" might hit a different instance with an empty memory.
+
+The fix isn't exotic, but it is a real migration:
+
+```ts
+// Before: relies on server-local session state (breaks under stateless core)
+const sessions = new Map<string, { authContext: AuthContext }>();
+
+server.onRequest((req) => {
+  const session = sessions.get(req.sessionId); // no session ID anymore
+  return handleToolCall(req, session.authContext);
+});
+
+// After: auth context resolved per-request from a token, no shared memory required
+server.onRequest(async (req) => {
+  const authContext = await resolveAuthContext(req.headers.authorization);
+  return handleToolCall(req, authContext);
+});
+```
+
+The practical rule: nothing your server needs to answer request N+1 correctly should live only in the process that handled request N. If your server needs cross-request state — a multi-step workflow, a long-running job — the spec's answer is the new Tasks extension, not an ad hoc in-memory map.
+
+## Auth gets serious
+
+The second major change is authorization. Earlier MCP auth was workable for a single developer connecting a personal API key, but it didn't map cleanly onto how enterprises actually manage identity. The 2026-07-28 spec aligns MCP's authorization flow with production OAuth 2.0 and OIDC deployments, which in practice means an MCP server can sit behind Okta, Entra ID, or any standards-compliant identity provider without a custom bridge.
+
+For a server we maintain internally, that mostly means replacing a bespoke API-key check with a real token validation step:
+
+```ts
+async function resolveAuthContext(authHeader?: string): Promise<AuthContext> {
+  if (!authHeader?.startsWith("Bearer ")) {
+    throw new McpAuthError("missing_token");
+  }
+  const token = authHeader.slice("Bearer ".length);
+  const claims = await verifyJwt(token, { issuer: OIDC_ISSUER, audience: MCP_AUDIENCE });
+  return { userId: claims.sub, scopes: claims.scope?.split(" ") ?? [] };
+}
+```
+
+This is a net win if you were already planning to put an MCP server in front of internal systems for a team, not just a single user — you get standard token expiry, standard scope checks, and standard revocation, instead of rolling your own.
+
+## Apps and Tasks: capabilities without touching the core
+
+Rather than growing the base protocol every time someone wants a new capability, the spec introduces a versioned extensions framework. MCP Apps is the first one worth knowing — it standardizes how a server can hand the client an interactive UI (a form, a picker, a small dashboard) instead of only returning text or JSON. MCP Tasks standardizes long-running, asynchronous work: a tool call that kicks off a job and lets the client poll or subscribe for completion, instead of holding a connection open or blocking.
+
+Both matter for the same reason: they give you a documented way to do things teams were previously improvising — usually with a custom webhook, a side-channel polling loop, or a proprietary UI protocol bolted onto MCP's tool-call responses.
+
+## Migration checklist for an existing server
+
+If you maintain an MCP server today, the 2026-07-28 spec is worth an explicit audit pass rather than a "we'll pick it up eventually":
+
+1. **Grep for session state.** Search your server for anything keyed by a session ID or held in a module-level variable across requests. Move it to a database, cache, or token claim.
+2. **Replace ad hoc auth with OIDC.** If your server currently validates a static API key, plan the move to token-based auth against your actual identity provider — this is also the change your security team will ask about first.
+3. **Reconsider long-running tool calls.** Any tool call that used to block for more than a few seconds is a candidate for the Tasks extension instead of a long HTTP connection.
+4. **Re-test under real statelessness.** Run your server behind a load balancer with session affinity disabled, or across two separate instances, before you trust it in production. This is the fastest way to surface state you didn't know you had.
+
+## Takeaways
+
+- The stateless core is a real architectural shift, not a version bump — audit for hidden session state before you upgrade a production server.
+- OAuth 2.0/OIDC support is the change enterprise teams should prioritize; it's what makes an internal MCP server safe to put in front of more than one user.
+- Apps and Tasks give you a standard way to ship interactive UI and async jobs — check there before building a custom workaround for either.
+- Test statelessness explicitly, with affinity disabled, rather than assuming your server is compliant because it still passes a quick manual check.

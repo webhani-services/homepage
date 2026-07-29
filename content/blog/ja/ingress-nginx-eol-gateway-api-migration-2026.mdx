@@ -1,0 +1,117 @@
+---
+title: "Ingress-NGINX が End of Life に — Gateway API への実務的な移行手順"
+description: "Community 版 Ingress-NGINX Controller は2026年3月に End of Life を迎えましたが、Cloud Native な Cluster の約半数が今も使い続けています。自社の影響範囲をどう確認し、Gateway API への Migration を実際どう進めるかを整理します。"
+date: "2026-07-30"
+status: "published"
+tags: ["Kubernetes", "Gateway API", "Ingress", "Cloud Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "ingress-nginx-eol-gateway-api-migration-2026"
+---
+
+## 地味だが見落としやすい Deadline
+
+Kubernetes SIG Network と Security Response Committee は2025年末、Community が保守する Ingress-NGINX Controller が2026年3月をもって Release を止めると発表しました。Bug Fix も Security Patch もこれ以降は出ません。この Deadline はすでに過ぎています。Kubernetes の Ecosystem 外ではあまり話題になっていませんが、一部の推計では Cloud Native な環境の約半数がまさにこの Controller を使っているとされ、今年もっとも影響が大きく、かつもっとも語られていない Deprecation の1つです。
+
+雑談の中で混同されがちな2点は、明確に切り分けておく価値があります。
+
+- **Kubernetes の `Ingress` API 自体はなくなりません。** 今も General Availability です。ただし Feature Freeze されていて、活発な開発は Gateway API に移っており、新しい機能が追加されることはありません。
+- **引退するのは Community の `ingress-nginx` Controller Project です。** F5/NGINX Inc. が別途保守している NGINX Ingress Controller（OSS 版・商用版）は別の Codebase であり、今も活発に開発が続いています。自社 Cluster で何が動いているかを監査する際、この2つを混同しないことです。
+
+もし End of Life を過ぎた後も Community 版 Controller を動かし続けているなら、Kubernetes の API Contract には違反していませんが、無期限に Patch の当たらない Software を動かしていることにはなります。Internet に露出している用途では、これは理論上のRiskではなく、実際の運用・Compliance 上のRiskです。
+
+## Step 1: 実際に何を動かしているかを確認する
+
+Migration を計画する前に、どの Controller が Deploy されているかを確認します。「うちは NGINX Ingress を使っている」という認識が、実は Community Project を指していて、活発に保守されている商用版ではなかった、というのはよくある思い込みです。
+
+```bash
+kubectl get pods -n ingress-nginx -o jsonpath='{.items[*].spec.containers[*].image}'
+# Community Project の Image は通常こういう形式:
+# registry.k8s.io/ingress-nginx/controller:v1.x.x
+```
+
+Image が `registry.k8s.io/ingress-nginx` から来ているなら、引退した Project を使っています。F5/NGINX 管理の Registry から来ているなら、活発に保守されている Controller を使っており、この Deadline は直接には関係しません。とはいえ Gateway API 自体の評価は、それはそれで検討する価値があります。
+
+## 現実的な選択肢
+
+1. **Gateway API へ Migration する。** 保守されている Project（Envoy Gateway、Cilium、Istio など、仕様を実装しているもの）の実装を使います。Kubernetes の Networking が実際に投資を続けている方向であり、もっとも長く使える選択肢です。
+2. **別の、活発に保守されている Ingress Controller に切り替える。**（Traefik、HAProxy、F5 NGINX Ingress Controller）。Routing Rule が単純であれば短期的な移行コストは低いですが、もう新機能が追加されない API を選ぶことになります。
+3. **商用 Support 付きで Community 版 Ingress-NGINX を使い続ける。** 複数の Vendor が、引退した Project に対する有償の Patch Backport を提供し始めています。時間は稼げますが、根本的な問題は解消しません。あくまで橋渡しであり、行き先ではありません。
+
+Ingress の Semantics に留まる強い理由がないほとんどの Team にとっては、選択肢1がDefaultとして妥当です。そして今は Tooling のおかげで、手作業での書き換えよりずっと現実的になっています。
+
+## Rule を手で翻訳する代わりに Ingress2Gateway を使う
+
+Kubernetes Project は `ingress2gateway` の 1.0 を Release しました。既存の `Ingress` Resource（一般的な ingress-nginx の Annotation を含む）を読み込み、対応する Gateway API の Resource — `Gateway`、`HTTPRoute` など — を出発点として生成する CLI です。
+
+```bash
+# Install（あるいは Container Image 経由で実行。Platform に応じて Project の Release を確認）
+ingress2gateway print --input-file existing-ingresses.yaml > gateway-api-resources.yaml
+```
+
+出力はあくまで下書きであり、そのまま差し替えられる完成品ではありません。Annotation ベースの挙動 — Rewrite Rule、Custom Timeout、Auth 用の Snippet — は必ずしも Gateway API に1対1で対応するわけではなく、まさにここで手動レビューが重要になります。生成された `HTTPRoute` は構造上正しく見えても、`nginx.ingress.kubernetes.io/*` Annotation にあった Header Rewrite Rule を静かに落としていることがあります。YAML レベルの見た目だけで信用せず、既存の Ingress Rule と1つずつ突き合わせて Diff を取ります。
+
+単純な Path ベースの Route の Before/After 例です。
+
+```yaml
+# Before: ingress-nginx 固有の Annotation を持つ Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /v1(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 8080
+---
+# After: Gateway API 版（Annotation の代わりに URLRewrite Filter を使用）
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-route
+spec:
+  parentRefs:
+    - name: shared-gateway
+  hostnames:
+    - api.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      backendRefs:
+        - name: api-service
+          port: 8080
+```
+
+ingress-nginx の Docs を読まないと発見できない、Vendor 固有の Annotation が、仕様自体に含まれる型付きの `URLRewrite` Filter になっている点に注目してください。これこそが Gateway API の「単に新しいから」を超えた実際の価値です。Routing の挙動が、Annotation の中に埋もれた文字列の慣習ではなく、可搬性のある構造化された Object になります。
+
+## 今この状況にいる Client に伝えていること
+
+- まず影響範囲を確認します。2年前の Helm Chart 名から推測せず、すべての Cluster で `kubectl get pods` を実行し、Image の Registry を確認します。
+- この Migration は、無関係な Kubernetes Upgrade に付け足す作業ではなく、独自の Test 期間を持つ独立した Project として扱います。この種の Migration での Routing Bug は、綺麗な CI の Failure としてではなく、本番での断続的な 404 や壊れた Auth Header として表面化します。
+- 特に Authentication や Rewrite のRogicを扱う部分では、完全に切り替える前に Canary の割合や一部の Hostname に限定して、新旧の Routing を並行稼働させます。
+- 次に予定している Maintenance Window までに Migration を終えられないなら、引退した Controller への商用 Patch Support は正当な繋ぎとして使えます。ただし恒久的な決定としてではなく、Owner と期限を明記した Technical Debt として管理します。
+
+## まとめ
+
+- Community 版 Ingress-NGINX は2026年3月時点で End of Life を過ぎています。自社が実際にどの Controller を使っているかを確認するまで、自分には関係ないと決めつけないことです。
+- Kubernetes の `Ingress` API 自体はなくなりませんが、Freeze されています。新しい機能は Gateway API 側に入ります。
+- `ingress2gateway` は完成した Migration ではなく、実質的な出発点を与えてくれます。Annotation ベースの挙動は、生成結果に対して Rule ごとの検証が必要です。
+- 広範な Cluster Upgrade に押し込む週末作業ではなく、Canary Rollout を伴う独立した Project として予算を確保します。

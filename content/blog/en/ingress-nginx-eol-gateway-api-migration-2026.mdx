@@ -1,0 +1,117 @@
+---
+title: "Ingress-NGINX Is at End of Life: A Practical Migration Path to Gateway API"
+description: "The community-maintained Ingress-NGINX controller reached end of life in March 2026, and roughly half of all cloud-native clusters still run it. Here's how to assess your exposure and what an actual migration to Gateway API looks like."
+date: "2026-07-30"
+status: "published"
+tags: ["Kubernetes", "Gateway API", "Ingress", "Cloud Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "ingress-nginx-eol-gateway-api-migration-2026"
+---
+
+## An unglamorous deadline that's easy to miss
+
+Kubernetes SIG Network and the Security Response Committee announced in late 2025 that the community-maintained Ingress-NGINX controller would stop receiving releases — no more bug fixes, no more security patches — as of March 2026. That deadline has already passed. It hasn't made much noise outside the Kubernetes ecosystem itself, but by some estimates roughly half of all cloud-native environments run this exact controller, which makes it one of the more consequential, least-discussed deprecations of the year.
+
+Two things are worth separating clearly, because they get conflated in casual conversation:
+
+- **The Kubernetes `Ingress` API itself is not going away.** It's still generally available. It's just feature-frozen — active development has moved to Gateway API, and it isn't getting new capabilities.
+- **The community `ingress-nginx` controller project is what's retiring.** The separately maintained NGINX Ingress Controller from F5/NGINX Inc. (open-source and commercial editions) is a different codebase and remains active — don't confuse the two when you're auditing what's running in your clusters.
+
+If you're running the community controller past its end-of-life date, you're not violating any Kubernetes API contract, but you are running unpatched software indefinitely. For anything internet-facing, that's a real operational and compliance risk, not a theoretical one.
+
+## Step one: find out what you're actually running
+
+Before planning a migration, confirm which controller is deployed. This is a common source of false confidence — "we're on NGINX Ingress" often turns out to mean the community project, not the actively maintained commercial one.
+
+```bash
+kubectl get pods -n ingress-nginx -o jsonpath='{.items[*].spec.containers[*].image}'
+# community project images typically look like:
+# registry.k8s.io/ingress-nginx/controller:v1.x.x
+```
+
+If your image comes from `registry.k8s.io/ingress-nginx`, you're on the retired project. If it's from an F5/NGINX-owned registry, you're on the actively maintained controller and this deadline doesn't directly apply to you — though it's still worth evaluating Gateway API on its own merits.
+
+## Your realistic options
+
+1. **Migrate to Gateway API**, using an implementation from a maintained project (Envoy Gateway, Cilium, Istio, or others that implement the spec). This is the direction Kubernetes networking is actively investing in, so it's the option with the longest runway.
+2. **Switch to a different, actively maintained Ingress controller** (Traefik, HAProxy, F5 NGINX Ingress Controller). Lower short-term migration effort if your routing rules are simple, but you're choosing an API that's no longer receiving new features.
+3. **Stay on community Ingress-NGINX with commercial support.** A few vendors now offer paid patch backports for the retired project. This buys time but doesn't remove the underlying problem — it's a bridge, not a destination.
+
+For most teams without a hard reason to stay on Ingress semantics, option 1 is the right default, and tooling now makes it far more approachable than a hand-written rewrite.
+
+## Using Ingress2Gateway instead of hand-translating rules
+
+The Kubernetes project shipped a 1.0 release of `ingress2gateway`, a CLI that reads existing `Ingress` resources (including common ingress-nginx annotations) and generates the equivalent Gateway API resources — `Gateway`, `HTTPRoute`, and related objects — as a starting point.
+
+```bash
+# Install (or run via a container image; check the project's releases for your platform)
+ingress2gateway print --input-file existing-ingresses.yaml > gateway-api-resources.yaml
+```
+
+The output is a draft, not a drop-in replacement. Annotation-based behavior — rewrite rules, custom timeouts, auth snippets — doesn't always have a 1:1 Gateway API equivalent, and this is exactly where manual review matters most. A generated `HTTPRoute` that looks structurally correct can still silently drop a header-rewrite rule that lived in an `nginx.ingress.kubernetes.io/*` annotation. Diff the generated routing behavior against your existing Ingress rule by rule before you trust it, not just at the YAML level.
+
+A representative before/after for a simple path-based route:
+
+```yaml
+# Before: Ingress with an ingress-nginx-specific annotation
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /v1(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 8080
+---
+# After: Gateway API equivalent (URLRewrite filter replaces the annotation)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-route
+spec:
+  parentRefs:
+    - name: shared-gateway
+  hostnames:
+    - api.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      backendRefs:
+        - name: api-service
+          port: 8080
+```
+
+Notice that the annotation — vendor-specific, undiscoverable without reading ingress-nginx's docs — becomes a typed `URLRewrite` filter that's part of the spec itself. That's the actual value of Gateway API beyond just "the new thing": routing behavior becomes a portable, structured object instead of a string convention buried in an annotation.
+
+## What we'd tell a client running this today
+
+- Confirm exposure first. `kubectl get pods` across every cluster, checking image registries — don't assume based on a Helm chart name from two years ago.
+- Treat the migration as its own project with its own testing window, not a side task bolted onto unrelated Kubernetes upgrades. Routing bugs in a migration like this surface as intermittent 404s and broken auth headers in production, not clean CI failures.
+- Run the old and new routing side by side behind a canary weight or a subset of hostnames before cutting over fully, especially for anything handling authentication or rewrite logic.
+- If you can't complete the migration before your next planned maintenance window, commercial patch support for the retired controller is a legitimate stopgap — just track it as technical debt with an owner and a date, not as a permanent decision.
+
+## Takeaways
+
+- Ingress-NGINX (the community project) is past end of life as of March 2026; confirm which controller you actually run before assuming this doesn't apply to you.
+- The Kubernetes `Ingress` API isn't disappearing, but it's frozen — Gateway API is where new capability is landing.
+- `ingress2gateway` gives you a real starting point, not a finished migration — annotation-based behavior needs rule-by-rule verification against the generated output.
+- Budget this as a dedicated project with a canary rollout, not a quick weekend task squeezed into a broader cluster upgrade.
