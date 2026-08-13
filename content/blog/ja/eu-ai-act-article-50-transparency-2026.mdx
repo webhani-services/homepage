@@ -1,0 +1,86 @@
+---
+title: "EU AI Act 第50条施行：チャットボット・AI Agent が満たすべき透明性義務"
+description: "2026年8月2日、EU AI Act 第50条の透明性義務が施行されました。AI Chatbot や AI Agent を提供する開発者・企業が何を実装すべきか、実務的な観点から整理します。"
+date: "2026-08-14"
+status: "published"
+tags: ["AI", "LLM", "Compliance", "Security", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "eu-ai-act-article-50-transparency-2026"
+---
+
+2026年8月2日、EU AI Act の第50条(透明性義務)が施行されました。欧州委員会は7月20日にガイドラインを採択しており、対象は「高リスク AI システム」に限定されません。Chatbot・音声 Assistant・AI Agent・AI 生成 Content を扱うほぼすべてのサービスが対象になります。違反時の制裁金は最大1,500万ユーロ、または全世界年間売上高の3%のいずれか高い方です。
+
+webhani では AI/LLM を組み込んだ Web Application の開発を手がけていますが、この規制は「EU圏内のユーザーに Service を提供しているか」で適用が決まるため、日本発のプロダクトでも無関係とは言えません。今回は開発者視点で、第50条が具体的に何を求めているかを整理します。
+
+## 第50条が定める4つのシナリオ
+
+第50条は Provider(AI System を開発・市場提供する者)と Deployer(自身の権限で AI System を使用する者)に分けて、以下4つのシナリオでの開示義務を定めています。
+
+1. **AI と直接対話する System**(Chatbot、音声 Assistant、AI Agent):ユーザーが AI と対話していることが自明でない限り、その旨を開示しなければならない
+2. **感情認識・生体分類 System**:使用されていることを対象者に通知する義務
+3. **AI 生成・改変 Content**(Deepfake を含む画像・音声・動画):Content が人工的に生成・改変されたものであることを明示
+4. **公共の利益に関する事項を扱う AI 生成テキスト**:機械可読な形式でマーキングし、検出可能にする
+
+このうち Web 開発者にとって最も影響が大きいのは1番目と4番目です。
+
+## 実装パターン:Chatbot の開示義務
+
+「自明でない限り開示が必要」という条文は曖昧に見えますが、実務上は UI 上に明示的なラベルを常時表示するのが安全な解釈です。
+
+```tsx
+// components/ChatDisclosure.tsx
+export function ChatDisclosure() {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="text-xs text-muted-foreground border-b px-3 py-2"
+    >
+      このChatはAI Assistantによって応答しています。
+    </div>
+  );
+}
+```
+
+会話開始時の Banner 表示だけでなく、セッション中も継続的に AI であることが分かる UI 状態を残すのが望ましい設計です。Session が長時間続く Support Chat などでは、ユーザーが途中から会話に参加した場合でも開示が見える位置に固定表示します。
+
+## 実装パターン:AI 生成 Content のマーキング
+
+第50条2項では、AI 生成テキストや画像に機械可読なマーキングを求めています。2026年5月の AI Omnibus 暫定合意により、施行日以前から市場に存在する生成 AI System には2026年12月2日までの猶予期間が設けられていますが、新規開発では最初から対応しておくべきです。
+
+C2PA (Coalition for Content Provenance and Authenticity) の Content Credentials は、画像・動画に暗号署名付きの Metadata を埋め込む業界標準として広く採用が進んでいます。テキストについては透かし(Watermark)技術の標準化がまだ流動的なため、まずは HTTP Response Header や構造化データでの明示から始めるのが現実的です。
+
+```typescript
+// app/api/generate/route.ts
+export async function POST(req: Request) {
+  const result = await generateText({ /* ... */ });
+
+  return Response.json(
+    { content: result.text },
+    {
+      headers: {
+        "X-AI-Generated": "true",
+        "X-AI-Generator": "webhani-assistant/1.0",
+      },
+    }
+  );
+}
+```
+
+将来的に C2PA や同等の Provenance 標準への対応が求められる可能性が高いため、生成 Pipeline の設計段階で Metadata 埋め込みの拡張点を用意しておくと、後からの対応コストを抑えられます。
+
+## webhani の見解
+
+この種の規制は「対応が面倒なコンプライアンス作業」と捉えられがちですが、実務的には UI/UX 設計の一部として組み込むのが最も効率的です。開示 Label や Provenance Metadata を後付けで追加しようとすると、Component 構造や API Response の形式を横断的に変更する必要が出てきます。
+
+AI 機能を持つ新規 Project では、設計初期の段階で「AI との対話であることの開示」「生成 Content のマーキング」を Component の標準仕様として組み込んでおくことを推奨します。EU 圏外向けの Service であっても、同種の規制は他地域でも広がりつつあるため、先回りした設計は長期的なコスト削減につながります。
+
+## まとめ
+
+- EU AI Act 第50条は2026年8月2日に施行済み、対象は高リスク System に限らない
+- Chatbot・AI Agent は「AI と対話している」ことの開示が必須
+- AI 生成 Content は機械可読なマーキングが必要(既存 System は2026年12月2日まで猶予)
+- 開示 UI と Provenance Metadata は、後付けではなく設計段階から組み込むのが効率的
+
+AI 機能の実装と合わせて、こうした規制対応の設計相談も承っています。

@@ -1,0 +1,73 @@
+---
+title: "Valkey 9.1 が主要 Linux Distribution の標準 Cache Package に:移行判断の基準"
+description: "Valkey 9.1 が Ubuntu 24.04+・Debian 13・Fedora 40+ の標準 Package として採用されました。Redis と比較した性能差と、既存 System を移行すべきかどうかの判断基準を整理します。"
+date: "2026-08-14"
+status: "published"
+tags: ["Database", "Caching", "Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "valkey-9-1-default-linux-distro-cache-2026"
+---
+
+2026年5月にRelease されたValkey 9.1が、Ubuntu 24.04以降・Debian 13・Fedora 40以降で標準 Cache Package として採用されました。`apt install valkey` や `dnf install valkey` を実行すれば、多くの環境で標準リポジトリからそのまま導入できる状態になっています。
+
+webhani では Session Store や API Response Cache の実装で Redis 互換 Product を選定する機会が多く、Valkey の採用状況は継続して追っています。今回は Valkey 9.1 の立ち位置と、既存 Redis 環境から移行すべきかどうかの判断基準を整理します。
+
+## なぜ主要 Distribution が Valkey を採用したか
+
+Valkey は Redis Inc. が2024年に Redis のライセンスを Source Available 系(SSPL 相当)に変更したことを受けて、Linux Foundation 傘下で発足した Fork です。Debian や Fedora のような Distribution は、Package Repository に含める Software のライセンス条件を重視するため、BSD-3 ライセンスを維持する Valkey の方が採用しやすい立場にあります。
+
+Redis Inc. 自体は2025年5月に AGPL への回帰を発表していますが、Distribution の標準 Package 選定はすでに Valkey へ移った後でした。
+
+## 性能面の実測値
+
+公開 Benchmark では、Valkey 9.1 は Redis 比で以下の改善が報告されています。
+
+- Throughput:+8% Operations per Second
+- Latency:P99 Latency が-22%
+- Memory 使用量:-20%
+
+```bash
+# 既存の Redis Client Library はそのまま使える
+$ valkey-cli ping
+PONG
+
+# Redis Protocol 互換のため、ioredis や node-redis の接続先を変えるだけで動作する
+```
+
+Protocol 互換性が高いため、Application Code 側の変更はほぼ不要です。移行の実質的な作業は Infrastructure 層(Package・Deploy Script・Monitoring 設定)に限定されます。
+
+## 移行判断のポイント
+
+新規 Project であれば、標準 Package として提供されている Valkey を採用するのが自然な選択です。一方、既存 System を移行するかどうかは、以下の観点で判断します。
+
+```yaml
+# docker-compose.yml での置き換え例
+services:
+  cache:
+    # image: redis:8-alpine
+    image: valkey/valkey:9.1-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - cache-data:/data
+```
+
+1. **Redis 固有の商用機能を使っているか**:Redis Enterprise の Active-Active Geo-Replication など、Valkey 側に相当機能がない場合は移行前に代替設計が必要
+2. **Client Library が Redis 固有の Extension に依存していないか**:一般的な GET/SET/Pub-Sub/Sorted Set 等は問題ないが、Redis 8 以降で追加された Vector Search など新しい機能は Valkey 側の対応状況を個別確認する
+3. **Managed Service を使っているか**:AWS ElastiCache や GCP Memorystore など既に Managed で運用している場合、Provider 側の Valkey 対応状況を先に確認する
+
+## webhani の見解
+
+Cache 層は Application の可用性に直結するため、慎重な移行計画が必要です。ただし今回の変化は「新規に Server を構築する際、どちらが標準 Package か」という選択の話であり、既存 System の緊急移行を要するものではありません。
+
+新規 Project では Valkey を標準選択肢として検討し、既存 Redis 環境については Managed Service の対応状況と商用機能への依存度を確認したうえで、次回の Infrastructure 更新タイミングに合わせて移行を検討するのが現実的なアプローチです。
+
+## まとめ
+
+- Valkey 9.1 が Ubuntu 24.04+・Debian 13・Fedora 40+ の標準 Cache Package に採用された
+- Redis 比で Throughput +8%、P99 Latency -22%、Memory -20% の性能改善が報告されている
+- Protocol 互換性が高く、Application Code の変更はほぼ不要
+- 移行判断は商用機能への依存度と Managed Service の対応状況で決める
+
+Cache 層の技術選定や移行計画についても、お気軽にご相談ください。
