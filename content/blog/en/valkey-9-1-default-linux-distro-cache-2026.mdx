@@ -1,0 +1,74 @@
+---
+title: "Valkey 9.1 Is Now the Default Cache Package on Major Linux Distros: Should You Migrate?"
+description: "Valkey 9.1 has become the default package on Ubuntu 24.04+, Debian 13, and Fedora 40+. Here's how it compares to Redis on performance, and a practical framework for deciding whether to migrate existing systems."
+date: "2026-08-14"
+status: "published"
+tags: ["Database", "Caching", "Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "valkey-9-1-default-linux-distro-cache-2026"
+---
+
+Valkey 9.1, released in May 2026, has become the default cache package on Ubuntu 24.04+, Debian 13, and Fedora 40+. Running `apt install valkey` or `dnf install valkey` now pulls it straight from the standard repositories on most systems.
+
+We evaluate Redis-compatible options regularly when building session stores and API response caches for clients, so we've been tracking Valkey's adoption closely. Here's where Valkey 9.1 stands, and a framework for deciding whether to migrate an existing Redis deployment.
+
+## Why the Major Distros Picked Valkey
+
+Valkey is the Linux Foundation-backed fork that emerged after Redis Inc. moved Redis's license to a source-available model (SSPL-equivalent) in 2024. Distributions like Debian and Fedora are strict about license terms for anything in their standard repositories, which put Valkey — still BSD-3 licensed — in a more favorable position for inclusion.
+
+Redis Inc. reverted to AGPL in May 2025, but by then distro packaging decisions had already shifted to Valkey.
+
+## The Performance Numbers
+
+Published benchmarks report the following improvements for Valkey 9.1 versus Redis:
+
+- Throughput: +8% operations per second
+- Latency: -22% P99 latency
+- Memory usage: -20%
+
+```bash
+# Existing Redis client libraries work unmodified
+$ valkey-cli ping
+PONG
+
+# Protocol compatibility means ioredis, node-redis, etc.
+# just need a different connection target
+```
+
+Because protocol compatibility is high, application code typically needs no changes. The real migration work sits at the infrastructure layer — packaging, deploy scripts, monitoring configuration.
+
+## A Framework for the Migration Decision
+
+For new projects, adopting Valkey as the distro-default package is the natural choice. For existing systems, weigh the decision on these points:
+
+```yaml
+# docker-compose.yml — a straightforward swap
+services:
+  cache:
+    # image: redis:8-alpine
+    image: valkey/valkey:9.1-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - cache-data:/data
+```
+
+1. **Are you relying on Redis Enterprise-specific features?** Active-Active geo-replication and similar commercial capabilities don't have direct Valkey equivalents — you'll need an alternative design before migrating.
+2. **Does your client library depend on Redis-specific extensions?** Standard GET/SET, pub/sub, and sorted sets are fine, but newer additions like Redis 8's vector search need to be checked against Valkey's current feature parity individually.
+3. **Are you on a managed service?** If you're already running AWS ElastiCache or GCP Memorystore, check the provider's Valkey support before planning a migration.
+
+## Our Take
+
+The cache layer sits directly on the availability critical path, so migrations deserve a careful plan. That said, this shift is really about which package is the default when you're standing up a new server — not a call for emergency migration of existing systems.
+
+For new projects, we'd default to evaluating Valkey first. For existing Redis deployments, check your managed service's support status and your dependence on commercial-only features, then fold the migration into your next planned infrastructure update rather than treating it as urgent.
+
+## Takeaways
+
+- Valkey 9.1 is now the default cache package on Ubuntu 24.04+, Debian 13, and Fedora 40+
+- Reported gains over Redis: +8% throughput, -22% P99 latency, -20% memory usage
+- Protocol compatibility is high, so application code changes are minimal
+- Base the migration decision on your dependence on commercial features and your managed service's support status
+
+Happy to help think through cache-layer technology choices or migration planning.

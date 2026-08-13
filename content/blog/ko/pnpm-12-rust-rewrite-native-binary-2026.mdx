@@ -1,0 +1,70 @@
+---
+title: "pnpm 12의 Rust 재작성: Node.js Launcher를 제거한 Native Binary"
+description: "pnpm 12는 TypeScript 구현을 Rust로 재작성하여, Node.js Launcher 없이 동작하는 Platform별 Native Binary로 배포됩니다. 무엇이 바뀌고 무엇이 그대로인지 정리합니다."
+date: "2026-08-14"
+status: "published"
+tags: ["JavaScript", "TypeScript", "Rust", "DevOps", "Tooling"]
+thumbnail: ""
+author: "webhani"
+slug: "pnpm-12-rust-rewrite-native-binary-2026"
+---
+
+JavaScript Ecosystem의 Rust 전환은 Vite의 Rolldown 통합과 Rspack의 부상으로 이미 진행 중이었는데, Package Manager의 핵심인 pnpm도 이 흐름에 합류했습니다. pnpm 12는 pnpm 11의 Rust 재작성 버전으로 개발 중이며, pnpm Monorepo 자체의 CI Workflow는 이미 v12 Alpha 버전으로 동작하고 있습니다.
+
+webhani는 여러 Project에서 Workspace 관리에 pnpm을 사용하고 있고, Install 시간은 CI Pipeline 속도에 직결됩니다. 이번 글에서는 pnpm 12가 실제로 무엇을 바꾸는지, 기존 Project에는 어떤 의미인지 정리합니다.
+
+## 가장 큰 변화: Node.js Launcher 제거
+
+pnpm 11까지는 `pnpm` Command 자체가 Node.js Script로 구현되어 있어서, 실행할 때마다 Node.js 기동 Cost가 발생했습니다. pnpm 12는 Platform별 Native Binary로 배포되기 때문에, Command 실행 시 Node.js 기동 과정을 거치지 않습니다.
+
+```bash
+# pnpm 11까지: Node.js가 기동된 후 pnpm 로직이 실행됨
+$ pnpm install
+
+# pnpm 12: Native Binary가 직접 실행됨
+$ pnpm install
+```
+
+Command 자체는 동일해 보이지만 내부 실행 경로가 다릅니다. `pnpm exec`, `pnpm run`을 자주 호출하는 Monorepo처럼 작은 Command를 빈번하게 실행하는 CI Step에서는, 이 기동 Cost 절감이 누적되어 체감할 수 있는 차이로 나타납니다.
+
+## Peer Dependency가 많은 Workspace에서 효과 뚜렷
+
+공식 Benchmark에 따르면 114개 Project, 약 21,000건의 Lockfile Entry를 가진 Bit의 Workspace에서 의존성 해결 시간이 약 16.0초에서 약 13.4초로 단축되었습니다. 이는 Peer Dependency 해결 Logic이 Rust 쪽에서 최적화된 결과입니다.
+
+```yaml
+# pnpm-workspace.yaml 구조의 Monorepo에서 특히 효과가 큼
+packages:
+  - "apps/*"
+  - "packages/*"
+```
+
+대규모 Monorepo에서 `pnpm install` 대기 시간이 CI Bottleneck으로 작용하고 있다면, v12로의 전환은 검토할 가치가 있습니다.
+
+## 호환성: v11과의 차이는 제한적
+
+공식 문서는 "일부 차이를 제외하면 pnpm 12는 pnpm 11과 동일하게 사용할 수 있다"고 명시하고 있습니다. 즉 `.npmrc` 설정 항목이나 `pnpm-lock.yaml` 형식에 대규모 Breaking Change가 발생할 가능성은 낮고, 기존 Script와 CI 설정을 대부분 그대로 활용할 수 있다는 의미입니다.
+
+다만 Alpha 단계에서는 세부적인 동작 차이가 남아 있을 수 있으므로, 운영 CI에 도입하기 전 다음과 같은 절차로 검증하는 것이 안전합니다.
+
+```bash
+# 기존 환경과 병행해서 동작을 확인
+$ corepack use pnpm@12.0.0-alpha.12
+$ pnpm install --frozen-lockfile
+$ pnpm run build
+$ pnpm run test
+```
+
+## webhani의 견해
+
+Package Manager의 Native Binary화는 Vite의 Rolldown, Rspack, 그리고 Bun·Deno의 흐름과 같은 맥락입니다. JavaScript Ecosystem의 Tooling 계층이 Rust(혹은 그에 준하는 Compile 언어)로 수렴하는 추세가 뚜렷합니다.
+
+다만 pnpm 12는 아직 Alpha 단계이므로 운영 Project에 즉시 도입하는 것은 권장하지 않습니다. 그러나 CI의 Install 시간이 Bottleneck으로 작용하는 대규모 Monorepo를 운영 중인 팀이라면, Staging 환경이나 개인 개발 환경에서 Alpha 버전을 미리 테스트해볼 가치는 있습니다. Stable Release 시점에 원활히 전환할 수 있도록 지금부터 호환성을 확인해두는 것을 권장합니다.
+
+## 정리
+
+- pnpm 12는 TypeScript 구현을 Rust로 재작성하여, Node.js Launcher를 거치지 않는 Native Binary로 배포됨
+- Peer Dependency가 많은 대규모 Workspace일수록 의존성 해결 속도 개선을 체감하기 쉬움
+- v11과의 API 호환성은 기본적으로 유지될 것으로 예상되나, Alpha 단계에서는 신중한 검증 필요
+- Vite, Rspack과 마찬가지로 JavaScript Tooling의 Rust화라는 큰 흐름의 일부
+
+Monorepo CI 설계나 Tooling 선정에 대해서도 편하게 문의해 주세요.
