@@ -1,0 +1,122 @@
+---
+title: "Diagnosing EKS API Server Throttling: APF, 429s, and What an AI Agent Actually Adds"
+description: "AWS's DevOps Agent can now flag API Priority and Fairness seat exhaustion behind EKS control plane 429s. A practical breakdown of what APF is, why it gets exhausted, and how to triage it with or without an AI agent."
+date: "2026-08-15"
+status: "published"
+tags: ["AWS", "EKS", "Kubernetes", "DevOps", "SRE"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-eks-devops-agent-api-throttling-2026"
+---
+
+Earlier this year AWS extended its DevOps Agent to diagnose a specific class of EKS control plane degradation: HTTP 429 responses caused by API Priority and Fairness (APF) seat exhaustion. It's a narrow capability, but it targets a real and recurring pain point. We've walked several clients through exactly this failure mode during incident response, usually with a spreadsheet of CloudWatch and Prometheus queries instead of an agent doing the correlation for us.
+
+This post covers what APF actually does, why clusters run into seat exhaustion at scale, what an AI diagnostic layer adds on top of manual triage, and the concrete steps we recommend taking regardless of which tooling flags the problem.
+
+## What API Priority and Fairness actually is
+
+APF has been stable in Kubernetes since 1.20, and EKS ships it enabled by default. It exists to protect `kube-apiserver` from being overwhelmed — before APF, a single misbehaving client could exhaust the apiserver's request-handling capacity and degrade the entire cluster, kubelets included.
+
+APF works through two custom resources:
+
+- **PriorityLevelConfiguration** defines a pool of concurrent request capacity, expressed in "seats." Each priority level gets a slice of the apiserver's total concurrency budget. Think of seats as concurrent-request slots, not a rate limit in the requests-per-second sense — a request holds a seat for its entire execution, so slow requests (large LIST calls, expensive watches) tie up seats longer than fast ones.
+- **FlowSchema** classifies incoming requests (by user, service account, group, or resource) and routes them to a PriorityLevelConfiguration, with a `distinguisher` type that determines how fairness is enforced within that level (e.g., fair queuing per user or per namespace).
+
+When a priority level's seats are all occupied, additional matching requests queue up to a configurable depth. Once the queue is also full, the apiserver rejects the request with a 429 and a `Retry-After` header. That's the mechanism — it's a deliberate, designed rejection, not a crash. The apiserver is protecting itself, and everything sharing that priority level pays the price at once.
+
+## Why this shows up more as clusters grow
+
+Seat exhaustion is rarely caused by raw traffic volume. It's almost always caused by request shape. A handful of workload patterns account for most of the incidents we've seen:
+
+- **Leader-election-heavy operators.** Every controller replica participating in leader election polls the apiserver on a short interval. Run a dozen operators with default settings and you have a steady background load that competes for the same default priority level as everything else.
+- **CI/CD systems issuing bursty kubectl/Helm calls.** A pipeline that fans out `kubectl apply` or `helm upgrade` across many services concurrently, especially during a mass deployment window, creates a short but intense spike exactly when the cluster is also busiest.
+- **Controllers with inefficient list-watch patterns.** A controller that re-lists a large resource (all Pods cluster-wide, for example) instead of relying on an informer cache generates large, slow requests that hold seats for a long time.
+- **HPA/VPA churn.** Autoscalers polling metrics and issuing frequent updates during a scaling event add sustained load right when the cluster is already under pressure from the traffic that triggered the scaling.
+
+None of these individually looks abusive. The problem is that by default they all land in the same `workload-low` or `global-default` priority level, so one noisy source degrades everyone else sharing that bucket — including, sometimes, the CNI or CSI controllers your cluster depends on to function.
+
+## What an AI diagnostic agent adds
+
+Manual triage for this incident looks roughly like: notice elevated latency or failed deployments, check apiserver latency dashboards, pull flow control metrics, cross-reference which FlowSchema is rejecting requests, then figure out which workload is generating that traffic — usually by grepping recent audit logs or checking which controllers restarted or scaled around the same time. It's not hard, but it's slow, and during an incident every extra dashboard hop costs time.
+
+What AWS's agent-based diagnosis adds is mostly correlation speed: pulling apiserver-side flow control signals (request concurrency against configured limits, per-priority-level rejection counts, queue wait times — conceptually similar to what the underlying flow control metrics expose) and lining them up against workload-level activity to produce a first-pass hypothesis. That's genuinely useful for the two questions that matter most during an incident:
+
+1. **Is this a noisy-neighbor problem** — one workload or FlowSchema consuming a disproportionate share of seats — **or is the control plane itself undersized** for the cluster's steady-state load?
+2. **Which specific workload is the source**, so you're not guessing across dozens of controllers under time pressure.
+
+An agent narrowing that down in seconds instead of the 20–30 minutes a manual correlation pass usually takes is a real time saving during an incident. It does not replace the judgment of deciding what to change.
+
+## Remediation steps, with or without an agent
+
+Whether the hypothesis comes from an AI agent or your own dashboard review, the actual fixes are the same. Start by inspecting current APF state directly:
+
+```bash
+kubectl get flowschemas
+kubectl get prioritylevelconfigurations
+kubectl get --raw /metrics | grep apiserver_flowcontrol
+```
+
+The raw metrics endpoint gives you the ground truth — concurrency usage, rejections, and queue depth per priority level — without depending on any dashboard being correctly wired up.
+
+From there:
+
+- **Give critical workloads their own priority level and FlowSchema.** Don't let your ingress controller or cluster autoscaler compete for seats with a CI pipeline's kubectl calls.
+- **Add client-side rate limiting and backoff to your own controllers.** `client-go`'s default QPS/burst settings are conservative for a single client but add up across many replicas; tune deliberately rather than accepting the default.
+- **Reduce list-watch load.** Prefer informers with field/label selectors over ad hoc LIST calls, and audit any controller that re-lists cluster-wide resources on a timer instead of relying on watch events.
+- **Spread CI/CD apiserver operations.** Stagger `kubectl`/`helm` calls across a deploy window instead of firing them all at once, and consider routing CI traffic through its own FlowSchema so a bad pipeline run can't starve production controllers.
+
+A minimal example that isolates a critical workload into its own priority level and routes matching requests to it:
+
+```yaml
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: PriorityLevelConfiguration
+metadata:
+  name: critical-controllers
+spec:
+  type: Limited
+  limited:
+    nominalConcurrencyShares: 20
+    limitResponse:
+      type: Queue
+      queuing:
+        queues: 16
+        handSize: 4
+        queueLengthLimit: 50
+---
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: FlowSchema
+metadata:
+  name: critical-controllers
+spec:
+  priorityLevelConfiguration:
+    name: critical-controllers
+  matchingPrecedence: 500
+  distinguisherMethod:
+    type: ByUser
+  rules:
+    - subjects:
+        - kind: ServiceAccount
+          serviceAccount:
+            name: critical-operator
+            namespace: platform
+      resourceRules:
+        - apiGroups: ["*"]
+          resources: ["*"]
+          verbs: ["*"]
+```
+
+## Trusting the diagnosis
+
+Our recommendation to clients is to treat AI-generated diagnosis — whether from AWS's DevOps Agent or any similar tool — as a fast first-pass hypothesis, not a conclusion to act on directly. APF configuration is shared, in-production control-plane infrastructure; a wrong FlowSchema change can shift the problem to a different workload instead of fixing it, or worse, starve something the agent didn't have visibility into. Verify the suggested root cause against the raw `apiserver_flowcontrol` metrics and recent audit logs before touching a PriorityLevelConfiguration that other teams depend on.
+
+## Checklist
+
+- [ ] Confirm 429s correlate with APF rejections, not a different bottleneck (etcd latency, webhook timeouts)
+- [ ] Run `kubectl get flowschemas` and `kubectl get prioritylevelconfigurations` to see current shape
+- [ ] Pull `apiserver_flowcontrol_*` metrics to identify which priority level is saturated
+- [ ] Identify the specific workload(s) generating the load, not just the priority level
+- [ ] Decide: isolate the workload into its own FlowSchema, or is the control plane genuinely undersized
+- [ ] Tune client-side QPS/burst and list-watch patterns in offending controllers before adding more APF isolation
+- [ ] Roll out APF changes to a non-production cluster first — this is shared infrastructure
+
+An AI agent can get you to the right question faster. Getting to the right answer still takes someone who understands the workloads sharing that control plane.

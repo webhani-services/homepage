@@ -1,0 +1,114 @@
+---
+title: "Telemetry Debt — 監視 Cost が上がり続けるのに誰も Dashboard を見ていない理由"
+description: "2026年、鳴りっぱなしで無視される Alert、誰も開かない Dashboard、際限なく積み上がる Metric Cardinality が Observability Cost を静かに押し上げています。OpenTelemetry の Sampling 戦略や Alert 統廃合を中心にした実践的な監査・改善プレイブックを解説します。"
+date: "2026-08-15"
+status: "published"
+tags: ["Observability", "OpenTelemetry", "SRE", "Kubernetes", "Cost Optimization"]
+thumbnail: ""
+author: "webhani"
+slug: "observability-telemetry-debt-2026"
+---
+
+多くのチームは、Observability platform に毎月いくら払っているかは即答できます。しかし、その Dashboard のうち先四半期に実際に開かれたものがどれか、どの Alert が毎週鳴っては調査もされず放置されているかを即答できるチームはかなり少ないです。この差分こそが「Telemetry Debt」です。何年もかけて積み上がった Metrics・Logs・Traces の instrumentation を、誰も棚卸ししないまま放置している状態を指します。
+
+これは Technical Debt と同じ構造を持ちますが、利子は Monitoring の請求額と On-call エンジニアの注意力の両方に付いてきます。放置すると Cost が増えるだけでなく、実際の Incident 対応時に必要な Signal が誰も片付けなかった Noise の下に埋もれてしまい、インシデント対応そのものを劣化させます。
+
+## Telemetry Debt はどう積み上がるのか
+
+一度の悪い判断で発生するものではなく、個別には妥当に見える小さな判断の積み重ねです。
+
+- **場当たり的な Alert 設計**: Incident が起きるたびに「二度と起きないように」と Alert が追加され、根本原因が直ってもそのまま放置されます。2年後、誰が選んだかも分からない閾値のまま毎月鳴り続けます。
+- **持ち主のいない Dashboard**: あるプロジェクトや Migration、あるいはもう存在しないチームのために作られた Dashboard が、そのまま共有フォルダに残り続けます。誰かがツールを開くたびに Query 負荷がかかり、Seat や API 予算を消費し続けます。
+- **無制限な Custom Metric の Cardinality**: `user_id` や `order_id`、あるいは正規化していない Request Path をそのまま Label に付けてしまうケースです。値のユニークな組み合わせごとに新しい Time Series が生成されるため、Traffic の多い Service では 1 つの Metric 定義が数百万の Series に膨れ上がります。多くの Observability Vendor は Active Series 数に応じて課金するため、これが直接 Cost に跳ね返ります。
+- **本番に残された Debug Level の Log**: バグ調査のために追加した詳細な Log が本番にそのまま残り、二度と戻されません。Service と Deploy の数だけ積み重なり、Log の取り込み量とそのコストが気づかないうちに数倍になります。
+
+これらは単体では誰の失敗でもありません。問題は「これはまだ必要か」を定期的に問い直すプロセスが存在しないことです。
+
+## 実践的な監査方法
+
+Client に改善案を提示する前に、webhani では次の 3 軸で監査を行います。
+
+**1. Dashboard の利用状況**: Grafana、Datadog、New Relic などの多くの Observability platform は、Dashboard 単位の閲覧履歴を UI または API で提供しています。直近 90 日の閲覧数を取得し、定期エクスポートや Synthetic Check ではなく実ユーザーによる閲覧がゼロまたはほぼゼロの Dashboard を削除・Archive 候補とします。
+
+**2. Alert の「鳴るだけで無視される」率**: Alert の発火履歴を Incident/Ticket 履歴と突き合わせます。四半期で 40 回鳴って Incident 起票に結び付いたのが 2 回だけの Alert は、誰も守っていません。On-call 担当に Slack 通知を無視する習慣を植え付けているだけです。発火回数が多く、対応アクションに繋がった割合が低い Alert を重点的に洗い出します。
+
+**3. Cardinality の Cost Driver**: 多くの Vendor は Active Series 数や取り込み量で Metric をランキング表示する機能を持っています。Prometheus を自前運用している場合は次のような Query で直接確認できます。
+
+```promql
+# Active Time Series 数の多い Metric 名 Top 10
+topk(10, count by (__name__)({__name__=~".+"}))
+```
+
+```promql
+# 特定 Metric の Cardinality を押し上げている Label を特定する
+count by (label_name) (
+  count by (label_name, __name__) (http_requests_total)
+)
+```
+
+実際には、`user_id` や `session_id`、あるいは無制限な Path Label を持つごく一部の Metric が全体 Series 数の大半を占めているケースがほとんどです。3〜4 個の Metric 定義を直すだけで、請求額を大きく動かせることも珍しくありません。
+
+## 改善のための技術的プレイブック
+
+### OpenTelemetry の Sampling 戦略
+
+OpenTelemetry は Traces・Metrics・Logs の instrumentation における de facto standard になっていますが、Trace 量に最も効くレバーは Sampling 戦略です。
+
+- **Head-based Sampling** は Trace 開始時点で固定確率に基づき保持するかどうかを決めます。安価でシンプルですが、本来調査したい遅い Trace やエラーを含む Trace を取りこぼす可能性があります。
+- **Tail-based Sampling** は Trace が完了するまで待ち、実際の結果に基づいて判断します。エラーや遅延した Trace は全て保持し、正常で速い Trace は一部だけ Sample します。Span を一時的にバッファし判断を後段で行う Collector が必要なため Cost は上がりますが、本当に重要な Trace を取りこぼしません。
+
+OpenTelemetry Collector における簡略化した Tail Sampling の設定例です。
+
+```yaml
+processors:
+  tail_sampling:
+    decision_wait: 10s
+    policies:
+      - name: keep-errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: keep-slow-requests
+        type: latency
+        latency:
+          threshold_ms: 500
+      - name: sample-the-rest
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 5
+```
+
+これはあくまで例示です。実運用では Policy の種類や組み合わせのロジックを Tuning する必要がありますが、「エラーと外れ値は必ず残し、通常 Traffic は積極的に間引く」という考え方は変わりません。
+
+### Log Level のポリシーと構造化 Logging の徹底
+
+明確なポリシーを定めましょう。`debug` Level はローカルと Staging 環境専用とし、本番に残った `debug` Log は削除または Feature Flag での制御を求める Follow-up Ticket を必須にします。あわせて JSON などの構造化 Logging を採用すれば、自由テキストを grep するのではなく Field 単位で Filter・集計でき、「念のため」大量に Log を出す動機自体を減らせます。
+
+### SLO に紐付けた Alert 統廃合
+
+CPU、Memory、Queue Depth、Disk といった個別の Infrastructure 症状ごとに低 Signal な Alert を大量に持つのではなく、可用性・レイテンシー・エラー率といった少数の SLO を定義し、Error Budget の消費速度(Burn Rate)で Alert します。よく Tuning された Burn Rate Alert 1 本が、多数の Noise の多い閾値 Alert を置き換え、Resource の些末な変化ではなく実際のユーザー影響を直接反映します。
+
+### Retention の階層化
+
+すべての Telemetry が同じ解像度・保持期間を必要とするわけではありません。目安としては、Full Resolution の Metrics/Traces は 15〜30 日 Hot に保持し、Trend 分析用の Downsample された集計は 6〜13 ヶ月保持、Incident 調査に使う高 Cardinality な Raw Data は調査期間終了後に破棄する、という構成が現実的です。多くの Platform はこれをネイティブにサポートしていますし、自前運用であれば Prometheus の Recording Rules と長期保存用の Backend で同様の効果を実現できます。
+
+## 運用体制と実施 Cadence
+
+Telemetry Debt が積み上がるのは、「追加する人」はいても「削除する人」がいないからです。webhani では次の 2 点をセットで推奨しています。
+
+1. **四半期ごとの Observability 監査**: Security Review と同じ重要度で扱い、Dashboard 利用状況レポート、Alert 発火・無視率レポート、Cardinality Top-N レポートを SRE/Platform チームと各 Service チームの代表者がレビューします。
+2. **発生源での Ownership**: Alert や Dashboard を作ったチームが、削除まで含めたそのライフサイクルの Owner です。SRE/Platform チームは監査プロセスと Tooling を Owner しますが、他チームの instrumentation を一方的に削除はせず、削除候補を提示して承認を求めます。これにより対立を生まずプロセスを迅速に回せます。
+
+## Checklist
+
+- [ ] 直近 90 日の Dashboard 閲覧履歴を取得し、未使用のものを Archive する
+- [ ] Alert の発火回数を Incident Ticket と突き合わせ、無視されている Alert を統廃合・削除する
+- [ ] Active Series 数で Metric をランキングし、Cardinality の主犯となっている Metric から修正する
+- [ ] 本番環境で Debug Level の Logging がデフォルト無効になっているか確認する
+- [ ] エラー・レイテンシーの可視性が重要な箇所には Tail-based Sampling を導入する
+- [ ] 症状レベルの閾値 Alert を SLO ベースの Burn Rate Alert に置き換える
+- [ ] Hot / Downsample / 破棄の Retention 階層を設定する
+- [ ] 監査の Owner(SRE/Platform)と instrumentation の Owner(発生元チーム)を明確にする
+- [ ] 今回の監査を終える前に次回四半期監査の日程を確定する
+
+Telemetry Debt は障害のように派手に自己主張しません。更新のたびに膨らむ請求額と、Monitoring を無視することを少しずつ学習していく On-call ローテーションとして静かに現れます。棚卸しを一度きりの掃除ではなく継続的な習慣として扱うことこそが、これを再発させない唯一の方法です。

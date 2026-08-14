@@ -1,0 +1,122 @@
+---
+title: "EKS API Server 429 오류 진단하기 — APF Seat 고갈과 AI Agent가 실제로 더해주는 것"
+description: "AWS DevOps Agent가 EKS Control Plane의 429 throttling을 API Priority and Fairness Seat 고갈 문제로 진단할 수 있게 되었습니다. APF의 동작 원리, Seat 고갈을 유발하는 Workload, AI Agent가 수동 진단 대비 무엇을 더해주는지 정리합니다."
+date: "2026-08-15"
+status: "published"
+tags: ["AWS", "EKS", "Kubernetes", "DevOps", "SRE"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-eks-devops-agent-api-throttling-2026"
+---
+
+올해 AWS는 DevOps Agent의 진단 범위를 확장해, EKS Control Plane의 특정 성능 저하 패턴 — API Priority and Fairness(APF) Seat 고갈로 인한 HTTP 429 응답 — 을 식별할 수 있도록 했습니다. 좁은 범위의 기능이지만, 실제로 반복해서 발생하는 문제를 정확히 짚고 있습니다. webhani도 여러 client의 incident response에서 이 패턴을 여러 차례 다뤘는데, 지금까지는 Agent 대신 CloudWatch와 Prometheus query를 여러 개 펼쳐놓고 직접 상관관계를 찾아야 했습니다.
+
+이 글에서는 APF가 실제로 무엇을 하는지, 규모가 커진 cluster에서 Seat 고갈이 왜 자주 발생하는지, AI 기반 진단이 수동 triage 대비 무엇을 더해주는지, 그리고 어떤 tool을 쓰든 공통적으로 취해야 할 대응을 정리합니다.
+
+## API Priority and Fairness란 무엇인가
+
+APF는 Kubernetes 1.20부터 Stable 상태인 기능이며, EKS에서는 기본으로 활성화되어 있습니다. 목적은 `kube-apiserver`가 과부하로 무너지지 않도록 보호하는 것입니다. APF가 도입되기 전에는 misbehaving한 client 하나가 apiserver의 처리 용량을 독점해 cluster 전체(kubelet 포함)를 저하시킬 수 있었습니다.
+
+APF는 두 가지 custom resource로 구성됩니다.
+
+- **PriorityLevelConfiguration**은 동시 실행 capacity의 pool을 "Seat" 단위로 정의합니다. 각 Priority Level은 apiserver 전체 concurrency budget 중 일부를 할당받습니다. Seat는 초당 request 수 같은 rate limit이 아니라 동시 실행 가능한 request slot에 가깝습니다. Request는 실행이 끝날 때까지 Seat를 점유하므로, 대용량 LIST call이나 비용이 큰 watch처럼 느린 request일수록 Seat를 더 오래 붙잡고 있게 됩니다.
+- **FlowSchema**는 들어오는 request를 user, Service Account, Group, resource 기준으로 분류해 해당 PriorityLevelConfiguration으로 라우팅합니다. `distinguisher` type에 따라 해당 Priority Level 내에서 fairness가 어떻게 적용되는지(user 단위, namespace 단위 등)가 결정됩니다.
+
+특정 Priority Level의 Seat가 모두 차면, 해당 조건에 맞는 이후 request는 설정된 깊이까지 queue에 쌓입니다. queue마저 가득 차면 apiserver는 `Retry-After` header와 함께 429로 request를 거부합니다. 이는 crash가 아니라 의도된 design상의 거부입니다. apiserver는 스스로를 보호하고 있는 것이며, 그 대가는 같은 Priority Level을 공유하는 모든 request가 한꺼번에 치르게 됩니다.
+
+## Cluster 규모가 커질수록 자주 나타나는 이유
+
+Seat 고갈은 단순한 traffic 양보다는 거의 항상 request의 "성격"에서 비롯됩니다. 실제 incident에서 자주 확인한 패턴은 다음과 같습니다.
+
+- **Leader Election이 많은 Operator.** Leader Election에 참여하는 각 Controller replica는 짧은 주기로 apiserver를 poll합니다. Default 설정의 Operator를 십여 개만 운영해도 다른 모든 request와 동일한 default Priority Level을 두고 경쟁하는 지속적인 background load가 생깁니다.
+- **버스트성 kubectl/Helm call을 발생시키는 CI/CD system.** 여러 service에 대해 `kubectl apply`나 `helm upgrade`를 동시에 fan-out하는 pipeline은, cluster가 가장 바쁜 시점에 짧지만 강한 spike를 만들어냅니다.
+- **비효율적인 List-Watch pattern을 가진 Controller.** Informer cache에 의존하지 않고 대규모 resource(예: cluster 전체 Pod)를 다시 list하는 Controller는 크고 느린 request를 발생시켜 Seat를 오래 점유합니다.
+- **HPA/VPA churn.** Scaling event 중 metrics를 poll하고 빈번하게 update를 발생시키는 Autoscaler는, cluster가 이미 traffic 증가로 압박받고 있는 바로 그 시점에 지속적인 load를 추가합니다.
+
+이런 패턴은 개별적으로 보면 문제가 없어 보입니다. 문제는 default 설정에서는 이것들이 모두 같은 `workload-low`나 `global-default` Priority Level에 몰린다는 점입니다. 그 결과, noisy한 source 하나가 같은 bucket을 공유하는 다른 모든 것 — 때로는 cluster가 동작하는 데 필요한 CNI나 CSI Controller까지 — 을 함께 저하시킵니다.
+
+## AI 진단 Agent가 더해주는 것
+
+이 incident의 수동 triage는 대략 이런 흐름입니다. latency 상승이나 deployment 실패를 인지하고, apiserver latency dashboard를 확인하고, flow control metrics를 가져오고, 어떤 FlowSchema가 request를 거부하고 있는지 대조한 뒤, 그 traffic을 발생시키는 workload가 무엇인지 — 대개는 최근 audit log를 grep하거나 비슷한 시점에 재시작·scale된 Controller를 확인하며 — 찾아냅니다. 어렵지는 않지만 느리고, incident 중에는 dashboard를 하나씩 옮겨 다닐 때마다 시간이 소모됩니다.
+
+AWS의 Agent 기반 진단이 더해주는 것은 주로 상관관계 분석의 속도입니다. apiserver 쪽 flow control signal(concurrency 사용량과 설정된 limit의 비교, Priority Level별 거부 횟수, queue 대기 시간 — 개념적으로 기반 flow control metrics가 노출하는 정보와 유사합니다)을 가져와 workload 단위 activity와 대조해 first-pass 가설을 만들어냅니다. 이는 incident 중 가장 중요한 두 가지 질문에 실질적으로 도움이 됩니다.
+
+1. **Noisy Neighbor 문제인가** — 특정 workload나 FlowSchema가 Seat를 불균형하게 소비하고 있는가 — **아니면 Control Plane 자체가 cluster의 정상 load 대비 과소 사이징된 것인가.**
+2. **구체적으로 어떤 workload가 원인인가.** 시간 압박 속에서 수십 개 Controller를 하나씩 추측하며 뒤질 필요가 없어집니다.
+
+Agent가 이를 몇 초 만에 좁혀준다는 것은, 수동 상관관계 분석에 보통 20~30분이 걸린다는 점을 감안하면 실질적인 시간 절약입니다. 다만 무엇을 변경할지 결정하는 판단 자체를 대체하지는 않습니다.
+
+## Remediation 절차 — Agent 유무와 무관하게
+
+가설이 AI Agent에서 나왔든 직접 dashboard를 확인해서 나왔든, 실제 대응 내용은 동일합니다. 먼저 현재 APF 상태를 직접 확인합니다.
+
+```bash
+kubectl get flowschemas
+kubectl get prioritylevelconfigurations
+kubectl get --raw /metrics | grep apiserver_flowcontrol
+```
+
+raw metrics endpoint는 dashboard가 제대로 연결되어 있는지에 의존하지 않고, Priority Level별 concurrency 사용량, 거부 횟수, queue 깊이라는 ground truth를 직접 제공합니다.
+
+그다음으로:
+
+- **핵심 workload에는 전용 Priority Level과 FlowSchema를 부여합니다.** Ingress Controller나 Cluster Autoscaler가 CI pipeline의 kubectl call과 같은 Seat를 두고 경쟁하지 않도록 합니다.
+- **자체 Controller에 client-side rate limiting과 backoff를 추가합니다.** `client-go`의 default QPS/burst 설정은 단일 client 기준으로는 보수적이지만 replica 수가 늘어나면 누적됩니다. default를 그대로 두지 말고 의도적으로 tuning하세요.
+- **List-Watch load를 줄입니다.** 임시방편적인 LIST call보다 field/label selector가 적용된 Informer를 사용하고, watch event에 의존하지 않고 timer로 cluster 전체 resource를 다시 list하는 Controller가 없는지 점검합니다.
+- **CI/CD의 apiserver 작업을 분산시킵니다.** `kubectl`/`helm` call을 deploy window 전체에 분산시켜 한 번에 몰아서 실행하지 않도록 하고, 문제가 있는 pipeline run이 production Controller를 굶주리게 하지 않도록 CI traffic을 전용 FlowSchema로 라우팅하는 것을 고려합니다.
+
+핵심 workload를 전용 Priority Level로 분리하고 해당 request를 그쪽으로 라우팅하는 최소 예시입니다.
+
+```yaml
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: PriorityLevelConfiguration
+metadata:
+  name: critical-controllers
+spec:
+  type: Limited
+  limited:
+    nominalConcurrencyShares: 20
+    limitResponse:
+      type: Queue
+      queuing:
+        queues: 16
+        handSize: 4
+        queueLengthLimit: 50
+---
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: FlowSchema
+metadata:
+  name: critical-controllers
+spec:
+  priorityLevelConfiguration:
+    name: critical-controllers
+  matchingPrecedence: 500
+  distinguisherMethod:
+    type: ByUser
+  rules:
+    - subjects:
+        - kind: ServiceAccount
+          serviceAccount:
+            name: critical-operator
+            namespace: platform
+      resourceRules:
+        - apiGroups: ["*"]
+          resources: ["*"]
+          verbs: ["*"]
+```
+
+## 진단 결과를 얼마나 신뢰할 것인가
+
+webhani가 client에게 권장하는 것은, AWS DevOps Agent든 유사한 tool이든 AI가 생성한 진단 결과를 "곧바로 적용할 결론"이 아니라 "빠른 first-pass 가설"로 취급하라는 것입니다. APF 설정은 여러 team이 공유하는, 운영 중인 Control Plane과 직결된 infrastructure입니다. 잘못된 FlowSchema 변경은 문제를 해결하는 대신 다른 workload로 옮기는 결과를 낳거나, 최악의 경우 Agent가 미처 파악하지 못한 무언가를 굶주리게 만들 수 있습니다. 다른 team이 의존하고 있는 PriorityLevelConfiguration을 건드리기 전에, 제시된 root cause를 반드시 raw `apiserver_flowcontrol` metrics와 최근 audit log로 검증하세요.
+
+## Checklist
+
+- [ ] 429가 APF 거부와 상관관계가 있는지 확인 (etcd latency나 webhook timeout 등 다른 bottleneck이 아닌지)
+- [ ] `kubectl get flowschemas`와 `kubectl get prioritylevelconfigurations`로 현재 구성 확인
+- [ ] `apiserver_flowcontrol_*` metrics를 가져와 어떤 Priority Level이 포화 상태인지 식별
+- [ ] Priority Level뿐 아니라 load를 발생시키는 구체적인 workload 식별
+- [ ] workload를 전용 FlowSchema로 분리할지, 아니면 Control Plane 자체가 정말 과소 사이징된 것인지 판단
+- [ ] APF 분리를 추가하기 전에 문제가 되는 Controller의 client-side QPS/burst와 List-Watch pattern부터 tuning
+- [ ] APF 변경은 먼저 비운영 cluster에 적용 — 이는 여러 team이 공유하는 infrastructure임
+
+AI Agent는 올바른 질문에 더 빨리 도달하도록 도와줍니다. 하지만 올바른 답에 도달하려면 여전히 그 Control Plane을 함께 사용하는 workload들을 이해하는 사람의 판단이 필요합니다.
