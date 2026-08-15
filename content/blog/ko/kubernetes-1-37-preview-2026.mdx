@@ -1,0 +1,78 @@
+---
+title: "Kubernetes 1.37 미리보기 — KYAML·Pod 단위 Resource·DRA Device Taint가 Stable로"
+description: "Kubernetes 1.37은 2026년 8월 26일 Release 예정이며, 16개의 Enhancement가 Stable로 승격됩니다. KYAML 출력, Pod 단위 Resource 요청, DRA Device Taint·Toleration 등 Platform Team이 미리 확인해야 할 내용을 정리했습니다."
+date: "2026-08-16"
+status: "published"
+tags: ["Kubernetes", "DevOps", "Cloud Infrastructure", "DRA"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-37-preview-2026"
+---
+
+## 8월 26일에 무엇이 오나
+
+Kubernetes 1.37은 2026년 8월 26일 Release 예정입니다. Project의 Sneak Peek 게시물을 보면 이번 Cycle에서 Stable로 승격되는 16개 Enhancement의 개요를 미리 확인할 수 있습니다. Production Cluster를 운영하는 Team이라면 특히 KYAML 출력, Pod 단위 Resource 요청, DRA Device Taint·Toleration의 GA 승격 이 세 가지에 주목할 만합니다. 하나하나는 화려하지 않지만, 각각 Platform Team이 매일 다루는 Workflow를 바꿔놓습니다.
+
+## KYAML — YAML의 함정 해소
+
+KYAML은 기존 Tool과 호환성을 유지하면서 YAML의 잘 알려진 함정을 피하도록 엄격한 Formatting 규칙을 적용한 YAML 방언입니다. 대표적인 예가 "Norway 문제"로, Quote 처리되지 않은 `NO`가 문자열 "Norway"가 아니라 Boolean 값 false로 조용히 Parsing되는 현상입니다. 국가 코드나 Version 문자열, 약어가 Manifest에서 의도치 않은 Type으로 변환돼 Debug에 시달려 본 적이 있다면 이게 왜 중요한지 바로 이해될 것입니다.
+
+KYAML이 `kubectl`의 Stable 출력 Option이 된다는 것은, YAML 전체를 벗어나지 않고도 잘못 Parsing될 가능성이 낮은 형태로 Manifest를 받을 수 있다는 뜻입니다. 대규모 GitOps Repository를 운영하는 Team이라면 직접 검증해 볼 가치가 있습니다.
+
+```bash
+# 사용 가능해지면 kubectl 기본 출력과 KYAML 출력을 비교
+kubectl get deployment my-app -o yaml
+kubectl get deployment my-app -o kyaml
+```
+
+Version 문자열, Region Code, Feature Flag 성격의 Key처럼 값 해석이 모호해지기 쉬운 Resource를 대상으로 두 출력을 Diff해 보면, 최소 한 곳에서는 이 차이가 실제로 문제가 되는 지점을 발견하게 될 것입니다.
+
+## Pod 단위 Resource
+
+Pod 단위 Resource 요청·제한이 1.37에서 Stable로 승격됩니다. 지금까지 Kubernetes의 Resource 요청·제한은 Container 단위로 설정돼, 여러 Container로 구성된 Pod 전체에 걸쳐 Resource를 Budget 관리하려면 어색한 우회 방법이 필요했습니다. Sidecar, Init Container, Main Workload가 공유 상한을 두고 서로 경쟁하는 구조였습니다. Pod 단위로 제한을 설정할 수 있다면, "이 Pod 전체가 X를 넘지 않아야 한다"는 것을 Container별로 수동 분배하고 실제 Traffic 아래에서 그 분배가 무너지지 않기를 바라는 대신 직접 표현할 수 있습니다.
+
+Service Mesh Proxy, Logging Agent, Security Scanner 같은 Sidecar Pattern이 Production 배포에서 예외가 아니라 기본이 되고 있는 상황에서 이 변화의 의미는 더 커집니다. 여러 Container로 구성된 Pod를 많이 운영하는 Cluster라면, 이번 Release에서 가장 즉각적으로 유용한 Stable 기능 중 하나입니다.
+
+## DRA Device Taint·Toleration의 GA 승격
+
+Dynamic Resource Allocation(DRA)은 여러 Release에 걸쳐 성숙해 왔는데, 1.37에서 Device Taint·Toleration Enhancement가 General Availability에 도달합니다. 이를 통해 DRA Driver 또는 User가 정의한 `DeviceTaintRule` Object를 통해 Cluster 운영자가 특정 Hardware Device(주로 GPU 등 전용 Accelerator)에 Taint를 지정할 수 있습니다.
+
+- `NoSchedule` Taint는 저하되거나 오프라인 상태인 Hardware에 새 Pod가 Scheduling되는 것을 막습니다.
+- `NoExecute` Taint는 해당 Device에서 현재 실행 중인 Pod를 Evict할 수 있어, 계획된 Maintenance Window에 유용합니다.
+- 특정 Taint를 감내해야 하는 Workload(예를 들어 불안정한 Device를 Debug하는 경우)는 `ResourceClaim`에 대응하는 Toleration을 직접 추가할 수 있습니다.
+
+GPU 기반 Workload를 운영하는 Team에게 — AI·ML Infrastructure가 Kubernetes 위에 올라가는 경우가 계속 늘고 있는 만큼 — 이는 실제 운영상의 공백을 메워줍니다. 이전에는 관련 없는 Workload에 영향을 주는 Node 단위 Taint를 편집하지 않고 저하된 GPU Node를 깔끔하게 순환에서 제외하려면 필요 이상의 수동 조정이 요구됐습니다.
+
+`DeviceTaintRule`의 개념적인 형태는 대략 다음과 같습니다.
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: DeviceTaintRule
+metadata:
+  name: gpu-maintenance-window
+spec:
+  deviceSelector:
+    driver: example.com/gpu-driver
+    pool: gpu-pool-a
+  taint:
+    key: maintenance
+    value: "scheduled"
+    effect: NoExecute
+```
+
+이는 어디까지나 개념을 보여주는 예시이며 그대로 복사해서 쓸 수 있는 Manifest는 아닙니다. DRA의 API Surface는 Release마다 계속 바뀌고 있으므로, 1.37 Release 후 정확한 Schema는 반드시 공식 API Reference로 확인하십시오.
+
+## Upgrade 전 확인 사항
+
+1. **GitOps Pipeline의 YAML 의존 부분을 점검합니다.** Config 생성 Step이 YAML의 기본(때로는 예상치 못한) Type 변환에 의존하고 있다면, KYAML 출력으로의 전환이 그 취약함을 드러낼 수 있습니다. 좋은 의미의 노출이지만 Diff를 검토할 시간은 확보해야 합니다.
+2. **여러 Container로 구성된 Pod의 Resource 제한 전제를 재검토합니다.** Tool이나 Dashboard가 현재 Container별 제한을 합산해서 Pod 단위 상한을 추정하고 있다면, Pod 단위 제한이 정식 Field가 된 이후 그 Logic을 수정해야 하는지 확인하십시오.
+3. **DRA로 관리되는 Hardware를 운영 중이라면 Taint 도입 계획을 세웁니다.** GA 승격은 Device Taint 자동화를 "지켜보기" 단계에서 실제 Maintenance Runbook으로 옮길 좋은 신호입니다.
+4. **`.0` Release가 늘 그렇듯, 최소 한 번의 Patch Release가 나올 때까지 Production Upgrade는 보류합니다.** 먼저 Staging Cluster에서 검증하십시오. 새로 GA된 기능은 공개 후 처음 몇 주 동안 Edge Case가 드러나는 경우가 많습니다.
+
+## 정리
+
+1.37의 주요 기능들은 개별적으로는 극적이지 않지만, 모아 놓고 보면 Kubernetes가 성숙도 예산을 어디에 쓰고 있는지 보여줍니다. 오래된 거친 부분(YAML의 모호함, Container 단위에만 머무른 Resource 제한)을 고치고, GPU와 AI Workload를 점점 더 많이 담당하게 된 새 Subsystem(DRA)을 강화하는 방향입니다. webhani는 이런 점진적이고 눈에 띄지 않는 개선까지 고려한 Kubernetes Upgrade Cycle 계획을 Client와 함께 수립하고 있습니다. 실제 운영상의 성과는 보통 이런 부분에서 나옵니다.
+
+---
+
+*참고: [Kubernetes v1.37 Sneak Peek (kubernetes.io)](https://kubernetes.io/blog/2026/07/31/kubernetes-v1-37-sneak-peek/), [Kubernetes 1.37: What You Need to Know (Cloudsmith)](https://cloudsmith.com/blog/kubernetes-1-37-what-you-need-to-know), [Kubernetes 1.37 Release: New Features, Beta & Stable Changes (PerfectScale)](https://www.perfectscale.io/blog/kubernetes-v1-37-sneak-peek)*

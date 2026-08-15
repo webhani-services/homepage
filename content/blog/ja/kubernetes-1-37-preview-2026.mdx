@@ -1,0 +1,78 @@
+---
+title: "Kubernetes 1.37 Preview — KYAML・Pod単位Resource・DRA Device TaintがStable化"
+description: "Kubernetes 1.37は2026年8月26日にRelease予定で、16件のEnhancementがStableに昇格します。KYAML出力、Pod単位のResource要求、DRA Device Taint・Tolerationなど、Platform Teamが事前に確認すべき点を解説します。"
+date: "2026-08-16"
+status: "published"
+tags: ["Kubernetes", "DevOps", "Cloud Infrastructure", "DRA"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-37-preview-2026"
+---
+
+## 8月26日に何が来るか
+
+Kubernetes 1.37は2026年8月26日にReleaseされる予定です。ProjectのSneak Peek記事から、今回のCycleでStableに昇格する16件のEnhancementの概要が見えてきました。本番Clusterを運用するTeamにとって特に注目すべきは、KYAML出力、Pod単位のResource要求、そしてDRA Device Taint・TolerationのGA化の3点です。どれも単体では派手さはありませんが、Platform Teamが日常的に触るWorkflowをそれぞれ変えるものです。
+
+## KYAML — YAMLの落とし穴を解消する
+
+KYAMLは、既存Toolと互換性を保ちながら、YAMLの有名な落とし穴を避けるための厳格なFormatting規則を適用したYAML方言です。代表例が「Norway問題」で、Quoteされていない`NO`が文字列「Norway」ではなくBoolean値のFalseとして静かにParseされてしまう現象です。国コードやVersion文字列、略語がManifest上で意図しないTypeにCoerceされてDebugに苦しんだ経験があれば、これが重要な理由はすぐに分かるはずです。
+
+KYAMLが`kubectl`のStableな出力Optionになるということは、YAML全体からTool Chainを乗り換えることなく、誤ってParseされにくい形式でManifestを取得できるようになるということです。大規模なGitOps Repositoryを運用しているTeamは、直接検証してみる価値があります。
+
+```bash
+# 利用可能になったら、kubectlのDefault出力とKYAML出力を比較する
+kubectl get deployment my-app -o yaml
+kubectl get deployment my-app -o kyaml
+```
+
+Version文字列やRegion Code、Feature Flag的なKeyなど、値の解釈が曖昧になりやすいResourceについて両者をDiffしてみると、少なくとも一箇所は違いが問題になる箇所が見つかるはずです。
+
+## Pod単位のResource
+
+Pod単位のResource要求・制限が1.37でStableに昇格します。従来、KubernetesのResource要求・制限はContainer単位で設定されており、複数のContainerを持つPod全体でResourceをBudget管理したい場合には不自然な回避策が必要でした。Sidecar、Init Container、Main Workloadがそれぞれ共有の上限を奪い合う構図です。Pod単位で制限を設定できれば、「このPod全体でX以内に収める」ことを、Container単位で手動に分割してその配分が実際のTraffic下で崩れないことを祈る必要なく、直接表現できます。
+
+Service Mesh Proxy、Logging Agent、Security ScannerといったSidecar Patternが本番環境において例外ではなく標準になりつつある中、この意味は大きくなっています。複数ContainerのPodを多く運用しているClusterであれば、今回のReleaseで最も即効性のあるStable機能の一つと言えます。
+
+## DRA Device TaintとTolerationがGAへ
+
+Dynamic Resource Allocation(DRA)はここ数Releaseにわたって成熟を続けてきましたが、1.37でDevice Taint・Toleration EnhancementがGeneral Availabilityに到達します。これにより、DRA Driverや、User定義の`DeviceTaintRule`Objectを通じてCluster運用者が、特定のHardware Device(主にGPUなどの専用Accelerator)にTaintを付与できるようになります。
+
+- `NoSchedule` Taintは、劣化または停止したHardwareへの新規Podのschedulingをblockします。
+- `NoExecute` Taintは、そのDevice上で実行中のPodをEvictできます。計画的なMaintenance Windowに有用です。
+- 特定のTaintを許容する必要があるWorkload(例えば不安定なDeviceのDebug用)は、`ResourceClaim`に対応するTolerationを直接追加できます。
+
+GPUを利用するWorkloadを運用しているTeamにとって — AI・ML InfrastructureがKubernetes上に乗るケースが年々増えていることを踏まえると — これは実際のOperation上のGapを埋めるものです。これまでは、無関係なWorkloadに影響するNode単位のTaintを編集することなく、劣化したGPU Nodeをきれいに切り離すには、必要以上の手動調整が求められていました。
+
+`DeviceTaintRule`の概念的な形は次のようなものです。
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: DeviceTaintRule
+metadata:
+  name: gpu-maintenance-window
+spec:
+  deviceSelector:
+    driver: example.com/gpu-driver
+    pool: gpu-pool-a
+  taint:
+    key: maintenance
+    value: "scheduled"
+    effect: NoExecute
+```
+
+これはあくまで概念的な例であり、そのままCopy & Pasteして使えるManifestではありません。DRAのAPI SurfaceはRelease毎に変化し続けているため、1.37 Release後に正式なAPI Referenceで正確なSchemaを確認してください。
+
+## Aupgrade前に確認すべきこと
+
+1. **GitOps PipelineのYAML依存部分を洗い出す。** Config生成StepがYAMLのDefault(時に予想外な)Type Coercionに依存している箇所があれば、KYAML出力への切り替えでその脆弱さが表面化する可能性があります。良い意味での表面化ですが、Diffを確認する時間は見込んでおくべきです。
+2. **複数ContainerのPodにおけるResource制限の前提を見直す。** ToolやDashboardが現状Container単位の制限を合算してPod単位の上限を推測している場合、Pod単位制限がFirst-class Fieldになった後にそのLogicを更新する必要がないか確認してください。
+3. **DRA管理下のHardwareを運用しているなら、Taint導入の計画を立てる。** GA化は、Device Taint自動化を「様子見」から実際のMaintenance Runbookへ組み込むタイミングとして良い目安になります。
+4. **`.0`Release時と同様、少なくとも1回のPatch Releaseまで本番Aupgradeは待つ。** まずStaging Clusterで検証を。新しくGA化した機能は、公開後の最初の数週間でEdge Caseが見つかることが多いものです。
+
+## まとめ
+
+1.37の主要機能はどれも単体では劇的なものではありませんが、まとめて見るとKubernetesが成熟のためのRiseを何に使っているかが分かります。長年のRough Edge(YAMLの曖昧さ、Container単位のみのResource制限)を修正し、GPUやAI Workloadを担うことが増えている新しいSubsystem(DRA)を強化するという方向性です。webhaniでは、こうした地味だが着実な改善を踏まえたKubernetes Aupgrade Cycleの計画をClientとともに進めています。実際のOperation上の成果は、多くの場合こうした部分にあります。
+
+---
+
+*参考: [Kubernetes v1.37 Sneak Peek (kubernetes.io)](https://kubernetes.io/blog/2026/07/31/kubernetes-v1-37-sneak-peek/), [Kubernetes 1.37: What You Need to Know (Cloudsmith)](https://cloudsmith.com/blog/kubernetes-1-37-what-you-need-to-know), [Kubernetes 1.37 Release: New Features, Beta & Stable Changes (PerfectScale)](https://www.perfectscale.io/blog/kubernetes-v1-37-sneak-peek)*

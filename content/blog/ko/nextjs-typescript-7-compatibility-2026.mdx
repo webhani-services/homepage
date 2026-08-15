@@ -1,0 +1,62 @@
+---
+title: "Next.js와 TypeScript 7 — 무엇이 깨졌고 어떻게 고쳐졌나"
+description: "Next.js 15.5.22는 TypeScript 7을 알기 어려운 Build 실패 대신 명확한 Error로 거부하도록 바뀌었고, 16.2.12에서 실제 지원이 Backport됐습니다. 무엇이 바뀌었고 Upgrade를 어떻게 계획해야 하는지 정리합니다."
+date: "2026-08-16"
+status: "published"
+tags: ["Next.js", "TypeScript", "Web Development", "Vercel"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-typescript-7-compatibility-2026"
+---
+
+## 조용하지만 중요한 호환성 수정
+
+TypeScript 7은 Go로 다시 작성된 Compiler를 도입하면서 큰 폭의 성능 향상을 가져왔고, 많은 Team이 서둘러 도입하고 싶어했습니다. 하지만 지난 몇 달 동안 Next.js Project에서 TypeScript 7을 시도해 봤다면, 깔끔한 Upgrade 대신 알기 어려운 실패를 만났을 가능성이 높습니다. Next.js는 이를 두 단계로 해결했습니다. 먼저 명확한 Error Message로, 그다음 실제 지원으로. 이 순서 자체가 빠르게 변하는 Dependency를 Framework Maintainer가 어떻게 다뤄야 하는지 보여주는 좋은 사례입니다.
+
+## 원래 문제
+
+수정 전에는 Next.js의 Build Tool이 TypeScript 7을 "호환 안 됨"이 아니라 "설치 안 됨"으로 잘못 인식했습니다. Auto-install을 비활성화한 Project — CI나 Docker Build에서 결정론적인 Dependency 해석을 원할 때 흔한 설정입니다 — 에서는, 실제로는 `typescript@7.x`가 `node_modules`에 설치돼 있는데도 TypeScript가 전혀 설치되지 않은 것 같은 Error로 Build가 실패했습니다. 짜증나는 실패 유형입니다. Error Message가 엉뚱한 방향을 가리키기 때문에, 진짜 원인이 Tool이 인식하지 못한 Version 불일치라는 걸 깨닫기 전까지 Lock File과 Install Step을 확인하느라 시간을 낭비하게 됩니다.
+
+## 1단계: 명확한 Error로
+
+Next.js 15.5.22는 TypeScript 7.0 이상을 명시적으로 감지해서, 조용히 "설치 안 됨"으로 잘못 보고하는 대신 대응 가능한 Error로 거부하도록 바뀌었습니다. 실제로는 대략 이런 모습입니다.
+
+```text
+Error: Detected TypeScript 7.0.2, which is not yet supported by this
+version of Next.js. Please downgrade to typescript@5.x, or upgrade
+Next.js to a version with TypeScript 7 support.
+```
+
+작은 변경이지만 의미가 있습니다. "아직 지원 안 됨"이라는 정직한 Error는 바로 대응할 수 있습니다. 반면 "설치 안 됨"이라는 잘못된 Error는 완전히 엉뚱한 Debug 경로로 이끕니다. 사내 Tool에서 비슷한 Version Gate를 운영하고 있다면 이 방식을 참고할 만합니다. 특정 Dependency Version을 지원할 수 없다면, 일반적인 Error가 그냥 나타나게 두지 말고 직접적으로 알려야 합니다.
+
+## 2단계: 실제 지원으로
+
+수정은 Error Message 개선에서 끝나지 않았습니다. Next.js는 TypeScript 7 지원을 안정 버전인 16.2 계열에 Backport했고, 16.2.12에서 적용됐습니다. Next.js 15.5.x 계열을 사용 중이라면, 이 Backport가 16.2 Branch에 적용된 것임을 주의해야 합니다. TypeScript 7이 그냥 동작할 거라 가정하기 전에, 사용 중인 정확한 Version의 Release Note를 확인하십시오. 모든 유지보수 대상 Branch에 동시에 지원이 들어간 것은 아닙니다.
+
+## Security Patch와 함께 처리하기
+
+이 호환성 수정은 2026년 7월 Next.js Security Release와 비슷한 시기에 나왔습니다. 이 Release에서는 16.2 계열(Active LTS, 16.2.11에서 수정)과 15.5 계열(Maintenance LTS, 15.5.21에서 수정)에 걸쳐 9건의 취약점이 패치됐고, 그중 4건은 High Severity로 SSRF, Middleware·Proxy Bypass, Denial of Service, Cache Confusion, 내부 Server Function 식별자 노출 등이 포함됩니다. TypeScript 7 관련 마찰 때문에 Security Update를 미루고 있던 Team이 있다면, 그 마찰은 이제 대부분 해소됐으니 더 미룰 이유가 없습니다.
+
+## 실용적인 Upgrade Checklist
+
+TypeScript Version이나 Next.js Version을 건드리기 전에 다음 순서로 확인하는 걸 권합니다.
+
+1. **현재 Next.js Version과 계열을 확인합니다.** `npx next --version`을 실행해서 16.2.x(Active LTS)인지 15.5.x(Maintenance LTS)인지 확인하십시오.
+2. **TypeScript 문제와 별개로 Security Patch를 먼저 적용합니다.** TypeScript 계획과 무관하게, 16.2.11 이상 또는 15.5.21 이상으로 올리면 실제 취약점이 막힙니다.
+3. **대상 Version에 TypeScript 7 Backport가 포함됐는지 확인합니다.** 가정하지 말고 해당 Patch Release의 Release Note를 직접 읽으십시오.
+4. **TypeScript Upgrade는 Next.js Version 변경과 별도 Commit으로 진행합니다.** 뭔가 깨지면 어느 변경이 원인인지 바로 알 수 있습니다.
+5. **Merge 전 CI에서 type-check Step을 다시 실행합니다.** Build만으로는 부족합니다. `tsc --noEmit`이 Pipeline에 포함돼 있지 않으면 Build는 성공해도 Type Error가 그냥 통과할 수 있습니다.
+
+```bash
+# 현재 Version을 빠르게 확인
+npx next --version
+npx tsc --version
+```
+
+## 정리
+
+이번 수정은 범위는 작았지만, 책임 있는 Dependency 호환성 대응의 좋은 예입니다. 먼저 비호환성을 명확히 인정하고, 준비가 됐을 때 실제 지원을 제공하는 방식 — 개발자를 오해를 부르는 Error 속에 방치하지 않는 태도입니다. "TypeScript 7의 Compiler 속도는 쓰고 싶은데 Build가 계속 실패한다"는 상황에 머물러 있던 Project가 있다면, 오늘 Next.js Version을 다시 확인해 볼 가치가 있습니다. webhani는 이런 Framework·Toolchain Upgrade 작업을 Client를 위해 꾸준히 수행하고 있습니다. 개별 Version 변경 못지않게 그 순서가 중요합니다.
+
+---
+
+*참고: [Release v15.5.22 (GitHub)](https://github.com/vercel/next.js/releases/tag/v15.5.22), [next build misdetects TypeScript 7 as missing (GitHub Issue #95490)](https://github.com/vercel/next.js/issues/95490), [July 2026 Security Release (Next.js Blog)](https://nextjs.org/blog/july-2026-security-release)*
