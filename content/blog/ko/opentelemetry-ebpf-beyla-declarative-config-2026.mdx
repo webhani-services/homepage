@@ -1,0 +1,103 @@
+---
+title: "2026년 OpenTelemetry — eBPF 기반 무코드 계측(Beyla)과 선언형 설정을 실무에서 언제 쓸까"
+description: "eBPF 기반 자동 계측 도구 Beyla와 OpenTelemetry Collector의 선언형 설정이 확산되고 있습니다. eBPF로 볼 수 있는 것과 없는 것, 그리고 LLM 호출을 기존 trace에 통합하는 방법을 코드 예시와 함께 정리합니다."
+date: "2026-08-17"
+status: "published"
+tags: ["OpenTelemetry", "Observability", "eBPF", "Monitoring", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "opentelemetry-ebpf-beyla-declarative-config-2026"
+---
+
+OpenTelemetry는 어느새 observability 계측의 사실상 표준으로 자리 잡았습니다. Python SDK만 놓고 봐도 월간 download가 2억 2,400만 건을 넘어섰다는 사실은, 이 프로젝트가 일부 얼리어답터 팀의 도구를 넘어 그냥 당연히 쓰는 infrastructure가 되었다는 뜻입니다. webhani는 Next.js/Node backend, Python service, 그리고 최근에는 client를 위해 구축하는 LLM 연동 API route가 함께 운영되는 환경을 다루고 있어서, observability 설계 결정은 앞으로의 운영 비용과 직결됩니다. 이번 글에서는 Grafana Labs가 주도해온 두 가지 흐름 — eBPF 기반 zero-code 계측(Beyla 프로젝트)과 OpenTelemetry Collector의 선언형 설정 — 을 실무 관점에서 정리합니다.
+
+## Telemetry를 얻는 두 가지 방식
+
+전통적으로 trace와 metric을 얻으려면 애플리케이션에 SDK를 붙이고, framework용 auto-instrumentation library를 설정하고, 그래도 부족한 부분은 수동으로 span을 작성하는 흐름이 일반적이었습니다. 지금도 이 방식이 가장 풍부한 telemetry를 제공하지만, 비용도 확실히 존재합니다. 모든 service에 SDK를 추가하고, 버전을 관리하고, 올바르게 설정해야 하며, 언어마다 다른 특성에도 대응해야 합니다.
+
+Beyla는 여기서 다른 접근을 취합니다. eBPF라는 Linux kernel 기술을 사용해서, 실행 중인 process를 수정하거나 재시작하지 않고도 observation code를 attach할 수 있습니다. Beyla는 sidecar나 daemonset 형태로 동작하면서 process의 network 활동을 kernel level에서 관찰하고, HTTP·gRPC·SQL level의 span과 metric을 재구성합니다. 애플리케이션 code는 한 줄도 바꾸지 않고, service에 SDK 의존성을 추가할 필요도 없습니다.
+
+## eBPF 계측이 실제로 볼 수 있는 것
+
+Beyla 방식의 eBPF 계측이 강한 영역은 request/response 경계의 가시성입니다. 수신되는 HTTP call, 다른 service로 나가는 outbound call, driver/socket level에서 관찰된 database query, gRPC call, 그리고 route별 기본 latency와 error rate 같은 metric들입니다. "service map을 보고 싶다", "payments service 호출이 느려지면 바로 알고 싶다" 정도의 요구라면, code를 전혀 건드리지 않고도 충족할 수 있습니다. 아무도 손대고 싶어하지 않는 legacy service에 뒤늦게 observability를 붙이거나, 사내의 자잘한 내부 도구 여러 개에 빠르게 가시성을 확보해야 할 때 특히 유용합니다.
+
+## eBPF가 보지 못하는 것
+
+한계도 마찬가지로 명확합니다. eBPF 계측은 process/network 경계를 넘나드는 통신, 혹은 계측된 kernel hook에 걸리는 것만 볼 수 있습니다. 그 span이 비즈니스 관점에서 무엇을 의미하는지는 알지 못합니다. `/api/checkout`으로의 request가 800ms 걸렸고 database를 3번 조회했다는 사실은 알 수 있지만, 그 800ms 중 600ms가 할인 code를 rule engine으로 검증하는 데 쓰였는지, 어떤 tenant ID나 feature flag가 관여했는지는 알 수 없습니다. custom attribute, 함수 내부의 특정 비즈니스 로직을 감싸는 span, process 내부 상태와 연결된 log처럼 애플리케이션 level context가 필요한 부분은 반드시 SDK 기반 수동 계측이 필요합니다. eBPF는 최소한의 바닥을 깔아주는 것이지, 그 이상의 해상도를 대신해주지는 않습니다.
+
+## 선언형 Collector 설정 — 하나의 정의를 모든 service에
+
+두 번째 변화는 화려하지는 않지만 일상적인 운영에서는 오히려 더 실질적입니다. OpenTelemetry Collector가 선언형 설정으로 이동하고 있는데, receiver·processor·exporter로 구성되는 telemetry pipeline을 명령형으로 하나씩 조립하는 대신 config file로 정의하는 방식입니다. Next.js service 몇 개, Python worker 몇 개, 그리고 최근에는 LLM 연동 route까지 섞여 있는 팀이라면 이 변화가 크게 다가옵니다. "batch 처리하고, PII를 redact하고, backend로 보낸다"는 pipeline 형태를 한 번 정의해두면, 환경별 차이를 최소화하면서 모든 service에 일관되게 적용할 수 있기 때문입니다. 각 service가 저마다 다른 Collector 설정을 갖고 시간이 지나면서 서로 어긋나는 상황을 막을 수 있습니다.
+
+혼합 환경을 위한 최소한의 선언형 Collector 설정은 다음과 같습니다.
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+  ebpf/beyla:
+    endpoint: http://beyla:9090
+
+processors:
+  batch:
+  attributes/redact:
+    actions:
+      - key: user.email
+        action: delete
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: production
+        action: upsert
+
+exporters:
+  otlp/backend:
+    endpoint: https://otel-collector.internal:4317
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp, ebpf/beyla]
+      processors: [attributes/redact, resource, batch]
+      exporters: [otlp/backend]
+```
+
+SDK로 계측된 Node service든, Beyla가 관찰하는 Python worker든 동일한 pipeline 정의로 흘러 들어갑니다. staging과 production 사이, 또는 수십 개의 microservice 사이에 이를 배포하는 작업은 repo마다 별도의 Collector 설정을 review하는 대신, 환경별 override를 포함한 config file 하나를 배포하는 것으로 끝납니다.
+
+## LLM 연동 endpoint를 나머지와 같은 trace로 추적하기
+
+이 부분이 webhani의 실무와 가장 직접적으로 맞닿아 있습니다. client를 위해 만들고 운영하는 API route 중 LLM을 호출하는 비중이 계속 늘고 있습니다. 이런 호출들은 AI 담당자만 들여다보는 별도 dashboard가 아니라, 나머지 request와 동일한 trace 안에 나타나야 합니다. OpenTelemetry의 semantic conventions가 생성 AI telemetry로도 확장되면서, LLM/agent 호출에 model 이름, token 수, request/response 크기 같은 표준 형식을 부여해 기존 HTTP·DB span과 같은 data model에 담을 수 있게 되었습니다.
+
+이건 eBPF만으로는 해결되지 않습니다. eBPF는 LLM provider API로 나가는 outbound HTTPS call은 관찰할 수 있지만, model 이름이나 token 사용량, 예상 비용까지는 알 수 없습니다. 이를 위해서는 LLM 호출을 감싸는 수동 span과 명시적인 attribute가 필요합니다.
+
+```typescript
+import { trace } from "@opentelemetry/api";
+
+const tracer = trace.getTracer("checkout-api");
+
+async function generateSummary(prompt: string) {
+  return tracer.startActiveSpan("llm.chat_completion", async (span) => {
+    span.setAttribute("gen_ai.system", "anthropic");
+    span.setAttribute("gen_ai.request.model", "claude-sonnet-5");
+
+    const start = Date.now();
+    const result = await callLlmProvider(prompt);
+
+    span.setAttribute("gen_ai.usage.input_tokens", result.usage.inputTokens);
+    span.setAttribute("gen_ai.usage.output_tokens", result.usage.outputTokens);
+    span.setAttribute("gen_ai.response.latency_ms", Date.now() - start);
+    span.end();
+    return result;
+  });
+}
+```
+
+이 span은 eBPF나 framework 자체 계측이 이미 만들어둔 수신 HTTP request span의 자식으로 기록되기 때문에, 결과적으로 하나의 trace 안에 HTTP request 수신, database 조회(eBPF가 포착), token/cost 정보가 담긴 LLM 호출(수동 계측이 포착), response 반환까지 한 줄로 이어집니다. LLM 전용 별도 도구를 도입할 필요 없이, 같은 trace 안의 span 하나로 다룰 수 있는 것입니다.
+
+## webhani의 실무 기준
+
+저희가 실제로 쓰는 경험칙은 이렇습니다. 내부 도구, legacy service, 손대기 어려운 third-party component처럼 engineering 공수를 들이고 싶지 않은 영역에는 Beyla 방식의 eBPF 계측을 기본값으로 둡니다. 그리고 checkout flow나 LLM 호출처럼 비즈니스 context, 비용, compliance와 직결되는 부분에만 수동 SDK span을 겹쳐 씌웁니다. Collector 설정은 선언형으로 한 번 표준화해서, 계측 방식이 다르더라도 모든 service가 같은 pipeline으로 흘러 들어가게 만듭니다. 이 조합을 쓰면 모든 걸 일일이 손으로 계측하겠다는 부담 없이도 폭넓은 가시성을 빠르게 확보하면서, 필요한 부분만 더 깊게 파고들 여지를 남겨둘 수 있습니다.
+
+Observability가 다루는 범위는 계속 넓어지고 있고, semantic conventions가 안정화되면서 지금 만든 dashboard와 alert이 앞으로도 계속 쓸모 있을 가능성이 커지고 있습니다. 대부분의 팀에게 실무상 과제는 "eBPF냐 SDK냐"를 고르는 것이 아니라, request path의 어느 부분에 어느 쪽이 필요한지를 정확히 판단하는 일입니다.

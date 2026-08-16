@@ -1,0 +1,103 @@
+---
+title: "OpenTelemetry in 2026: Deciding Between eBPF Auto-Instrumentation and SDK Spans"
+description: "eBPF-based zero-code instrumentation (Beyla) and declarative Collector config are changing how teams roll out observability. A practical breakdown of what eBPF can and can't see, and how to trace LLM-backed endpoints alongside the rest of your stack."
+date: "2026-08-17"
+status: "published"
+tags: ["OpenTelemetry", "Observability", "eBPF", "Monitoring", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "opentelemetry-ebpf-beyla-declarative-config-2026"
+---
+
+OpenTelemetry has quietly become the default answer to "how do we instrument this service." Its Python SDK alone is now pulled over 224 million times a month, which tells you the project has moved past the early-adopter phase into infrastructure-you-just-use territory. For webhani, this matters directly: we run a mix of Next.js/Node backends, Python services, and — increasingly — LLM-backed API routes for clients, and observability decisions we make now shape how much engineering time gets spent on instrumentation later. This post is a practical look at two developments reshaping that decision: eBPF-based zero-code instrumentation (the Beyla project) and declarative configuration for the OpenTelemetry Collector.
+
+## Two Ways to Get Telemetry Out of a Service
+
+Traditionally, getting traces and metrics out of an application meant adding an SDK, wiring up auto-instrumentation libraries for your framework, and writing manual spans around anything the auto-instrumentation didn't cover. That's still the default path, and it still produces the richest telemetry. But it has a real cost: every service needs the SDK added, kept up to date, and configured correctly, and every language runtime has its own quirks.
+
+Grafana Labs has been pushing a different approach through Beyla: instrumentation via eBPF, a Linux kernel technology that lets you attach observation code to running processes without modifying or even restarting them. Beyla runs as a sidecar or daemonset, watches process network activity at the kernel level, and reconstructs HTTP, gRPC, and SQL-level spans and metrics — all without a single line of application code changing, and without an SDK dependency in your service at all.
+
+## What eBPF Instrumentation Actually Captures
+
+Beyla-style eBPF instrumentation is genuinely good at request/response boundary visibility: incoming HTTP calls, outbound calls to other services, database queries observed at the driver/socket level, gRPC calls, and basic latency and error-rate metrics per route. If your goal is "give me a service map and know when a call to the payments service is slow," eBPF gets you there with zero code changes, which matters a lot when you're retrofitting observability onto a legacy service nobody wants to touch, or standing up visibility across a fleet of small internal tools quickly.
+
+## What eBPF Cannot See
+
+The limitation is equally concrete: eBPF instrumentation only sees what crosses process/network boundaries or hits instrumented kernel hooks. It has no idea what a span means in business terms. It can tell you a request to `/api/checkout` took 800ms and called the database three times, but it can't tell you that of those 800ms, 600ms was spent validating a discount code against a rules engine, or which tenant ID or feature flag was involved. Anything that requires application-level context — a custom attribute, a span that wraps a specific business operation inside a function rather than at a call boundary, or a log correlated with a specific in-process state — needs manual SDK instrumentation. eBPF is a floor, not a ceiling.
+
+## Declarative Collector Config: One Definition, Many Services
+
+The second shift is less flashy but arguably more useful day to day: the OpenTelemetry Collector is moving toward declarative configuration, where you define your telemetry pipeline — receivers, processors, exporters — as a config file rather than assembling it imperatively. For a team running a handful of Next.js services, a couple of Python workers, and now some LLM-backed routes, this matters because it means you can define one pipeline shape (batch, sample, redact PII, route to your backend) and apply it consistently across every environment, rather than each service owning its own bespoke setup that drifts over time.
+
+A minimal declarative Collector config for a mixed fleet looks like this:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+  ebpf/beyla:
+    endpoint: http://beyla:9090
+
+processors:
+  batch:
+  attributes/redact:
+    actions:
+      - key: user.email
+        action: delete
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: production
+        action: upsert
+
+exporters:
+  otlp/backend:
+    endpoint: https://otel-collector.internal:4317
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp, ebpf/beyla]
+      processors: [attributes/redact, resource, batch]
+      exporters: [otlp/backend]
+```
+
+Every service — whether it's SDK-instrumented Node code sending OTLP, or a Python worker eBPF is watching — feeds into the same pipeline definition. Rolling this out across staging and production, or across a dozen microservices, becomes a matter of distributing one config file (with environment-specific overrides) rather than reviewing custom Collector setup per repo.
+
+## Tracing an LLM-Backed Endpoint the Same Way as Everything Else
+
+This is the part most relevant to webhani's own work: a growing share of the API routes we build and maintain for clients now call out to an LLM, and those calls need to show up in the same trace as the rest of the request — not in a separate dashboard only the AI team looks at. OpenTelemetry's semantic conventions now extend to generative-AI telemetry, giving LLM/agent calls a standard shape (model name, token counts, request/response size) so they slot into the same data model as your HTTP and DB spans.
+
+eBPF alone won't get you this. It'll see the outbound HTTPS call to the LLM provider's API, but it won't know the model, the token usage, or the estimated cost — that requires a manual span with explicit attributes around the LLM call itself:
+
+```typescript
+import { trace } from "@opentelemetry/api";
+
+const tracer = trace.getTracer("checkout-api");
+
+async function generateSummary(prompt: string) {
+  return tracer.startActiveSpan("llm.chat_completion", async (span) => {
+    span.setAttribute("gen_ai.system", "anthropic");
+    span.setAttribute("gen_ai.request.model", "claude-sonnet-5");
+
+    const start = Date.now();
+    const result = await callLlmProvider(prompt);
+
+    span.setAttribute("gen_ai.usage.input_tokens", result.usage.inputTokens);
+    span.setAttribute("gen_ai.usage.output_tokens", result.usage.outputTokens);
+    span.setAttribute("gen_ai.response.latency_ms", Date.now() - start);
+    span.end();
+    return result;
+  });
+}
+```
+
+Because this span is a child of the request span that eBPF or the framework's own instrumentation already created for the incoming HTTP call, you end up with one trace showing the full path: HTTP request in, DB lookups (captured by eBPF), LLM call with token/cost data (captured manually), and the response out. No separate LLM observability tool required — it's just another span in the same trace.
+
+## How webhani Approaches This in Practice
+
+Our working rule of thumb: use Beyla-style eBPF instrumentation as the default for anything you don't want to spend engineering time on — internal tools, legacy services, third-party components you can't easily modify — and layer manual SDK spans only where business context actually matters: checkout flows, LLM calls, anything with cost or compliance implications. Standardize the Collector config once, declaratively, and let every service — regardless of instrumentation method — feed into it. That combination gets a team broad visibility fast without committing to instrumenting everything by hand, while keeping the option open to go deeper exactly where it pays off.
+
+Observability tooling keeps expanding in scope, and semantic convention stability means dashboards and alerts built today are more likely to still work as the ecosystem evolves. The practical task for most teams isn't picking eBPF or SDKs — it's knowing which parts of the request path need which.
