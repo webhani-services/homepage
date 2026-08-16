@@ -1,0 +1,103 @@
+---
+title: "2026年の OpenTelemetry — eBPF によるゼロコード計装 (Beyla) と宣言的設定の実務的な使い分け"
+description: "eBPF ベースの自動計装ツール Beyla と OpenTelemetry Collector の宣言的設定が普及しつつあります。eBPF で見えるもの・見えないもの、そして LLM 呼び出しを既存トレースに統合する方法を実装例つきで解説します。"
+date: "2026-08-17"
+status: "published"
+tags: ["OpenTelemetry", "Observability", "eBPF", "Monitoring", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "opentelemetry-ebpf-beyla-declarative-config-2026"
+---
+
+OpenTelemetry は、いつの間にか observability 計装の事実上の標準になりました。Python SDK だけでも月間 2 億 2400 万 download を超えており、もはや一部の先進的な team だけが使う tool ではなく、当たり前に使われる infrastructure の一部になっています。webhani では Next.js / Node の backend、Python service、そして最近は client 向けに構築する LLM 連携の API route が混在する環境を運用しており、observability の設計判断は今後の運用コストに直結します。今回は Grafana Labs が主導している 2 つの動き — eBPF による zero-code 計装（Beyla project）と OpenTelemetry Collector の宣言的設定 — を実務目線で整理します。
+
+## Telemetry を取得する 2 つのアプローチ
+
+従来、trace や metrics を取得するには application に SDK を組み込み、framework 用の auto-instrumentation library を設定し、それでも足りない部分は手動で span を書くという流れが一般的でした。今もこれが最も豊富な telemetry を得られる方法ですが、コストも実際にあります。すべての service に SDK を追加し、version を維持し、正しく設定する必要があり、言語ごとの癖にも対応しなければなりません。
+
+Beyla は、それとは異なるアプローチを取ります。eBPF という Linux kernel の技術を使い、実行中の process にコードを変更・再起動することなく observation code を attach できます。Beyla は sidecar や daemonset として動作し、process の network 活動を kernel level で監視して、HTTP・gRPC・SQL level の span と metrics を再構築します。application code は一切変更せず、service に SDK 依存を追加する必要もありません。
+
+## eBPF 計装で実際に見えるもの
+
+Beyla のような eBPF 計装が得意なのは、request/response の境界での可視性です。受信した HTTP call、他 service への outbound call、driver / socket level で観測された database query、gRPC call、そして route ごとの latency や error rate といった基本的な metrics です。「service map が欲しい」「payments service への呼び出しが遅くなったら気づきたい」という要求であれば、code を一切変更せずに実現できます。誰も触りたがらない legacy service に後から observability を追加したい場合や、社内の小さな tool 群に手早く可視性を確保したい場合には特に有効です。
+
+## eBPF が見えないもの
+
+限界も同じくらい明確です。eBPF 計装が見えるのは process / network の境界を越える通信、または計装済みの kernel hook に到達したものだけです。span がビジネス上何を意味するかは分かりません。「`/api/checkout` への request が 800ms かかり、database に 3 回 access した」ことは分かっても、その 800ms のうち 600ms が割引 code の validation ロジックに費やされたことや、どの tenant ID や feature flag が関わっていたかは分かりません。application level の context — custom attribute、関数内部の特定のビジネス処理を包む span、process 内部の状態と紐づく log — が必要な場合は、SDK による手動計装が必須です。eBPF は「最低限の底上げ」であり、それ以上の解像度を代替するものではありません。
+
+## 宣言的な Collector 設定 — 1つの定義を全 service に
+
+もう一つの変化は地味ですが、日々の運用ではむしろ影響が大きいものです。OpenTelemetry Collector が宣言的設定へと移行しつつあり、receiver・processor・exporter からなる telemetry pipeline を imperative に組み立てるのではなく、config file として定義できるようになっています。Next.js の service がいくつか、Python worker がいくつか、そして最近は LLM 連携の route も抱えるチームにとって、これは大きな意味を持ちます。「batch 処理し、PII を redact し、backend に送る」という pipeline の形を一度定義すれば、環境ごとの差分を最小限にして全 service に一貫適用できるからです。各 service が独自の Collector 設定を持ち、時間とともに乖離していく状況を避けられます。
+
+混在環境向けの最小限の宣言的 Collector 設定は次のようになります。
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+  ebpf/beyla:
+    endpoint: http://beyla:9090
+
+processors:
+  batch:
+  attributes/redact:
+    actions:
+      - key: user.email
+        action: delete
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: production
+        action: upsert
+
+exporters:
+  otlp/backend:
+    endpoint: https://otel-collector.internal:4317
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp, ebpf/beyla]
+      processors: [attributes/redact, resource, batch]
+      exporters: [otlp/backend]
+```
+
+SDK で計装された Node の service も、Beyla が監視している Python worker も、同じ pipeline 定義に流れ込みます。staging と production の間、あるいは十数個の microservice の間で展開する作業は、repo ごとに独自の Collector 設定をレビューするのではなく、環境ごとの override を含む 1 つの config file を配布するだけになります。
+
+## LLM 連携の endpoint を他と同じ trace で追う
+
+ここが webhani の実務に最も直結する部分です。client 向けに構築・運用する API route の中で、LLM を呼び出すものが増えています。それらの呼び出しは、AI チームだけが見る別の dashboard ではなく、他の request と同じ trace に現れる必要があります。OpenTelemetry の semantic conventions は生成 AI の telemetry にも拡張されつつあり、LLM / agent の呼び出しに model 名・token 数・request/response size といった標準的な形式を与え、既存の HTTP や DB の span と同じ data model に載せられるようになっています。
+
+これは eBPF だけでは実現できません。eBPF は LLM provider の API への outbound HTTPS call は観測できますが、model 名や token 使用量、推定コストまでは分かりません。それには LLM 呼び出しを囲む手動の span と explicit な attribute が必要です。
+
+```typescript
+import { trace } from "@opentelemetry/api";
+
+const tracer = trace.getTracer("checkout-api");
+
+async function generateSummary(prompt: string) {
+  return tracer.startActiveSpan("llm.chat_completion", async (span) => {
+    span.setAttribute("gen_ai.system", "anthropic");
+    span.setAttribute("gen_ai.request.model", "claude-sonnet-5");
+
+    const start = Date.now();
+    const result = await callLlmProvider(prompt);
+
+    span.setAttribute("gen_ai.usage.input_tokens", result.usage.inputTokens);
+    span.setAttribute("gen_ai.usage.output_tokens", result.usage.outputTokens);
+    span.setAttribute("gen_ai.response.latency_ms", Date.now() - start);
+    span.end();
+    return result;
+  });
+}
+```
+
+この span は、eBPF や framework 自身の計装がすでに作成している受信 HTTP request の span の子として記録されるため、結果として 1 つの trace の中に、HTTP request の受信、database の参照（eBPF が捕捉）、token / cost 情報付きの LLM 呼び出し（手動計装が捕捉）、そして response の返却までが一直線に並びます。LLM 専用の別 tool を導入する必要はなく、単に同じ trace の中の 1 つの span として扱えます。
+
+## webhani での実務判断
+
+私たちの経験則としては、まず内部 tool や legacy service、簡単に手を入れられない third-party component など、engineering の工数をかけたくない部分には Beyla のような eBPF 計装を default として採用します。そして checkout flow や LLM 呼び出しなど、ビジネス context やコスト・compliance に直結する部分にだけ、手動の SDK span を重ねます。Collector の設定は宣言的に一度標準化し、計装方法が違っても全 service を同じ pipeline に流し込みます。この組み合わせにより、すべてを手作業で計装するコミットメントなしに広範な可視性を素早く確保しつつ、必要な箇所だけ深く掘り下げる余地を残せます。
+
+Observability の対象範囲は年々広がっており、semantic conventions の安定化によって、今作った dashboard や alert が今後も使い続けられる可能性が高まっています。多くの team にとって実務上の課題は「eBPF か SDK か」を選ぶことではなく、request path のどの部分にどちらが必要かを見極めることです。
