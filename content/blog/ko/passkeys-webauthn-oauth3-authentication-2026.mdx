@@ -1,0 +1,146 @@
+---
+title: "2026년 인증 기술: Passkey와 WebAuthn의 운영 전환, OAuth3의 위치"
+description: "Passkey는 이제 실험적 기술을 넘어 운영 표준이 되었습니다. 95% 이상의 브라우저 지원과 규제 요구사항이 만나면서 조직 차원의 도입이 가속화되고 있습니다."
+date: "2026-08-18"
+status: "published"
+tags: ["인증", "WebAuthn", "Passkey", "보안", "OAuth", "규정준수"]
+thumbnail: ""
+author: "webhani"
+slug: "passkeys-webauthn-oauth3-authentication-2026"
+---
+
+## Passkey는 선택이 아닌 표준이 되었다
+
+2026년 중반, Passkey 도입은 단순한 보안 Best Practice에서 운영 필수 사항으로 전환되었습니다. WebAuthn은 Chrome 67+, Edge 18+, Safari 13+(iOS 14.5+), 주요 Chromium 기반 브라우저, iOS 16+, Android 9+, Windows 10+ 환경에서 95% 이상의 지원 율을 달성했습니다. Microsoft는 2025년 5월 신규 소비자 계정의 기본 인증 방식을 Passkey로 변경했으며, NIST SP 800-63-4(2025년 7월 발행)는 동기화된 Passkey 인증기를 AAL2(Authenticator Assurance Level 2) 요구사항으로 분류했습니다. EU NIS2 지침은 중요 서비스 인증에 Password 단독 사용을 명시적으로 권고하지 않고 있습니다.
+
+이제 Passkey는 "앞서나가는 기술"이 아닌 규제와 사용자 기대치가 만나는 지점입니다.
+
+## Passkey 도입의 실제 효과
+
+기술 선택을 평가할 때 숫자는 중요합니다. 업계 데이터에 따르면 Passkey 인증 성공률은 약 93%(Password 인증은 63%), 완료 시간은 약 73% 단축됩니다. Passkey를 대규모로 도입한 조직들은 인증 관련 Help Desk 요청이 81% 감소했다고 보고하고 있습니다. 이런 수치들만으로도 Passkey 도입에 충분한 동기가 됩니다.
+
+기술적 기반도 성숙했습니다. W3C WebAuthn 표준은 안정적이고, 모든 주요 프로그래밍 언어에서 Server-side Library가 제공되며, 사용자 경험은 간단합니다. Face인식, Fingerprint, 또는 Device PIN으로 로그인하면 끝입니다. 일회용 코드나 별도 앱이 필요 없습니다.
+
+### 구현의 기본 흐름
+
+Frontend에서는 Browser의 `navigator.credentials` API가 중심입니다.
+
+```javascript
+// 등록: Passkey 생성 및 등록
+async function registerPasskey(userId, userName, userEmail) {
+  const credential = await navigator.credentials.create({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rp: {
+        name: "example.com",
+        id: "example.com"
+      },
+      user: {
+        id: crypto.getRandomValues(new Uint8Array(16)),
+        name: userEmail,
+        displayName: userName
+      },
+      pubKeyCredParams: [
+        { alg: -7, type: "public-key" },   // ES256
+        { alg: -257, type: "public-key" }  // RS256
+      ],
+      timeout: 60000,
+      attestation: "direct",
+      userVerification: "preferred"
+    }
+  });
+  
+  if (!credential) return null;
+  // credential을 Server로 전송하여 저장
+  return credential;
+}
+
+// 인증: Passkey를 사용하여 로그인
+async function authenticateWithPasskey(challenge) {
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge: challenge,
+      timeout: 60000,
+      userVerification: "preferred",
+      rpId: "example.com"
+    }
+  });
+  
+  if (!assertion) return null;
+  // assertion을 Server로 전송하여 검증
+  return assertion;
+}
+```
+
+Backend에서는 작업이 명확합니다. 등록 시에는 공개 키와 인증기 메타데이터를 저장하고, 인증 시에는 암호화 서명을 검증하면 됩니다. `go-webauthn`, `@simplewebauthn/server`, Python의 `webauthn` 같은 Library들이 암호화 세부사항을 처리합니다. 비밀 키는 사용자 Device에만 남습니다.
+
+## 단계적 전환, 한 번에 모두 바꾸기는 아니다
+
+대부분의 조직은 Password에서 Passkey로 한 번에 전환할 수 없습니다. Webhani가 여러 Enterprise 고객에게 적용한 현실적인 접근법은 다음과 같습니다.
+
+### 1단계: Passkey를 선택 사항으로 추가
+
+기존 Password 인증과 나란히 Passkey 등록·인증을 제공합니다. 사용자가 선택할 수 있습니다. Session 관리(JWT, OAuth 2.0)는 변하지 않습니다. Passkey는 단지 새로운 Credential 유형일 뿐입니다. 이 단계는 일반적으로 3~6개월 동안 진행되며, 사용자와 Support Team이 적응할 시간을 줍니다.
+
+### 2단계: Passkey를 기본값으로
+
+활성 사용자의 40~50%가 Passkey를 등록하면, 신규 가입과 Account Recovery의 권장 경로를 Passkey로 변경합니다. 기존 Password 사용자도 인증할 수 있지만, 신규 계정은 Passkey를 기본으로 합니다. Support Ticket이 안정화되는 시점입니다.
+
+### 3단계: Password 단계 폐지
+
+사용자의 80% 이상이 적극적으로 Passkey를 사용할 때 Password 인증을 중단합니다. Backup Code와 Admin 지원 Account Recovery는 Fallback으로 유지합니다. 이 단계는 2단계 시작 후 6~12개월 뒤에 시작됩니다.
+
+타이밍은 임의적이지 않습니다. 각 단계에서는 Testing이 필요합니다. 사용자가 새 Device에서 로그인할 수 있나? Enrollment Flow가 오래된 Browser에서 작동하나? Support 요청은 관리 가능한 수준인가? 이런 검증을 거치지 않으면 운영 마찰로 무너집니다.
+
+## 규제의 힘이 도입을 가속한다
+
+NIST SP 800-63-4의 AAL2 분류는 중요합니다. Passkey를 "보안 개선"에서 "규정준수 요구사항"으로 격상시키기 때문입니다. 정부, 금융, 의료, 중요 인프라 등 NIST 800-63 준수 대상 조직은 이제 Passkey 도입에 구체적인 규제 명령을 받습니다.
+
+EU NIS2 지침은 2024년 10월부터 시행되기 시작했으며, 2025년 10월 이후 더 폭넓은 범위에 적용됩니다. 중요 서비스의 인증에 "손상될 수 없는 인증 방식"을 요구합니다. Passkey가 정확히 여기에 들어갑니다. Password 단독 시스템은 들어갈 수 없습니다. 이 규제로 인해 유럽 전역에서 Passkey 도입 Pilot이 폭발적으로 증가했으며, 많은 조직이 2026~2027년에 운영 환경으로 전환하고 있습니다.
+
+IT Consulting Firm 입장에서는 이것이 기회입니다. 고객들은 더 이상 "Passkey를 해야 하나?"라고 묻지 않습니다. "규정을 만족시키려면 언제까지 구현해야 하나?"라고 묻습니다.
+
+## OAuth3: 미래의 표준, 현재의 선택은 아니다
+
+"OAuth3"라는 용어가 보안과 Protocol 설계 분야에서 자주 등장하지만, 명확히 할 필요가 있습니다. **OAuth 3.0은 아직 Ratified된 표준이 아닙니다.** 현재는 Protocol Designer와 보안 연구자들 사이의 비공식 논의일 뿐입니다.
+
+2012년 발행되고 2023년 OAuth 2.1로 업데이트된 OAuth 2.0은 여전히 업계의 실질적 표준입니다. 잘 작동하지만 설계상 결함도 있습니다. PKCE는 처음부터 포함되지 않고 나중에 추가되었고, Refresh Token 관리는 운영적으로 복잡하며, Enterprise 사용 사례(세밀한 권한 위임, 감사 추적)는 외부 Policy Layer에 의존합니다.
+
+비공식 OAuth3 논의는 다음을 중심으로 합니다.
+
+- Modern Cryptography를 Foundation으로(나중 덧붙임이 아닌)
+- 더 간단한 Refresh Token Lifecycle
+- Enterprise 시나리오에 더 나은 기본값
+- Passkey 같은 신흥 인증 표준과의 더 나은 정렬
+
+이는 가치 있는 업계 대화지만, 아직 표준이 아닙니다. IETF 워킹 그룹이 공식화한 것도 아니고, 널리 유포되는 Draft RFC도 없습니다. 구현은 연구 프로토타입일 뿐 Production Library가 아닙니다.
+
+**2026년의 구현 팀에게는 OAuth 2.0이 올바른 선택입니다.** Authorization Flow가 단순하다면 OAuth 2.0으로 충분하고 충분히 검증되었습니다. 세밀한 권한이나 Enterprise 위임이 필요하다면 OAuth 2.0을 확장할 수 있습니다(Custom Scope, Policy Layer, Grant Type 등). 2026년에 OAuth3로의 전환을 계획하는 것은 현실적 근거가 없습니다.
+
+표준화 과정은 계속 지켜봐야 합니다. 2027~2028년경 OAuth3가 논의에서 Draft를 거쳐 구현 단계로 이동할 수 있습니다. 하지만 현재 시점에서는 결정해야 할 사항이 아닙니다.
+
+## 실무 관점의 Passkey 구현 전략
+
+Client와 개발팀을 위해 Webhani가 생각하는 Passkey 구현 Strategy입니다.
+
+1. **Opt-in으로 시작한다.** 기존 인증과 나란히 Passkey를 옵션으로 제공합니다. 도입률을 측정하고 Production에서의 Failure Mode를 배웁니다.
+
+2. **UX와 Support에 투자한다.** Passkey는 대부분의 사용자에게 Password보다 간단하지만, Edge Case는 존재합니다. Cross-device Flow, Device 분실, 구형 Browser 등을 충분히 Test하고 Support를 체계화합니다.
+
+3. **Compliance와 Audit를 계획한다.** NIST 800-63이나 NIS2가 조직에 적용된다면, Passkey의 기능을 Compliance 요구사항에 명시적으로 맵핑합니다. Audit Trail과 Device 등록 메타데이터는 중요합니다.
+
+4. **Backup은 버리지 않는다.** Passkey는 암호화 강도가 뛰어나지만, 사용자 편의는 복구 수단에 달려 있습니다. Backup Code, Security Key Fallback, Admin 지원 복구는 필수입니다.
+
+5. **OAuth3는 모니터하되, 기다리지는 않는다.** Passkey 도입을 지금 시작합니다. OAuth 3.0은 미래의 대화이지, 현재의 결정이 아닙니다.
+
+## 마무리: 전환은 이미 진행 중이다
+
+2026년의 Passkey 도입은 더 이상 Pilot이나 Early Adopter 열정의 문제가 아닙니다. 사용자 기대치 충족, 규제 요구사항 만족, Authentication 운영 오버헤드 감소의 문제입니다. 기술은 성숙했고, Browser 지원은 광범위하며, 조직의 수요는 증가하고 있습니다.
+
+OAuth3는 여전히 업계 논의입니다. 장기 Architecture 사고로는 가치 있는 Context지만, 현재 구현 결정의 포인트는 아닙니다.
+
+Webhani는 두 분야 모두에서 조직을 지원합니다. Passkey 배포 Strategy, Compliance 맵핑, Authentication Infrastructure 아키텍처 결정 모두 말입니다. 사용자 경험, 보안, 규제가 만나는 이 지점이 이제 긴급한 대화가 되었습니다.
+
+---
+
+*참고: [WebAuthn Level 3 Specification (w3.org)](https://www.w3.org/TR/webauthn-3/), [NIST SP 800-63-4 Digital Identity Guidelines (nist.gov)](https://pages.nist.gov/800-63-3/), [State of Passkeys 2026 (state-of-passkeys.io)](https://state-of-passkeys.io/)*
