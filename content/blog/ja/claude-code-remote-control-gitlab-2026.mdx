@@ -1,0 +1,82 @@
+---
+title: "Claude Code 2.1.233 — GitLab MR 対応、Session 自動継続、そして落ちない Remote Control"
+description: "2026年8月14日リリースの Claude Code 2.1.233 は、GitLab Merge Request の可視化、利用上限リセットをまたぐ Session 自動継続、Remote Control の耐障害性を強化しました。複数クライアント案件を並行運用するコンサルティングチームにとって何が変わるかを整理します。"
+date: "2026-08-19"
+status: "published"
+tags: ["Claude Code", "GitLab", "DevOps", "AIコーディング", "チーム開発"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-remote-control-gitlab-2026"
+---
+
+## 地味だが効く Update
+
+2026年8月14日にリリースされた Claude Code 2.1.233 は、月初の Auto Mode デフォルト化と比べると地味な内容です。Status Bar に増えたバッジ一つ、`/config` のトグル一つ、Remote Control の失敗パターンの修正一つ。見出しになるような機能ではありません。ですが、複数クライアントの Repository を並行して触るコンサルティングの現場では、この3つが地味に効きます。
+
+共通しているのは「継続性」です。Git Host が違う、利用上限に当たった、別の端末で Browser Tab を閉じてしまった——こうした「境界」で Session が切れていたのが、今回のリリースで随分と粘るようになりました。実際に何が変わったのか、そして webhani としてどう運用を変えたかをまとめます。
+
+## GitLab の Merge Request がやっと一級市民に
+
+これまで Claude Code の Git 連携は、実質 GitHub 前提でした。クライアントが GitLab を使っている場合——日本の Enterprise や規制業種では自社ホストの GitLab がまだ主流です——Git 操作自体は問題なく動くものの、Merge Request の状態を Claude Code 側から把握する手段がありませんでした。
+
+2.1.233 でこれが変わります。GitLab の Remote を持つ Repository で、`glab` CLI が認証済みであれば、Footer / Statusline に MR バッジが表示されるようになりました。Draft、Pending、Green（Approve/Mergeable）の3状態です。この MR 情報は `--worktree` 実行時や `claude agents` View にも反映され、Open な Merge Request は `!N` という表記で見えるようになります。
+
+GitLab 連携済みの Repository で作業しているときの Terminal Footer はこうなります。
+
+```text
+main ~/projects/client-billing-api  !42 (pending)  Auto Mode
+```
+
+`claude agents` View 側でも、Background で走らせた Agent が Merge Request を作成していれば、わざわざ `glab mr view` を叩かなくても一覧に出てきます。
+
+```text
+$ claude agents
+  agent-7f3a  billing-service  refactor-invoice-calc  !42 (pending)
+  agent-2c91  billing-service  add-retry-backoff       !45 (draft)
+```
+
+見落としやすいのが前提条件です。この機能は `glab auth status` がその GitLab Instance に対して認証済みである場合にのみ動きます。新規クライアント案件の Machine や CI Sandbox では、この認証が入っていないことが普通にあります。そしてバッジが出ないだけで Error にはならないので、「あれ、MR バッジが出ない」と気づくまで数日かかることも珍しくありません。案件立ち上げ時のセットアップ手順に `glab auth login` を組み込んでおくのが安全です。
+
+## 利用上限のリセットをまたいでも Session が止まらない
+
+Monorepo 全体の依存関係更新、Test Suite の移行、一晩がかりの Refactoring——こうした長時間の Agentic Task は、しばしば1回の利用枠を超えます。従来は利用上限に当たった時点で Session が完全に停止しました。誰かが気づいて、リセットを待って、手動で再開する必要があり、その間に Agent がどこまで進んでいたかを見失うこともありました。
+
+2.1.233 では、利用上限がリセットされると Session が自動で継続されます。デフォルトでの挙動ではなく、`/config` のトグルで制御します。
+
+```text
+$ claude
+> /config
+
+Session Behavior
+  [x] 利用上限のリセット後に Session を自動継続する
+  [ ] 利用上限のリセット後に Session を自動継続する  ← 手動再開にしたい場合はオフ
+```
+
+「40個の Route File を Express から Fastify に移行し、各バッチごとに Test Suite を実行する」といったタスクでは、これが「一晩で終わっているタスク」と「深夜2時に人間の対応待ちで止まっているタスク」の分かれ目になります。退社前に Kick off しておくタイプの作業には確実に効きます。
+
+ただし、これはレビュー省略の許可証ではありません。8時間放置している間に、Agent は8時間分の判断を無人で下し続けています。再開ポイントを扱うときは、無人稼働の Agent Session に対するのと同じ姿勢で臨むべきです。最終的な Test の結果だけでなく、Diff そのものに目を通してから信頼してください。
+
+## Session が消えても Remote Control が詰まなくなった
+
+Remote Control は claude.ai や Mobile App から Claude Code の Session を操作できる機能です。デスクで Task を Kick off した Engineer が、外出先から進捗を確認したり指示を追加したりするのに便利です。従来は、元の Session が削除されていた場合（claude.ai 側でクリアされた、App 側で Evict された、単純に期限切れになったなど）、そちらから再開しようとすると単純に失敗していました。Error が出て最初からやり直しになり、Agent が何をしていたかという文脈も一緒に失われていました。
+
+今回の Update で、削除された Session の会話を再開しようとすると、Error を返す代わりに代替の Session が新規に開始されるようになりました。作業が行き止まりにならず継続します。
+
+これが一番効くのは引き継ぎの場面です。クライアント案件では、日中に Engineer A が Client Repository で Claude Code Session を開始し、夜間の監視を Engineer B に claude.ai 経由で引き継ぐ、あるいは Client との打ち合わせの合間に Phone から様子を見る、といった運用がよくあります。以前は、クライアント側で元 Session が既に消えていると、この引き継ぎが黙って壊れていました。今は復旧しますが、代替 Session はあくまで新しい Session であり、削除された元の Session の会話履歴を自動的に完全継承するわけではありません。引き継ぎ直後は「新しい起点」として扱い、Agent が Task の内容を正しく理解しているかを確認してから無人稼働に戻すべきです。
+
+## webhani での運用変更
+
+今回の Release を受けて、実際に変えた運用を挙げます。
+
+- **新規案件の Checklist に `glab auth login` を追加。** クライアントが GitLab を使っている場合、Repository の Clone や `.env` セットアップと同列の Day 1 作業として扱います。省略しても何も壊れませんが、MR バッジが静かに出ないだけなので、誰かが「あれ、Agent の Status Line に MR が出ないね」と言い出すまで気づきにくい問題です。
+- **一晩がかりのバッチ作業では自動継続をオンに。** Codemod、依存関係の一括更新、大規模な Test 移行など、機械的な長時間タスクでは「利用上限リセット後の自動継続」を有効にし、翌朝 Diff 全体をレビューしてから Merge する運用にしています。
+- **判断力が必要な Interactive Session ではオフに。** Architecture の意思決定や、認証・課金・Data Migration に関わる Task では、数時間のギャップを無人で埋められるより、いったん止まって人間を待ってくれる方を選びます。
+- **Remote Control の引き継ぎには一言メモを残す。** 代替 Session は履歴を自動継承しないため、claude.ai 経由で Session を引き継いだ人は、その時点で Agent がどういう状態だったかを PR の説明や Slack Thread に一行残すようにしています。Anthropic が追加した耐障害性が「文脈が無傷で残っている」という前提に頼らないようにするためです。
+
+## まとめ
+
+Claude Code 2.1.233 は新しい能力を追加したというより、Tool と時間の「継ぎ目」で発生していた摩擦を取り除いた Release です。GitLab のクライアントは GitHub ユーザーと同じ水準の Merge Request 可視性を得て、長時間タスクは利用上限のリセットで止まらなくなり、Remote Control 経由の引き継ぎは失敗ではなく緩やかな劣化で済むようになりました。Prompt の書き方を変える必要はありません。必要なのは `glab` の認証を正しく設定し、自動継続をどこで使うかを意図的に決め、配管がどれだけ頑丈になっても Agent の出力を同じ厳しさでレビューし続けることです。
+
+---
+
+*参考: [Claude Code Adds GitLab Support (ai-tldr.dev)](https://ai-tldr.dev/releases/anthropic-claude-code-gitlab-support/), [Claude Code Changelog (gradually.ai)](https://www.gradually.ai/en/changelogs/claude-code/), [Claude Code Release Updates (releasebot.io)](https://releasebot.io/updates/anthropic/claude-code)*
