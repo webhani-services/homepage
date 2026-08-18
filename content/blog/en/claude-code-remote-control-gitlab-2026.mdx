@@ -1,0 +1,82 @@
+---
+title: "Claude Code 2.1.233: GitLab Merge Requests, Session Continuation, and a Remote Control That Doesn't Give Up"
+description: "Claude Code 2.1.233 (August 14, 2026) adds GitLab merge request visibility, automatic session continuation across usage-limit resets, and more resilient Remote Control handoffs. Here's what it means for consulting teams running long agentic sessions across multiple client stacks."
+date: "2026-08-19"
+status: "published"
+tags: ["Claude Code", "GitLab", "DevOps", "AI coding", "team collaboration"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-remote-control-gitlab-2026"
+---
+
+## A Quieter Release With Real Operational Impact
+
+Claude Code 2.1.233 shipped on August 14, 2026, alongside Anthropic's broader push toward "faster, safer sessions" and tighter permission controls. Compared to the Auto Mode rollout earlier in the month, this release looks minor on paper: a status bar badge, a toggle in `/config`, and a fix for a failure mode in Remote Control. None of it makes headlines. All three matter if you run Claude Code across several client codebases in parallel, which is exactly what a consulting team does.
+
+The common thread is continuity. Claude Code now tracks more state across the boundaries that used to break a session — a different Git host, a usage-limit reset, a browser tab closed on the wrong device. Here's what actually changed and how we're adjusting our workflow around it.
+
+## GitLab Merge Requests Get First-Class Treatment
+
+Until this release, Claude Code's Git integration leaned GitHub by default. If your client ran GitLab — self-hosted GitLab is still the norm at a lot of Japanese enterprises and regulated industries — you got working Git operations but no merge request awareness in the tool itself.
+
+2.1.233 changes that. In any repo with a GitLab remote and an authenticated `glab` CLI, Claude Code now shows an MR badge in the footer/statusline, with draft, pending, and green (approved/mergeable) states. The same MR context now flows through to `--worktree` sessions and the `claude agents` view, where open merge requests show up as `!N` instead of being invisible.
+
+A session working against a GitLab-backed repo now looks like this in the terminal footer:
+
+```text
+main ~/projects/client-billing-api  !42 (pending)  Auto Mode
+```
+
+And inside the `claude agents` view, a background agent that opened a merge request reports it directly instead of requiring a manual `glab mr view`:
+
+```text
+$ claude agents
+  agent-7f3a  billing-service  refactor-invoice-calc  !42 (pending)
+  agent-2c91  billing-service  add-retry-backoff       !45 (draft)
+```
+
+The prerequisite is easy to miss: this only works if `glab auth status` reports an authenticated session for that GitLab instance. On a fresh client machine, or in a CI sandbox, that auth is not there by default, and the badge simply doesn't appear — Claude Code doesn't error, it just falls back to plain Git status. Worth checking during environment setup on any new engagement, not after you notice the badge is missing three days in.
+
+## Sessions That Survive a Usage-Limit Reset
+
+Long agentic runs — a dependency upgrade across a monorepo, a test-suite migration, an overnight refactor — routinely outlast a single usage window. Previously, hitting the plan's usage limit mid-task meant the session stopped outright. Someone had to notice, wait for the reset, and manually resume, often losing momentum or forgetting exactly where the agent left off.
+
+Claude Code now continues automatically once the usage limit resets, instead of terminating the session. The behavior is a toggle, not a forced default — check it in `/config`:
+
+```text
+$ claude
+> /config
+
+Session Behavior
+  [x] Automatically continue session after usage limit resets
+  [ ] Automatically continue session after usage limit resets  ← toggle off if you want manual resume
+```
+
+For a task like "migrate this Express API to Fastify across 40 route files, run the test suite after each batch," this is the difference between a task that finishes overnight and one that stalls at 2am waiting for a human to notice. It's a meaningful win for anything you'd normally kick off before leaving the office.
+
+It is not a substitute for review. A session that quietly resumes eight hours later has had eight hours to keep making decisions unsupervised. Treat the point where it picked back up the same way you'd treat any unattended agent run: read the diff, not just the final test output, before you trust it.
+
+## Remote Control No Longer Dies When a Session Disappears
+
+Remote Control lets you drive a Claude Code session from claude.ai or the mobile app — useful when an engineer starts a task at their desk and wants to check on it, or nudge it, from somewhere else. Previously, if the underlying session had been deleted (cleared from claude.ai, evicted from the app, or simply expired), trying to resume it from the other side just failed. You'd get an error and have to start over, losing whatever context you had about what the agent was doing.
+
+Now, resuming a conversation whose session was deleted starts a replacement session instead of throwing an error. The task continues instead of dead-ending.
+
+This matters most for handoffs. In a consulting engagement, it's common for one engineer to kick off a Claude Code session against a client repo, then hand monitoring duties to a teammate for the evening via claude.ai, or check in from a phone between client calls. If the original session had already been cleaned up on the client side, that handoff used to break silently. Now it recovers, though the replacement session is a new session — it does not automatically inherit the exact conversation history of the one that was deleted, so treat it as a fresh continuation point and confirm the agent's understanding of the task before trusting it to keep going unattended.
+
+## How webhani Is Adjusting Client Workflows
+
+A few concrete changes we're making based on this release:
+
+- **New engagement checklist.** For any client on GitLab, `glab auth login` against their instance is now a day-one setup step, right alongside cloning the repo and setting up `.env`. Skipping it doesn't break anything, it just means the MR badge silently never shows up, which is easy to miss until someone asks why merge request status isn't visible in an agent's status line.
+- **Overnight batch work gets the continuation toggle on.** For long mechanical tasks — codemods, dependency bumps, large-scale test migrations — we leave "automatically continue after usage limit resets" enabled and schedule a morning review of the full diff before merging anything.
+- **Interactive, judgment-heavy sessions get it off.** For tasks involving architectural decisions or anything touching auth, billing, or data migrations, we prefer the session to stop and wait for a human rather than silently keep working across a multi-hour gap.
+- **Remote Control handoffs get logged.** Because a replacement session doesn't carry over full history automatically, whoever picks up a session via claude.ai now leaves a one-line note in the PR description or Slack thread about what state the agent was in before handing off, so the resilience Anthropic added doesn't rely on the assumption that context survived intact.
+
+## Summary
+
+Claude Code 2.1.233 doesn't add new capabilities so much as it removes friction at the seams between tools and time: GitLab clients get the same merge-request visibility GitHub users already had, long-running tasks survive a usage-limit reset instead of stalling, and session handoffs through Remote Control degrade gracefully instead of failing outright. None of it requires you to change how you prompt Claude Code. It does require you to set up `glab` auth correctly, decide deliberately where automatic continuation is appropriate, and keep reviewing agent output with the same rigor regardless of how resilient the plumbing has become.
+
+---
+
+*References: [Claude Code Adds GitLab Support (ai-tldr.dev)](https://ai-tldr.dev/releases/anthropic-claude-code-gitlab-support/), [Claude Code Changelog (gradually.ai)](https://www.gradually.ai/en/changelogs/claude-code/), [Claude Code Release Updates (releasebot.io)](https://releasebot.io/updates/anthropic/claude-code)*

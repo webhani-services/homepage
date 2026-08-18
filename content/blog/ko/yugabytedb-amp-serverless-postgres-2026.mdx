@@ -1,0 +1,84 @@
+---
+title: "YugabyteDB AMP: 'Agent마다 전용 Postgres'가 실제로 해결하는 것"
+description: "YugabyteDB 2026.1과 함께 공개된 AMP는 Scale-to-Zero Serverless 모델로 모든 AI Agent나 Tenant에게 독립된 Postgres Database를 제공합니다. webhani가 Multi-tenant 설계를 검토할 때 따지는 기준을 정리합니다."
+date: "2026-08-19"
+status: "published"
+tags: ["PostgreSQL", "Database", "Serverless", "Multi-tenancy", "AI Agent"]
+thumbnail: ""
+author: "webhani"
+slug: "yugabytedb-amp-serverless-postgres-2026"
+---
+
+Yugabyte가 YugabyteDB 2026.1과 함께 발표한 AMP(Agentic Multitenant Postgres)는 Tenant나 Multi-agent System의 각 Agent에게 독립적이고 Wire 호환되는 Postgres Database를 하나씩 부여하는 구조입니다. CPU 사용량 기준으로 과금하고, Idle 상태에서는 비용이 0이 됩니다. 공유 Schema도, Tenant를 구분하는 Row Level Security(RLS) Policy도 없이, Tenant 간 경계가 물리적인 Database 단위로 바뀝니다.
+
+발표 자체는 단순하지만, 이게 실제로 어떤 문제를 해결하는지부터 정리해야 특정 Project에 적용할 가치가 있는지 판단할 수 있습니다.
+
+## 이 방식이 겨냥하는 문제
+
+대부분의 Multi-tenant SaaS는 두 가지 Model 중 하나를 선택합니다. `tenant_id` Column과 RLS를 사용하는 공유 Schema, 아니면 고정 크기 Instance 위에서 Tenant마다 독립된 Database(또는 Schema)를 운영하는 방식입니다. 둘 다 잘 알려진 약점이 있습니다.
+
+공유 Schema 기반 RLS는 운영 비용이 낮습니다. Postgres Instance 하나, Connection Pool 하나로 N개 Tenant를 처리할 수 있죠. 하지만 Risk가 한 곳에 집중됩니다. `WHERE tenant_id = ...` 조건 누락, RLS Policy 설정 실수, 특정 Tenant의 무거운 Query 하나가 같은 Instance를 쓰는 다른 모든 Tenant에 영향을 줍니다. Multi-tenant Traffic이 갑자기 튀면 Connection Pool이 쉽게 고갈되는데, Pool 자체가 모든 Tenant Traffic을 공유하기 때문입니다.
+
+반대로 RDS나 Cloud SQL 같은 전통적인 Managed Postgres 위에서 Tenant마다 Instance를 따로 두는 방식은 격리 문제는 해결하지만, 운영과 비용 문제를 그대로 곱해버립니다. Tenant가 50개면 Instance도 50개, Backup도 50벌, Patch도 50번, 절반이 거의 Idle 상태여도 월 최소 비용은 50개 Instance 분량이 그대로 발생합니다. 대부분의 팀이 Tenant 수가 수십 개를 넘기는 지점에서 이 방식을 포기하는 이유입니다.
+
+AMP는 Database-per-tenant의 격리 수준을 유지하면서 고정 비용 하한선을 없애려는 시도입니다. 여러 개의 작은 Postgres 호환 Database를 공유된 분산 Infrastructure 위에 촘촘히 배치하고, 실제로 소비한 CPU만큼만 과금합니다. Idle한 Tenant Database는 비용이 0이고, Traffic이 급증하는 Tenant는 Migration 없이 Compute를 추가로 받을 수 있습니다.
+
+## 지금의 Database-per-tenant는 어떤 모습인가
+
+일반적인 공유 Schema 구성은 이렇게 생겼습니다.
+
+```sql
+-- 하나의 공유 Instance, RLS로 Tenant를 분리
+CREATE TABLE invoices (
+  id BIGSERIAL PRIMARY KEY,
+  tenant_id UUID NOT NULL,
+  amount NUMERIC NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON invoices
+  USING (tenant_id = current_setting('app.tenant_id')::uuid);
+
+-- Application이 Request나 Session마다 설정
+SET app.tenant_id = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
+```
+
+이 방식은 잘 동작하지만, 격리는 결국 Application의 규율과 모든 Table에서 영구히 정확하게 설정되어야 하는 Policy에 의존합니다. Database-per-tenant Model은 경계를 논리적인 것이 아니라 물리적인 것으로 바꿔서 이 Bug Category 자체를 없앱니다.
+
+```bash
+# Serverless Postgres 호환 Platform에서 Tenant/Agent별로
+# Database를 Provisioning하는 예시 (AMP 방식의 개념적 이미지)
+psql "postgresql://admin@control-plane.example.com:5433" -c \
+  "CREATE DATABASE tenant_3fa85f64 WITH OWNER = tenant_role;"
+
+# 각 Tenant/Agent는 자신의 Database 이름으로 접속 (Wire Protocol은 동일)
+psql "postgresql://app_user:***@cluster.example.com:5433/tenant_3fa85f64"
+```
+
+`tenant_id` Column도, RLS Policy 감사도 필요 없고, Refactoring 중에 `WHERE` 절이 빠져서 Tenant 경계를 넘나드는 Query가 실행되는 Bug도 원천적으로 생기지 않습니다. Tradeoff는 "모든 Query에서 격리 Logic을 정확히 작성하는 것"에서 "N개의 Database Object를 관리하는 것"으로 옮겨가고, AMP는 자동화와 Scale-to-Zero 과금이 그 관리 비용을 충분히 낮춰준다는 데 걸고 있습니다.
+
+## 어디에 잘 맞는가
+
+특히 AI Agent Architecture에서는 이 방식의 이점이 더 뚜렷합니다. 실행되어 자신의 작업 상태에 대해 짧게 읽고 쓰다가 몇 시간씩 Idle 상태로 남는 Agent는, 상시 가동되는 고정 크기 Instance와는 궁합이 나쁩니다. 대부분의 시간을 Idle Compute 비용으로 지불하게 되죠. 공유 Schema 방식과도 궁합이 나쁜데, Agent야말로 예측 불가능하고 Burst성 강한 Query Pattern을 만들어 같은 Pool을 공유하는 다른 Tenant에게 Noisy Neighbor 문제를 일으키기 쉬운 Workload이기 때문입니다. Scale-to-Zero 과금과 물리적 격리 모두 "수천 개의 짧고 Burst성 강한 Workload"에 자연스럽게 들어맞습니다.
+
+반면 수백 개 Tenant 규모에서 안정적인 Traffic을 갖는 일반적인 B2B SaaS라면 AMP의 우위는 그렇게 명확하지 않습니다. 충분히 검증된 Policy Set과 적절한 Connection Pooling(PgBouncer, Supavisor 등)을 갖춘 공유 Schema RLS는 그 규모에서 여전히 실용적이고, 자동화된 Tenant별 Provisioning이라도 운영 대상 자체는 잘 Tuning된 Cluster 하나보다 커지기 쉽습니다.
+
+## webhani가 Migration을 권하기 전에 확인하는 것들
+
+Client에게 Database-per-tenant나 Database-per-agent Model로의 전환을 제안하기 전에, webhani는 다음을 확인합니다.
+
+- **Wire 호환성의 깊이.** "PostgreSQL Wire 호환"이라는 표현이 실제로 Cover하는 범위는 제품마다 다릅니다. Client가 의존하는 Extension, Data Type, Query Pattern(JSONB 연산자, `pg_trgm`, 전문 검색, Window Function 등)을 Marketing 문구를 그대로 믿지 않고 대상 Platform에서 직접 Test합니다.
+- **Migration Tool의 성숙도.** Yugabyte에 내장된 Voyager Agent는 Oracle, SQL Server, MongoDB로부터의 Migration까지 지원한다고 주장합니다. 그러나 주장되는 지원 범위와, 실제 Client Schema(Trigger, Stored Procedure, 제약 조건의 Edge Case 포함)에서 Production 수준으로 검증된 지원은 다른 이야기입니다. Staging 복제본을 대상으로 실제 Migration을 돌려본 뒤 판단합니다.
+- **Vendor Lock-in 위험.** 표준 PostgreSQL Wire Protocol을 쓰면 Query Layer의 Lock-in은 줄어들지만, 운영 Agent(Architect, Perf Advisor, Nexus)와 과금 Model 자체는 Yugabyte 고유입니다. "떠날 때 드는 비용"과 "도입할 때 드는 비용"을 별개의 질문으로 나눠서 검토합니다.
+- **Vector·Graph Query 필요성.** Client의 Agent Workload가 Vector 검색이나 Graph 탐색을 관계형 Query와 함께 정말로 필요로 한다면, 동일한 Wire 호환 Database 안에서 둘 다 지원하는 Platform은 별도의 전용 Store(다른 Instance의 pgvector, 덧붙인 Graph Layer)를 따로 운영할 필요를 없애줍니다. 이건 Marketing용 Checkbox가 아니라 실질적인 단순화입니다.
+- **Serverless 이후의 성장 경로.** Serverless에서 Dedicated Tier로, Rewrite도 접속 문자열 변경도 없이 Workload를 옮길 수 있다는 주장은 문서만 읽고 믿을 게 아니라 실제 Load Test로 검증해야 하는 종류의 약속입니다. 특히 출시 당일 Traffic 급증에 의존하기 전에는 반드시 확인합니다.
+
+## 요약
+
+AMP의 핵심 Idea, 즉 "Tenant나 Agent 단위의 물리적 격리를 실제 사용한 Compute만큼만 과금하며 제공한다"는 접근은 Multi-tenant Postgres Architecture의 두 가지 실질적인 문제, 공유 Schema에서의 RLS Policy Risk와 작은 Dedicated Instance를 다수 운영할 때의 고정 비용 하한선을 직접 겨냥합니다. 수천 개의 Burst성 강하고 자주 Idle 상태가 되는 Workload를 가진 Agent 중심 Architecture에는 상당히 잘 맞습니다. 반면 중간 규모 Tenant 수에 안정적인 Traffic을 가진 B2B SaaS라면, 견고한 Connection Pooling을 갖춘 공유 Schema RLS가 여전히 합리적인 기본값이며, Migration 여부는 실제로 Test한 Wire 호환성, 실제 Schema로 검증한 Migration Tool, 그리고 무엇이 진짜 이식 가능하고 무엇이 특정 Vendor에 종속되는지에 대한 정직한 계산에 달려 있습니다.
+
+---
+
+*참고: [YugabyteDB AMP](https://www.yugabyte.com/amp/), [The Data Backbone for Thousands of Agents (Yugabyte)](https://www.yugabyte.com/blog/data-backbone-for-thousands-of-agents/), [YugabyteDB Scales Agentic Postgres (The New Stack)](https://thenewstack.io/yugabytedb-agentic-postgres-scaling/)*

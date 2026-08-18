@@ -1,0 +1,84 @@
+---
+title: "YugabyteDB AMPが解決する「Agentごとに専用Postgres」という発想"
+description: "YugabyteDB 2026.1で発表されたAMPは、Scale-to-ZeroのServerless Postgresで、AI AgentやTenantごとに独立したDatabaseを持たせる仕組みです。webhaniがMulti-tenant設計を検討する際の判断基準を整理します。"
+date: "2026-08-19"
+status: "published"
+tags: ["PostgreSQL", "Database", "Serverless", "Multi-tenancy", "AI Agent"]
+thumbnail: ""
+author: "webhani"
+slug: "yugabytedb-amp-serverless-postgres-2026"
+---
+
+Yugabyte社がYugabyteDB 2026.1と同時に発表したAMP（Agentic Multitenant Postgres）は、TenantやAI Agentひとつひとつに独立したPostgres互換Databaseを割り当て、CPU使用分のみ課金し、Idle状態ではコストがゼロになるというServerless Postgresです。共有Schemaも、Row Level Security（RLS）のPolicyもなく、Tenant間の境界は物理的なDatabase単位になります。
+
+発表自体はシンプルですが、これが実際にどの課題を解決するのかを整理してから、自社のProjectに適用すべきかを判断する必要があります。
+
+## 解決しようとしている課題
+
+多くのMulti-tenant SaaSは、大きく2つのModelのどちらかを選びます。ひとつは`tenant_id`列とRLSによる共有Schema、もうひとつはTenantごとに独立したDatabase（またはSchema）を固定サイズのInstanceで運用する方式です。どちらにも既知の弱点があります。
+
+共有SchemaベースのRLSは運用コストが低く、1つのPostgres Instanceと1つのConnection PoolでN個のTenantを支えられますが、Riskが集中します。`WHERE tenant_id = ...`の条件漏れ、RLS Policyの設定ミス、あるいは特定Tenantの重いQueryが、同じInstanceを共有する他のTenantに影響します。Multi-tenantのTrafficが突発的に増えるとConnection Poolが枯渇しやすいのも、Poolが全Tenant共有だからです。
+
+一方、RDSやCloud SQLのような従来型Managed Postgres上でTenantごとにInstanceを立てる方式は、Isolationの問題は解決しますが、運用とCostの問題を掛け算で増やします。50TenantならInstanceも50、Backupも50セット、Patch適用も50回、しかも半分がほぼIdleでも月額最低料金は50Instance分発生します。多くのチームがTenant数が数十を超えたあたりでこの方式を諦めるのはこのためです。
+
+AMPは、Database-per-tenantのIsolationを維持しながら固定Cost Floorを取り除こうとするApproachです。多数の小さなPostgres互換Databaseを共有の分散Infrastructure上に集約し、実際に消費したCPUにのみ課金します。IdleなTenant DatabaseはCostゼロ、急激にTrafficが増えたTenantはMigrationなしでComputeを追加できます。
+
+## 現状のDatabase-per-tenant実装
+
+典型的な共有Schema方式は次のようになります。
+
+```sql
+-- 単一の共有Instance、RLSでTenantを分離
+CREATE TABLE invoices (
+  id BIGSERIAL PRIMARY KEY,
+  tenant_id UUID NOT NULL,
+  amount NUMERIC NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON invoices
+  USING (tenant_id = current_setting('app.tenant_id')::uuid);
+
+-- Application側でRequestまたはSessionごとに設定
+SET app.tenant_id = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
+```
+
+これは機能しますが、Isolationの担保はApplication側の規律と、全Tableで永久に正しく設定され続けるPolicyに依存します。Database-per-tenant Modelは、境界を論理的ではなく物理的なものにすることで、このBug Categoryそのものを排除します。
+
+```bash
+# Serverless Postgres互換Platform上でTenant/Agentごとに
+# Databaseを Provisioning する例（AMP的な仕組みの概念イメージ）
+psql "postgresql://admin@control-plane.example.com:5433" -c \
+  "CREATE DATABASE tenant_3fa85f64 WITH OWNER = tenant_role;"
+
+# 各Tenant/AgentはそれぞれのDatabase名で接続する（Wire Protocolは共通）
+psql "postgresql://app_user:***@cluster.example.com:5433/tenant_3fa85f64"
+```
+
+`tenant_id`列もRLS Policyの監査も不要で、Refactoring中に`WHERE`句が消えてTenantを跨いでQueryが実行されるようなBugも起こりません。Tradeoffは「全QueryでIsolation Logicを正しく書く」から「N個のDatabase Objectを管理する」に移り、AMPは自動化とScale-to-Zero課金によってその管理Costを十分に低く抑えられる、という賭けをしています。
+
+## どこに向いているか
+
+特にAI Agent Architectureでは、この方式の優位性がより明確です。起動して自分の作業状態に対して短時間の読み書きを行い、その後数時間Idleになる、といったAgentは、常時稼働の固定サイズInstanceとは相性が悪く、ほとんどの時間Idle Computeに課金され続けることになります。共有Schema方式とも相性が悪く、Agentのような予測不能でBurst的なQuery Patternは、同じPoolを共有する他TenantへのNoisy Neighbor問題を引き起こしやすい性質を持ちます。Scale-to-Zero課金と物理的Isolationは、どちらも「数千の短命でBurst的なWorkload」に自然に適合します。
+
+一方、数百Tenant規模で安定したTrafficを持つ一般的なB2B SaaSでは、AMPの優位性はそれほど明確ではありません。十分に監査されたPolicy Setと適切なConnection Pooling（PgBouncerやSupavisorなど）を備えた共有SchemaのRLSは、その規模であれば依然として実用的で、自動化されたTenantごとのProvisioningであっても、その運用Surfaceは1つのよくTuningされたClusterより大きくなりがちです。
+
+## webhaniが移行前に確認するポイント
+
+Clientに対してDatabase-per-tenantまたはDatabase-per-agent Modelへの移行を提案する前に、webhaniでは以下を確認します。
+
+- **Wire互換性の深さ。**「PostgreSQL Wire互換」という表現が実際にカバーする範囲には幅があります。ClientがDependしているExtension、Data Type、Query Pattern（JSONB演算子、`pg_trgm`、全文検索、Window関数など）を、Marketing上の主張を鵜呑みにせず対象Platformで実際にTestします。
+- **Migration Toolの成熟度。**Yugabyteが組み込むVoyager AgentはOracle、SQL Server、MongoDBからのMigrationにも対応すると謳っていますが、謳われているSupportと、実際のClient Schema（Trigger、Stored Procedure、制約のEdge Caseを含む）でProductionレベルで検証されたSupportは別物です。Stagingの複製に対して実際にMigrationを実行してから判断します。
+- **Vendor Lock-inの範囲。**標準的なPostgres Wire Protocolを使うことでQuery LayerのLock-inは軽減されますが、運用Agent（Architect、Perf Advisor、Nexus）や課金Modelそのものは Yugabyte固有です。「離脱するCost」と「導入するCost」を別々のQuestionとして切り分けて検討します。
+- **VectorおよびGraph Queryの必要性。**ClientのAgent WorkloadがVector検索やGraph探索をRelational Queryと組み合わせて本当に必要とする場合、同一のWire互換Database内で両方をSupportするPlatformは、別途Specialized Store（別Instance上のpgvectorや後付けのGraph Layer）を運用する必要をなくします。これはMarketing上のCheckboxではなく実質的なSimplificationです。
+- **Serverlessから先の成長Path。**ServerlessからDedicated Tierへ、Rewriteも接続文字列の変更もなくWorkloadを移行できるという主張は、Documentを読むだけでなく、実際のLoad Testで検証すべき類の約束です。特にLaunch日のTraffic Spikeに依存する前には必ず確認します。
+
+## まとめ
+
+AMPの核心的なAideaである「TenantまたはAgentごとの物理的Isolationを、実際に使ったCompute分のみ課金する形で提供する」ことは、Multi-tenant Postgres Architectureにおける2つの実際の課題、すなわち共有SchemaにおけるRLS Policyのリスクと、多数の小さなDedicated Instanceを運用する際の固定Cost Floorに直接対応します。数千のBurst的でしばしばIdleになるWorkloadを抱えるAgent中心のArchitectureには非常に適しています。一方、中規模のTenant数で安定したTrafficを持つB2B SaaSでは、堅牢なConnection Poolingを伴う共有SchemaのRLSが依然として妥当なDefaultであり、移行の判断はTest済みのWire互換性、実Schemaで検証済みのMigration Tool、そして何が本当にPortableで何が特定Vendorへの依存になるかの正直な棚卸しに基づくべきです。
+
+---
+
+*参考: [YugabyteDB AMP](https://www.yugabyte.com/amp/), [The Data Backbone for Thousands of Agents (Yugabyte)](https://www.yugabyte.com/blog/data-backbone-for-thousands-of-agents/), [YugabyteDB Scales Agentic Postgres (The New Stack)](https://thenewstack.io/yugabytedb-agentic-postgres-scaling/)*

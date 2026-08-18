@@ -1,0 +1,82 @@
+---
+title: "Claude Code 2.1.233 — GitLab Merge Request, Session 자동 재개, 끊기지 않는 Remote Control"
+description: "2026년 8월 14일 출시된 Claude Code 2.1.233은 GitLab Merge Request 가시성, 사용량 한도 초기화를 넘나드는 Session 자동 재개, Remote Control의 복원력을 강화했습니다. 여러 클라이언트 프로젝트를 동시에 운영하는 컨설팅 팀 관점에서 무엇이 달라지는지 정리합니다."
+date: "2026-08-19"
+status: "published"
+tags: ["Claude Code", "GitLab", "DevOps", "AI 코딩", "팀 협업"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-remote-control-gitlab-2026"
+---
+
+## 작지만 실무에 바로 영향을 주는 Update
+
+2026년 8월 14일 출시된 Claude Code 2.1.233은 이달 초의 Auto Mode 기본 전환에 비하면 눈에 띄지 않는 Release입니다. Status Bar에 Badge 하나가 추가되고, `/config`에 Toggle 하나가 생기고, Remote Control의 특정 실패 패턴이 고쳐진 정도입니다. 헤드라인이 될 만한 내용은 아닙니다. 하지만 여러 클라이언트의 Codebase를 동시에 다루는 컨설팅 팀 입장에서는, 이 세 가지가 매일의 작업 흐름에 실질적으로 영향을 줍니다.
+
+공통 주제는 "연속성"입니다. Git Host가 바뀌거나, 사용량 한도에 걸리거나, 다른 기기에서 Browser Tab을 닫아버리거나 — 이런 경계 지점에서 끊기던 Session이 이번 Release로 훨씬 잘 버티게 되었습니다. 실제로 무엇이 바뀌었고, webhani는 이를 어떻게 운영에 반영했는지 정리합니다.
+
+## GitLab Merge Request가 이제 정식으로 지원됩니다
+
+지금까지 Claude Code의 Git 연동은 사실상 GitHub 중심이었습니다. 클라이언트가 GitLab을 쓰는 경우 — 일본 Enterprise나 규제 산업에서는 자체 호스팅 GitLab이 여전히 표준입니다 — Git 작업 자체는 문제없이 동작했지만, Merge Request 상태를 Tool 안에서 확인할 방법이 없었습니다.
+
+2.1.233부터는 다릅니다. GitLab Remote가 연결된 Repository에서 `glab` CLI가 인증되어 있으면, Footer/Statusline에 MR Badge가 표시됩니다. Draft, Pending, Green(승인/병합 가능) 세 가지 상태를 보여줍니다. 이 MR 정보는 `--worktree` 실행과 `claude agents` View에도 반영되어, 열려 있는 Merge Request가 `!N` 형태로 표시됩니다.
+
+GitLab이 연결된 Repository에서 작업할 때 Terminal Footer는 이렇게 보입니다.
+
+```text
+main ~/projects/client-billing-api  !42 (pending)  Auto Mode
+```
+
+`claude agents` View에서도, Background에서 실행 중인 Agent가 Merge Request를 열어 두었다면 별도로 `glab mr view`를 실행하지 않아도 목록에 바로 나타납니다.
+
+```text
+$ claude agents
+  agent-7f3a  billing-service  refactor-invoice-calc  !42 (pending)
+  agent-2c91  billing-service  add-retry-backoff       !45 (draft)
+```
+
+놓치기 쉬운 전제 조건이 있습니다. 이 기능은 `glab auth status`가 해당 GitLab Instance에 대해 인증된 상태일 때만 동작합니다. 신규 클라이언트 프로젝트의 Machine이나 CI Sandbox에는 이 인증이 기본으로 되어 있지 않은 경우가 흔합니다. 그리고 Badge가 안 뜨는 것 자체는 Error가 아니기 때문에, "왜 MR Badge가 안 보이지"라는 의문이 며칠 뒤에야 나오는 경우가 많습니다. 신규 프로젝트 착수 Checklist에 `glab auth login`을 처음부터 포함하는 것이 안전합니다.
+
+## 사용량 한도가 초기화되어도 Session이 멈추지 않습니다
+
+Monorepo 전체의 의존성 업그레이드, Test Suite 이관, 밤새 돌리는 Refactoring — 이런 장시간 Agentic Task는 종종 한 번의 사용량 Window를 넘깁니다. 지금까지는 작업 도중 사용량 한도에 걸리면 Session이 그대로 멈췄습니다. 누군가 이를 알아차리고, 초기화를 기다렸다가, 수동으로 재개해야 했고, 그 사이 Agent가 어디까지 진행했는지 맥락을 놓치는 경우도 있었습니다.
+
+2.1.233부터는 사용량 한도가 초기화되면 Session이 자동으로 재개됩니다. 강제 기본값이 아니라 Toggle이며, `/config`에서 확인할 수 있습니다.
+
+```text
+$ claude
+> /config
+
+Session Behavior
+  [x] 사용량 한도 초기화 후 Session 자동 재개
+  [ ] 사용량 한도 초기화 후 Session 자동 재개  ← 수동 재개를 원하면 끄세요
+```
+
+"40개 Route File을 Express에서 Fastify로 이관하고, 각 Batch마다 Test Suite를 실행한다" 같은 Task라면, 이 기능이 "밤새 완료되는 작업"과 "새벽에 사람 확인만 기다리며 멈춰 있는 작업"의 차이를 만듭니다. 퇴근 전에 Kick off해 두는 작업에는 확실히 유용합니다.
+
+다만 이것이 Review 생략을 허용하는 것은 아닙니다. 8시간 동안 조용히 재개되어 있었다는 것은, 그 8시간 동안 Agent가 사람 없이 계속 판단을 내렸다는 뜻입니다. 재개 시점을 다룰 때는 무인으로 돌아간 다른 Agent Session과 동일한 기준으로 접근해야 합니다. 최종 Test 결과만이 아니라 Diff 자체를 먼저 확인하고 나서 신뢰하십시오.
+
+## Session이 삭제되어도 Remote Control이 끊기지 않습니다
+
+Remote Control은 claude.ai나 Mobile App에서 Claude Code Session을 조작할 수 있는 기능입니다. 자리에서 Task를 Kick off한 Engineer가 외부에서 진행 상황을 확인하거나 지시를 추가할 때 유용합니다. 지금까지는 원본 Session이 삭제된 경우 — claude.ai에서 Clear되었거나, App에서 Evict되었거나, 단순히 만료된 경우 — 그쪽에서 재개를 시도하면 그냥 실패했습니다. Error가 뜨고 처음부터 다시 시작해야 했으며, Agent가 무엇을 하고 있었는지에 대한 맥락도 함께 사라졌습니다.
+
+이번 Update로, 삭제된 Session의 대화를 재개하려 하면 Error 대신 대체 Session이 새로 시작됩니다. 작업이 막다른 길에서 끝나지 않고 이어집니다.
+
+이것이 가장 힘을 발휘하는 상황은 인계입니다. 컨설팅 프로젝트에서는 낮에 Engineer A가 클라이언트 Repository에서 Claude Code Session을 시작하고, 저녁 모니터링을 claude.ai를 통해 Engineer B에게 넘기거나, 클라이언트 미팅 사이사이 Phone으로 상태를 확인하는 일이 흔합니다. 예전에는 클라이언트 쪽에서 원본 Session이 이미 삭제되어 있으면 이 인계가 조용히 깨졌습니다. 지금은 복구되지만, 대체 Session은 어디까지나 새 Session이며 삭제된 원본 Session의 대화 이력을 자동으로 완전히 물려받지는 않습니다. 인계 직후에는 이를 "새로운 시작점"으로 취급하고, Agent가 Task를 올바르게 이해하고 있는지 확인한 뒤 다시 무인 상태로 돌려야 합니다.
+
+## webhani의 운영 변화
+
+이번 Release를 반영해 실제로 바꾼 운영 방식입니다.
+
+- **신규 프로젝트 Checklist에 `glab auth login` 추가.** 클라이언트가 GitLab을 사용한다면, Repository Clone이나 `.env` 설정과 같은 수준의 Day 1 작업으로 취급합니다. 생략해도 아무것도 깨지지 않지만, MR Badge가 조용히 안 보일 뿐이라서 누군가 "Agent Status Line에 MR이 왜 안 보이지"라고 묻기 전까지는 알아채기 어렵습니다.
+- **밤샘 Batch 작업은 자동 재개를 켜 둡니다.** Codemod, 의존성 일괄 업데이트, 대규모 Test 이관처럼 기계적인 장시간 작업에는 "사용량 한도 초기화 후 자동 재개"를 활성화하고, 다음 날 아침 전체 Diff를 검토한 뒤에 Merge합니다.
+- **판단이 필요한 Interactive Session은 끕니다.** Architecture 결정, 인증·결제·Data Migration이 걸린 Task는 몇 시간의 공백을 무인으로 채우는 것보다, 멈춰서 사람을 기다려 주는 쪽을 선택합니다.
+- **Remote Control 인계에는 한 줄 메모를 남깁니다.** 대체 Session이 이력을 자동으로 물려받지 않기 때문에, claude.ai를 통해 Session을 인계받는 사람은 그 시점에 Agent가 어떤 상태였는지 PR 설명이나 Slack Thread에 한 줄 남기도록 하고 있습니다. Anthropic이 추가한 복원력이 "맥락이 온전히 남아 있다"는 가정에 기대지 않도록 하기 위함입니다.
+
+## 요약
+
+Claude Code 2.1.233은 새로운 기능을 추가했다기보다, Tool과 시간의 "이음매"에서 발생하던 마찰을 줄인 Release입니다. GitLab을 쓰는 클라이언트는 GitHub 사용자와 같은 수준의 Merge Request 가시성을 얻고, 장시간 작업은 사용량 한도 초기화에도 멈추지 않으며, Remote Control을 통한 인계는 완전 실패 대신 완만한 저하로 이어집니다. Prompt 작성 방식을 바꿀 필요는 없습니다. 필요한 것은 `glab` 인증을 제대로 설정하고, 자동 재개를 어디서 쓸지 의도적으로 결정하고, 기반 구조가 아무리 견고해져도 Agent 출력을 동일한 기준으로 계속 검토하는 것입니다.
+
+---
+
+*참고: [Claude Code Adds GitLab Support (ai-tldr.dev)](https://ai-tldr.dev/releases/anthropic-claude-code-gitlab-support/), [Claude Code Changelog (gradually.ai)](https://www.gradually.ai/en/changelogs/claude-code/), [Claude Code Release Updates (releasebot.io)](https://releasebot.io/updates/anthropic/claude-code)*
