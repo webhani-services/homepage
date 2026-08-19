@@ -1,0 +1,65 @@
+---
+title: "Browser에서 1,400 tokens/sec — Liquid AI의 WebGPU Demo가 보여주는 Client-side AI의 현재"
+description: "Liquid AI의 LFM2.5 230M Model이 Custom WebGPU Kernel로 Browser 안에서 1,400 tokens/sec를 기록했습니다. Server도, API Key도 필요 없는 이 기술로 지금 실용적으로 만들 수 있는 Client-side AI 기능을 정리합니다."
+date: "2026-08-20"
+status: "published"
+tags: ["AI", "LLM", "WebGPU", "Frontend", "Edge AI"]
+thumbnail: ""
+author: "webhani"
+slug: "liquid-ai-lfm2-webgpu-browser-inference-2026"
+---
+
+## 작은 Model, 빠른 Browser
+
+최근 webml-community가 공개한 Demo가 화제가 됐습니다. Liquid AI의 2억 3천만 Parameter Model인 "LFM2.5 230M"이 M4 Max Browser Tab 안에서만 동작하면서, 직접 작성한 WebGPU Kernel로 약 1,400 tokens/sec를 기록한 것입니다. Backend 호출도, API Key도, Network Round Trip도 전혀 없습니다.
+
+Browser 안에서 LLM 추론을 돌리는 것 자체는 새로운 이야기가 아닙니다. WebLLM 같은 Project는 이미 오래전부터 WebGPU를 통해 양자화된 Model을 Client-side에서 실행해 왔습니다. 이번에 주목할 부분은 조합입니다. 작은 Parameter 수에서 효율을 최우선으로 설계된 Architecture(Liquid Foundation Models)에, 대부분의 추론 Library가 기본 탑재하는 범용 Backend보다 의미 있는 차이로 Throughput을 뽑아내는 Custom Kernel을 결합한 것입니다. 그 결과 나온 속도는 단순한 기술 Demo 수준을 넘어, 실제 Real-time UX를 지탱할 수 있는 수준입니다.
+
+## Web 개발팀이 주목해야 하는 이유
+
+Browser 안에서 추론을 돌리는 것은 특정 유형의 기능에 대해 비용과 Latency 구조 자체를 바꿉니다.
+
+- **한계 비용이 0에 가까움**：Model이 Client에 Cache되면, Request당 비용도 Rate Limit 관리도 필요 없어집니다.
+- **Round Trip Latency가 없음**：Autocomplete, 간단한 분류, 페이지 내 제안처럼 짧고 즉각적인 반응이 중요한 작업에서는, Model의 정밀도보다 Network 왕복을 건너뛰는 것 자체가 더 중요할 때가 많습니다.
+- **Data가 기기 밖으로 나가지 않음**：초안, Form 입력, 사내 Memo처럼 민감한 정보를 다루는 기능에서는 Server로 보내지 않는다는 것 자체가 Privacy와 Compliance 측면에서 실질적인 단순화입니다.
+- **Cache 이후에는 Offline에서도 동작**：PWA나 Offline 내성이 있는 App이라면, 제한된 범위의 AI 기능을 연결 없이도 유지할 수 있습니다.
+
+## 적합하지 않은 영역
+
+2억 3천만 Parameter Model은 범용 Assistant가 아닙니다. 사내에서 그렇게 과대 포장해서 설명하지 않는 것이 중요합니다. Text 분류, 짧은 Autocomplete, Keyword 추출, 간단한 재작성, 가벼운 의도 파악처럼 범위가 좁은 작업에는 잘 맞습니다. 반면 긴 Context에서의 Multi-turn 대화나, 사람의 검수 없이 출력 품질을 담보해야 하는 용도, Open-ended한 추론을 수행하는 Frontier Model의 대체재로는 적합하지 않습니다.
+
+고려해야 할 현실적인 제약도 있습니다. WebGPU 지원 여부는 Browser마다 다르며, 오래된 Browser나 일부 Mobile 기기에는 Fallback 경로가 필요합니다. 기기 Memory 용량 편차도 크고, 최초 Load 시 Model 다운로드 크기는 무시할 수 없는 UX 비용입니다. 이는 "즉시 되는 척"으로 넘길 문제가 아니라 Caching과 Loading State 설계로 해결해야 할 부분입니다.
+
+## 최소 구성 예시
+
+Hugging Face의 Transformers.js는 기본적으로 WebGPU Execution Provider를 지원하며, 지원하지 않는 환경에서는 WebAssembly로 Fallback합니다. 아래는 Feature Detection을 포함한 최소 구성 예시입니다.
+
+```js
+import { pipeline } from "@huggingface/transformers";
+
+async function createLocalAssistant() {
+  const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;
+
+  const generate = await pipeline("text-generation", "onnx-community/example-small-lm", {
+    device: hasWebGPU ? "webgpu" : "wasm",
+    dtype: "q4", // 양자화로 다운로드 크기와 Memory 사용량을 낮춤
+  });
+
+  return async (prompt) => {
+    const result = await generate(prompt, { max_new_tokens: 64 });
+    return result[0].generated_text;
+  };
+}
+```
+
+사용하는 Model은 자사 Task에 맞는 WebGPU 대응 소형 Model로 바꾸면 됩니다. 중요한 것은 Pattern입니다. 지원 여부를 감지하고, 그에 따라 Backend를 전환하고, 양자화를 적극적으로 적용해서 다운로드 크기와 Memory 사용량을 Browser Tab에 맞는 수준으로 유지하는 설계입니다.
+
+## webhani의 견해
+
+비용 민감도나 Data Privacy가 제약 조건이 되는, 범위가 좁은 Client-side AI 기능을 Prototyping하기에는 좋은 선택지라고 봅니다. App 내 검색 재정렬, 메시지 전송 전 가벼운 Content 검수, Form 입력 제안 등이 구체적인 예시입니다. 다만 Product의 핵심 AI 기능을 Server-side Model에서 옮겨야 할 이유는 아닙니다. 품질과 일관성 면에서는 여전히 직접 통제 가능한 환경에서 동작하는 더 큰 Model이 유리합니다.
+
+WebGPU 지원을 전제로 삼지 말고 처음부터 Server-side Fallback을 준비할 것, 그리고 2억 3천만 Parameter Model이 할 수 있는 것과 할 수 없는 것을 이해관계자에게 정확히 전달할 것을 권장합니다. Demo의 속도는 분명 인상적이지만, 속도가 곧 능력을 의미하지는 않습니다. 적절한 범위의 Task에 사용하면 비용과 Latency 면에서 실질적인 이득이 있지만, Product의 주력 AI 기능을 대체하려 하면 기대에 못 미칠 가능성이 큽니다.
+
+---
+
+*참고: [WebLLM: A High-Performance In-Browser LLM Inference Engine (mlc-ai)](https://github.com/mlc-ai/web-llm), [1,400 Tokens Per Second in Your Browser (Essa Mamdani)](https://essamamdani.com/blog/lfm2-5-230m-webgpu-browser-inference-1400-tokens-per-second)*
