@@ -1,0 +1,64 @@
+---
+title: "Buildkite GitHub Actions Plugin — CI/CD Lock-in을 피하는 실용적 접근"
+description: "2026년 8월 17일, Buildkite의 GitHub Actions OSS Plugin이 Public Preview에 들어갔습니다. 기존 GitHub Actions Workflow를 그대로 다른 CI 기반에서 실행할 수 있는 구조를 Lock-in 회피 관점에서 정리합니다."
+date: "2026-08-21"
+status: "published"
+tags: ["CI/CD", "GitHub Actions", "Buildkite", "DevOps", "개발 도구"]
+thumbnail: ""
+author: "webhani"
+slug: "buildkite-github-actions-plugin-2026"
+---
+
+## GitHub Actions Workflow가 그대로 동작합니다
+
+2026년 8월 17일, Buildkite는 GitHub Actions OSS Plugin을 Public Preview로 공개했습니다. 기존 `.github/workflows/*.yml`에 작성된 GitHub Actions Workflow를 다시 작성하지 않고 Buildkite Pipeline 위에서 실행할 수 있는 구조입니다. 호환되는 Workflow를 그대로 실행하다가, 준비가 되면 Buildkite Native Pipeline으로 단계적으로 전환할 수 있습니다.
+
+Webhani는 여러 Client 프로젝트에서 CI/CD 기반 선정과 Migration을 지원하고 있어, 이런 "Migration Cost를 낮추는 가교 기능"은 실무상 관심이 높은 주제입니다.
+
+## 왜 이것이 문제를 해결하는가
+
+CI/CD 기반을 전환할 때 가장 큰 장벽은 "이미 동작하는 Workflow를 처음부터 다시 작성하는 Cost"입니다. GitHub Actions로 수십~수백 개의 Workflow File을 운영 중인 프로젝트를 다른 기반으로 옮기려면, 단순 문법 차이뿐 아니라 Actions Marketplace에 의존한 처리를 대체 구현해야 하는 경우가 많아, Migration Project 자체가 몇 주에서 몇 달까지 걸리는 일도 드물지 않습니다.
+
+Buildkite의 접근 방식은 이 "재작성"을 뒤로 미룰 수 있다는 점이 특징입니다.
+
+```yaml
+# Buildkite pipeline.yml (예시)
+steps:
+  - label: "Run existing GitHub Actions workflow"
+    plugins:
+      - github-actions#v1.0.0:
+          workflow: ".github/workflows/ci.yml"
+          job: "test"
+```
+
+먼저 기존 Workflow를 그대로 Buildkite 위에서 실행하도록 기반을 전환하고, 이후 필요한 부분부터 Buildkite Native Step으로 다시 작성해가는 단계적 Migration이 가능해집니다.
+
+## CI/CD 기반 선정에서 Lock-in을 피하는 관점
+
+Webhani가 Client에게 제안할 때는 CI/CD 기반 자체의 기능 비교뿐 아니라 "전환 Cost"를 사전에 산정하는 것을 중시합니다.
+
+- **Workflow 자산의 이식성**: GitHub Actions 고유 문법이나 Marketplace Actions에 강하게 의존할수록 다른 기반으로의 전환 Cost가 높아집니다
+- **단계적 Migration의 여지**: 일괄 전환이 아니라 Repository 단위, Workflow 단위로 단계적으로 옮길 수 있는 구조인지 확인합니다
+- **병행 운영 기간의 설계**: Migration 기간 중 기존 기반과 신규 기반을 동시에 운영할 경우의 추가 Cost를 미리 산정해둡니다
+
+Buildkite의 GitHub Actions Plugin은 바로 두 번째, 세 번째 관점에 직접적으로 효과가 있는 기능입니다. 호환 Layer를 두면 Migration 결정과 실제 재작성 작업을 분리할 수 있습니다.
+
+## 실무 검토 Point
+
+Webhani는 이런 호환 Layer를 도입할 때 다음을 확인할 것을 권장합니다.
+
+1. **호환 범위를 조기에 파악하기**: 모든 GitHub Actions 문법과 Marketplace Actions가 완전히 호환된다고 보장할 수 없으므로, 실제 사용 중인 Workflow로 동작 검증을 진행합니다
+2. **성능 특성 차이를 측정하기**: 같은 Workflow라도 실행 기반이 바뀌면 Cache 적중률이나 Job 병렬도가 달라져 실행 시간에 차이가 생길 수 있습니다
+3. **Migration의 목표를 명확히 하기**: "호환 Layer로 계속 운영"할지, "최종적으로 Native Pipeline으로 완전 전환"할지를 프로젝트 초기 단계에서 합의해둡니다
+
+## GitHub Actions 요금 동향과의 관계
+
+같은 시기 GitHub Actions의 Linux 표준 Runner 요금이 CircleCI와 동일한 수준인 분당 0.006달러로 맞춰졌다는 보도도 있었습니다. CI/CD 시장 전반에서 요금 차이가 좁혀지는 가운데, 기반 선정의 판단 기준이 "가격"에서 "전환 용이성"이나 "기존 Ecosystem과의 통합도"로 무게 중심이 옮겨가는 것으로 보입니다. Buildkite 같은 호환 Layer의 등장은 이런 흐름을 상징하는 움직임이라 할 수 있습니다.
+
+## 정리
+
+Buildkite의 GitHub Actions OSS Plugin은 CI/CD 기반 전환을 "전부 다시 쓰거나, 그대로 머물거나"라는 양자택일에서 벗어나게 해주는 기능입니다. 호환 Layer로 전환의 초기 속도를 높이면서 필요한 부분부터 단계적으로 Native 구조로 옮겨갈 수 있는 설계는, 여러 Client 환경에서 CI/CD 기반 선정을 지원하는 Webhani에게도 참고할 만한 접근입니다. CI/CD 기반을 검토할 때는 단순 기능 비교뿐 아니라 이런 "전환 용이성"도 평가 축에 포함할 것을 권장합니다.
+
+---
+
+*참고: [Buildkite Changelog (buildkite.com)](https://buildkite.com/resources/changelog/)*
