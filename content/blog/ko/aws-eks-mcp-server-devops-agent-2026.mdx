@@ -1,0 +1,65 @@
+---
+title: "AWS EKS MCP Server로 Kubernetes 자연어 조작하기 — 도입 전 정리해야 할 Guardrail"
+description: "AWS가 EKS MCP Server와 DevOps Agent를 Preview로 공개했습니다. AI Coding Assistant에서 자연어로 Kubernetes Cluster를 조작할 수 있게 되는 동시에, Production 도입 시 주의할 점을 정리합니다."
+date: "2026-08-22"
+status: "published"
+tags: ["AWS", "Kubernetes", "MCP", "DevOps", "AI"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-eks-mcp-server-devops-agent-2026"
+---
+
+## EKS가 MCP를 지원하게 되었습니다
+
+AWS가 완전관리형 EKS MCP Server(Preview)를 공개했습니다. Model Context Protocol(MCP)을 통해 AI Coding Assistant가 자연어로 Kubernetes Cluster와 상호작용할 수 있게 하는 구조입니다. 동시에 Kubernetes 운영에 Agentic Reasoning을 도입하는 AWS DevOps Agent(Preview)도 발표되었습니다.
+
+Webhani는 Client Infra 운영에서 Kubernetes를 다루는 프로젝트가 여럿 있어, MCP를 통한 Cluster 조작이 실무에서 어디까지 통할지 검토가 필요했습니다. 이번 글에서 그 내용을 정리합니다.
+
+## MCP로 달라지는 Kubernetes 조작
+
+지금까지 Kubernetes Cluster의 상태 확인이나 Troubleshooting에는 `kubectl` Command를 매번 조합해야 했습니다. EKS MCP Server를 사용하면 Claude Code 같은 MCP 지원 Client에서 "default Namespace에서 CrashLoopBackOff 상태인 Pod를 알려줘"와 같은 자연어 지시로 해당 Cluster 조작을 실행할 수 있습니다.
+
+```json
+// .mcp.json (Claude Code 등 MCP Client 설정 예시)
+{
+  "mcpServers": {
+    "eks": {
+      "command": "aws-eks-mcp-server",
+      "args": ["--cluster", "prod-cluster", "--region", "ap-northeast-1"]
+    }
+  }
+}
+```
+
+Kubernetes 조작 Command를 외우고 있지 않아도 장애 조사 초동 대응을 빠르게 진행할 수 있다는 점은 실무상 큰 장점입니다. 다만 이 편리함이 곧 "Production Cluster를 자연어로 조작할 수 있다"는 의미이기도 하다는 점은 신중히 다뤄야 합니다.
+
+## AWS DevOps Agent와의 조합
+
+DevOps Agent는 한 발 더 나아가 Agentic Reasoning, 즉 단발성 Command 실행을 넘어 여러 단계에 걸친 운영 작업을 자율적으로 구성해 실행하는 구조를 도입합니다. "특정 Service의 Latency 악화 원인을 조사해서 대응해줘" 같은 모호한 지시에서 출발해 Log 확인, Metric 조회, Scaling 설정 조정까지를 하나의 흐름으로 실행할 가능성이 있습니다.
+
+강력한 기능인 만큼, AI가 판단해 실행하는 작업 범위가 넓어질수록 예상치 못한 변경이 Production 환경에 가해질 Risk도 비례해서 커집니다. Webhani는 이런 Agentic 운영을 도입할 때 최소한 다음 설계를 필수로 요구합니다.
+
+- **Read-only 권한과 변경 작업 권한 분리**: 장애 조사 단계에서는 Read-only Credential만 부여하고, 실제 변경 작업에는 별도 승인 단계를 둡니다
+- **변경을 수반하는 작업은 Dry Run을 거치도록 설계**: `kubectl apply --dry-run`이나 IaC의 Plan 결과를 반드시 사람이 검토한 뒤 적용합니다
+- **감사 Log는 별도 계통으로 보관**: MCP Server를 경유한 작업 이력을 Cluster 측 감사 Log(Kubernetes Audit Log)와 대조할 수 있는 형태로 저장합니다
+
+## Container 시작 속도 개선과의 궁합
+
+같은 시기 AWS가 발표한 SOCI(Seekable OCI)의 Parallel Pull Mode는 큰 Model File을 포함한 AI Container의 시작을 최대 60% 가속화한다고 알려져 있습니다. DevOps Agent가 Scaling이나 Pod 재시작을 자율적으로 판단하게 되면, 시작 속도 자체가 전체 운영 Latency에 직결됩니다. 두 기능은 독립적이지만, AI 관련 Workload의 Kubernetes 운영이라는 맥락에서는 서로 보완하는 관계입니다.
+
+## 도입 시 Checklist
+
+Webhani가 Client에게 이런 종류의 Tool을 제안할 때는 다음 순서로 검증을 진행합니다.
+
+1. **Staging 환경에서 MCP 연결을 먼저 시도**: Production Cluster에 연결하기 전, 권한을 제한한 Staging 환경에서 자연어 조작의 동작을 확인합니다
+2. **위험한 조작 Pattern을 사전에 식별**: Namespace 삭제, Secret 조회, RBAC 변경 등 영향 범위가 큰 작업을 명시적으로 Deny List에 올립니다
+3. **사람의 Review Point를 명확히 정의**: 어디까지가 자동 승인이고 어디서부터 사람의 확인이 필요한지 Team 내에서 합의합니다
+4. **기존 Monitoring/Alert 체계와 통합**: MCP 경유 작업도 오류 발생 시 기존 Alert 경로로 전달되도록 설정합니다
+
+## 정리
+
+EKS MCP Server와 DevOps Agent는 Kubernetes 운영의 진입 장벽을 크게 낮출 잠재력을 가지고 있습니다. 장애 조사 속도가 빨라지고 운영 담당자가 Command 암기에서 벗어날 수 있다는 점은 실무상 상당한 이점입니다. 다만 자연어로 Production Infra를 조작할 수 있다는 것은, 권한 설계와 Review 체계가 곧 안전성의 분기점이 된다는 뜻이기도 합니다. Webhani는 이런 새로운 Agentic DevOps Tool을 Guardrail 설계와 함께 Client에게 제안하고 있습니다.
+
+---
+
+*참고: [AWS at KubeCon EU 2026 (aws.amazon.com/blogs/containers)](https://aws.amazon.com/blogs/containers/aws-at-kubecon-eu-2026-open-source-leadership-meets-production-innovation)*

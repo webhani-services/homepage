@@ -1,0 +1,65 @@
+---
+title: "AWS EKS MCP ServerでKubernetesを自然言語操作する — 導入前に整理すべきガードレール"
+description: "AWSがEKS MCP ServerとDevOps Agentをプレビュー公開しました。AIコーディングアシスタントからKubernetesクラスタを自然言語で操作できるようになる一方、本番運用に導入する際の注意点を整理します。"
+date: "2026-08-22"
+status: "published"
+tags: ["AWS", "Kubernetes", "MCP", "DevOps", "AI"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-eks-mcp-server-devops-agent-2026"
+---
+
+## EKSがMCPに対応した
+
+AWSが、フルマネージドのEKS MCP Server(プレビュー)を公開しました。Model Context Protocol(MCP)を介して、AIコーディングアシスタントがKubernetesクラスタと自然言語でやり取りできるようになる仕組みです。あわせて、Kubernetes運用にAgentic Reasoningを持ち込むAWS DevOps Agent(プレビュー)も発表されています。
+
+Webhaniではクライアントのインフラ運用にKubernetesを扱う案件が複数あり、MCP経由でのクラスタ操作がどこまで実用に耐えるかを検討する必要があります。本稿ではその整理をおこないます。
+
+## MCPでKubernetes操作が変わること
+
+これまでKubernetesクラスタの状態確認やトラブルシューティングには、`kubectl` のコマンドを都度組み立てる必要がありました。EKS MCP Serverを使うと、Claude CodeのようなMCP対応クライアントから「default名前空間でCrashLoopBackOffになっているPodを教えて」といった自然言語の指示で、対応するクラスタ操作を実行できます。
+
+```json
+// .mcp.json (Claude Code等のMCPクライアント設定イメージ)
+{
+  "mcpServers": {
+    "eks": {
+      "command": "aws-eks-mcp-server",
+      "args": ["--cluster", "prod-cluster", "--region", "ap-northeast-1"]
+    }
+  }
+}
+```
+
+Kubernetesの操作コマンドを覚えていなくても、障害調査の初動を素早く進められる点は実務上のメリットです。一方で、この便利さがそのまま「本番クラスタに対して自然言語で操作できる」ことを意味する点は、慎重に扱う必要があります。
+
+## AWS DevOps Agentとの組み合わせ
+
+DevOps AgentはさらにAgentic Reasoning、つまり単発のコマンド実行にとどまらず、複数ステップにまたがる運用タスクを自律的に組み立てて実行する仕組みを持ち込みます。「あるサービスのレイテンシが悪化している原因を調べて対処してほしい」といった曖昧な指示から、ログ確認、メトリクス参照、スケーリング設定の調整までを一連の流れとして実行できる可能性があります。
+
+これは強力な一方、AIが判断して実行する操作範囲が広がるほど、想定外の変更が本番環境に加わるリスクも比例して増えます。Webhaniでは、この種のAgentic運用を導入する際に、少なくとも次の設計を必須にしています。
+
+- **読み取り専用と変更操作の権限を分離する**: 障害調査フェーズでは読み取り専用のクレデンシャルのみを渡し、実際の変更操作には別途承認ステップを挟む
+- **変更を伴う操作はドライランを経由させる**: `kubectl apply --dry-run` やIaCのplan出力を必ず人間がレビューしてから適用する
+- **監査ログを別系統で保持する**: MCPサーバー経由の操作履歴を、クラスタ側の監査ログ(Kubernetes Audit Log)と突き合わせられる形で保存する
+
+## コンテナ起動高速化との相性
+
+同時期にAWSが発表したSOCI(Seekable OCI)のParallel Pullモードは、大きなモデルファイルを含むAIコンテナの起動を最大60%高速化するとされています。DevOps AgentがスケーリングやPodの再起動を自律的に判断するようになると、起動速度そのものが運用全体のレイテンシに直結します。両者は独立した機能ですが、AI関連ワークロードのKubernetes運用という文脈では相互に補完し合う関係にあります。
+
+## 導入する際のチェックリスト
+
+Webhaniがクライアントにこの種のツールを提案する際は、次の順序で検証を進めます。
+
+1. **ステージング環境でMCP接続を試す**: 本番クラスタに接続する前に、権限を絞ったステージング環境で自然言語操作の挙動を確認する
+2. **危険な操作パターンを洗い出す**: Namespace削除、Secret参照、RBAC変更など、影響範囲の大きい操作を明示的に拒否リスト化する
+3. **人間のレビューポイントを明確にする**: どの操作までが自動承認で、どこから人間の確認が必要かをチーム内で合意しておく
+4. **既存の監視・アラートと統合する**: MCP経由の操作もエラー発生時に既存のアラート経路に乗るよう設定する
+
+## まとめ
+
+EKS MCP ServerとDevOps Agentは、Kubernetes運用の敷居を大きく下げる可能性を持っています。障害調査のスピードが上がり、運用担当者がコマンドの暗記から解放されるメリットは実務上大きいものです。一方で、自然言語で本番インフラを操作できるということは、権限設計とレビュー体制がそのまま安全性の分水嶺になることを意味します。Webhaniでは、こうした新しいAgentic DevOpsツールを、ガードレールの設計とセットで顧客に提案しています。
+
+---
+
+*参考: [AWS at KubeCon EU 2026 (aws.amazon.com/blogs/containers)](https://aws.amazon.com/blogs/containers/aws-at-kubecon-eu-2026-open-source-leadership-meets-production-innovation)*
