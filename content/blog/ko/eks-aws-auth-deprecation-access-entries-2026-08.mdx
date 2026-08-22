@@ -1,0 +1,73 @@
+---
+title: "EKS의 aws-auth ConfigMap은 Deprecated: 그런데도 Cluster의 81%가 여전히 사용 중"
+description: "AWS가 Deprecated 처리한 EKS aws-auth ConfigMap 인증 방식을 Cluster의 81%가 아직도 사용하고 있습니다. Access Entries로의 전환 절차와 Risk를 실무 관점에서 정리합니다."
+date: "2026-08-23"
+status: "published"
+tags: ["AWS", "EKS", "Kubernetes", "IAM", "Security"]
+thumbnail: ""
+author: "webhani"
+slug: "eks-aws-auth-deprecation-access-entries-2026-08"
+---
+
+2026년 8월 The New Stack가 보도한 조사에 따르면, AWS가 이미 Deprecated 처리한 "aws-auth ConfigMap" 인증 방식을 EKS Cluster의 81%가 여전히 사용하고 있다고 합니다. 대체 수단인 "EKS Access Entries"는 IAM API와 Native하게 통합되어 훨씬 감사(Audit)하기 쉬운 구조지만, 실제 현장에서의 전환은 예상보다 더디게 진행되고 있습니다.
+
+이 Gap은 AWS Managed Service에서 흔히 나타나는 패턴을 보여줍니다. "Deprecated = 즉각적인 위험"이 아니라 "Deprecated = 조용히 쌓이는 기술 부채"라는 패턴입니다. 이번 글에서는 aws-auth ConfigMap이 왜 문제가 되는지, 그리고 Access Entries로의 전환이 실제로 어떻게 진행되는지 정리합니다.
+
+## aws-auth ConfigMap의 구조적 문제
+
+aws-auth ConfigMap은 IAM User·Role을 Kubernetes RBAC에 Mapping하는 방식이지만, 그 실체는 Cluster 안에 놓인 한 장의 YAML 파일입니다. 여기에는 몇 가지 구조적 약점이 있습니다.
+
+- **Schema 검증이 없다**: ConfigMap 내용은 자유 서식 YAML로, Format 실수나 의도치 않은 Role 부여를 막아줄 표준 Validation이 존재하지 않는다
+- **IAM 쪽에서 보이지 않는다**: 누가 어떤 Cluster에 어떤 Role로 접근할 수 있는지를 IAM Policy 목록이나 AWS Organizations Audit Tool로 횡단적으로 파악할 수 없다
+- **Single Point of Failure가 될 수 있다**: ConfigMap을 잘못 수정하면 최악의 경우 Cluster 관리자 본인이 접근 권한을 잃는 Self-Lockout이 발생할 수 있다
+
+이는 Kubernetes Community에서 오랫동안 지적되어 온 문제이며, AWS가 Access Entries라는 대안을 마련한 배경이기도 합니다.
+
+## Access Entries란 무엇인가
+
+EKS Access Entries는 Cluster 단위의 접근 제어를 EKS API로 직접 관리할 수 있는 방식입니다. IAM Principal과 Kubernetes Permission(표준 Cluster Role 또는 Custom Access Policy)을 ConfigMap을 거치지 않고 EKS 쪽에서 직접 연결합니다.
+
+장점은 명확합니다.
+
+- IAM Policy·CloudTrail과 동일한 방식으로 누가 무엇에 접근할 수 있는지 감사할 수 있다
+- Terraform·CloudFormation 같은 IaC로 선언적으로 관리하기 쉽다
+- YAML 수동 편집으로 인한 Human Error Risk가 줄어든다
+
+## 실제 전환 절차
+
+곧바로 API Mode로 전환하지 말고 단계적으로 진행하는 것이 안전합니다. `authenticationMode`는 `CONFIG_MAP` → `API_AND_CONFIG_MAP` → `API` 순서로 전환합니다.
+
+```bash
+# Step 1: 현재 인증 Mode 확인
+aws eks describe-cluster --name my-cluster \
+  --query "cluster.accessConfig.authenticationMode"
+
+# Step 2: 병행 지원 Mode로 전환 (기존 aws-auth는 그대로 동작)
+aws eks update-cluster-config \
+  --name my-cluster \
+  --access-config authenticationMode=API_AND_CONFIG_MAP
+
+# Step 3: 기존 IAM Principal에 대응하는 Access Entry 생성
+aws eks create-access-entry \
+  --cluster-name my-cluster \
+  --principal-arn arn:aws:iam::123456789012:role/platform-admin \
+  --kubernetes-groups system:masters
+
+# Step 4: 동작 확인 후 aws-auth ConfigMap 의존 제거
+aws eks update-cluster-config \
+  --name my-cluster \
+  --access-config authenticationMode=API
+```
+
+중요한 것은 Step 2와 Step 4 사이에 충분한 검증 기간을 두는 것입니다. 전환 대상 IAM Principal을 파악할 때는 `kubectl get configmap aws-auth -n kube-system -o yaml`로 현재 상태를 Export하고, 빠짐없이 Access Entry로 변환했는지 확인한 뒤 최종 전환으로 넘어가야 합니다.
+
+## webhani의 권장 사항
+
+1. **운영 환경보다 먼저 검증 환경에서 전환을 완료한다**: `API_AND_CONFIG_MAP` Mode는 전환 기간의 안전망으로 설계된 것이므로 적극 활용한다
+2. **CI/CD Pipeline의 Service Account도 함께 점검한다**: 사람 User뿐 아니라 CI용 IAM Role이 aws-auth에 의존하고 있지 않은지 확인한다
+3. **전환 후에도 aws-auth ConfigMap을 즉시 삭제하지 않는다**: `API` Mode로 전환하면 ConfigMap 자체는 무해화될 뿐이므로, Rollback 참고용으로 일정 기간 남겨두는 것이 안전하다
+4. **IaC로 관리한다**: Access Entry의 생성·삭제를 Terraform 등의 Code로 관리해 수동 작업을 최소화한다
+
+81%라는 수치는 많은 조직이 "잘 동작하는 것은 건드리지 않는다"는 판단을 계속해온 결과이기도 합니다. 하지만 Deprecated된 기능은 결국 지원 종료라는 형태로 강제 전환을 요구하게 됩니다. 지금 계획적으로 전환을 진행해두는 것이 결과적으로 가장 비용이 낮은 선택입니다.
+
+참고: [AWS deprecated this EKS auth method. 81% of clusters still run it. - The New Stack](https://thenewstack.io/kubernetes-fleet-security-management/), [Grant IAM users access to Kubernetes with a ConfigMap - Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/auth-configmap.html)

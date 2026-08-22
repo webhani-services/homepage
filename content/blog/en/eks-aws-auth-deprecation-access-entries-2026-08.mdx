@@ -1,0 +1,73 @@
+---
+title: "EKS's aws-auth ConfigMap Is Deprecated — and 81% of Clusters Still Run It"
+description: "AWS deprecated the aws-auth ConfigMap authentication method for EKS, but 81% of clusters haven't migrated. Here's why that matters and how to move to Access Entries safely."
+date: "2026-08-23"
+status: "published"
+tags: ["AWS", "EKS", "Kubernetes", "IAM", "Security"]
+thumbnail: ""
+author: "webhani"
+slug: "eks-aws-auth-deprecation-access-entries-2026-08"
+---
+
+A survey reported by The New Stack in August 2026 found that 81% of EKS clusters still rely on the aws-auth ConfigMap for authentication, despite AWS having deprecated it in favor of EKS Access Entries — a mechanism that integrates directly with the IAM API and is far easier to audit. The gap between "deprecated" and "actually migrated" here is wide, and it's a familiar pattern with managed AWS services: deprecation rarely means immediate danger, but it does mean technical debt that accumulates quietly.
+
+This post covers why aws-auth ConfigMap is a problem worth fixing, and what the migration path to Access Entries actually looks like.
+
+## What's wrong with aws-auth ConfigMap
+
+aws-auth ConfigMap maps IAM users and roles to Kubernetes RBAC, but under the hood it's just a single free-form YAML file living inside the cluster. That design has a few structural weaknesses:
+
+- **No schema validation.** The ConfigMap content is arbitrary YAML with no built-in guardrails against formatting mistakes or accidental over-permissioning.
+- **No visibility from the IAM side.** You can't cross-reference who has access to which cluster with what role using standard IAM policy tooling or AWS Organizations audit tools.
+- **A single point of failure.** A bad edit to the ConfigMap can lock out cluster administrators themselves — a self-inflicted lockout that's painful to recover from.
+
+These are known, long-discussed limitations in the Kubernetes community, and they're exactly why AWS built Access Entries as the replacement.
+
+## What Access Entries actually gives you
+
+EKS Access Entries manage cluster-level access control directly as an EKS API resource. IAM principals get mapped to Kubernetes permissions — either the standard cluster roles or a custom access policy — without going through a ConfigMap at all.
+
+The benefits are concrete:
+
+- Access is auditable through the same IAM policy and CloudTrail tooling you already use elsewhere
+- Declarative management via Terraform or CloudFormation becomes straightforward
+- The risk of human error from hand-editing YAML drops significantly
+
+## The actual migration steps
+
+Don't flip straight to API mode. Migrate `authenticationMode` in stages: `CONFIG_MAP` → `API_AND_CONFIG_MAP` → `API`.
+
+```bash
+# Step 1: Check the current authentication mode
+aws eks describe-cluster --name my-cluster \
+  --query "cluster.accessConfig.authenticationMode"
+
+# Step 2: Switch to dual mode (existing aws-auth keeps working)
+aws eks update-cluster-config \
+  --name my-cluster \
+  --access-config authenticationMode=API_AND_CONFIG_MAP
+
+# Step 3: Create Access Entries for each existing IAM principal
+aws eks create-access-entry \
+  --cluster-name my-cluster \
+  --principal-arn arn:aws:iam::123456789012:role/platform-admin \
+  --kubernetes-groups system:masters
+
+# Step 4: After verification, cut over fully
+aws eks update-cluster-config \
+  --name my-cluster \
+  --access-config authenticationMode=API
+```
+
+The critical part is giving yourself real verification time between Step 2 and Step 4. Before you cut over, export the current state with `kubectl get configmap aws-auth -n kube-system -o yaml` and confirm every principal in there has a corresponding Access Entry — no exceptions.
+
+## webhani's recommendations
+
+1. **Finish the migration in a non-production environment first.** `API_AND_CONFIG_MAP` mode exists as a safety net for exactly this reason — use it.
+2. **Audit CI/CD service accounts, not just human users.** IAM roles used by pipelines are just as likely to depend on aws-auth as individual developers.
+3. **Don't delete the ConfigMap immediately after cutover.** Once you're in `API` mode, the ConfigMap becomes inert — keeping it around briefly as a rollback reference costs nothing.
+4. **Manage Access Entries as code.** Handle creation and deletion through Terraform or similar IaC to keep manual operations to a minimum.
+
+That 81% figure reflects a lot of organizations making the reasonable-sounding call to leave working infrastructure alone. But deprecated features eventually reach end-of-support, at which point the migration stops being optional. Doing it on your own schedule now is the cheaper path.
+
+Sources: [AWS deprecated this EKS auth method. 81% of clusters still run it. - The New Stack](https://thenewstack.io/kubernetes-fleet-security-management/), [Grant IAM users access to Kubernetes with a ConfigMap - Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/auth-configmap.html)

@@ -1,0 +1,74 @@
+---
+title: "Next.jsが8月26日にCritical脆弱性を含むSecurity Releaseを予告:今からできる備え"
+description: "Next.jsが16.3系と15.5系を対象に、8月26日にCritical severityの脆弱性を修正するScheduled Security Releaseを予告しました。パッチ公開前にチームが準備できることを整理します。"
+date: "2026-08-23"
+status: "published"
+tags: ["Next.js", "Security", "Vercel", "Web Development", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-security-release-2026-08-26"
+---
+
+Next.jsチームは、2026年8月26日にScheduled Security Releaseを予告しています。対象はNext.js 16.3系と15.5系で、Critical severityの脆弱性1件を含む修正が予定されています。2026年に入ってからNext.jsは月次でのSecurity Releaseを継続しており、今回もその流れの一つですが、「Critical」という評価が事前に公表されている点は見過ごせません。
+
+脆弱性の詳細は、慣例としてパッチ公開と同時か、その後に開示されます。したがって現時点でCVEの内容を推測して対策を語ることはできませんが、逆に言えば「詳細が分からない今だからこそ準備しておくべきこと」があります。本記事では、Critical脆弱性の開示当日にチームが慌てないための備えを整理します。
+
+## なぜ「予告」の段階で動く必要があるのか
+
+Next.jsのようなフレームワークレベルの脆弱性は、修正対象がアプリケーションコードではなくフレームワーク自体であるため、パッチ適用以外の恒久対策がないケースが多いというのが実情です。ミドルウェアやApp Routerの内部処理に起因する脆弱性の場合、WAFルールなどの緩和策だけで完全に防ぐことが難しいことも過去にありました。
+
+そのため、「脆弱性の内容を待ってから動く」のではなく、「開示された瞬間に最短時間でパッチを当てられる状態」を今のうちに作っておくことが、実質的に唯一の有効な備えになります。
+
+## 今からできる準備
+
+### 1. 依存関係のPin状況を確認する
+
+`package.json`でNext.jsのバージョンをどう固定しているか確認してください。キャレット(`^`)指定のままだと、意図しないタイミングでのマイナーバージョン更新が起きたり、逆にlockfileが古いまま更新が止まっていたりします。
+
+```bash
+# 現在のNext.jsバージョンとlockfileの整合性を確認
+npm ls next
+npm outdated next
+```
+
+### 2. Security Advisoryの購読経路を確保する
+
+GitHubのWatch設定で `vercel/next.js` リポジトリの Security Advisory 通知を受け取れるようにしておくと、公式Blogの確認を待たずに一次情報へアクセスできます。
+
+### 3. デプロイパイプラインの所要時間を把握しておく
+
+Critical脆弱性は「気づいてからデプロイ完了まで」の時間が実質的なリスク露出時間になります。CI/CDのビルド〜デプロイにかかる標準時間を把握し、緊急パッチ適用時に承認フローを短縮できる運用ルール(例:Security Patchに限りペアレビューで即マージ可、など)をあらかじめ決めておくと、当日の判断が速くなります。
+
+```yaml
+# .github/workflows/security-patch.yml (例)
+name: security-patch-fast-track
+on:
+  workflow_dispatch:
+    inputs:
+      next_version:
+        description: "適用するNext.jsのバージョン"
+        required: true
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: npm install next@${{ github.event.inputs.next_version }} --save-exact
+      - run: npm run build
+      - run: npm test
+```
+
+### 4. LTSブランチの運用方針を確認する
+
+16.3系・15.5系の両方が対象になっているということは、最新版だけでなく一つ前のメジャー系列を使っているプロジェクトも影響を受ける可能性があるということです。自社が現在どちらの系列を追従しているか、複数プロジェクトを抱えている場合は棚卸しをしておきましょう。
+
+## webhaniの推奨
+
+1. **8月26日前後はデプロイ担当者のスケジュールを確保しておく**: Critical脆弱性の場合、当日〜翌営業日中の対応が望ましい
+2. **本番環境と同じバージョンのStaging環境を用意しておく**: パッチ適用後の動作確認を、本番反映前に素早く行える体制を維持する
+3. **middlewareやApp Routerのカスタム実装を洗い出しておく**: 過去の類似脆弱性ではmiddleware周りが影響範囲になったケースがあり、自社のカスタム実装が影響を受けるかを素早く判断できるようにしておくと対応が早まる
+4. **クライアントへの影響説明テンプレートを用意しておく**: 受託開発の現場では、脆弱性公表後にクライアントへ状況説明が必要になることが多い。定型フォーマットを事前に用意しておくと当日の負荷が下がる
+
+Critical脆弱性の内容自体は公開されるまで分かりませんが、「対応スピードを決めるのは事前準備の量」という点は毎回変わりません。webhaniでは、Next.jsを採用するプロジェクトのSecurity Release対応フローの整備も支援しています。
+
+参考: [Next.js Updates by Vercel - August 2026 - Releasebot](https://releasebot.io/updates/vercel/next-js)
