@@ -1,0 +1,73 @@
+---
+title: "EKSのaws-auth ConfigMapは非推奨に:81%のClusterが未移行という現実"
+description: "AWSが非推奨としたEKSのaws-auth ConfigMap認証方式を、Clusterの81%が依然として使用しています。Access Entriesへの移行手順とリスクを実務目線で解説します。"
+date: "2026-08-23"
+status: "published"
+tags: ["AWS", "EKS", "Kubernetes", "IAM", "Security"]
+thumbnail: ""
+author: "webhani"
+slug: "eks-aws-auth-deprecation-access-entries-2026-08"
+---
+
+2026年8月、The New Stackが報じた調査によると、AWSがすでに非推奨とした「aws-auth ConfigMap」による認証方式を、EKS Clusterの81%が依然として使い続けているとされています。移行先である「EKS Access Entries」はIAM APIとネイティブに統合された、より安全で監査しやすい仕組みですが、実際の現場での置き換えは想像以上に進んでいません。
+
+このギャップは、AWSのマネージドサービスにありがちな「非推奨=即座に危険」ではなく「非推奨=技術的負債として静かに蓄積する」パターンの典型例です。今回は、なぜaws-auth ConfigMapが問題視されているのか、Access Entriesへの移行がどう進むのかを整理します。
+
+## aws-auth ConfigMapの何が問題なのか
+
+aws-auth ConfigMapは、IAMのUserやRoleをKubernetesのRBACにマッピングするための仕組みですが、その実態はKubernetes Cluster内に置かれた1枚のYAMLファイルです。ここに、いくつかの構造的な弱点があります。
+
+- **スキーマ検証がない**: ConfigMapの中身は自由記述のYAMLであり、フォーマットミスや意図しないRole付与を防ぐバリデーションが標準では存在しない
+- **IAM側から見えない**: 誰がどのClusterにどのRoleでアクセスできるかを、IAM Policyの一覧やAWS Organizationsの監査ツールから横断的に把握できない
+- **単一障害点になりうる**: ConfigMapを誤って壊すと、最悪の場合Cluster管理者自身がアクセス権を失う「セルフロックアウト」が起こりうる
+
+これらは長年Kubernetesコミュニティで指摘されてきた既知の課題であり、AWSがAccess Entriesという代替手段を用意した背景でもあります。
+
+## Access Entriesとは何か
+
+EKS Access Entriesは、Cluster単位のアクセス制御をEKSのAPIとして直接管理できる仕組みです。IAM PrincipalとKubernetesのPermission(標準のCluster RoleまたはカスタムAccess Policy)を、ConfigMapを介さずにEKS側で紐付けます。
+
+利点は明確です。
+
+- IAM PolicyやCloudTrailと同じ仕組みで、誰が何にアクセスできるかを監査できる
+- Terraform/CloudFormationなどIaCから宣言的に管理しやすい
+- YAMLの手編集によるヒューマンエラーのリスクが下がる
+
+## 移行の実際の手順
+
+移行はいきなりAPIモードへ切り替えるのではなく、段階的に進めるのが安全です。`authenticationMode`は`CONFIG_MAP` → `API_AND_CONFIG_MAP` → `API`の順で移行します。
+
+```bash
+# Step 1: 現在の認証モードを確認
+aws eks describe-cluster --name my-cluster \
+  --query "cluster.accessConfig.authenticationMode"
+
+# Step 2: 両対応モードに切り替える(既存のaws-authはそのまま機能する)
+aws eks update-cluster-config \
+  --name my-cluster \
+  --access-config authenticationMode=API_AND_CONFIG_MAP
+
+# Step 3: 既存のIAM Principalに対応するAccess Entryを作成
+aws eks create-access-entry \
+  --cluster-name my-cluster \
+  --principal-arn arn:aws:iam::123456789012:role/platform-admin \
+  --kubernetes-groups system:masters
+
+# Step 4: 動作確認後、aws-auth ConfigMapへの依存を断つ
+aws eks update-cluster-config \
+  --name my-cluster \
+  --access-config authenticationMode=API
+```
+
+重要なのは、Step 2からStep 4の間に十分な検証期間を置くことです。移行対象のIAM Principalを洗い出す際は、`kubectl get configmap aws-auth -n kube-system -o yaml`で現状をエクスポートし、漏れなくAccess Entryへ変換したことを確認してから最終切り替えに進んでください。
+
+## webhaniの推奨
+
+1. **本番環境より先に検証環境で移行を完了させる**: `API_AND_CONFIG_MAP`モードは移行期間の安全網として設計されているため、積極的に活用する
+2. **CI/CDパイプラインのService Accountも棚卸しする**: 人間のUserだけでなく、CI用のIAM Roleがaws-authに依存していないか確認する
+3. **移行後もaws-auth ConfigMapを即座に削除しない**: `API`モードへの切り替え後もConfigMap自体は無害化されるだけなので、ロールバック用のドキュメントとして一定期間残しておくと安心
+4. **IaCで管理する**: Access Entriesの作成・削除をTerraformなどのコードで管理し、手動オペレーションを最小化する
+
+81%という数字は、多くの組織が「動いているものは触らない」判断を続けてきた結果でもあります。しかし非推奨機能は、いずれサポート終了という形で強制移行を迫られます。今のうちに計画的な移行を進めておくことが、結果的に最も低コストな選択です。
+
+参考: [AWS deprecated this EKS auth method. 81% of clusters still run it. - The New Stack](https://thenewstack.io/kubernetes-fleet-security-management/)、[Grant IAM users access to Kubernetes with a ConfigMap - Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/auth-configmap.html)
