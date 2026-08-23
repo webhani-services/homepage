@@ -1,0 +1,173 @@
+---
+title: "JWT Signature Verification: Why This Keeps Breaking in 2026"
+description: "CVE-2026-29000 in pac4j-jwt exposed a systemic pattern in authentication: developers who handle encryption but forget to verify signatures. We break down why this happens and how to fix it."
+date: "2026-08-24"
+status: "published"
+tags: ["Security", "JWT", "OAuth", "Authentication", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "jwt-signature-verification-vulnerabilities-2026"
+---
+
+## Signature verification: the perennial weak link
+
+If you track vulnerability disclosures in authentication systems, you notice a pattern. The top of any "JWT security mistakes" list reads the same way year after year: attackers forge JWTs because the server never verified the signature.
+
+In August 2026, this pattern repeated itself across multiple libraries and platforms. CVE-2026-29000 in pac4j-jwt, CVE-2026-48611 in an OAuth implementation, and CVE-2026-55040 in Microsoft SharePoint all centered on the same root: a gap between where a token is verified and where the claims are trusted.
+
+Understanding why this happens requires a distinction many developers gloss over: the difference between *confidentiality* (keeping secrets encrypted) and *authenticity* (proving you trust the claims).
+
+## The core confusion: JWE wrapping
+
+JWTs come in two flavors:
+
+- **JWS** (JSON Web Signature): Signs the payload, proving no one altered the claims.
+- **JWE** (JSON Web Encryption): Encrypts the payload, keeping the claims secret.
+
+The natural instinct is to treat encryption as a form of authentication. If I encrypted this token myself, and I'm the only one with the key, surely the token is trustworthy.
+
+That instinct is wrong.
+
+Encryption proves *confidentiality*, not *authenticity*. Someone with your public RSA key can wrap any payload they want inside a JWE. They can't read what's inside (good for confidentiality), but the server that decrypts the JWE still has no proof of who created the claims inside.
+
+This is exactly what CVE-2026-29000 in pac4j-jwt exploited. The library's JwtAuthenticator would:
+
+1. Decrypt the JWE (using the server's private key).
+2. Extract the inner JWT.
+3. **Skip verifying the inner JWT's signature.**
+4. Trust the claims.
+
+From the attacker's perspective: I get your public RSA key (often trivial — just load your certificate from the JWKS endpoint). I craft a JWT with admin claims. I wrap it in a JWE encrypted with your public key. Your server decrypts it, sees a JWT, assumes it's valid because *it came from inside encrypted material*, and grants admin access.
+
+The fix is conceptually simple: decrypt the JWE, then verify the signature of the inner JWT as if it had arrived unsigned. Don't conflate the encryption step with the authentication step.
+
+## Why this matters: The broader pattern
+
+CVE-2026-29000 is one instance of a family of signature-verification failures:
+
+- **Accepting `alg: none`**: The JWT header says "this is unsigned" — the server trusts it anyway.
+- **Algorithm confusion** (RS256 vs HS256): The server has the public key for RS256 verification. An attacker sends the same token with `alg: HS256`, fooling the library into using the public key as an HMAC secret. With public information, they can forge a valid HMAC.
+- **Unsafe `kid` header handling**: The token claims key ID 42. The server looks up key 42 without validating that the key ID came from a trusted source, not the attacker's claim.
+- **Nested-token trust collapse**: As in pac4j-jwt, trusting encrypted or wrapped tokens without re-verifying the inner token's signature.
+
+All of these boil down to one principle: **the signature is where authenticity lives**. Every other field — the algorithm, the key ID, the wrapping layer — is a hint to *how* to verify, not proof *that* it's been verified.
+
+## Practical defense: Build verification correctly
+
+Here's a concrete Node.js / TypeScript pattern for safe JWT verification:
+
+```typescript
+import jwt from 'jsonwebtoken';
+
+interface VerifyOptions {
+  expectedAlgorithm: 'HS256' | 'RS256' | 'ES256';
+  publicKey: string;
+  issuer: string;
+  audience: string;
+}
+
+// SAFE: Explicit algorithm allowlist, no trust in the header
+function verifyJWT(token: string, options: VerifyOptions): jwt.JwtPayload {
+  try {
+    const decoded = jwt.verify(token, options.publicKey, {
+      algorithms: [options.expectedAlgorithm], // Only accept this algorithm
+      issuer: options.issuer,
+      audience: options.audience,
+    });
+    
+    if (typeof decoded !== 'object' || !decoded.sub) {
+      throw new Error('Invalid token structure');
+    }
+    
+    return decoded;
+  } catch (error) {
+    throw new Error(`JWT verification failed: ${error instanceof Error ? error.message : 'unknown'}`);
+  }
+}
+
+// UNSAFE: Trust the header's algorithm choice
+function verifyJWTUnsafe(token: string, publicKey: string): jwt.JwtPayload {
+  // Bad: the attacker's `alg` header controls the verification method
+  const decoded = jwt.verify(token, publicKey);
+  return decoded as jwt.JwtPayload;
+}
+
+// Example usage
+const options: VerifyOptions = {
+  expectedAlgorithm: 'RS256',
+  publicKey: process.env.JWT_PUBLIC_KEY!,
+  issuer: 'https://auth.example.com',
+  audience: 'my-app',
+};
+
+const payload = verifyJWT(token, options);
+console.log(`Verified user: ${payload.sub}`);
+```
+
+The key differences:
+
+1. **Explicit `algorithms` array**: Only allow RS256, not whatever the token header claims.
+2. **Issuer and audience validation**: Prevent token reuse across unrelated systems.
+3. **Structure validation**: Check that required fields exist.
+4. **Error handling**: Don't hide verification failures behind generic success paths.
+
+## Handling nested/encrypted tokens
+
+If you receive JWE-wrapped JWTs (encrypted outer, signed inner), separate the steps:
+
+```typescript
+import jwt from 'jsonwebtoken';
+import { jwtDecrypt } from 'jose'; // For JWE decryption
+
+async function verifyEncryptedJWT(
+  encryptedToken: string,
+  privateKey: string,
+  signaturePublicKey: string
+): Promise<jwt.JwtPayload> {
+  // Step 1: Decrypt the JWE
+  const decrypted = await jwtDecrypt(
+    encryptedToken,
+    Buffer.from(privateKey, 'base64')
+  );
+  
+  // Step 2: Extract the inner JWT as a string
+  const innerJWT = decrypted.payload.toString('utf-8');
+  
+  // Step 3: Verify the signature of the inner JWT (not optional)
+  const payload = jwt.verify(innerJWT, signaturePublicKey, {
+    algorithms: ['RS256'],
+    issuer: 'https://auth.example.com',
+    audience: 'my-app',
+  });
+  
+  return payload as jwt.JwtPayload;
+}
+```
+
+The critical line: even though we just decrypted the JWE, we still verify the inner JWT's signature. Encryption and signature verification are independent operations.
+
+## OAuth: "Disabled" is not the same as "unreachable"
+
+A secondary vulnerability class appeared in August 2026: OAuth implementation bugs where improper authentication checks allowed account hijacking even when OAuth was not enabled in the application.
+
+The lesson: if OAuth code exists in your codebase (even if you ship with it disabled), that code path can still be reached by a direct attacker. Disabling a feature at the UI level doesn't prevent hitting the endpoints directly. Guard OAuth handlers with the same authentication checks you use for regular login — don't rely on feature flags to make unreachable code actually unreachable.
+
+## Audit checklist for your JWT implementation
+
+Before shipping authentication code, walk through these items:
+
+1. **Specify algorithms explicitly**: Your code should name RS256 or HS256 by name, not read it from the token header. If you see `algorithms: [jwt.decode(token).header.alg]`, stop and fix it.
+
+2. **Verify signatures before trusting claims**: Even if the token came through an encrypted layer, decrypt first, then verify the signature. Don't treat decryption as authentication.
+
+3. **Validate issuer and audience**: Ensure the `iss` and `aud` claims match your expectations. Prevent token reuse across unrelated services.
+
+4. **Keep libraries patched**: CVE-2026-29000 affected pac4j-jwt versions before 4.5.9, 5.7.9, and 6.3.3. Set up dependency scanning to catch this automatically.
+
+5. **Use short-lived tokens with refresh rotation**: Even if your signature verification is perfect, a leaked token should expire in minutes, not days. Refresh tokens (stored server-side with proper rotation) reduce blast radius.
+
+If any of these items requires re-architecting your authentication layer, it's worth the cost now. The alternative is discovering this during an incident.
+
+---
+
+*References: pac4j-jwt vulnerability (CVE-2026-29000), RFC 7519 (JSON Web Token), RFC 7516 (JSON Web Encryption), RFC 7518 (JSON Web Algorithms), OWASP JWT Cheat Sheet.*

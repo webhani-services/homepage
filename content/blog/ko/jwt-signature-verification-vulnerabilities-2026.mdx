@@ -1,0 +1,173 @@
+---
+title: "JWT 서명 검증이 계속 실패하는 이유 (2026년판)"
+description: "pac4j-JWT의 CVE-2026-29000은 암호화는 처리하지만 서명 검증을 잊는 개발자의 패턴을 노출했습니다. 이 취약점이 발생하는 이유와 대응 방법을 설명합니다."
+date: "2026-08-24"
+status: "published"
+tags: ["Security", "JWT", "OAuth", "Authentication", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "jwt-signature-verification-vulnerabilities-2026"
+---
+
+## 서명 검증: 항상 취약해지는 부분
+
+인증 시스템의 취약점을 추적하다 보면 반복되는 패턴을 발견합니다. "JWT 보안 실수" 리스트의 상단은 매년 같습니다: 서버가 서명을 검증하지 않기 때문에 공격자가 JWT를 위조할 수 있다는 것입니다.
+
+2026년 8월, 이 패턴은 여러 라이브러리와 플랫폼에서 반복되었습니다. pac4j-JWT의 CVE-2026-29000, OAuth 구현의 CVE-2026-48611, Microsoft SharePoint의 CVE-2026-55040 모두 같은 근본 원인을 가지고 있었습니다: 토큰이 검증되는 위치와 클레임이 신뢰되는 위치 사이의 간격입니다.
+
+이 패턴이 왜 반복되는지 이해하려면 많은 개발자가 간과하는 구별이 필요합니다. **기밀성**(비밀을 암호화로 보호하기)과 **진정성**(클레임을 신뢰할 수 있음을 증명하기)의 차이입니다.
+
+## 핵심 혼동: JWE 래핑
+
+JWT는 두 가지 형식으로 나뉩니다.
+
+- **JWS**(JSON Web Signature): 페이로드에 서명하여 클레임이 변조되지 않았음을 증명합니다.
+- **JWE**(JSON Web Encryption): 페이로드를 암호화하여 클레임을 비밀로 유지합니다.
+
+자연스러운 직관은 암호화를 인증의 한 형태로 취급하는 것입니다. 제가 이 토큰을 직접 암호화했고 저만 키를 가지고 있다면, 그 토큰은 신뢰할 만합니다.
+
+그 직관은 틀렸습니다.
+
+암호화는 **기밀성**을 증명하지만, **진정성**은 증명하지 않습니다. 당신의 공개 RSA 키를 가진 누구나 JWE 내에 임의의 페이로드를 래핑할 수 있습니다. 내부 내용을 읽을 수는 없습니다(기밀성은 좋습니다). 하지만 JWE를 복호화하는 서버는 내부의 클레임이 누구에 의해 생성되었는지 증명할 방법이 전혀 없습니다.
+
+이것이 정확히 CVE-2026-29000이 pac4j-JWT를 악용한 방식입니다. 라이브러리의 JwtAuthenticator는 다음과 같이 동작했습니다.
+
+1. JWE를 복호화합니다(서버의 비공개 키 사용).
+2. 내부 JWT를 추출합니다.
+3. **내부 JWT의 서명 검증을 건너뜁니다**.
+4. 클레임을 신뢰합니다.
+
+공격자의 관점에서: 당신의 공개 RSA 키를 얻습니다(종종 간단함. JWKS 엔드포인트에서 인증서를 로드하기만 하면 됨). 관리자 클레임이 있는 JWT를 만듭니다. 그것을 공개 키로 암호화한 JWE로 래핑합니다. 서버가 복호화하고 JWT를 보고 "이것은 암호화된 자료 내부에서 나왔으니 유효해야 한다"고 가정하고 관리자 액세스를 부여합니다.
+
+수정은 개념적으로 간단합니다: JWE를 복호화한 다음, 내부 JWT의 서명을 마치 서명 없이 도착한 것처럼 검증합니다. 암호화 단계와 인증 단계를 혼동하지 마세요.
+
+## 왜 중요한가: 더 넓은 패턴
+
+CVE-2026-29000은 서명 검증 실패 계열의 한 사례입니다.
+
+- **`alg: none` 수락**: JWT 헤더가 "이것은 서명되지 않음"이라고 말합니다. 서버는 여전히 신뢰합니다.
+- **알고리즘 혼동**(RS256 vs HS256): 서버가 RS256 검증용 공개 키를 가지고 있습니다. 공격자가 `alg: HS256`으로 같은 토큰을 보내면 라이브러리가 공개 키를 HMAC 시크릿으로 사용하도록 속입니다. 공개 정보가 있으면 유효한 HMAC을 위조할 수 있습니다.
+- **안전하지 않은 `kid` 헤더 처리**: 토큰이 키 ID 42를 요청합니다. 서버가 키 ID가 신뢰할 수 있는 출처에서 오는지 아니면 공격자의 클레임에서 오는지 검증하지 않고 키 42를 조회합니다.
+- **중첩 토큰 신뢰 붕괴**: pac4j-JWT의 경우처럼, 내부 토큰의 서명을 재검증하지 않고 암호화되거나 래핑된 토큰을 신뢰합니다.
+
+이 모든 것은 한 원칙으로 귀결됩니다. **서명은 진정성이 존재하는 곳입니다**. 다른 모든 필드(알고리즘, 키 ID, 래핑 레이어)는 검증 방법을 나타내는 힌트일 뿐, 검증되었다는 증명이 아닙니다.
+
+## 실제 방어: 검증을 올바르게 구축하기
+
+안전한 JWT 검증의 구체적인 Node.js / TypeScript 패턴입니다.
+
+```typescript
+import jwt from 'jsonwebtoken';
+
+interface VerifyOptions {
+  expectedAlgorithm: 'HS256' | 'RS256' | 'ES256';
+  publicKey: string;
+  issuer: string;
+  audience: string;
+}
+
+// 안전: 명시적인 알고리즘 허용 목록, 헤더 신뢰 없음
+function verifyJWT(token: string, options: VerifyOptions): jwt.JwtPayload {
+  try {
+    const decoded = jwt.verify(token, options.publicKey, {
+      algorithms: [options.expectedAlgorithm], // 이 알고리즘만 수락
+      issuer: options.issuer,
+      audience: options.audience,
+    });
+    
+    if (typeof decoded !== 'object' || !decoded.sub) {
+      throw new Error('Invalid token structure');
+    }
+    
+    return decoded;
+  } catch (error) {
+    throw new Error(`JWT verification failed: ${error instanceof Error ? error.message : 'unknown'}`);
+  }
+}
+
+// 위험: 헤더의 알고리즘 선택을 신뢰
+function verifyJWTUnsafe(token: string, publicKey: string): jwt.JwtPayload {
+  // 나쁨: 공격자의 `alg` 헤더가 검증 방법을 제어
+  const decoded = jwt.verify(token, publicKey);
+  return decoded as jwt.JwtPayload;
+}
+
+// 사용 예
+const options: VerifyOptions = {
+  expectedAlgorithm: 'RS256',
+  publicKey: process.env.JWT_PUBLIC_KEY!,
+  issuer: 'https://auth.example.com',
+  audience: 'my-app',
+};
+
+const payload = verifyJWT(token, options);
+console.log(`Verified user: ${payload.sub}`);
+```
+
+주요 차이점:
+
+1. **명시적 `algorithms` 배열**: RS256만 허용하며, 토큰 헤더가 요청하는 것이 아닙니다.
+2. **Issuer 및 Audience 검증**: 관련 없는 시스템 간 토큰 재사용을 방지합니다.
+3. **구조 검증**: 필수 필드가 존재하는지 확인합니다.
+4. **에러 처리**: 검증 실패를 제네릭 성공 경로 뒤에 숨기지 마세요.
+
+## 중첩/암호화된 토큰 처리
+
+JWE로 래핑된 JWT를 수신하는 경우(외부는 암호화, 내부는 서명), 단계를 분리하세요.
+
+```typescript
+import jwt from 'jsonwebtoken';
+import { jwtDecrypt } from 'jose'; // JWE 복호화용
+
+async function verifyEncryptedJWT(
+  encryptedToken: string,
+  privateKey: string,
+  signaturePublicKey: string
+): Promise<jwt.JwtPayload> {
+  // 단계 1: JWE 복호화
+  const decrypted = await jwtDecrypt(
+    encryptedToken,
+    Buffer.from(privateKey, 'base64')
+  );
+  
+  // 단계 2: 내부 JWT를 문자열로 추출
+  const innerJWT = decrypted.payload.toString('utf-8');
+  
+  // 단계 3: 내부 JWT의 서명 검증 (필수)
+  const payload = jwt.verify(innerJWT, signaturePublicKey, {
+    algorithms: ['RS256'],
+    issuer: 'https://auth.example.com',
+    audience: 'my-app',
+  });
+  
+  return payload as jwt.JwtPayload;
+}
+```
+
+중요한 라인: JWE를 방금 복호화했더라도, 내부 JWT의 서명은 검증합니다. 암호화와 서명 검증은 독립적인 작업입니다.
+
+## OAuth: "비활성화"는 "도달 불가"를 의미하지 않음
+
+2026년 8월에 두 번째 취약점 클래스가 나타났습니다. OAuth 구현 버그로, 애플리케이션에서 OAuth가 활성화되지 않았을 때도 부적절한 인증 검사로 인해 계정 탈취가 가능했습니다.
+
+교훈: OAuth 코드가 코드베이스에 존재하면(비활성화되어 배포되더라도) 그 코드 경로는 직접 공격자가 접근할 수 있습니다. UI 레벨에서 기능을 비활성화하는 것은 엔드포인트에 직접 접근하는 것을 방지하지 않습니다. OAuth 핸들러를 보호할 때는 일반 로그인에 사용하는 것과 동일한 인증 검사를 사용하세요. 기능 플래그에 의존하여 도달 불가능한 코드를 실제로 도달 불가능하게 만들지 마세요.
+
+## JWT 구현 감사 체크리스트
+
+인증 코드를 배포하기 전에 다음 항목을 확인하세요.
+
+1. **알고리즘을 명시적으로 지정**: 코드가 RS256 또는 HS256을 이름으로 지정해야 합니다. 토큰 헤더에서 읽지 않아야 합니다. `algorithms: [jwt.decode(token).header.alg]`이 보이면 중단하고 수정하세요.
+
+2. **클레임을 신뢰하기 전에 서명 검증**: 토큰이 암호화 계층을 통과했더라도 먼저 복호화한 후 서명을 검증하세요. 암호화를 인증으로 취급하지 마세요.
+
+3. **Issuer 및 Audience 검증**: `iss` 및 `aud` 클레임이 예상 값과 일치하는지 확인하세요. 관련 없는 서비스 간 토큰 재사용을 방지합니다.
+
+4. **라이브러리 패치 유지**: CVE-2026-29000은 4.5.9, 5.7.9, 6.3.3 이전의 pac4j-jwt 버전에 영향을 미쳤습니다. 이를 자동으로 감지하도록 종속성 스캔을 설정하세요.
+
+5. **단기 토큰과 새로고침 로테이션 사용**: 서명 검증이 완벽해도 누출된 토큰은 며칠이 아닌 몇 분 안에 만료되어야 합니다. 새로고침 토큰(서버측 저장, 적절한 로테이션)은 영향 범위를 줄입니다.
+
+이 항목들 중 하나라도 인증 계층 재아키텍처를 필요로 한다면, 지금 수행할 가치가 있습니다. 대안은 인시던트 중에 이를 발견하는 것입니다.
+
+---
+
+*참고: pac4j-JWT 취약점(CVE-2026-29000), RFC 7519(JSON Web Token), RFC 7516(JSON Web Encryption), RFC 7518(JSON Web Algorithms), OWASP JWT 치트시트.*

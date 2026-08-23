@@ -1,0 +1,170 @@
+---
+title: "Claude Code 2.1.237: Prompt Caching Correctness and Output Conciseness"
+description: "The August 2026 Claude Code update fixed a prompt-caching bug that was silently inflating costs and latency for long-running agent sessions. We break down why this matters operationally and introduce the new Concise output style for terminal-heavy workflows."
+date: "2026-08-24"
+status: "published"
+tags: ["Claude Code", "AI Coding", "Developer Productivity", "LLM"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-concise-output-prompt-caching-2026-08"
+---
+
+## Silent cost bleed: the caching bug that went unnoticed
+
+On August 19, 2026, Claude Code released version 2.1.237, which included a fix for an insidious prompt-caching bug. The issue itself is technical—contexts that should have been reused were being resent on each API call—but its operational impact is worth spelling out, because this is the kind of bug that silently compounds over weeks of agent sessions without triggering obvious failures.
+
+To ground this: imagine a team running Claude Code as a persistent dev assistant in their CI/CD pipeline. They have a large project context (system prompt, tool definitions, a few reference files). In a naive setup without caching, sending this context on every agent turn looks like this:
+
+- System prompt + instructions: 8 KB
+- Tool definitions (Bash, file read, grep, edit): 15 KB
+- Reference files pinned in the context (project structure, naming conventions, architecture docs): 25 KB
+- Actual conversation history for this turn: 5 KB
+- Total: 53 KB per turn
+
+On a typical multi-step agent task (say, a code review that involves 8–12 tool calls across 5–6 agent turns), that's roughly 300 KB of redundant context transmission per task, plus the compute cost of re-processing the same system prompt and tool definitions. Over a month of CI runs—maybe 50 code review runs—that's 15 MB of unnecessary transmission and reprocessing per month per project.
+
+With prompt caching working correctly, the first turn sends the 48 KB of stable context and the API caches it (charged at roughly 25% of the normal token price for cached context). Subsequent turns reuse that cache, paying only for the small conversation history deltas. The savings compound: with caching, that 15 MB becomes roughly 2 MB of transmitted tokens, and the compute cost drops proportionally.
+
+The caching bug meant teams were paying the full non-cached price without realizing it. For a team with 5 projects running regular agent-assisted code review, the monthly cost difference is real—somewhere in the range of $200–800 depending on project size and agent frequency. More importantly for fast iteration: if your agent tasks are taking longer than expected to complete, a broken cache silently turns a 2-minute task into a 4-minute task because the API is reprocessing context it should have cached.
+
+## Why the fix matters for sustainable agent workflows
+
+The immediate lesson is that prompt caching is not a free optimization—it's a foundational assumption for making agentic workflows economically viable at scale. If you're running Claude Code as a long-running dev assistant, or embedding agent calls into your CI/CD, caching correctness directly affects:
+
+**Cost predictability.** A team budgeting $500/month for agent-assisted code review needs to know whether they're getting full benefit from caching. With the bug, actual costs were higher, and scaling up would become a painful, non-linear curve.
+
+**Latency consistency.** Agent tasks that depend on system prompts, tool definitions, and reference contexts benefit from cache hits because the API skips re-processing that stable content. When caching breaks silently, users see slower completions and might attribute it to model slowness or network lag instead of a configuration issue.
+
+**Context window economics.** In agentic workflows, you're often pinning reference materials (architecture guides, naming conventions, security policies) in the system context to guide agent behavior. With caching, you can afford more of this reference material because it's cached after the first hit. Without correct caching, the same material becomes expensive to repeat, and teams end up stripping it out, resulting in lower-quality agent outputs.
+
+The v2.1.237 fix restores these assumptions. But the deeper lesson is that cache correctness is invisible until it breaks, so it's worth explicitly verifying in your setup.
+
+## Concise output style: signal-to-noise for long-running sessions
+
+The same release introduced a new output style option called "Concise." This addresses a different pain point: verbose agent output.
+
+By default, Claude Code's agent mode returns full explanatory prose alongside code changes. This is useful for interactive sessions where you want to understand the reasoning. But in terminal-heavy workflows—running agents in a headless CI environment, reviewing agent logs in bulk, or keeping transcripts for audit purposes—that verbosity creates noise that obscures the actual work product (the code changes, the tool calls, the decisions made).
+
+Concise mode strips the explanatory narrative without removing the work output. A typical verbose agent turn might look like:
+
+```
+I'll analyze the failing test and implement a fix. Let me first examine the error message to understand what's happening, then look at the relevant code section, then write a targeted fix that addresses the root cause without introducing side effects.
+
+[... 8 file reads, 2 greps ...]
+
+The issue is a race condition in the event listener cleanup. The current code doesn't unsubscribe before destroying the component, so stale callbacks fire after unmount. I'll add a cleanup step in the useEffect return.
+
+[... edit ...]
+
+The fix is minimal and surgical—just two lines added to the cleanup function. This ensures the listener is removed before the component unmounts.
+```
+
+In Concise mode, the same turn becomes:
+
+```
+Examining error → race condition detected in cleanup → fix applied (useEffect return handler).
+```
+
+For a 20-step agent task in a CI log that you're scanning for patterns or debugging, the difference is stark. Verbose mode produces 40–50 KB of prose; Concise mode produces 2–3 KB of signal. The code changes themselves are identical—only the narration changes.
+
+This is useful in several scenarios:
+
+- **CI logs:** Agent runs in your pipeline produce cleaner, more scannable transcripts that don't bury the actual diff.
+- **Audit trails:** Long-term storage of agent sessions for compliance or learning purposes benefits from the reduced noise.
+- **Parallel agent coordination:** When multiple agents are working on related tasks and you need to track high-level decisions without wading through prose, Concise output reduces context switching.
+- **Model cost:** Fewer prose tokens means slightly lower API costs for the same work output.
+
+The trade-off is that you lose the reasoning explanation, which can be valuable for understanding *why* an agent made a decision. Teams should think deliberately about which agent tasks need verbose explanations (interactive problem-solving, debugging, architectural decisions) versus which can live with Concise output (routine refactors, test additions, code generation).
+
+## Webhani's recommendation: structuring for cache-friendly workflows
+
+To make both the caching fix and Concise output work well, we recommend a small structural investment in how you configure agent contexts.
+
+First, separate stable context (system prompt, tool definitions, reference materials) from turn-specific content (conversation history, current PR diff). This makes the caching boundary explicit:
+
+```yaml
+# claude-code settings (in .claude/CLAUDE.md)
+## Project Configuration
+name: webhani-project
+version: 1
+
+## Stable Context (cached after first turn)
+system_context: |
+  You are an AI coding assistant for webhani Inc., a web development and cloud infrastructure company.
+  Our codebase uses Next.js 16, React 19, TypeScript, and Tailwind CSS.
+  
+  ### Naming Conventions
+  - Components: PascalCase, prefixed with Area (AreaHero, AreaServices)
+  - Hooks: camelCase, prefixed with use (useScrollReveal)
+  - Files: kebab-case for non-components
+  
+  ### Commit Style
+  - Format: "feat: description" or "fix: description"
+  - Co-author: "Co-Authored-By: Claude Code <noreply@anthropic.com>"
+
+reference_files:
+  - src/lib/constants.ts      # i18n locales and global constants
+  - docs/architecture.md       # system design overview
+  - .github/CODEOWNERS        # ownership rules for review routing
+
+## Output Configuration
+output_style: "concise"  # Use "verbose" for interactive sessions
+log_level: "info"        # Suppress debug output in CI
+```
+
+This structure ensures:
+- The system context block stays under 10 KB and is cached after the first API call.
+- Reference files (constants, architecture docs) are pinned and cached, not re-sent on every turn.
+- Output style is tuned for the environment (Concise in CI, Verbose for interactive development).
+
+Second, verify that caching is working as expected. Add a small check to your agent initialization:
+
+```typescript
+// Verify prompt caching is enabled
+const client = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+const response = await client.messages.create({
+  model: "claude-opus-5",
+  max_tokens: 100,
+  system: [
+    {
+      type: "text",
+      text: "You are a helpful assistant.",
+      cache_control: { type: "ephemeral" }  // Explicit cache control
+    }
+  ],
+  messages: [
+    { role: "user", content: "Hello" }
+  ]
+});
+
+// Check usage for cache performance
+console.log("Cache creation tokens:", response.usage.cache_creation_input_tokens);
+console.log("Cache read tokens:", response.usage.cache_read_input_tokens);
+console.log("Regular input tokens:", response.usage.input_tokens);
+```
+
+If `cache_read_input_tokens` is zero on subsequent calls, caching isn't working correctly. This is the canary that would have caught the v2.1.237 bug.
+
+Third, decide per-task whether Concise or Verbose makes sense. A decision matrix:
+
+| Task | Mode | Reason |
+|------|------|--------|
+| Interactive debugging | Verbose | Need full reasoning to understand decisions |
+| Routine code generation | Concise | Signal-to-noise; output is the code, not the explanation |
+| Security review | Verbose | Need to understand threat analysis |
+| CI automated refactor | Concise | Noise-reduction; humans review the diff later |
+| Architecture change | Verbose | Need clear decision rationale |
+
+## Takeaways
+
+- **Caching bugs are invisible until they compound.** If you're running agent-assisted workflows in CI or as a persistent assistant, audit whether prompt caching is working. Use the token usage fields to verify cache hits are happening.
+- **Stable context should be explicit and separated from conversation history.** Structure your CLAUDE.md or system prompts so that system instructions, tool definitions, and reference materials are clearly marked for caching. This keeps turns small and makes cost predictable.
+- **Concise output is not universally better—it's an option.** Use Concise mode for CI logs, audit trails, and routine code generation. Use Verbose mode for interactive problem-solving, architectural decisions, and debugging where you need to see the reasoning.
+- **Cache correctness is a cost-control lever you can measure.** If you don't have visibility into whether caching is working, you're paying more than you think. Add a check to your agent setup that logs cache hit rates and alert if they drop.
+
+---
+
+*Claude Code v2.1.237 released August 19, 2026, including fixes for prompt-caching behavior and the introduction of the Concise output style option.*
