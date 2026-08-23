@@ -1,0 +1,164 @@
+---
+title: "Consolidating Redis, Kafka, and Elasticsearch onto PostgreSQL: When and Why"
+description: "2026 has seen teams moving away from stacked specialized data stores toward PostgreSQL-only architectures using its mature extension ecosystem. We examine the operational tradeoffs and when this makes sense."
+date: "2026-08-24"
+status: "published"
+tags: ["PostgreSQL", "Database", "Architecture", "Caching", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "postgres-consolidation-redis-kafka-2026"
+---
+
+## The operational cost of specialization
+
+A typical mid-size backend team in 2025 found itself running: PostgreSQL for transactional data, Redis for caching, Kafka for event streaming, Elasticsearch for search, and perhaps one more cache layer in front. Each system had its own operational burden — separate backup procedures, different monitoring thresholds, distinct security postures, and separate failure modes. When something broke, the on-call engineer had to mentally context-switch between four different data stores to diagnose the issue.
+
+By 2026, enough teams have consolidated these workloads onto PostgreSQL that the pattern is worth examining seriously. This isn't because PostgreSQL became better at everything — it didn't. It's because for teams whose requirements don't demand the specialized throughput or durability guarantees of Redis or Kafka, the operational simplicity of one database often outweighs the feature loss.
+
+The hidden costs of running multiple data stores compound:
+
+**Backup and disaster recovery complexity.** Each system has different backup mechanics, recovery procedures, and restore-test ceremonies. A team maintains separate RTO and RPO definitions per store. When an incident occurs, recovery time depends on which system failed and how — there's no single playbook.
+
+**Monitoring surface expands with each system.** You need separate dashboards for cache hit rates, queue lag, index freshness, and database performance. Missing a threshold on any system can cause cascading failures elsewhere. The on-call rotation must be trained on all four tools.
+
+**Security diverges.** Different systems have different authentication models, encryption options, and audit logging capabilities. Compliance reviews demand different evidence collection per store. Network segmentation rules multiply.
+
+**Failure modes are harder to reason about.** If a query is slow, is it a database issue, a stale cache, or missing index in Elasticsearch? If a job isn't running, is Kafka down, or did the consumer crash? Multiple failure modes become correlated failures when one system depends on another.
+
+For startups and small teams — which make up a large part of webhani's client base — this operational weight is real. A two-person backend team spending time on Redis failover drills is time not spent on product features.
+
+## What PostgreSQL can genuinely replace
+
+PostgreSQL's extension ecosystem in 2026 is mature enough for several concrete use cases.
+
+**Basic caching:** If your cache eviction policy is simple LRU or TTL-based, and hit rates in the 70-85% range are acceptable, PostgreSQL can serve this via `UNLOGGED` tables. Unlogged tables skip WAL writes, so they're fast for read-heavy workloads. When the server restarts, they're cleared — acceptable for cache data. For many teams whose cache is a performance nice-to-have rather than a correctness requirement, this eliminates the Redis deployment.
+
+```sql
+CREATE UNLOGGED TABLE cache (
+  key TEXT PRIMARY KEY,
+  value JSONB,
+  expires_at TIMESTAMP NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_cache_expires ON cache(expires_at);
+
+-- Background worker (cron or application-level)
+DELETE FROM cache WHERE expires_at < NOW();
+```
+
+**Job queues and lightweight pub/sub:** PostgreSQL's `LISTEN`/`NOTIFY` and `FOR UPDATE SKIP LOCKED` patterns handle many queueing workloads without Kafka. The key insight is that `FOR UPDATE SKIP LOCKED` lets you safely claim a row (job) from a queue table without blocking readers or competing workers.
+
+```sql
+CREATE TABLE job_queue (
+  id BIGSERIAL PRIMARY KEY,
+  type TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW(),
+  claimed_at TIMESTAMP,
+  claimed_by TEXT,
+  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed'))
+);
+
+-- Worker process claims jobs atomically
+BEGIN;
+SELECT id, type, payload FROM job_queue
+  WHERE status = 'pending'
+  ORDER BY created_at
+  LIMIT 10
+  FOR UPDATE SKIP LOCKED;
+
+-- If rows returned, claim them
+UPDATE job_queue SET status = 'processing', claimed_by = 'worker-001', claimed_at = NOW()
+  WHERE id = ANY(ARRAY[...claimed ids...]);
+
+COMMIT;
+
+-- After processing, update status
+UPDATE job_queue SET status = 'completed' WHERE id = $1;
+```
+
+This pattern works for job queues that don't require Kafka's ordered, replicated durability guarantees. For teams whose queue depth is measured in thousands rather than millions, and reprocessing a job on worker failure is acceptable, this eliminates the Kafka cluster.
+
+**Full-text search and fuzzy matching:** PostgreSQL's full-text search with `tsvector` and trigram search (`pg_trgm`) handles basic and moderate-scale search. You won't get Elasticsearch's relevance tuning, but for product search, user search within a SaaS app, or searching documentation, it's reasonable.
+
+```sql
+CREATE TABLE documents (
+  id BIGSERIAL PRIMARY KEY,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  search_vector tsvector GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', title), 'A') || 
+    setweight(to_tsvector('english', body), 'B')
+  ) STORED
+);
+
+CREATE INDEX idx_search_vector ON documents USING GIN(search_vector);
+
+-- Search query
+SELECT id, title, ts_rank(search_vector, query) as rank
+FROM documents, plainto_tsquery('english', 'user authentication') AS query
+WHERE search_vector @@ query
+ORDER BY rank DESC
+LIMIT 20;
+
+-- Fuzzy matching
+CREATE INDEX idx_title_trgm ON documents USING GIN(title gin_trgm_ops);
+
+SELECT id, title, similarity(title, 'authentification') as sim
+FROM documents
+WHERE title % 'authentification'
+ORDER BY sim DESC;
+```
+
+**Vector similarity search for embeddings:** PostgreSQL's pgvector extension enables basic vector search for AI workloads — finding similar embeddings without a separate vector database. For small-to-medium embedding collections (under 1M vectors), this is practical.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE embeddings (
+  id BIGSERIAL PRIMARY KEY,
+  content TEXT,
+  embedding vector(1536)
+);
+
+CREATE INDEX ON embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+
+-- Find similar embeddings
+SELECT id, content, embedding <-> $1 as distance
+FROM embeddings
+ORDER BY distance
+LIMIT 10;
+```
+
+## Where PostgreSQL genuinely should not replace specialized systems
+
+The temptation to consolidate everything onto PostgreSQL ends when requirements exceed what PostgreSQL reasonably handles.
+
+**Very high-throughput event streaming.** If you're capturing millions of events per second with strict ordering guarantees and multi-day retention for replay, Kafka isn't just faster — it's architected for this problem in ways PostgreSQL isn't. Kafka's distributed log guarantees and consumer group offset management are proven at scale. PostgreSQL becomes a bottleneck, not a choice.
+
+**Sub-millisecond cache hit requirements at scale.** Redis's in-memory data structure optimizations and network protocol (RESP) are built for microsecond-level latency at 100k+ concurrent connections. PostgreSQL, even with `UNLOGGED` tables and no WAL writes, adds query parsing, planning, and executor overhead. If your cache hit latency budget is sub-millisecond and your hit rate is in the millions per second, Redis remains the right choice.
+
+**Complex full-text relevance tuning.** Elasticsearch's BM25 relevance model, faceting, aggregations, and relevance debugging tools are purpose-built for search. PostgreSQL's full-text search is adequate for basic queries but lacks the tuning surface (field boosting, synonym management, query analysis chains) that search-heavy products depend on. If your team spends meaningful time on search relevance, Elasticsearch specialization is justified.
+
+## A practical decision framework
+
+Here's a straightforward checklist to decide when PostgreSQL consolidation makes sense for your team:
+
+**1. Is your team small enough that operational complexity matters?** If you're under 15 backend engineers and on-call rotations are tight, consolidation reduces cognitive load. If you have dedicated database operations staff, they can probably justify Kafka+Redis+Elasticsearch as a specialty.
+
+**2. Are your throughput requirements genuinely modest?** Consolidate on Postgres if: your cache is serving 1k-10k requests/second, your job queue depth is under 100k jobs, your search index is under 10M documents. Beyond that, begin measuring against specialized system requirements.
+
+**3. Is your team willing to accept operational tradeoffs?** Postgres gives you simpler operations at the cost of raw performance. If you're willing to accept slightly higher latency or lower cache hit rates in exchange for one backup procedure and one monitoring dashboard, consolidation works. If every millisecond of latency or percentage point of cache efficiency matters to your product metrics, don't force it.
+
+**4. Do your requirements have a future growth rate?** If you expect 10x growth in event volume within a year, building on Kafka now is cheaper than migrating later. If your growth is steady and modest, Postgres gives you runway to consolidate initially and specialize later when you have evidence that specialization is needed.
+
+**5. Is your team's expertise in Postgres deep?** If your team is already expert in PostgreSQL internals (MVCC, index selection, query planning), consolidation reduces the total expertise surface area your team must own.
+
+## Conclusion
+
+PostgreSQL in 2026 is powerful enough that consolidation is a legitimate architectural choice, not a limitation. The question isn't whether PostgreSQL can technically do caching or queueing — it can. The question is whether your team's constraints (size, growth rate, operational maturity, latency requirements) make the tradeoff worthwhile.
+
+For the small-to-mid-size teams that make up much of the SaaS and startup ecosystem, the answer increasingly is yes. Start with Postgres. Add Redis when cache hit latency or throughput demands it with evidence. Add Kafka when job queue semantics require distributed transaction semantics. Add Elasticsearch when search tuning becomes a feature, not an implementation detail.
+
+Specialization should be a response to measured constraints, not an assumption.

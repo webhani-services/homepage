@@ -1,0 +1,173 @@
+---
+title: "JWTの署名検証が繰り返し破壊される理由（2026年版）"
+description: "pac4j-JWTのCVE-2026-29000は、暗号化は処理するが署名検証を忘れる開発者のパターンを露呈しました。この脆弱性がなぜ起こるのか、どう対策するかを解説します。"
+date: "2026-08-24"
+status: "published"
+tags: ["Security", "JWT", "OAuth", "Authentication", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "jwt-signature-verification-vulnerabilities-2026"
+---
+
+## 署名検証：常に脆弱になる部分
+
+認証システムの脆弱性を追跡していると、あるパターンに気づきます。「JWT セキュリティの間違い」リストの最上位は毎年同じです：サーバーが署名を検証していないため、攻撃者が JWT を偽造できるということです。
+
+2026年8月、このパターンは複数のライブラリとプラットフォームで繰り返されました。pac4j-JWT の CVE-2026-29000、OAuth 実装の CVE-2026-48611、Microsoft SharePoint の CVE-2026-55040 は、すべて同じ根本原因を持っていました：トークンが検証される場所とクレイムが信頼される場所のギャップです。
+
+このパターンがなぜ何度も起こるのかを理解するには、多くの開発者が見落とす区別が必要です。**機密性**（秘密を暗号化で守ること）と**真正性**（クレイムを信頼できることを証明すること）の違いです。
+
+## 核心的な混同：JWEのラッピング
+
+JWT には 2 つの形式があります。
+
+- **JWS**（JSON Web Signature）：ペイロードに署名し、クレイムが改ざんされていないことを証明します。
+- **JWE**（JSON Web Encryption）：ペイロードを暗号化し、クレイムを秘密にします。
+
+自然な直感は、暗号化を認証の形式として扱うことです。自分で このトークンを暗号化したなら、そして自分だけがキーを持っているなら、そのトークンは信頼できるはずです。
+
+その直感は間違っています。
+
+暗号化は**機密性**を証明し、**真正性**は証明しません。あなたの公開 RSA キーを持っている者は、JWE 内に任意のペイロードをラップできます。内部の内容は読めません（機密性は良好）。ただし、JWE を復号化するサーバーは、内部のクレイムを誰が作成したかの証明がまったくありません。
+
+これはまさに CVE-2026-29000 で pac4j-JWT が悪用されたものです。ライブラリの JwtAuthenticator は次のように動作していました。
+
+1. JWE を復号化する（サーバーの秘密キーを使用）。
+2. 内部の JWT を抽出する。
+3. **内部の JWT の署名検証をスキップする**。
+4. クレイムを信頼する。
+
+攻撃者の視点から考えると：あなたの公開 RSA キーを入手します（しばしば簡単です。JWKS エンドポイントから証明書をロードするだけ）。管理者クレイムを持つ JWT を作成します。それを公開キーで暗号化した JWE にラップします。サーバーは復号化して JWT を見て、「これは暗号化された素材の内部から来たものだから有効に違いない」と想定し、管理者アクセスを許可します。
+
+修正は概念的には簡単です：JWE を復号化してから、内部の JWT の署名を、署名なしで到着したかのように検証します。暗号化ステップと認証ステップを混同してはいけません。
+
+## なぜこれが重要か：より広いパターン
+
+CVE-2026-29000 は署名検証の失敗の一族の一例です。
+
+- **`alg: none` を受け入れる**：JWT ヘッダーは「これは署名なし」と言います。サーバーはそれでも信頼します。
+- **アルゴリズム混同**（RS256 vs HS256）：サーバーは RS256 検証用の公開キーを持っています。攻撃者は `alg: HS256` で同じトークンを送信し、ライブラリを騙して HMAC シークレットとして公開キーを使用させます。公開情報があれば、有効な HMAC を偽造できます。
+- **不安全な `kid` ヘッダー処理**：トークンがキー ID 42 を要求しています。サーバーはキー ID が信頼できるソースから来ているのか、それとも攻撃者の要求から来ているのかを検証せずにキー 42 を検索します。
+- **ネストされたトークン信頼の崩壊**：pac4j-JWT の例のように、内部トークンの署名を再検証せずに暗号化またはラップされたトークンを信頼する。
+
+これらはすべて 1 つの原則に帰着します。**署名は真正性が存在する場所です**。その他のフィールド（アルゴリズム、キー ID、ラッピング層）はすべて、どのように検証するかのヒントであり、それが検証されたことの証明ではありません。
+
+## 実装上の防御：検証を正しく構築する
+
+安全な JWT 検証の具体的な Node.js / TypeScript パターンは次のとおりです。
+
+```typescript
+import jwt from 'jsonwebtoken';
+
+interface VerifyOptions {
+  expectedAlgorithm: 'HS256' | 'RS256' | 'ES256';
+  publicKey: string;
+  issuer: string;
+  audience: string;
+}
+
+// 安全：明示的なアルゴリズム許可リスト、ヘッダーへの信頼なし
+function verifyJWT(token: string, options: VerifyOptions): jwt.JwtPayload {
+  try {
+    const decoded = jwt.verify(token, options.publicKey, {
+      algorithms: [options.expectedAlgorithm], // このアルゴリズムのみを受け入れる
+      issuer: options.issuer,
+      audience: options.audience,
+    });
+    
+    if (typeof decoded !== 'object' || !decoded.sub) {
+      throw new Error('Invalid token structure');
+    }
+    
+    return decoded;
+  } catch (error) {
+    throw new Error(`JWT verification failed: ${error instanceof Error ? error.message : 'unknown'}`);
+  }
+}
+
+// 危険：ヘッダーのアルゴリズム選択を信頼する
+function verifyJWTUnsafe(token: string, publicKey: string): jwt.JwtPayload {
+  // 悪い：攻撃者の `alg` ヘッダーが検証方法を制御する
+  const decoded = jwt.verify(token, publicKey);
+  return decoded as jwt.JwtPayload;
+}
+
+// 使用例
+const options: VerifyOptions = {
+  expectedAlgorithm: 'RS256',
+  publicKey: process.env.JWT_PUBLIC_KEY!,
+  issuer: 'https://auth.example.com',
+  audience: 'my-app',
+};
+
+const payload = verifyJWT(token, options);
+console.log(`Verified user: ${payload.sub}`);
+```
+
+主な違い：
+
+1. **明示的な `algorithms` 配列**：RS256 のみを許可し、トークンヘッダーが要求するものではなく。
+2. **Issuer と Audience の検証**：関連のないシステム間でのトークン再利用を防止します。
+3. **構造検証**：必須フィールドが存在することを確認します。
+4. **エラー処理**：検証失敗を汎用的な成功パスの背後に隠さないでください。
+
+## ネストされた/暗号化されたトークンの処理
+
+JWE でラップされた JWT を受け取る場合（外側は暗号化、内側は署名）、ステップを分離します。
+
+```typescript
+import jwt from 'jsonwebtoken';
+import { jwtDecrypt } from 'jose'; // JWE復号化用
+
+async function verifyEncryptedJWT(
+  encryptedToken: string,
+  privateKey: string,
+  signaturePublicKey: string
+): Promise<jwt.JwtPayload> {
+  // ステップ 1：JWE を復号化する
+  const decrypted = await jwtDecrypt(
+    encryptedToken,
+    Buffer.from(privateKey, 'base64')
+  );
+  
+  // ステップ 2：内部の JWT を文字列として抽出する
+  const innerJWT = decrypted.payload.toString('utf-8');
+  
+  // ステップ 3：内部 JWT の署名を検証する（オプションではない）
+  const payload = jwt.verify(innerJWT, signaturePublicKey, {
+    algorithms: ['RS256'],
+    issuer: 'https://auth.example.com',
+    audience: 'my-app',
+  });
+  
+  return payload as jwt.JwtPayload;
+}
+```
+
+重要な行は：JWE を復号化したばかりでも、内部 JWT の署名は検証します。暗号化と署名検証は独立した操作です。
+
+## OAuth：「無効」は「到達不可」を意味しない
+
+2026年8月、OAuth 実装バグが現れました。不適切な認証チェックにより、アプリケーションで OAuth が有効にされていない場合でもアカウント乗っ取りが可能でした。
+
+教訓：OAuth コードがコードベースに存在する場合（有効にして出荷しない場合でも）、そのコード パスには直接攻撃者がアクセスできます。UI レベルでフィーチャーを無効化しても、エンドポイントに直接アクセスされるのを防ぎません。OAuth ハンドラーをガードする場合は、通常のログインに使用するのと同じ認証チェックを使用してください。フィーチャー フラグに依存して到達不可能なコードを実際に到達不可能にしてはいけません。
+
+## JWT 実装の監査チェックリスト
+
+認証コードを出荷する前に、これらの項目を確認してください。
+
+1. **アルゴリズムを明示的に指定する**：コードは RS256 または HS256 を名前で指定する必要があります。トークン ヘッダーから読み込みません。`algorithms: [jwt.decode(token).header.alg]` が見える場合は、停止して修正してください。
+
+2. **クレイムを信頼する前に署名を検証する**：トークンが暗号化レイヤーを経由していても、最初に復号化してから署名を検証します。暗号化を認証として扱わないでください。
+
+3. **Issuer と Audience を検証する**：`iss` と `aud` クレイムが期待値と一致していることを確認します。関連のないサービス間でのトークン再利用を防止します。
+
+4. **ライブラリを パッチ状態に保つ**：CVE-2026-29000 は 4.5.9、5.7.9、6.3.3 より前の pac4j-jwt バージョンに影響しました。これを自動的にキャッチするように依存関係スキャンをセットアップしてください。
+
+5. **短命トークンとリフレッシュローテーションを使用する**：署名検証が完璧でも、漏洩したトークンは数日ではなく数分で期限切れになるべきです。リフレッシュトークン（サーバー側に保存、適切にローテーション）は影響範囲を軽減します。
+
+これらの項目のいずれかが認証レイヤーの再アーキテクチャを要求する場合、今それを実行する価値があります。代替案はインシデント中にこれを発見することです。
+
+---
+
+*参考：pac4j-JWT 脆弱性（CVE-2026-29000）、RFC 7519（JSON Web Token）、RFC 7516（JSON Web Encryption）、RFC 7518（JSON Web Algorithms）、OWASP JWT チートシート。*
