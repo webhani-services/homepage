@@ -1,0 +1,93 @@
+---
+title: "Next.js Critical 취약점 Security Release 공개: 패치 후 반드시 확인해야 할 것들"
+description: "예고되었던 Next.js 16.3계열·15.5계열 대상 Critical Security Release가 공개되었습니다. 패치를 적용하는 것으로 끝내지 말고, 적용 이후 팀이 점검해야 할 항목을 정리합니다."
+date: "2026-08-26"
+status: "published"
+tags: ["Next.js", "Security", "Vercel", "Web Development", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-security-patch-verification-2026-08-26"
+---
+
+Next.js 팀이 예고했던 Scheduled Security Release가 오늘 공개되었습니다. 대상은 16.3계열과 15.5계열이며, Critical severity 취약점을 포함한 수정 사항이 반영되었습니다. 사전 예고 단계에서는 상세 내용이 공개되지 않았지만, 패치 공개와 동시에 대상 버전 범위가 확정된 형태입니다.
+
+대부분의 팀에게는 여기서부터가 진짜 작업입니다. `next upgrade` 명령을 실행하는 것으로 끝나는 게 아니라, 패치가 실제로 반영됐는지 검증하고, 전체 환경에 안전하게 배포하고, 다음에는 더 빠르게 대응할 수 있도록 프로세스를 다듬는 것까지가 하나의 흐름이라고 생각합니다. 이번 글에서는 "패치를 적용한 이후"에 집중해서 실무 체크포인트를 정리합니다.
+
+## "적용됐는지"를 눈으로 확인하지 말고 기계적으로 검증한다
+
+모노레포나 마이크로 프론트엔드 구성에서는 `package.json`을 눈으로 확인하는 것만으로는 놓치는 경우가 생깁니다. caret(`^`) 지정이 의도치 않게 미패치 버전으로 resolve되거나, lockfile이 오래된 채로 방치될 수 있습니다.
+
+```bash
+# 실제로 설치된 버전 확인 (package.json의 지정값이 아님)
+npm ls next --all
+
+# lockfile에서 next 버전만 추출
+node -e "
+const lock = require('./package-lock.json');
+for (const [key, pkg] of Object.entries(lock.packages)) {
+  if (key.endsWith('node_modules/next')) {
+    console.log(key, pkg.version);
+  }
+}
+"
+```
+
+여러 workspace를 운영 중이라면 이 체크를 전체 workspace에 대해 돌리는 스크립트를 만들어두는 것이 좋습니다. 다음 Security Release 때도 그대로 재사용할 수 있습니다.
+
+## CI에 영구적인 버전 Gate를 추가한다
+
+패치 적용이 누락된 채로 프로덕션에 배포되는 것을 막으려면, 취약한 버전 범위를 CI에서 차단하는 장치를 상시로 두는 것을 추천합니다.
+
+```yaml
+# .github/workflows/security-gate.yml
+name: Next.js Version Gate
+on: [pull_request]
+
+jobs:
+  check-next-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fail if next version is below patched range
+        run: |
+          RESOLVED=$(npm ls next --json | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).dependencies.next.version')
+          echo "Resolved next version: $RESOLVED"
+          npx semver "$RESOLVED" -r ">=16.3.3 <17.0.0 || >=15.5.24 <16.0.0" || {
+            echo "::error::next version does not satisfy the patched range"
+            exit 1
+          }
+```
+
+이런 Gate는 한 번 만들어두면, 다음 Security Release 때 버전 범위만 수정하면 됩니다. 매번 수동으로 확인하는 절차를 조직 프로세스에서 줄일 수 있다는 점이 핵심입니다.
+
+## 적용 직후에는 로그와 에러율을 평소보다 자주 확인한다
+
+패치로 인해 Middleware나 App Router의 내부 동작이 미묘하게 바뀌는 경우가 있기 때문에, 배포 후 몇 시간에서 하루 정도는 평소보다 세밀하게 모니터링하는 것을 권장합니다.
+
+- 5xx 에러율이 급격히 변하지는 않는지
+- Middleware를 거치는 요청의 지연 시간이 나빠지지 않는지
+- WAF나 리버스 프록시 단에서 새롭게 차단되는 요청 패턴이 없는지
+
+저희도 실제 프로젝트에서 Security Release 직후 몇 시간 동안은 대시보드를 상시 화면에 띄워두고, 이상 징후가 보이면 바로 롤백 판단을 내릴 수 있는 체제를 갖추고 있습니다.
+
+## 단계적 롤아웃을 표준 절차로 만든다
+
+Critical 등급이 붙으면 "지금 당장 전체 환경에 적용하고 싶다"는 마음이 앞서기 쉽지만, 카나리 배포를 거치는 편이 결과적으로 더 빠르고 안전하게 전체 배포를 끝낼 수 있는 경우가 많습니다.
+
+```bash
+# 예: Vercel에서의 카나리 롤아웃
+vercel deploy --prod --skip-domain   # 먼저 preview URL에서 검증
+# 문제 없으면 프로덕션 도메인으로 alias 전환
+vercel alias set <preview-url> your-domain.com
+```
+
+이 절차를 사전에 문서화해두면, 다음 Critical Release가 발생했을 때 판단에 걸리는 시간을 크게 줄일 수 있습니다.
+
+## 정리
+
+- 패치 적용 여부는 눈으로 보지 말고 CI로 자동 검증한다
+- 취약한 버전 범위를 차단하는 Gate를 상시로 유지한다
+- 적용 직후에는 평소보다 높은 해상도로 모니터링한다
+- 카나리 롤아웃 절차를 미리 문서화해둔다
+
+Next.js는 2026년 들어 매월 Security Release를 이어오고 있으며, 이번과 같은 Critical 사례는 앞으로도 발생할 수 있습니다. "그때그때 대응"이 아니라, 이번 대응을 프로세스로 남겨두는 것이 다음 초동 대응 속도를 좌우합니다.

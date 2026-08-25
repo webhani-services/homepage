@@ -1,0 +1,94 @@
+---
+title: "Next.js Critical脆弱性のSecurity Releaseが公開:パッチ適用後に確認すべきこと"
+description: "予告されていたNext.js 16.3系・15.5系向けのCritical Security Releaseが公開されました。パッチを当てて終わりにせず、適用後にチームが確認すべきポイントを整理します。"
+date: "2026-08-26"
+status: "published"
+tags: ["Next.js", "Security", "Vercel", "Web Development", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-security-patch-verification-2026-08-26"
+---
+
+Next.jsチームが予告していたScheduled Security Releaseが本日公開されました。対象は16.3系・15.5系で、Critical severityの脆弱性を含む修正が含まれています。予告段階では詳細が伏せられていましたが、パッチの公開と同時に対象バージョンが明らかになった形です。
+
+多くのチームにとって、ここからが本番です。Security Releaseは「upgradeコマンドを叩いて終わり」ではなく、当たったことを検証し、環境全体に展開し、同じ状況が起きたときに今より速く動けるようにするところまでが一連の作業だと考えています。本記事では、その「当てた後」に絞って実務的なチェックポイントを整理します。
+
+## まず「当たっているか」を機械的に確認する
+
+目視でpackage.jsonを確認するだけでは、モノレポやマイクロフロントエンド構成では見落としが発生します。CIに組み込める形で確認するのが安全です。
+
+```bash
+# インストールされている実バージョンを確認(package.jsonの指定値ではない点に注意)
+npm ls next --all
+
+# lockfile上のnextのバージョンだけを抽出
+node -e "
+const lock = require('./package-lock.json');
+for (const [key, pkg] of Object.entries(lock.packages)) {
+  if (key.endsWith('node_modules/next')) {
+    console.log(key, pkg.version);
+  }
+}
+"
+```
+
+モノレポの場合は、対象workspaceすべてに対してこのチェックを回すスクリプトを用意しておくと、次回以降のSecurity Releaseでも使い回せます。
+
+## CIにバージョンGateを追加する
+
+パッチ適用が漏れたまま本番にデプロイされることを防ぐため、脆弱なバージョン範囲をCIでブロックする仕組みを恒久的に入れておくことをおすすめします。
+
+```yaml
+# .github/workflows/security-gate.yml
+name: Next.js Version Gate
+on: [pull_request]
+
+jobs:
+  check-next-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fail if next version is below patched range
+        run: |
+          VERSION=$(node -p "require('./package.json').dependencies.next")
+          echo "Detected next version spec: $VERSION"
+          npx semver "$(npm ls next --json | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).dependencies.next.version')" \
+            -r ">=16.3.3 <17.0.0 || >=15.5.24 <16.0.0" || {
+              echo "::error::next version does not satisfy the patched range"
+              exit 1
+            }
+```
+
+この手のGateは一度作ってしまえば、次のSecurity Releaseのときにバージョン範囲を書き換えるだけで再利用できます。「その都度手動で確認する」を組織のプロセスから減らせるのが利点です。
+
+## 適用後にログとエラー率を見る
+
+パッチ適用によってMiddlewareやApp Routerの内部挙動が変わるケースがあるため、リリース後は数時間〜1日程度、通常より注意深くモニタリングすることをおすすめします。
+
+- 5xxエラー率の急変がないか
+- Middleware経由のリクエストでレイテンシが悪化していないか
+- WAFやリバースプロキシ側で新たに弾かれているリクエストパターンがないか
+
+弊社の案件でも、Security Release直後の数時間はダッシュボードを常時表示にしておき、異常があればすぐにロールバック判断ができる体制を組むようにしています。
+
+## 段階的ロールアウトを標準化する
+
+Critical脆弱性の場合、「今すぐ全環境に当てたい」という気持ちが先行しがちですが、カナリアデプロイを経由したほうが結果的に早く安全に展開できることが多いです。
+
+```bash
+# 例: Vercelでのカナリアロールアウト
+vercel deploy --prod --skip-domain  # まずプレビューURLで検証
+# 問題なければ本番ドメインへエイリアス
+vercel alias set <preview-url> your-domain.com
+```
+
+トラフィックの一部だけを新バージョンに流し、主要メトリクスが安定していることを確認してから全体展開する、というステップを社内標準として文書化しておくと、次のCritical Releaseのときに判断で迷う時間を減らせます。
+
+## まとめ
+
+- パッチ適用の確認は目視ではなくCIで自動化する
+- 脆弱なバージョン範囲をブロックするGateを恒久的に用意しておく
+- 適用直後は通常より高い解像度でモニタリングする
+- カナリアロールアウトの手順を事前に文書化しておく
+
+Next.jsは2026年に入ってから月次でSecurity Releaseを継続しており、今回のようなCritical案件も今後起こり得ます。「毎回どうするか考える」のではなく、今回の対応を仕組み化しておくことが、次回の初動時間を大きく左右します。
