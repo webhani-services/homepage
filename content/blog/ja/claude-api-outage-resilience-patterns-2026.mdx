@@ -1,0 +1,186 @@
+---
+title: "Providerの障害でも落ちないAI機能の作り方"
+description: "2026年8月24日、AnthropicのClaudeで数時間規模の障害が発生しました。リトライ、サーキットブレーカー、フォールバック、UXの段階的劣化など、Provider障害に備える実践的な設計パターンをコード付きで解説します。"
+date: "2026-08-27"
+status: "published"
+tags: ["AI", "可用性", "TypeScript", "LLM", "アーキテクチャ"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-api-outage-resilience-patterns-2026"
+---
+
+## 障害は「危機」ではなく「リマインダー」
+
+2026年8月24日、Anthropicのステータスページ上では05:06 UTC頃からエラー率の上昇が報告され、複数の主要なClaudeモデルで約3時間にわたり `529 Overloaded` エラーが多発したと報告されています（ステータスページの報告による）。Anthropicから詳細な原因分析は公表されておらず、また2026年を通じて同様の障害報告が複数回記録されています。
+
+このこと自体は、このスケールのHosted APIとしては珍しいことではありません。むしろ重要なのは、AI機能をリリースするすべてのクライアントに私たちが必ず聞く質問です。「Providerが3時間止まったとき、あなたのプロダクトはどう振る舞いますか？」正直な答えが「スピナーが回り続けて、最後にエラーが出るだけ」というケースは少なくありません。これはProvider側の問題ではなく、設計側のギャップであり、LLM以前から存在する定石パターンを正しく適用すれば解決できます。
+
+## 素朴なリトライは障害を悪化させる
+
+リクエストが失敗すると、反射的にリトライしたくなります。しかし固定間隔・即時リトライ・上限なしのリトライは、Provider障害時に最もやってはいけないことの一つです。1万クライアントが一斉に2秒ごとにリトライすれば、すでに苦しんでいるサービスに対して同期したハンマーを打ち込むようなものです。これがThundering Herd問題で、ステータスページで「回復しかけては再び悪化する」というサイクルが見られる大きな原因の一つは、このリトライトラフィック自体がProvider側の回復を妨げていることにあります。
+
+対策はExponential BackoffとJitterの組み合わせです。リトライ間隔を指数的に伸ばしつつ、実際の待機時間をランダム化することで、クライアント同士のリトライが同期しないようにします。
+
+```typescript
+async function callWithBackoff<T>(
+  fn: () => Promise<T>,
+  { maxRetries = 5, baseDelayMs = 500, maxDelayMs = 20_000 } = {}
+): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!isRetryable(err) || attempt >= maxRetries) throw err;
+      const exp = Math.min(maxDelayMs, baseDelayMs * 2 ** attempt);
+      const delay = Math.random() * exp; // full jitter
+      await new Promise((r) => setTimeout(r, delay));
+      attempt++;
+    }
+  }
+}
+
+function isRetryable(err: unknown): boolean {
+  const status = (err as { status?: number })?.status;
+  return status === 429 || status === 529 || status === 503;
+}
+```
+
+ここで重要なのは2点です。まず、「後で再試行すべき」ステータスコードだけをリトライ対象にすること。400（不正なリクエスト）や401（認証エラー）は何度リトライしても同じ結果になるだけで、レイテンシ予算を無駄に消費します。次に、Provider側が `Retry-After` ヘッダーを返す場合は、自前のBackoff計算式より優先して尊重すべきです。
+
+## サーキットブレーカー: 溜め込まずに早く諦める
+
+Backoffは個々のリクエスト失敗への対処です。しかしProviderが20分間ダウンし続けている状況では、すべてのリクエストがキューに溜まり、リトライし、結局タイムアウトする、というループが接続・メモリ・ユーザーの忍耐を消耗させます。ここでサーキットブレーカーの出番です。
+
+サーキットブレーカーは失敗率を監視し、Closed（通常状態）・Open（即座に失敗させ、Providerを呼ばない）・Half-Open（少数のテストリクエストだけ通して回復を確認する）の3状態を遷移します。
+
+```typescript
+type CircuitState = "closed" | "open" | "half-open";
+
+class CircuitBreaker {
+  private state: CircuitState = "closed";
+  private failures = 0;
+  private lastFailureAt = 0;
+
+  constructor(
+    private readonly failureThreshold = 5,
+    private readonly resetTimeoutMs = 30_000
+  ) {}
+
+  async call<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state === "open") {
+      if (Date.now() - this.lastFailureAt < this.resetTimeoutMs) {
+        throw new Error("circuit_open");
+      }
+      this.state = "half-open";
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (err) {
+      this.onFailure();
+      throw err;
+    }
+  }
+
+  private onSuccess() {
+    this.failures = 0;
+    this.state = "closed";
+  }
+
+  private onFailure() {
+    this.failures++;
+    this.lastFailureAt = Date.now();
+    if (this.failures >= this.failureThreshold) this.state = "open";
+  }
+}
+```
+
+効果は明確です。ブレーカーがOpenになると、以降のすべての呼び出しはマイクロ秒単位で即座に失敗するようになり、30秒のタイムアウトを待つ必要がなくなります。これにより、ユーザーがスピナーを見ている間にリクエストキューが詰まったり、サーバーの接続が枯渇したりする事態を防げます。
+
+## タイムアウトと冪等性キー
+
+LLM呼び出しには必ず明示的なタイムアウトを設定してください。ProviderのSDKデフォルト値にも、Platform側のHTTPデフォルトタイムアウトにも頼るべきではありません。どちらもユーザーが実際に待てる時間より長めに設定されがちだからです。
+
+```typescript
+async function callModel(prompt: string, signal?: AbortSignal) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    return await client.messages.create(
+      { model: "claude-sonnet", messages: [{ role: "user", content: prompt }] },
+      { signal: controller.signal }
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+```
+
+リトライによって、レコード書き込みやメール送信といった副作用を伴うリクエストが再送される可能性がある場合は、冪等性キー（Idempotency Key）を付与し、リトライで副作用が重複しないようにします。キーは試行ごとではなく、論理的な操作単位で1つ生成し、その操作の全リトライで使い回します。
+
+```typescript
+const idempotencyKey = crypto.randomUUID();
+// この論理リクエストの全リトライで同じキーを使い回す
+```
+
+すべてのLLM ProviderのAPIが冪等性キーをネイティブサポートしているわけではありません。サポートがない場合は、モデル呼び出し前に下流のアクションに対してリクエストIDを紐づけるなど、重複排除ロジックを自前で実装する必要があります。
+
+## マルチProviderフォールバックと段階的な機能低下
+
+私たちがこれまで構築してきた最も堅牢なAIプロダクトは、ユーザー向けの重要な機能を単一のモデルや単一のProviderに依存させません。Backoff後もプライマリ呼び出しが失敗し、サーキットがOpenになった場合は、優先順位に沿ってフォールバックします。
+
+```typescript
+async function generateWithFallback(prompt: string) {
+  const chain = [
+    () => breaker.call(() => callModel(prompt, { model: "claude-primary" })),
+    () => breaker.call(() => callModel(prompt, { model: "claude-smaller" })),
+    () => callAlternateProvider(prompt),
+    () => getCachedOrTemplatedResponse(prompt),
+  ];
+
+  for (const attempt of chain) {
+    try {
+      return await attempt();
+    } catch {
+      continue;
+    }
+  }
+  throw new Error("all_providers_exhausted");
+}
+```
+
+すべての段階を別のフルスペックモデルにする必要はありません。同系統の小型・高速モデル、頻出クエリに対するキャッシュ済みレスポンス、既知の意図に対するテンプレート応答なども、このフォールバックの正当な一段として機能します。重要なのは「回答なし」を最終手段にすることであり、最初のフォールバックにしないことです。
+
+## 壊れているように見せないUXの段階的劣化
+
+エンジニアリング側でどれだけ耐障害性を作り込んでも、最初の呼び出しが失敗した瞬間に真っ白なエラー画面が出るようでは意味がありません。ハッピーパスだけでなく、失敗パスもUIとして設計してください。
+
+- 固まったスピナーではなく、「生成に時間がかかっています」のように、キュー待ちやリトライ中であることを明示的に表示する
+- 可能であれば部分的な結果を返す。ストリーミング中に接続が切れた場合、届いた分は破棄せず保持し、残りだけを再取得できるようにする
+- フォールバックチェーンを本当に使い切った場合は、具体的な次のアクション（再試行ボタン、「数分後にもう一度お試しください」、AIを使わない代替導線など）を添えた明確なメッセージを表示する
+- キャッシュやテンプレート応答にダウングレードしたことをユーザーに気づかせずに済ませない。ライブなモデル応答と比べて明らかに質が劣る場合は、その旨を簡潔に伝える
+
+## 自社サービスだけでなくProviderも監視する
+
+ここまでの内容だけでは、いつエスカレーションすべきかが分かりません。Provider側のステータスページやステータスAPI（Anthropic、OpenAIをはじめ多くのProviderが公開しています）は、障害時に誰かが手動で確認するタブではなく、自社の監視パイプラインに組み込むべきです。
+
+```typescript
+async function checkProviderStatus(statusUrl: string) {
+  const res = await fetch(statusUrl);
+  const data = await res.json();
+  if (data.status.indicator !== "none") {
+    await notifyOnCall(`Provider status: ${data.status.description}`);
+  }
+}
+```
+
+これを定期実行するか、Providerがwebhookを提供していればそれを購読し、自社のエラー率ダッシュボードと同じアラート経路に統合してください。実際の障害発生時、これによって「自社側のリグレッションではなく、Provider側の問題である」と数分単位で早く判断できるようになり、対応方針そのものが変わります。
+
+## webhaniがクライアントに伝えていること
+
+クライアントのAI機能をスコープする際、私たちは必ず早い段階でこう問いかけます。「モデルが使えなくなったとき、フォールバックはどうなっていますか」。「もし」ではなく「いつか必ず起きる」という前提です。どのProviderにも障害は起こりますし、四半期を通じて一度も障害が起きないことのほうがむしろ例外的です。BackoffとJitter、モデル呼び出し前段のサーキットブレーカー、明示的なタイムアウト、フォールバックチェーン、そして劣化状態を正直に伝えるUI——これらは最初から組み込んでおく分には決して高くつきません。クライアントが最初の障害でサポート問い合わせの急増を経験した後に後付けするほうが、はるかに高くつきます。
+
+8月24日の障害は、私たちの把握している限り大きな実害を残しませんでしたし、Anthropicの信頼性自体は業界水準で見ても十分に高いと考えています。しかし「Providerがいずれ直してくれる」というのは耐障害性の戦略ではなく、単なる願望に過ぎません。モデルAPIも他の重要な外部依存と同じように扱い、「いつか必ず落ちる」ことを前提にプロダクトを設計しておくことで、障害を自社サービスの障害ではなく、単なる一時的な不便に留めることができます。

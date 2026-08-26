@@ -1,0 +1,186 @@
+---
+title: "Provider 장애에도 죽지 않는 AI 기능 설계하기"
+description: "2026년 8월 24일, Anthropic Claude 플랫폼에서 수시간 규모의 장애가 발생했습니다. Retry, Circuit Breaker, Fallback, UX degradation 등 Provider 장애를 견디는 실전 설계 패턴을 코드와 함께 정리합니다."
+date: "2026-08-27"
+status: "published"
+tags: ["AI", "Reliability", "TypeScript", "LLM", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-api-outage-resilience-patterns-2026"
+---
+
+## 장애는 위기가 아니라 리마인더입니다
+
+2026년 8월 24일, Anthropic의 Status Page에는 UTC 기준 05:06경부터 오류율 상승이 보고되었고, Status Page 보고에 따르면 여러 주요 Claude 모델에서 약 3시간 동안 `529 Overloaded` 오류가 다수 발생한 것으로 나타났습니다. Anthropic은 상세한 원인 분석(Root Cause)을 공개하지 않았으며, 2026년 한 해 동안 유사한 장애 보고가 여러 차례 있었습니다.
+
+이 자체는 이 규모의 Hosted API에서 드문 일은 아닙니다. 더 중요한 질문은 저희가 AI 기능을 출시하는 모든 Client에게 반드시 묻는 것입니다. "Provider가 3시간 동안 멈추면 여러분의 Product는 어떻게 동작하나요?" 솔직한 답이 "스피너만 돌다가 결국 에러가 뜬다"인 경우가 적지 않습니다. 이것은 Provider의 문제가 아니라 설계의 공백이며, LLM 이전부터 존재해온 정석 패턴들을 제대로 적용하면 해결할 수 있습니다.
+
+## 무작정 Retry하면 장애가 더 악화됩니다
+
+요청이 실패하면 반사적으로 재시도(Retry)하고 싶어집니다. 하지만 고정 간격, 즉시 재시도, 상한 없는 재시도는 Provider 장애 상황에서 Client가 할 수 있는 최악의 대응에 가깝습니다. 1만 개의 Client가 동시에 2초마다 Retry한다면, 이미 힘겨운 서비스에 동기화된 망치를 계속 내려치는 것과 같습니다. 이것이 바로 Thundering Herd 문제이며, Status Page에서 "회복되는 듯하다가 다시 악화되는" 패턴이 반복되는 주된 이유 중 하나가 바로 이 Retry 트래픽 자체가 회복을 방해하기 때문입니다.
+
+해법은 Exponential Backoff와 Jitter를 결합하는 것입니다. Retry 간격을 지수적으로 늘리면서, 실제 대기 시간을 무작위화해 Client들의 Retry가 동시에 몰리지 않도록 합니다.
+
+```typescript
+async function callWithBackoff<T>(
+  fn: () => Promise<T>,
+  { maxRetries = 5, baseDelayMs = 500, maxDelayMs = 20_000 } = {}
+): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!isRetryable(err) || attempt >= maxRetries) throw err;
+      const exp = Math.min(maxDelayMs, baseDelayMs * 2 ** attempt);
+      const delay = Math.random() * exp; // full jitter
+      await new Promise((r) => setTimeout(r, delay));
+      attempt++;
+    }
+  }
+}
+
+function isRetryable(err: unknown): boolean {
+  const status = (err as { status?: number })?.status;
+  return status === 429 || status === 529 || status === 503;
+}
+```
+
+여기서 중요한 것이 두 가지입니다. 첫째, "나중에 다시 시도하면 될" Status Code만 Retry 대상으로 삼아야 합니다. 400(잘못된 요청)이나 401(인증 오류)은 몇 번을 Retry해도 결과가 같고, Latency Budget만 소모합니다. 둘째, Provider가 `Retry-After` 헤더를 반환한다면 직접 계산한 Backoff 공식보다 그 값을 우선해야 합니다.
+
+## Circuit Breaker: 쌓아두지 말고 빠르게 실패하기
+
+Backoff는 개별 요청의 실패에 대응하는 방식입니다. 하지만 Provider가 20분 동안 다운되어 있는 상황이라면, 모든 요청이 큐에 쌓이고, Retry되고, 결국 Timeout으로 끝나는 과정이 Connection, Memory, 그리고 사용자의 인내심을 계속 소모시킵니다. 여기서 Circuit Breaker가 필요합니다.
+
+Circuit Breaker는 실패율을 추적하며 Closed(정상), Open(즉시 실패 처리, Provider 호출 자체를 하지 않음), Half-Open(소수의 Test 요청만 통과시켜 복구 여부 확인) 3가지 상태를 오갑니다.
+
+```typescript
+type CircuitState = "closed" | "open" | "half-open";
+
+class CircuitBreaker {
+  private state: CircuitState = "closed";
+  private failures = 0;
+  private lastFailureAt = 0;
+
+  constructor(
+    private readonly failureThreshold = 5,
+    private readonly resetTimeoutMs = 30_000
+  ) {}
+
+  async call<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state === "open") {
+      if (Date.now() - this.lastFailureAt < this.resetTimeoutMs) {
+        throw new Error("circuit_open");
+      }
+      this.state = "half-open";
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (err) {
+      this.onFailure();
+      throw err;
+    }
+  }
+
+  private onSuccess() {
+    this.failures = 0;
+    this.state = "closed";
+  }
+
+  private onFailure() {
+    this.failures++;
+    this.lastFailureAt = Date.now();
+    if (this.failures >= this.failureThreshold) this.state = "open";
+  }
+}
+```
+
+효과는 분명합니다. Breaker가 Open 상태가 되면 이후의 모든 호출은 30초짜리 Timeout을 기다릴 필요 없이 밀리초 단위로 즉시 실패합니다. 덕분에 사용자가 스피너를 보고 있는 동안 요청 큐가 밀리거나 서버 Connection이 고갈되는 상황을 막을 수 있습니다.
+
+## Timeout과 Idempotency Key
+
+LLM 호출에는 반드시 명시적인 Timeout을 설정해야 합니다. Provider SDK의 기본값이나 Platform의 기본 HTTP Timeout에 의존해서는 안 됩니다. 둘 다 사용자가 실제로 기다릴 수 있는 시간보다 넉넉하게 잡혀 있는 경우가 많기 때문입니다.
+
+```typescript
+async function callModel(prompt: string, signal?: AbortSignal) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    return await client.messages.create(
+      { model: "claude-sonnet", messages: [{ role: "user", content: prompt }] },
+      { signal: controller.signal }
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+```
+
+Retry 과정에서 Record 저장이나 Email 발송처럼 부작용(Side Effect)이 있는 요청이 중복 실행될 수 있다면, Idempotency Key를 붙여 Retry로 인한 중복 실행을 막아야 합니다. Key는 시도(Attempt)마다가 아니라 논리적인 작업(Operation) 단위로 한 번만 생성하고, 해당 작업의 모든 Retry에서 동일하게 사용합니다.
+
+```typescript
+const idempotencyKey = crypto.randomUUID();
+// 이 논리적 요청의 모든 Retry에서 동일한 Key를 재사용합니다
+```
+
+모든 LLM Provider의 API가 Idempotency Key를 Native로 지원하는 것은 아닙니다. 지원하지 않는다면, 모델 호출 이전에 하위 Action에 Request ID를 매핑하는 식으로 중복 제거 로직을 직접 구현해야 합니다.
+
+## Multi-Provider Fallback과 점진적 성능 저하
+
+저희가 지금까지 구축한 가장 견고한 AI Product들은 사용자에게 중요한 기능을 단일 모델이나 단일 Provider에만 의존시키지 않습니다. Backoff 이후에도 Primary 호출이 실패하고 Circuit이 Open 상태가 되면, 우선순위에 따라 Fallback합니다.
+
+```typescript
+async function generateWithFallback(prompt: string) {
+  const chain = [
+    () => breaker.call(() => callModel(prompt, { model: "claude-primary" })),
+    () => breaker.call(() => callModel(prompt, { model: "claude-smaller" })),
+    () => callAlternateProvider(prompt),
+    () => getCachedOrTemplatedResponse(prompt),
+  ];
+
+  for (const attempt of chain) {
+    try {
+      return await attempt();
+    } catch {
+      continue;
+    }
+  }
+  throw new Error("all_providers_exhausted");
+}
+```
+
+모든 단계를 또 다른 풀사이즈 모델로 채울 필요는 없습니다. 같은 계열의 더 작고 빠른 모델, 반복 질의에 대한 Cache된 응답, 잘 알려진 Intent에 대한 Template 응답도 이 Fallback Chain의 정당한 단계로 활용할 수 있습니다. 핵심은 "응답 없음"을 최후의 수단으로 두는 것이지, 첫 번째 Fallback으로 삼지 않는 것입니다.
+
+## 망가진 것처럼 보이지 않는 UX Degradation
+
+아무리 Engineering 단에서 Resilience를 잘 구축해도, 첫 호출이 실패하는 순간 화면에 빈 에러 메시지만 뜬다면 의미가 없습니다. Happy Path뿐 아니라 실패 경로도 UI로 설계해야 합니다.
+
+- 멈춰있는 스피너 대신 "생성 중입니다, 평소보다 시간이 걸리고 있습니다" 같은 방식으로 대기(Queued)나 재시도(Retrying) 상태를 명시적으로 보여줍니다
+- 가능하다면 부분 결과(Partial Result)를 반환합니다. Streaming 도중 연결이 끊기면 이미 도착한 부분은 버리지 않고 유지하고, 나머지만 다시 받을 수 있게 합니다
+- Fallback Chain을 모두 소진했다면, 구체적인 다음 행동(재시도 버튼, "잠시 후 다시 시도해주세요", AI를 쓰지 않는 대체 경로 등)이 담긴 명확한 메시지를 보여줍니다
+- Cache나 Template 응답으로 조용히 Downgrade해서 사용자가 눈치채지 못하게 하지 않습니다. 실시간 모델 응답보다 품질이 확연히 떨어진다면 그 사실을 간단히 알려줍니다
+
+## 우리 서비스뿐 아니라 Provider도 함께 모니터링하기
+
+여기까지의 내용만으로는 언제 Escalation해야 하는지 알 수 없습니다. Provider의 Status Page나 Status API(Anthropic, OpenAI를 비롯한 대부분의 Provider가 제공)는 장애 발생 시 누군가 수동으로 확인하는 탭이 아니라, 우리 자체의 Monitoring Pipeline에 통합되어야 합니다.
+
+```typescript
+async function checkProviderStatus(statusUrl: string) {
+  const res = await fetch(statusUrl);
+  const data = await res.json();
+  if (data.status.indicator !== "none") {
+    await notifyOnCall(`Provider status: ${data.status.description}`);
+  }
+}
+```
+
+이를 주기적으로 Polling하거나, Provider가 Webhook을 제공한다면 이를 구독해 자체 오류율 Dashboard와 동일한 Alert 경로로 연결하세요. 실제 장애 상황에서 이는 "우리 쪽 Regression이 아니라 Provider 문제"라는 것을 몇 분이라도 빠르게 판단하게 해주며, 이는 대응 방식 전체를 바꿉니다.
+
+## webhani가 Client에게 늘 전달하는 것
+
+Client의 AI 기능을 Scoping할 때 저희는 항상 초반에 이렇게 묻습니다. "모델을 사용할 수 없을 때 Fallback은 무엇인가요?" "혹시"가 아니라 "언젠가 반드시"라는 전제입니다. 어떤 Provider든 장애는 발생하며, 한 분기 동안 장애가 단 한 번도 없었다면 오히려 예외적인 경우입니다. Jitter를 더한 Backoff, 모델 호출 앞단의 Circuit Breaker, 명시적인 Timeout, Fallback Chain, 그리고 저하된 상태를 솔직하게 알려주는 UI — 이것들은 처음부터 설계에 포함시키는 비용이 결코 크지 않습니다. Client가 첫 장애로 인한 문의 폭증을 겪은 뒤 뒤늦게 추가하는 비용이 훨씬 큽니다.
+
+저희가 파악하기로 8월 24일 장애가 큰 실질적 피해를 남기지는 않았고, Anthropic의 신뢰성 자체도 업계 수준에서 충분히 견고하다고 보고 있습니다. 하지만 "Provider가 언젠가 고쳐주겠지"는 Resilience 전략이 아니라 그저 바람일 뿐입니다. 모델 API도 다른 중요한 외부 의존성과 동일하게 취급하고, "언젠가는 반드시 장애가 난다"는 전제로 Product를 설계해두면, 그 장애는 우리 서비스 자체의 장애가 아니라 일시적인 불편으로 그칠 수 있습니다.
