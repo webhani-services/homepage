@@ -1,0 +1,107 @@
+---
+title: "자율 탐색형 AI 테스트 Agent, '테스트 스위트 불필요'가 실제로 바꾸는 것"
+description: "테스트 스크립트 없이 앱을 스스로 클릭하며 버그를 찾아내는 AI Agent는 QA에 새로 등장한 도구이지만, CI Gate를 대체하지는 않습니다. 어디에 효과적이고 어디에는 아닌지, 그리고 안전하게 도입하는 방법을 정리합니다."
+date: "2026-08-27"
+status: "published"
+tags: ["QA", "Testing", "AI", "Playwright", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "ai-autonomous-testing-agents-qa-2026"
+---
+
+## 최근 몇 달간 반복해서 받은 질문
+
+최근 몇 달 동안 여러 고객사로부터 비슷한 질문을 받았습니다. "테스트 스크립트가 하나도 없는데 AI Agent가 앱을 알아서 클릭하면서 버그를 찾아내는 데모를 봤다. 우리 Playwright 스위트를 이걸로 대체해야 하나요?"
+
+결론부터 말하면 "대체"는 아닙니다. 다만 이 카테고리 자체는 실제로 새로운 흐름이고, 무엇을 대체하고 무엇을 대체하지 않는지 정리해둘 가치가 있습니다. 과도한 기대도, 무조건적인 무시도 둘 다 피해야 할 지점입니다.
+
+자율 탐색형 테스트 Agent는 사전에 작성된 스크립트를 따르는 대신, Web이나 Desktop Application을 스스로 조작하며 탐색하는 AI Agent입니다. 버튼을 클릭하고 Form을 채우고 링크를 따라가며 상태 전이를 발생시키면서, Application의 구조를 스스로 파악해 나갑니다. "필수 항목이 비어 있는 상태에서 모달이 아직 애니메이션 중일 때 제출 버튼을 누르면 어떻게 되는가" 같은 Test Case는 누구도 작성하지 않았습니다. Agent가 그 경로를 스스로 발견한 것입니다.
+
+기존 스크립트 기반 테스트와는 동작 방식 자체가 다릅니다. 정확히 무엇이 새로운지 구체적으로 살펴보겠습니다.
+
+## Playwright, Cypress 스크립트와 구조적으로 무엇이 다른가
+
+아무리 잘 작성된 E2E 스크립트라도 정해진 경로를 따라갑니다. `/checkout`으로 이동하고, Field A를 채우고, Button B를 클릭하고, C를 assert합니다. 이 경로는 스크립트 작성자가 사전에 결정한 것입니다. 입력이 같으면 절차와 assertion도 매번 동일합니다. 즉 결정론적(deterministic)입니다. 이는 Regression Gate로 사용하기 위해 반드시 필요한 성질입니다.
+
+반면 탐색형 Agent는 다음과 비슷하게 동작합니다.
+
+```
+loop:
+  현재 페이지 상태를 관찰한다 (DOM / accessibility tree / screenshot)
+  가능한 action을 추론한다 (클릭 가능한 요소, form field, navigation)
+  "이전에 본 적 있는가", "의미 있어 보이는가" 기준으로 action 우선순위를 매긴다
+  action을 선택해 실행한다
+  새 상태를 기록하고 이상 징후를 남긴다 (에러, console warning, layout 깨짐, dead end)
+  app에 대한 내부 map을 업데이트한다
+```
+
+고정된 스크립트는 없고, "테스트"는 Agent가 가진 Application 모델로부터 실행 시점에 동적으로 생성됩니다. 게다가 이 모델은 Agent가 어떤 분기를 탐색하느냐에 따라 매번 달라집니다. Playwright spec을 작성하는 QA Engineer보다는, Bug Bash 중인 사람의 탐색적 테스트에 더 가까운 동작입니다. Agent는 이미 있는 Test Plan을 더 빠르게 실행하는 게 아니라, 그 자리에서 자신만의 Test Plan을 만들어 갑니다. 그래서 아무도 문서화하지 않은 경로 — 이중 제출로 인한 Race Condition, 브라우저 뒤로가기 후 남는 고립된 상태, 숫자 Field에 이모지를 넣었을 때 후속 계산이 깨지는 케이스 등 — 를 우연히 발견할 수 있습니다.
+
+## 실제로 도움이 되는 지점
+
+가장 강력한 활용처는 "Coverage를 증명하는 것"이 아니라 "Coverage를 발견하는 것"입니다. 구체적으로 세 가지입니다.
+
+- **신규 기능이나 빠르게 변하는 UI.** 기능을 막 출시했는데 Test 작성 Backlog가 따라오지 못한 상황. 누군가 스크립트를 작성할 시간이 날 때까지 자동 Coverage 없이 배포하는 대신, Staging 환경에 탐색 Pass를 돌리면 당일 안에 명백한 결함을 걸러낼 수 있습니다.
+- **낯선 Codebase.** Test 이력이 거의 없는 고객사의 Legacy Application을 인수받았을 때, 탐색 Agent를 몇 시간 돌리는 것만으로 사람이 손으로 클릭해보는 것보다 빠르게 "어디가 취약한지"에 대한 초기 지도를 얻을 수 있습니다.
+- **아무도 적어두지 않은 Edge Case.** 스크립트 기반 Test는 작성자가 예상한 범위만 검증합니다. "제출 버튼을 빠르게 두 번 클릭하면 어떻게 되는가", "Flow 중간에 Viewport를 Resize하면 어떻게 되는가"를 시도해보는 Agent는, 애초에 계획에 없던 종류의 버그를 잡아냅니다.
+
+공통점은, 모두 "무엇을 테스트할지 결정하는 것" 자체가 Bottleneck인 상황이라는 점입니다.
+
+## 결정론적 테스트를 대체하지는 못하는 부분
+
+데모에서는 잘 언급되지 않는 부분이라 명확히 짚고 넘어가겠습니다.
+
+**Compliance, Audit용 증적.** "사용자가 X를 했을 때 시스템이 정확히 Y를 수행한다는 사실을, 이 날짜에 검증했다"는 증거가 규제 기관이나 감사인에게 필요하다면, 고정된 Assertion을 가진 버전 관리되는 결정론적 Test가 필요합니다. 실행마다 다른 경로를 밟도록 설계된 Agent의 탐색 로그로는 대체할 수 없습니다.
+
+**Business Logic에 연결된 정밀한 Regression Assertion.** "청구서 합계가 항목 합계 + 세금 − 할인과 센트 단위까지 일치하는가"는, 정확성의 기준을 명시적으로 주지 않는 한 탐색 Agent가 확실히 검증할 수 있는 항목이 아닙니다. 탐색 Agent는 페이지가 에러를 뱉었다거나 화면이 눈에 띄게 깨졌다는 것을 알아채는 데는 강하지만, 특정 숫자 출력이 특정 기대값과 일치하는지 확인하는 데는 상당히 약합니다.
+
+**CI Gate에 필요한 결정론적 재현성.** CI Gate는 매번 동일한 기준으로 빠르고 예측 가능하게 pass/fail을 반환해야 합니다. 실행할 때마다 경로가 달라지는 Agent는 안정적인 Green/Red Signal을 줄 수 없고, Merge를 막는 Gate가 감당할 수 없는 속도 저하와 비결정성을 끌어들입니다.
+
+정리하면, 탐색 Agent는 문제를 "찾는 것"에는 뛰어나지만, 정확성을 "증명하는" System of Record로는 아직 부족합니다. 이 둘을 혼동하는 것이 도입 후 문제가 되는 지점입니다.
+
+## 현실적인 통합 패턴
+
+저희가 권장하는 방식은 두 Layer를 분리해 각자 잘하는 일에 집중시키는 것입니다.
+
+1. **결정론적 스위트(Playwright, Vitest 등)를 CI Gate의 본체로 유지합니다.** 모든 PR에서 실행되고 Merge를 Block하며, Assertion은 이미 알려진 Business 요구사항에 직접 대응합니다. 탐색형 Agent를 도입해도 여기는 손대지 않습니다.
+2. **탐색 Agent는 별도의 Non-blocking Discovery Job으로 돌립니다.** 야간 배치나 Release 전에 Staging 환경을 대상으로 실행하는 형태입니다.
+3. **발견된 항목은 "신뢰"하지 않고 "Triage"합니다.** Agent가 찾아낸 모든 항목은 재현 시도가 첨부된 Ticket이 되고, 사람이 검토한 뒤 대응합니다. 재현이 확인된 항목은 스크립트화된 Regression Test 후보가 되어 결정론적 스위트에 편입되고, 이를 통해 같은 버그가 조용히 재발하는 것을 막습니다.
+
+Pipeline 연결 구조를 개념적으로 그리면 이렇습니다.
+
+```yaml
+# .github/workflows/ci.yml — Blocking Gate, 변경 없음
+on: [pull_request]
+jobs:
+  test:
+    steps:
+      - run: npm run test:unit
+      - run: npx playwright test   # 결정론적, Merge하려면 반드시 통과
+
+# .github/workflows/nightly-discovery.yml — 별도, Non-blocking
+on:
+  schedule:
+    - cron: "0 3 * * *"
+jobs:
+  explore:
+    steps:
+      - run: deploy-to-staging
+      - run: run-exploratory-agent --target https://staging.example.com
+      - run: create-tickets-from-findings --require-human-review
+```
+
+Discovery Job은 Merge를 Block하지 않습니다. Backlog에 지식을 공급하고, 사람이 검토해 재현성이 확인된 것만 시간을 두고 결정론적 스위트로 승격됩니다. 탐색 Agent는 기존 Test를 대체하는 게 아니라, 새로운 Test Case의 공급원이 되는 셈입니다.
+
+## 명확히 짚고 넘어갈 위험 요소
+
+**"Coverage 완전"이라는 잘못된 안도감.** Agent의 탐색 Report는 수십 페이지를 방문하고 수백 건의 Interaction을 기록한 것처럼 보여, 언뜻 철저해 보입니다. 하지만 정작 중요하게 여기는 Business Critical 경로는 한 번도 거치지 않았을 수 있습니다. "Agent가 2시간 탐색했는데 아무것도 못 찾았다"와 "결제 Flow가 정상 동작한다"는 같은 주장이 아니며, 이를 동일시하면 Gap을 인지하지 못한 채 넘어가게 됩니다.
+
+**비결정성으로 인한 재현 어려움.** Agent가 동적으로 생성한 경로에서 버그를 밟았다면, 개발자가 Debug하기 위해 나중에 그 경로를 정확히 재현하려면 Agent 쪽의 꼼꼼한 Session/Action Log가 필요합니다. 이게 없으면 "어젯밤 Agent가 버그를 찾았다"는 재현 불가능한 Bug Report가 되어, 차라리 보고가 없는 것보다 다루기 어려워집니다.
+
+**Agent가 찾은 결과는 사람의 검토를 거쳐야 신뢰할 수 있습니다.** Agent는 의도된 Loading 상태, Animation, 표준적이지 않지만 정상적인 UI Pattern을 결함으로 오판할 수 있습니다. Triage 단계 없이 Agent의 발견 결과를 그대로 Ticket Queue에 흘려보내면 몇 주 안에 해당 Tool에 대한 신뢰가 무너집니다.
+
+## webhani의 관점
+
+기존 QA Process에 새 Tool을 도입할 때와 같은 조언을 드립니다. 대체가 아니라 "추가"로 시도해보시길 권합니다. Staging 환경 하나를 정하고, 탐색 Agent를 몇 주간 야간 Job으로 돌려보세요. 그리고 두 가지를 측정합니다. 기존 스위트와 수동 QA가 놓쳤던, 진짜로 새롭고 재현 가능한 문제를 몇 건 찾아냈는지. 그리고 그 결과를 Triage하는 데 팀이 얼마나 공수를 썼는지. Signal 대비 Noise 비율이 맞다면 Release Checklist에 편입하고, 맞지 않는다면 몇 주간의 Background Job을 잃은 것일 뿐 CI Gate에는 아무 영향이 없습니다.
+
+이 Category는 주목할 가치가 있고, 적절한 지점에서는 도입할 가치도 있습니다. 다만 이는 "무엇을 놓치고 있는지 모르는 것을 찾아내는" Tool이지, "이미 참이어야 하는 것을 증명하는" 대체 수단은 아닙니다.

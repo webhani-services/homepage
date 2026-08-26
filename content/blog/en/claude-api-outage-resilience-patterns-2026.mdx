@@ -1,0 +1,186 @@
+---
+title: "Building AI Features That Survive a Provider Outage"
+description: "Anthropic's Claude platform saw a multi-hour outage on August 24, 2026. Here are the concrete engineering patterns — backoff, circuit breakers, fallback models, and UX degradation — that keep your product up when the model provider isn't."
+date: "2026-08-27"
+status: "published"
+tags: ["AI", "Reliability", "TypeScript", "LLM", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-api-outage-resilience-patterns-2026"
+---
+
+## The outage as a reminder, not a crisis
+
+On August 24, 2026, Anthropic's status page flagged elevated error rates starting around 05:06 UTC, and for roughly three hours several flagship Claude models returned `529 Overloaded` errors to a large share of requests, according to status page reports. Anthropic hasn't published a detailed root-cause postmortem, and this wasn't an isolated event — status pages logged multiple disruptions across 2026.
+
+None of that is unusual for a hosted API at this scale. What matters more is a question we ask every client who's shipping an AI feature: what does your product do in the three hours a model provider is down? Too often the honest answer is "shows a spinner, then an error." That's a design gap, not a provider problem, and it's fixable with patterns that have existed since long before LLMs — they just need to be applied correctly to this class of API.
+
+## Naive retries make an outage worse
+
+The instinct when a request fails is to retry it. Done naively — fixed delay, immediate retry, no cap — this is close to the worst thing a client can do during a provider incident. If ten thousand clients all retry every 2 seconds, you've built a synchronized hammer against a service that's already struggling. This is the thundering herd problem, and it's a major reason status pages show "recovering, then degraded again" cycles during incidents: the retry traffic itself prevents recovery.
+
+The fix is exponential backoff with jitter — each retry waits longer than the last, and the exact wait time is randomized so clients don't retry in lockstep.
+
+```typescript
+async function callWithBackoff<T>(
+  fn: () => Promise<T>,
+  { maxRetries = 5, baseDelayMs = 500, maxDelayMs = 20_000 } = {}
+): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!isRetryable(err) || attempt >= maxRetries) throw err;
+      const exp = Math.min(maxDelayMs, baseDelayMs * 2 ** attempt);
+      const delay = Math.random() * exp; // full jitter
+      await new Promise((r) => setTimeout(r, delay));
+      attempt++;
+    }
+  }
+}
+
+function isRetryable(err: unknown): boolean {
+  const status = (err as { status?: number })?.status;
+  return status === 429 || status === 529 || status === 503;
+}
+```
+
+Two details matter here. First, only retry on the status codes that actually mean "try again later" — a 400 (bad request) or 401 (auth) will fail identically every time, and retrying it just burns latency budget. Second, respect a `Retry-After` header if the API sends one; it's more accurate than any backoff formula you write.
+
+## Circuit breakers: fail fast instead of piling up hung requests
+
+Backoff handles individual request failure. It doesn't handle the case where the provider is down for the next twenty minutes and every request queues, retries, and times out anyway — burning connections, memory, and user patience. That's what circuit breakers are for.
+
+A circuit breaker tracks failure rate and moves through three states: closed (normal), open (short-circuit, fail immediately without calling the provider), and half-open (let a small number of test requests through to check recovery).
+
+```typescript
+type CircuitState = "closed" | "open" | "half-open";
+
+class CircuitBreaker {
+  private state: CircuitState = "closed";
+  private failures = 0;
+  private lastFailureAt = 0;
+
+  constructor(
+    private readonly failureThreshold = 5,
+    private readonly resetTimeoutMs = 30_000
+  ) {}
+
+  async call<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state === "open") {
+      if (Date.now() - this.lastFailureAt < this.resetTimeoutMs) {
+        throw new Error("circuit_open");
+      }
+      this.state = "half-open";
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (err) {
+      this.onFailure();
+      throw err;
+    }
+  }
+
+  private onSuccess() {
+    this.failures = 0;
+    this.state = "closed";
+  }
+
+  private onFailure() {
+    this.failures++;
+    this.lastFailureAt = Date.now();
+    if (this.failures >= this.failureThreshold) this.state = "open";
+  }
+}
+```
+
+The payoff: once the breaker opens, every subsequent call fails in microseconds instead of waiting for a 30-second timeout. That keeps your request queue from backing up and your server from running out of connections while a client waits on a spinner.
+
+## Timeouts and idempotency keys
+
+Every LLM call needs an explicit timeout — don't rely on the provider SDK's default, and don't rely on the platform's default HTTP timeout either, since both tend to be generous for what a user is willing to wait for.
+
+```typescript
+async function callModel(prompt: string, signal?: AbortSignal) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    return await client.messages.create(
+      { model: "claude-sonnet", messages: [{ role: "user", content: prompt }] },
+      { signal: controller.signal }
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+```
+
+If your retry logic can re-send a request that partially succeeded — say, a request that triggered a side effect like writing a record or sending an email — attach an idempotency key so a retry doesn't duplicate the effect. Generate the key once per logical operation (not per attempt) and pass it through every retry of that operation:
+
+```typescript
+const idempotencyKey = crypto.randomUUID();
+// reuse this same key across all retry attempts for one logical request
+```
+
+Not every LLM provider's API supports idempotency keys natively; where it doesn't, put the dedupe logic on your own side — a request ID stored against the downstream action before you call the model.
+
+## Multi-provider fallback and graceful degradation
+
+The most resilient AI products we've built don't depend on a single model or a single provider for anything user-facing and critical. When the primary call fails after backoff and the circuit is open, fall back — in order of preference:
+
+```typescript
+async function generateWithFallback(prompt: string) {
+  const chain = [
+    () => breaker.call(() => callModel(prompt, { model: "claude-primary" })),
+    () => breaker.call(() => callModel(prompt, { model: "claude-smaller" })),
+    () => callAlternateProvider(prompt),
+    () => getCachedOrTemplatedResponse(prompt),
+  ];
+
+  for (const attempt of chain) {
+    try {
+      return await attempt();
+    } catch {
+      continue;
+    }
+  }
+  throw new Error("all_providers_exhausted");
+}
+```
+
+Not every step needs to be a full second model — a smaller/faster model in the same family, a cached response for a repeated query, or a templated non-AI answer for a well-known intent are all legitimate rungs on that ladder. The point is that "no answer" is the last resort, not the first fallback.
+
+## UX degradation that doesn't feel broken
+
+Engineering resilience is wasted if the UI still shows a blank error the moment the first call fails. Design the interface for the failure path, not just the happy path:
+
+- Show a queued or retrying state explicitly ("Generating — this is taking longer than usual") instead of a frozen spinner.
+- Return partial results where possible — if you're streaming tokens and the connection drops mid-stream, keep what arrived and let the user retry the remainder rather than discarding it.
+- Give a clear, specific message when you've genuinely exhausted the fallback chain, with a concrete next step (retry button, "try again in a few minutes", or a non-AI path to the same outcome).
+- Avoid silently downgrading in a way the user can't tell — if a cached or templated answer is materially weaker than a live model response, say so briefly rather than presenting it as equivalent.
+
+## Watching the provider, not just your own service
+
+None of the above tells you when to escalate. Provider status pages and status APIs (Anthropic, OpenAI, and most others publish one) should feed your own monitoring, not just be a tab someone checks manually during an incident.
+
+```typescript
+async function checkProviderStatus(statusUrl: string) {
+  const res = await fetch(statusUrl);
+  const data = await res.json();
+  if (data.status.indicator !== "none") {
+    await notifyOnCall(`Provider status: ${data.status.description}`);
+  }
+}
+```
+
+Poll this on a schedule (or subscribe to a webhook where the provider offers one) and wire it into the same alerting path as your own error-rate dashboards. During an actual incident, this buys your team minutes of lead time — knowing it's provider-side, not your own regression, changes the entire response.
+
+## What we tell clients
+
+Every AI feature we scope for a client gets asked the same question early: what's the fallback when the model is unavailable? Not "if" — when, because every provider has incidents, and a single quarter with zero disruptions would be the exception. The patterns above — backoff with jitter, a circuit breaker in front of the model call, explicit timeouts, a fallback chain, and an honest UI state for degraded service — aren't expensive to build in from day one. They're expensive to retrofit after a client has had their first outage-driven support spike.
+
+The August 24 incident didn't do any lasting damage that we're aware of, and Anthropic's own reliability track record is solid by industry standards. But "the provider will fix it eventually" isn't a resilience strategy — it's a hope. Treat the model API the same way you'd treat any other critical third-party dependency: assume it will fail, and build the product so that failure is an inconvenience, not an outage of your own.
