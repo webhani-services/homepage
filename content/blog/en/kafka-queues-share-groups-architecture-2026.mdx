@@ -1,0 +1,80 @@
+---
+title: "Kafka's Native Queue Semantics Are Production-Ready: When to Retire Your RabbitMQ Layer"
+description: "KIP-932 brought share-group-based queue semantics to Apache Kafka, and the feature is now production-ready. We look at what that actually changes for teams running Kafka alongside RabbitMQ or SQS, and lay out a decision framework for when consolidating on Kafka makes sense — and when it doesn't."
+date: "2026-08-28"
+status: "published"
+tags: ["Kafka", "RabbitMQ", "Message Queue", "Architecture", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "kafka-queues-share-groups-architecture-2026"
+---
+
+## The queue-vs-log divide just got smaller
+
+For most of Kafka's history, picking it meant accepting log semantics: every consumer group reads every message on a partition, in order, and "pop one message, ack it, move on" — the RabbitMQ/SQS style of point-to-point queueing — wasn't a native fit. Teams that needed both patterns typically ran Kafka for event streaming and a separate broker (RabbitMQ, SQS, or similar) for task queues, accepting the operational overhead of two messaging systems in exchange for each one doing its native job well.
+
+KIP-932 changes that calculus. It introduces share groups to Kafka — a consumer model where multiple consumers can cooperatively read from the same partition and acknowledge individual records independently, instead of the traditional one-partition-per-consumer assignment. According to the Apache Kafka project, this queue-semantics support reached production readiness in the 4.2 release. That's a meaningful shift: it's no longer strictly true that Kafka can't do point-to-point queueing natively.
+
+## What share groups actually enable
+
+The practical difference from classic Kafka consumer groups is per-record acknowledgment instead of per-partition offset commits. In a standard consumer group, one consumer owns a partition, and failure recovery means replaying from the last committed offset — which can mean reprocessing records that already succeeded. Share groups let multiple consumers pull from the same partition and ack records individually, closer to how a task queue behaves.
+
+```properties
+# consumer.properties — share group configuration
+group.id=order-processing-share-group
+group.type=share
+share.acknowledgement.mode=explicit
+```
+
+```java
+// Explicit per-record acknowledgment with a Kafka share consumer
+ShareConsumer<String, Order> consumer = new KafkaShareConsumer<>(props);
+consumer.subscribe(List.of("orders"));
+
+while (true) {
+    ConsumerRecords<String, Order> records = consumer.poll(Duration.ofMillis(500));
+    for (ConsumerRecord<String, Order> record : records) {
+        try {
+            processOrder(record.value());
+            consumer.acknowledge(record, AcknowledgeType.ACCEPT);
+        } catch (RetryableException e) {
+            consumer.acknowledge(record, AcknowledgeType.RELEASE); // redeliver
+        } catch (Exception e) {
+            consumer.acknowledge(record, AcknowledgeType.REJECT);  // dead-letter
+        }
+    }
+}
+```
+
+That `RELEASE` / `REJECT` distinction is the piece that used to require bolting a separate queue on top of Kafka, or accepting the reprocessing cost of offset-based recovery.
+
+## Where this genuinely changes an architecture decision
+
+Consolidating on Kafka-only makes sense when your task-queue workload already lives next to event-streaming data you're keeping in Kafka anyway. The operational win is real: one broker to run, one monitoring stack, one team's operational muscle memory, instead of maintaining Kafka *and* RabbitMQ *and* the glue code that occasionally moves data between them.
+
+RabbitMQ 4.1's stream improvements have narrowed the raw throughput gap in some workloads, but that's not really the deciding factor for most teams — task-queue workloads are rarely bottlenecked on raw messages-per-second in the first place. The deciding factor is architectural surface area: do you want two messaging systems, or one.
+
+## Where RabbitMQ (or SQS) still earns its keep
+
+Share groups close the gap; they don't erase it. A few patterns still favor a dedicated queue broker:
+
+- **Priority queues.** Kafka partitions have no native concept of message priority. If you need "process refund requests before newsletter emails," RabbitMQ's priority queues are a native fit; on Kafka you'd be building that logic yourself with separate topics and consumer-side ordering logic.
+- **Per-message delay/scheduling with fine granularity.** RabbitMQ's delayed-message exchange and SQS's per-message visibility timeout are more direct primitives here than anything in the Kafka share-group model today.
+- **Low operational footprint for a small, queue-only workload.** If a service's only messaging need is a simple job queue with no event-streaming use case anywhere else in the system, standing up a Kafka cluster (even a managed one) to get queue semantics is disproportionate. A managed SQS queue or a small RabbitMQ instance is still less to operate.
+- **Strict FIFO with exactly-once delivery guarantees at the application boundary.** Kafka's exactly-once semantics apply within Kafka-to-Kafka processing (via transactions); once you're acknowledging into a share group with a heterogeneous consumer pool, you're back to designing for at-least-once and idempotent processing — which is often fine, but it's a design decision, not a given.
+
+## A practical decision framework
+
+| Situation | Recommendation |
+|---|---|
+| Already running Kafka for events; also maintaining RabbitMQ purely for task queues | Evaluate migrating task queues to Kafka share groups — real operational simplification |
+| Need message priority or fine-grained delay scheduling | Keep a dedicated queue broker |
+| Small service, queue-only, no existing Kafka footprint | Don't introduce Kafka just for this — use a managed queue (SQS) instead |
+| High-throughput event streaming with an occasional task-queue-shaped consumer | Kafka share groups are a good fit, avoids a second system for a minority use case |
+
+## Takeaways
+
+- **KIP-932 share groups make Kafka a legitimate option for point-to-point task queues**, not just event streams — this is new as of the 4.2 line, not a rebrand of existing behavior.
+- **The strongest case for consolidating is reducing operational surface area**, not raw throughput — most task-queue workloads were never throughput-bound in the first place.
+- **Priority, fine-grained delay, and small/isolated queue-only workloads still favor a dedicated broker.** Don't force a migration where the native features aren't there yet.
+- **Idempotent, at-least-once processing is still the right default assumption** even on share groups — design consumers accordingly rather than assuming exactly-once for free.

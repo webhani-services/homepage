@@ -1,0 +1,88 @@
+---
+title: "After the August 26 GitHub Actions Outage: Designing CI/CD That Survives a Platform Failure"
+description: "GitHub Actions went down again on August 26, 2026, stalling builds and deploys worldwide. We look at what a single-provider CI/CD dependency actually costs you and lay out concrete patterns — fallback runners, idempotent deploys, and break-glass procedures — for pipelines that keep working when the platform doesn't."
+date: "2026-08-28"
+status: "published"
+tags: ["CI/CD", "GitHub Actions", "DevOps", "Reliability", "Incident Response"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-outage-cicd-resilience-2026"
+---
+
+## Another outage, same lesson
+
+GitHub Actions went down again on August 26, 2026, with the disruption starting around 15:11 UTC according to GitHub's own incident report (via [The Register](https://www.theregister.com/devops/2026/08/26/github-actions-was-down-yet-again/5292679)). Builds stalled, deploys froze, and — for any team whose release process is *only* a `git push` to a protected branch plus a workflow file — nothing shipped until the platform recovered.
+
+This isn't a criticism of GitHub Actions specifically. Every CI/CD provider has outages; it's a matter of when, not if. The interesting question isn't "was this outage bad" — it's "what does it cost a team when their entire deploy path has exactly one point of failure, and is that cost worth avoiding." For most of the client pipelines we review at webhani, the answer is yes, and the fix is cheaper than people expect.
+
+## What a single-provider dependency actually costs
+
+When Actions goes down, three different things break, and they have different severities:
+
+1. **CI feedback on pull requests stops.** Annoying, but low-severity — code review can proceed manually, merges can be delayed a few hours.
+2. **Scheduled and automated deploys stop.** Medium severity — feature releases slip, but nothing is actively broken in production.
+3. **Hotfix deploys for an active incident can't ship.** This is the one that matters. If your CI provider is down at the same moment you have a production incident that needs a code fix, you're now blocked on two independent outages instead of one, and the second one — your own CI system — is entirely within your control to de-risk.
+
+That third scenario is the one worth designing against. You don't need to eliminate your dependency on GitHub Actions for routine work; you need an emergency path that doesn't depend on it.
+
+## Pattern 1: a break-glass deploy path outside the primary CI provider
+
+The lowest-effort version of this is a deploy script that a human can run locally or from a secondary runner, using the same build and release logic your pipeline uses — not a hand-rolled one-off that nobody has exercised.
+
+```bash
+#!/usr/bin/env bash
+# scripts/break-glass-deploy.sh
+# Runs the same build+deploy steps CI would, without depending on GitHub Actions.
+set -euo pipefail
+
+IMAGE_TAG=$(git rev-parse --short HEAD)
+
+echo "Building image ${IMAGE_TAG}..."
+docker build -t "registry.example.com/app:${IMAGE_TAG}" .
+
+echo "Running the same test gate CI enforces..."
+docker run --rm "registry.example.com/app:${IMAGE_TAG}" npm test
+
+echo "Pushing and deploying..."
+docker push "registry.example.com/app:${IMAGE_TAG}"
+kubectl set image deployment/app app="registry.example.com/app:${IMAGE_TAG}" --record
+
+echo "Deployed ${IMAGE_TAG}. Verify health before closing the incident."
+```
+
+The requirement that makes this actually usable in an incident: it has to be run in a dry-run at least quarterly, or it will silently rot the moment the real pipeline diverges from it. A break-glass path nobody has tested is a false sense of security.
+
+## Pattern 2: idempotent deploys so a retry after an outage is safe
+
+A deploy pipeline that isn't idempotent turns "the platform came back up mid-run" into its own incident — partial migrations, half-applied config, duplicate side effects from a job that appeared to fail but had already sent a webhook. Idempotency is what makes "just retry" a safe answer instead of a risky one.
+
+```typescript
+// Idempotent migration guard, keyed by a deterministic migration id
+async function applyMigration(id: string, run: () => Promise<void>) {
+  const alreadyApplied = await db.query(
+    "SELECT 1 FROM schema_migrations WHERE id = $1",
+    [id]
+  );
+  if (alreadyApplied.rowCount > 0) {
+    console.log(`Migration ${id} already applied, skipping`);
+    return;
+  }
+  await run();
+  await db.query("INSERT INTO schema_migrations (id, applied_at) VALUES ($1, now())", [id]);
+}
+```
+
+The same principle applies to deploy jobs themselves: tag releases by content hash rather than build number, so re-running a workflow that partially executed doesn't push a second, subtly different artifact under the same version.
+
+## Pattern 3: decouple "can I merge" from "can I deploy"
+
+Many teams wire deploys directly off a merge-to-main trigger, which means a CI outage doesn't just block new commits — it blocks releasing anything already merged and ready to ship, including hotfixes that landed just before the outage started. Splitting these into two triggers (merge runs tests and tags a release candidate; a separate, manually triggerable deploy step promotes a tagged candidate) means an outage in the CI provider's *workflow scheduler* doesn't necessarily block a deploy that only needs the *artifact registry and deploy target* to be reachable.
+
+## What we recommend to clients
+
+- **Run the break-glass script for real, on a schedule** — not as a one-time exercise you write and forget.
+- **Make deploys idempotent by default**, not as an afterthought bolted on after the first incident caused by a bad retry.
+- **Decouple release tagging from deploy execution**, so a platform outage degrades your release *cadence*, not your ability to ship a hotfix during an active incident.
+- **Write down who has the authority to trigger break-glass**, before you need it. The worst time to figure out an approval process is during an outage.
+
+None of this requires multi-cloud CI or a second Actions-equivalent running in parallel — that's usually overkill for the actual risk profile. It requires making your one critical path (shipping a fix during an incident) not depend on the one system that just went down.

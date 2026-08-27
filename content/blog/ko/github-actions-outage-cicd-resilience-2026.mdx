@@ -1,0 +1,88 @@
+---
+title: "8월 26일 GitHub Actions 장애가 남긴 교훈: Platform이 멈춰도 살아남는 CI/CD 설계"
+description: "2026년 8월 26일 GitHub Actions가 다시 장애를 일으키며 전 세계 Build와 Deploy가 멈췄습니다. 단일 Provider 의존 CI/CD의 실질적인 Cost를 짚어보고, Fallback Runner·멱등한 Deploy·Break-glass 절차 등 Platform 장애 상황에서도 동작하는 Pipeline을 위한 구체적인 Pattern을 제시합니다."
+date: "2026-08-28"
+status: "published"
+tags: ["CI/CD", "GitHub Actions", "DevOps", "안정성", "Incident 대응"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-outage-cicd-resilience-2026"
+---
+
+## 또 같은 교훈
+
+2026년 8월 26일, GitHub Actions가 다시 장애를 일으켰습니다. [The Register](https://www.theregister.com/devops/2026/08/26/github-actions-was-down-yet-again/5292679) 보도에 따르면 GitHub의 자체 Incident Report 기준으로 장애는 UTC 15시 11분경 시작되었습니다. Build는 멈추고 Deploy는 정지되었으며, Release Process가 보호된 Branch에 대한 `git push`와 Workflow File만으로 구성된 팀이라면 Platform이 복구될 때까지 아무것도 배포할 수 없었습니다.
+
+이는 GitHub Actions만의 문제를 지적하려는 것이 아닙니다. 어떤 CI/CD Provider든 장애는 발생합니다. 일어날지 말지가 아니라 언제 일어날지의 문제입니다. 정말 물어야 할 질문은 "이번 장애가 얼마나 심각했는가"가 아니라 "Deploy 경로 전체가 단일 실패 지점 하나에 의존할 때 팀이 치르는 실질적인 비용은 무엇이며, 그것을 피할 가치가 있는가"입니다. webhani가 검토하는 대부분의 Client Pipeline에서 답은 "그렇다"이고, 해결책은 생각보다 저렴합니다.
+
+## 단일 Provider 의존이 실제로 만드는 비용
+
+Actions가 멈추면 심각도가 서로 다른 세 가지 일이 동시에 일어납니다.
+
+1. **Pull Request에 대한 CI Feedback이 멈춥니다.** 성가시지만 심각도는 낮습니다. Code Review는 수동으로 진행할 수 있고, Merge를 몇 시간 미뤄도 됩니다.
+2. **예약된 자동 Deploy가 멈춥니다.** 중간 정도의 심각도로, Feature Release가 밀리지만 Production에서 무언가가 실제로 망가지는 것은 아닙니다.
+3. **진행 중인 Incident에 대한 Hotfix Deploy를 내보낼 수 없습니다.** 여기가 진짜 문제입니다. CI Provider가 down된 바로 그 순간에 Code 수정이 필요한 Production Incident가 발생하면, 이제 두 개의 독립적인 장애에 동시에 발이 묶입니다. 그리고 그 중 두 번째, 즉 자체 CI System에 대한 의존은 원래 팀이 스스로 Risk를 낮출 수 있는 영역입니다.
+
+설계로 대비해야 할 것은 바로 이 세 번째 시나리오입니다. 일상 업무에서 GitHub Actions 의존을 없앨 필요는 없습니다. 필요한 것은 그것에 의존하지 않는 비상 경로입니다.
+
+## Pattern 1: 주 CI Provider 밖에 있는 Break-glass Deploy 경로
+
+가장 적은 노력으로 만들 수 있는 형태는, Pipeline이 사용하는 것과 동일한 Build·Release Logic을 사람이 Local이나 별도 Runner에서 실행할 수 있는 Deploy Script입니다. 아무도 실행해본 적 없는 즉흥적인 일회성 Script여서는 안 됩니다.
+
+```bash
+#!/usr/bin/env bash
+# scripts/break-glass-deploy.sh
+# GitHub Actions에 의존하지 않고 CI와 동일한 Build+Deploy 단계를 실행
+set -euo pipefail
+
+IMAGE_TAG=$(git rev-parse --short HEAD)
+
+echo "Building image ${IMAGE_TAG}..."
+docker build -t "registry.example.com/app:${IMAGE_TAG}" .
+
+echo "Running the same test gate CI enforces..."
+docker run --rm "registry.example.com/app:${IMAGE_TAG}" npm test
+
+echo "Pushing and deploying..."
+docker push "registry.example.com/app:${IMAGE_TAG}"
+kubectl set image deployment/app app="registry.example.com/app:${IMAGE_TAG}" --record
+
+echo "Deployed ${IMAGE_TAG}. Verify health before closing the incident."
+```
+
+이것을 실제 Incident에서 쓸 수 있게 만드는 조건은 최소 분기마다 실제로 Dry Run 해보는 것입니다. 검증되지 않은 Break-glass 경로는 실제 Pipeline과 조용히 어긋나며, 정작 필요한 순간에는 쓸모가 없습니다. 그것은 거짓된 안도감일 뿐입니다.
+
+## Pattern 2: 장애 이후 Retry가 안전하도록 만드는 멱등한 Deploy
+
+멱등하지 않은 Deploy Pipeline은 "Platform이 실행 도중 복구되었다"는 상황 자체를 새로운 Incident로 만들어 버립니다. 절반만 적용된 Migration, 일부만 반영된 Config, 실패한 것처럼 보였지만 이미 Webhook을 보낸 Job으로 인한 중복 실행 같은 것들입니다. 멱등성이 있어야 "그냥 다시 실행하면 된다"가 위험한 답이 아니라 안전한 답이 됩니다.
+
+```typescript
+// Migration ID로 고유하게 식별되는 멱등한 Migration Guard
+async function applyMigration(id: string, run: () => Promise<void>) {
+  const alreadyApplied = await db.query(
+    "SELECT 1 FROM schema_migrations WHERE id = $1",
+    [id]
+  );
+  if (alreadyApplied.rowCount > 0) {
+    console.log(`Migration ${id} already applied, skipping`);
+    return;
+  }
+  await run();
+  await db.query("INSERT INTO schema_migrations (id, applied_at) VALUES ($1, now())", [id]);
+}
+```
+
+같은 원칙을 Deploy Job 자체에도 적용할 수 있습니다. Build 번호가 아니라 Content Hash로 Release에 Tag를 붙이면, 부분적으로 실행된 Workflow를 재실행하더라도 같은 Version 아래 미묘하게 다른 Artifact가 중복 Push되는 일을 막을 수 있습니다.
+
+## Pattern 3: "Merge할 수 있는가"와 "Deploy할 수 있는가"를 분리하기
+
+많은 팀이 Main Branch로의 Merge를 Deploy Trigger로 직접 연결해두는데, 이 경우 CI 장애는 새 Commit만 막는 것이 아니라 이미 Merge되어 배포 준비가 끝난 것, 예를 들어 장애 직전에 들어간 Hotfix의 Release까지 막아버립니다. 이를 두 단계 Trigger로 분리하면, 즉 Merge는 Test를 실행하고 Release Candidate에 Tag를 붙이는 역할만 하고 실제 Deploy는 별도의 수동 Trigger 가능한 Step에서 Candidate를 Promote하는 구조로 만들면, CI Provider의 Workflow Scheduler 자체의 장애가 Artifact Registry와 Deploy 대상에만 접근할 수 있으면 되는 Deploy까지 반드시 막지는 않게 됩니다.
+
+## Client에게 권장하는 것
+
+- **Break-glass Script는 실제로, 정기적으로 실행하세요.** 작성만 해두고 잊어버리는 일회성 연습이 아니어야 합니다.
+- **Deploy는 기본적으로 멱등하게 만드세요.** 첫 번째 잘못된 Retry Incident가 터진 뒤 덧붙이는 것이 아니라 처음부터 설계에 포함해야 합니다.
+- **Release Tag 부여와 Deploy 실행을 분리하세요.** Platform 장애가 Release 속도만 늦추고, Incident 대응 중 Hotfix를 배포할 능력까지 빼앗지 않도록 합니다.
+- **누가 Break-glass를 Trigger할 권한을 갖는지 미리 문서화하세요.** 장애가 발생한 상황에서 Approval Process를 그때 정하는 것은 최악의 Timing입니다.
+
+이 모든 것이 Multi-cloud CI나 병렬로 돌아가는 두 번째 Actions급 System을 요구하는 것은 아닙니다. 실제 Risk Profile에 비하면 보통 그것은 과합니다. 필요한 것은 정말 중요한 경로 하나, 즉 Incident 중 Hotfix를 배포하는 능력을 방금 멈춘 그 하나의 System에 의존시키지 않는 것뿐입니다.
