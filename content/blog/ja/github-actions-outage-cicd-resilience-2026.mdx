@@ -1,0 +1,88 @@
+---
+title: "8月26日のGitHub Actions障害から学ぶ: PlatformDownでも止まらないCI/CDの設計"
+description: "2026年8月26日、GitHub Actionsが再び障害を起こし、世界中のBuildとDeployが停止しました。単一Providerに依存するCI/CDの実質的なコストを検証し、Fallback Runner・冪等なDeploy・Break-glass手順など、Platform障害時にも動き続けるPipelineの具体的なPatternを紹介します。"
+date: "2026-08-28"
+status: "published"
+tags: ["CI/CD", "GitHub Actions", "DevOps", "信頼性", "Incident対応"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-outage-cicd-resilience-2026"
+---
+
+## また同じ教訓
+
+2026年8月26日、GitHub ActionsがDownしました。[The Register](https://www.theregister.com/devops/2026/08/26/github-actions-was-down-yet-again/5292679)が報じたGitHubの Incident Reportによれば、障害はUTC 15:11頃から始まりました。Buildは止まり、Deployは凍結し、Releaseフローが「保護されたBranchへの `git push` とWorkflow File」だけに依存しているチームでは、Platformが復旧するまで何もShipできませんでした。
+
+これはGitHub Actions固有の問題を指摘したいわけではありません。どのCI/CD Providerにも障害は起きます。問題は「起きるかどうか」ではなく「いつ起きるか」です。本当に問うべきは「今回の障害がどれだけ痛かったか」ではなく、「Deploy経路全体が単一障害点しか持たないことの実質コストは何か、そしてそれは回避する価値があるコストか」です。webhaniがReviewしているClient PipelineのほとんどではAnswerはYesであり、対策は思われているより安価です。
+
+## 単一Providerへの依存が実際に生むコスト
+
+Actionsが止まると、重要度の異なる3つのことが同時に壊れます。
+
+1. **Pull RequestへのCI Feedbackが止まる。** 煩わしいですが重要度は低く、Code Reviewは手動で続けられ、Mergeを数時間遅らせれば済みます。
+2. **定期実行・自動DeployがStopする。** 中程度の重要度で、Feature Releaseは後ろ倒しになりますが、Productionで何かが壊れているわけではありません。
+3. **稼働中のIncidentに対するHotfix Deployができない。** ここが本当に問題になる部分です。CI Providerがdown中にProduction Incidentが発生し、Code修正が必要になった場合、独立した2つの障害に同時にブロックされることになります。しかも2つ目の障害、つまり自社のCI Systemへの依存は、本来自社でRiskをコントロールできる部分です。
+
+設計で対応すべきなのはこの3番目のシナリオです。日常業務でのGitHub Actions依存をゼロにする必要はありません。必要なのは、それに依存しない緊急経路です。
+
+## Pattern 1: 主要CI Providerの外にあるBreak-glass Deploy経路
+
+最も低コストな実装は、Pipelineが使っているのと同じBuild・Release Logicを、人間がLocalまたは副次的なRunnerから実行できるDeploy Scriptです。誰も動かしたことのない手作りの一発物では意味がありません。
+
+```bash
+#!/usr/bin/env bash
+# scripts/break-glass-deploy.sh
+# GitHub Actionsに依存せず、CIと同じBuild・Deploy手順を実行する
+set -euo pipefail
+
+IMAGE_TAG=$(git rev-parse --short HEAD)
+
+echo "Building image ${IMAGE_TAG}..."
+docker build -t "registry.example.com/app:${IMAGE_TAG}" .
+
+echo "Running the same test gate CI enforces..."
+docker run --rm "registry.example.com/app:${IMAGE_TAG}" npm test
+
+echo "Pushing and deploying..."
+docker push "registry.example.com/app:${IMAGE_TAG}"
+kubectl set image deployment/app app="registry.example.com/app:${IMAGE_TAG}" --record
+
+echo "Deployed ${IMAGE_TAG}. Verify health before closing the incident."
+```
+
+これを実際にIncidentで使えるものにする条件は、最低でも四半期に一度は実際にDry Runすることです。テストされていないBreak-glass経路は、本物のPipelineから静かに乖離し、いざというときに使えません。それは安心感を演出するだけの罠です。
+
+## Pattern 2: 障害後のRetryを安全にする冪等なDeploy
+
+冪等でないDeploy Pipelineは、「Platformが実行途中で復旧した」という状況をそれ自体がIncidentに変えてしまいます。中途半端に適用されたMigration、半分だけ反映されたConfig、実際にはWebhookを送信済みなのに失敗したように見えたJobによる重複実行などです。冪等性があってこそ、「とりあえずRetryすればいい」がRiskのある回答ではなく安全な回答になります。
+
+```typescript
+// Migration IDで一意にキーされる冪等なMigration Guard
+async function applyMigration(id: string, run: () => Promise<void>) {
+  const alreadyApplied = await db.query(
+    "SELECT 1 FROM schema_migrations WHERE id = $1",
+    [id]
+  );
+  if (alreadyApplied.rowCount > 0) {
+    console.log(`Migration ${id} already applied, skipping`);
+    return;
+  }
+  await run();
+  await db.query("INSERT INTO schema_migrations (id, applied_at) VALUES ($1, now())", [id]);
+}
+```
+
+同じ考え方はDeploy Job自体にも適用できます。Build番号ではなくContent Hashでリリースにタグ付けすれば、部分的に実行されたWorkflowを再実行しても、同じVersionの下で微妙に異なるArtifactが二重にPushされることを防げます。
+
+## Pattern 3: 「Mergeできるか」と「Deployできるか」を分離する
+
+多くのチームはMain BranchへのMergeを直接Deploy TriggerにしていますがCI障害はNew Commitをブロックするだけでなく、すでにMergeされてShip準備が整っているもの、たとえば障害直前に着地したHotfixのReleaseまでブロックしてしまいます。これを2段階のTriggerに分離すると、つまりMergeはTestを実行してRelease Candidateにタグ付けするだけ、実際のDeployは別の手動Trigger可能なStepでCandidateをPromoteする形にすると、CI ProviderのWorkflow Scheduler自体の障害が、Artifact RegistryとDeploy先にさえ到達できればよいDeployまで必ずしもブロックしなくなります。
+
+## Clientへの推奨事項
+
+- **Break-glass Scriptは定期的に実際に実行する。** 書いて放置する一度きりの演習にしないでください。
+- **DeployはDefaultで冪等にする。** 最初のBad Retry Incidentが起きてから後付けするのではなく、最初から組み込みます。
+- **Release Tag付けとDeploy実行を分離する。** Platform障害がRelease頻度を落とすだけで済み、Incident対応中のHotfix Shipping能力を奪わないようにします。
+- **Break-glassを誰がTriggerする権限を持つかを事前に文書化する。** 障害発生中にApproval Processを考え始めるのは最悪のタイミングです。
+
+これはMulti-cloud CIや並行稼働する第二のActions相当System を要求するものではありません。実際のRisk Profileに対してそれは通常Overkillです。求められているのは、本当に重要な1本の経路、つまりIncident中にHotfixをShipする能力を、たった今Downした1つのSystemに依存させないことです。

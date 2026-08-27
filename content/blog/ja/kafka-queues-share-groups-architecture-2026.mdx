@@ -1,0 +1,80 @@
+---
+title: "KafkaのNative Queue Semanticsが本番運用可能に: RabbitMQ層を廃止すべきタイミング"
+description: "KIP-932によってApache KafkaにShare Groupベースのqueue semanticsが導入され、本番運用可能な段階に達しました。RabbitMQやSQSと併用しているチームにとって何が変わるのかを検証し、Kafkaへの統合が有効なケースとそうでないケースを判断するFrameworkを示します。"
+date: "2026-08-28"
+status: "published"
+tags: ["Kafka", "RabbitMQ", "Message Queue", "Architecture", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "kafka-queues-share-groups-architecture-2026"
+---
+
+## QueueとLogの境界が縮まった
+
+Kafkaを選ぶことは長らく、Log Semanticsを受け入れることを意味していました。すべてのConsumer GroupはPartition内の全Messageを順番に読み、「1件Popして確認応答し、次へ進む」というRabbitMQやSQSのようなPoint-to-Point Queueingは、Native な使い方ではありませんでした。両方のPatternが必要なチームは通常、Event StreamingにKafkaを、Task QueueにRabbitMQなど別のBrokerを使い、Messaging Systemを2つ運用する負担を受け入れる代わりに、それぞれの得意分野をNativeにこなす構成を選んでいました。
+
+KIP-932はこの計算を変えます。これはKafkaにShare Groupを導入するもので、複数のConsumerが同じPartitionを協調的に読み込み、従来のPartitionごとに1Consumerという割り当てではなく、個々のRecordを独立してAcknowledgeできるConsumer Modelです。Apache Kafka Projectによれば、このQueue Semanticsサポートは4.2 Releaseで本番運用可能な段階に達しました。これは意味のある転換です。「Kafkaは Native にPoint-to-Point Queueingができない」というのは、もはや厳密には正しくありません。
+
+## Share Groupが実際に可能にすること
+
+従来のKafka Consumer Groupとの実務上の違いは、Partitionごとのoffset commitではなく、Record単位のAcknowledgeです。標準的なConsumer Groupでは1つのConsumerが1つのPartitionを所有し、失敗からの復旧は最後にCommitされたoffsetからのReplayを意味します。これはすでに成功していたRecordの再処理につながることがあります。Share Groupでは複数のConsumerが同じPartitionからPullし、それぞれ個別にRecordをAckできるため、Task Queueの挙動に近づきます。
+
+```properties
+# consumer.properties — share group configuration
+group.id=order-processing-share-group
+group.type=share
+share.acknowledgement.mode=explicit
+```
+
+```java
+// Kafka Share Consumerによる Record単位の明示的なAcknowledge
+ShareConsumer<String, Order> consumer = new KafkaShareConsumer<>(props);
+consumer.subscribe(List.of("orders"));
+
+while (true) {
+    ConsumerRecords<String, Order> records = consumer.poll(Duration.ofMillis(500));
+    for (ConsumerRecord<String, Order> record : records) {
+        try {
+            processOrder(record.value());
+            consumer.acknowledge(record, AcknowledgeType.ACCEPT);
+        } catch (RetryableException e) {
+            consumer.acknowledge(record, AcknowledgeType.RELEASE); // 再配信
+        } catch (Exception e) {
+            consumer.acknowledge(record, AcknowledgeType.REJECT);  // Dead-letterへ
+        }
+    }
+}
+```
+
+この`RELEASE` / `REJECT`の使い分けこそ、これまでKafkaの上に別のQueueを載せるか、Offsetベースの復旧に伴う再処理コストを受け入れるかのどちらかを強いていた部分です。
+
+## Architecture判断が実際に変わる場面
+
+すでにEvent Streamingの用途でKafkaにあるDataの隣にTask Queueの負荷がある場合、Kafkaへの統合は理にかなっています。運用面のメリットは実質的です。Broker、Monitoring Stack、チームの運用ノウハウを1つに集約でき、KafkaとRabbitMQ、そしてその間でDataを移動させるGlue Codeまで維持する必要がなくなります。
+
+RabbitMQ 4.1のStream改善によって一部のWorkloadではRaw Throughputの差は縮まりましたが、これはほとんどのチームにとって決定要因ではありません。Task Queue Workloadがそもそも1秒あたりのMessage数でBottleneckになることは稀だからです。決定要因はArchitectureの複雑さ、つまり2つのMessaging Systemを持つか1つにするかです。
+
+## それでもRabbitMQ（あるいはSQS）が有利な場面
+
+Share GroupはGapを縮めますが、消し去るわけではありません。以下のPatternは依然として専用Queue Brokerに分があります。
+
+- **優先度付きQueue。** Kafka PartitionにはMessage Priorityという概念がNativeには存在しません。「返金Requestをメール配信より先に処理する」といった要件には、RabbitMQのPriority Queueが自然に合います。Kafkaでこれを実現するには、別のTopicとConsumer側の順序制御を自前で構築することになります。
+- **細かい粒度のPer-message Delay / Scheduling。** RabbitMQのDelayed Message ExchangeやSQSのPer-message Visibility Timeoutは、現時点のKafka Share Group Modelよりも直接的なPrimitiveを提供します。
+- **小規模でQueueのみのWorkloadにおける低い運用負荷。** あるServiceのMessagingの用途が単純なJob Queueだけで、System内の他の場所にEvent Streamingの用途がまったくない場合、Queue Semanticsを得るためだけにKafka Cluster（Managed Serviceであっても）を立てるのは過剰です。Managed SQS Queueや小規模なRabbitMQ Instanceの方が運用は軽くなります。
+- **Application境界での厳密なFIFOとExactly-once保証。** KafkaのExactly-once SemanticsはTransactionを介したKafka to Kafkaの処理内で成立します。異種混在のConsumer PoolでShare Groupへ確認応答する段階になると、At-least-onceと冪等な処理を前提とした設計に戻ります。それ自体は多くの場合問題ありませんが、自明に得られるものではなく、明確な設計判断が必要です。
+
+## 実務的な判断Framework
+
+| 状況 | 推奨 |
+|---|---|
+| すでにEvent用にKafkaを運用しており、Task QueueのためだけにRabbitMQも維持している | Kafka Share Groupへの移行を検討する価値あり。実質的な運用簡素化になる |
+| Message Priorityや細かいDelay Schedulingが必要 | 専用Queue Brokerを維持する |
+| 小規模Service、Queueのみの用途、既存のKafka基盤なし | このためだけにKafkaを導入しない。Managed Queue（SQS等）を使う |
+| 高Throughputなevent streamingに、時折Task Queue的なConsumerが混じる | Kafka Share Groupが適合し、少数派の用途のために第二のSystemを持たずに済む |
+
+## まとめ
+
+- **KIP-932のShare Groupにより、KafkaはEvent Streamだけでなく Point-to-Point Task Queueの正当な選択肢になりました。** これは4.2系での新機能であり、既存挙動の呼び方を変えただけのものではありません。
+- **統合の最も強い根拠はRaw Throughputではなく運用面の複雑さの削減です。** Task Queue Workloadはそもそも Throughputで律速されることはほとんどありません。
+- **優先度、細かいDelay、小規模かつQueue専用のWorkloadは依然として専用Brokerに分があります。** Native機能がまだ揃っていない領域で無理に移行しないでください。
+- **Share Group上でも冪等でAt-least-onceな処理をDefaultの前提とすべきです。** Exactly-onceがタダで手に入ると想定せず、それに合わせてConsumerを設計してください。
