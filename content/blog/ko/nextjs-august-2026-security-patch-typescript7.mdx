@@ -1,0 +1,59 @@
+---
+title: "Next.js 8월 Security Release와 놓치면 안 되는 TypeScript 7 마감 시한"
+description: "Next.js가 이번 달 16.3.3과 15.5.24를 출시하며 Critical Severity 취약점 2건을 수정했습니다. 동시에 15.5 계열은 TypeScript 7을 명시적으로 거부하기 시작했습니다. 무엇을 먼저 Patch해야 하는지, TypeScript 7 준비 상태를 어떻게 점검해야 하는지 정리합니다."
+date: "2026-08-30"
+status: "published"
+tags: ["Next.js", "TypeScript", "Web Security", "React", "Upgrade"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-august-2026-security-patch-typescript7"
+---
+
+## 두 개의 Release, 서로 다른 긴급도
+
+Next.js의 2026년 8월 Security Release는 두 Active Branch 모두를 커버합니다. 16.x 계열용 16.3.3과, 15.x 계열로 Backport된 15.5.24입니다. 둘 다 Critical Severity 취약점 2건을 수정했습니다. Production에서 둘 중 하나의 Major Version을 운영 중이라면, 이번 건은 "여유 있을 때 Patch하면 되는" 건이 아니라 "지금 당장 Patch해야 하는" 건입니다. Request Path 한복판에 위치한 Framework의 Critical Severity는 다음 Deploy Window를 기다리지 말고 그 전에 반영해야 합니다.
+
+별도로, Security Item으로 분류되지 않아 놓치기 쉽지만, 15.5 계열은 이제 TypeScript 7.0 이상을 명시적인 Error로 거부합니다. 반면 16.x 계열은 TypeScript 7을 정식 지원합니다. 이 두 가지 사실은 나란히 놓고 보면 어긋납니다. 15.x에서 CVE를 Patch하면서 동시에 TypeScript 7로 넘어가는 것은, 같은 Major Version 위에서는 양립할 수 없는 목표입니다.
+
+## Step 1: Patch가 먼저, 판단은 그다음
+
+TypeScript 7 검토 때문에 Security Patch를 미루면 안 됩니다. 현재 사용 중인 Major Version에 맞춰 오늘 바로 Patch Release를 적용하세요.
+
+```bash
+# 16.x 계열
+npm install next@16.3.3
+
+# 15.x 계열
+npm install next@15.5.24
+```
+
+Deploy 전에 기존 Test Suite와 핵심 Route에 대한 Smoke Test를 반드시 실행하세요. 이 정도로 핵심적인 Framework의 Patch Release는 Scope 자체는 좁아도, 간혹 Middleware나 Custom Server 설정과의 호환성 문제가 드러나는 경우가 있습니다.
+
+## Step 2: TypeScript 7 준비 상태를 실제로 점검하기
+
+TypeScript 7은 Compiler를 대대적으로 다시 작성한 Release로(Core Logic을 Native Code로 옮겨 속도를 크게 개선), 일부 Diagnostics는 TypeScript 5.x 계열보다 엄격해졌습니다. Migration을 계획하기 전에, 기존 Codebase가 이전 동작 방식에 의존하고 있지는 않은지 먼저 확인해야 합니다.
+
+```bash
+# 현재 Compiler Version 확인
+npx tsc --version
+
+# TS7에서 드러날 가능성이 높은 Diagnostics를 미리 파악하기 위한 Dry Run
+npx tsc --noEmit --strict
+```
+
+`--strict`를 실행했을 때 팀이 아직 검토하지 못한 Error가 대량으로 나온다면, 이는 단순한 Routine Dependency Bump가 아니라 실제 시간을 확보해야 하는 Migration이라는 신호입니다.
+
+## Step 3: Track을 명확하게 정하기
+
+15.x 계열이 TypeScript 7을 적극적으로 차단하기 시작한 만큼, 팀이 택할 수 있는 Track은 크게 두 가지입니다.
+
+- **15.x 계열, TypeScript 5.x 계열 유지.** TypeScript 7 전용 기능에 의존하지 않는다면 단기적으로는 문제없지만, Framework Major와 Compiler Major라는 2단계 Upgrade를 미루고 있을 뿐이며, 미룰수록 부담은 커집니다.
+- **먼저 16.x 계열로 이동한 뒤, TypeScript 7은 자체 일정에 맞춰 도입.** 두 Migration을 분리할 수 있어, Compiler Upgrade를 같은 PR에 묶지 않고도 활발히 개발 중인 Major Version으로 옮겨갈 수 있습니다.
+
+클라이언트 Project에서는 기본적으로 후자를 권장합니다. Framework Version은 옮기면서 팀이 이미 신뢰하는 TypeScript Version은 그대로 유지하면 변경 범위를 Review 가능한 수준으로 유지할 수 있습니다. TypeScript 7 도입은 Framework 이전이 안정된 뒤, 별도의 저Risk 작업으로 분리해서 진행할 수 있습니다.
+
+## 이번 주 클라이언트에게 전달하는 내용
+
+1. 16.3.3 또는 15.5.24로 즉시 Patch합니다. 다른 계획된 작업과 분리해, 평소와 동일하게 Critical Severity Dependency Alert로 취급합니다.
+2. 아직 Migration 계획이 없더라도 `tsc --noEmit --strict`를 지금 실행해, TypeScript 7과의 Gap을 미리 파악된 상태로 만들어 둡니다.
+3. 아직 Next.js 15.x 계열이라면, 16.x 계열 이전을 별도 Scope의 작업으로 계획에 포함시킵니다. 관련 없는 Feature Branch에 섞지 말고, 15.x의 TypeScript 7 거부로 인해 나중에 급하게 Upgrade를 강요당하는 상황도 피해야 합니다.

@@ -1,0 +1,59 @@
+---
+title: "Next.jsの8月Security Releaseと、見過ごせないTypeScript 7の期限"
+description: "Next.jsは今月16.3.3と15.5.24をリリースし、Critical Severityの脆弱性2件を修正しました。同時に15.5系はTypeScript 7を明示的に拒否するようになっています。何を先にPatchすべきか、TypeScript 7への準備状況をどう確認すべきかを整理します。"
+date: "2026-08-30"
+status: "published"
+tags: ["Next.js", "TypeScript", "Web Security", "React", "アップグレード"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-august-2026-security-patch-typescript7"
+---
+
+## 2つのReleaseに、異なる緊急度
+
+Next.jsの2026年8月Security Releaseは両方のActive Branchをカバーしています。16.x系向けの16.3.3と、15.x系へのBackportである15.5.24です。いずれもCritical Severityの脆弱性2件を修正しています。本番環境でどちらかのMajor Versionを稼働させているなら、これは「都合の良いタイミングでPatchする」ものではなく「今すぐPatchする」対象です。Request Pathの中核に位置するFrameworkのCritical Severityは、次のDeploy Windowを待たず、それより前に適用すべきものです。
+
+もう一つ、Security Itemとしては目立たないため見落とされがちですが、15.5系はTypeScript 7.0以上を明示的なErrorとして拒否するようになりました。一方16.x系はTypeScript 7を正式にSupportしています。この2つの事実は並べると噛み合いません。15.xでCVEをPatchしつつ、いずれTypeScript 7へ移行するというのは、同じMajor Version上では両立しないゴールです。
+
+## Step 1: 先にPatch、判断は後で
+
+TypeScript 7の検討でSecurity Patchを遅らせてはいけません。現在のMajor Versionに合わせて、今すぐPatch Releaseを適用してください。
+
+```bash
+# 16.x系の場合
+npm install next@16.3.3
+
+# 15.x系の場合
+npm install next@15.5.24
+```
+
+Deployする前に、既存のTest Suiteと重要なRouteに対するSmoke Testを実施してください。これほど中核的なFrameworkのPatch Releaseでは、Patch自体のScopeが狭くても、稀にMiddlewareやCustom Server Configとの相性問題が表面化することがあります。
+
+## Step 2: TypeScript 7への準備状況を確認する
+
+TypeScript 7はCompilerの大幅な書き換えを伴うRelease（Core LogicをNative Codeへ移行し、大幅な高速化を実現）で、一部のDiagnosticsはTypeScript 5.x系より厳格になっています。移行を計画する前に、既存のCodebaseが旧来の挙動に依存していないかを確認しましょう。
+
+```bash
+# 現在のCompiler Versionを確認
+npx tsc --version
+
+# TS7で顕在化しやすいDiagnosticsを早期に洗い出すためのDry Run
+npx tsc --noEmit --strict
+```
+
+`--strict`を実行した結果、未対応のErrorが大量に出てくるようなら、それはルーティンのDependency Bumpではなく、まとまった時間を確保すべきMigrationだというSignalです。
+
+## Step 3: どちらのTrackを取るか、意図的に選ぶ
+
+15.x系がTypeScript 7を積極的にBlockするようになった以上、チームが取り得るTrackは大きく2つです。
+
+- **15.x系にとどまり、TypeScript 5.x系も維持する。** TypeScript 7限定の機能に依存していなければ短期的には問題ありませんが、Framework MajorとCompiler Majorという2段階のUpgradeを先送りにしているだけで、待つほど負債は大きくなります。
+- **先に16.x系へ移行し、TypeScript 7は自分たちのペースで導入する。** 2つのMigrationを切り離せるため、Compiler Upgradeを同じPRに含めることなく、Active開発中のMajor Versionへ乗り換えられます。
+
+クライアントのProjectでは基本的に後者を推奨しています。Frameworkのバージョンを移行しつつ、Teamがすでに信頼しているTypeScript Versionを維持することで変更範囲をReview可能な粒度に保てます。TypeScript 7の導入は、Framework移行が落ち着いたあとに切り出せる、独立した低Riskの作業になります。
+
+## 今週クライアントに伝えていること
+
+1. 16.3.3または15.5.24へのPatchを即座に実施する。他のPlanned Workとは切り離し、Critical SeverityのDependency Alertとして通常どおり扱う。
+2. まだMigrationの予定がなくても、`tsc --noEmit --strict`を今すぐ実行し、TypeScript 7とのGapを既知の情報にしておく。
+3. まだNext.js 15.x系であれば、16.x系への移行を独立したScopeの作業として計画に組み込む。無関係なFeature Branchに紛れ込ませず、また15.xのTypeScript 7拒否によって後から急いでUpgradeを迫られる事態も避ける。
