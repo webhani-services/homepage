@@ -1,0 +1,59 @@
+---
+title: "Next.js's August Security Release and the TypeScript 7 Deadline You Can't Ignore"
+description: "Next.js shipped 16.3.3 and 15.5.24 this month fixing two critical-severity vulnerabilities, while 15.5 now hard-rejects TypeScript 7. We walk through what to patch first and how to check your project's TypeScript 7 readiness before it becomes a build-blocking surprise."
+date: "2026-08-30"
+status: "published"
+tags: ["Next.js", "TypeScript", "Web Security", "React", "Upgrades"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-august-2026-security-patch-typescript7"
+---
+
+## Two releases, two different urgencies
+
+Next.js's August 2026 security release covers both active branches — 16.3.3 for teams on the 16.x line and 15.5.24 as a backport for anyone still on 15.x — and closes two critical-severity vulnerabilities. If you're running either major version in production, this is a patch-now release, not a patch-when-convenient one. Critical severity on a framework that sits in your request path means the fix should ship ahead of your next planned deploy window, not inside it.
+
+Separately, and easy to miss because it isn't framed as a security item, the 15.5 line now hard-rejects TypeScript ≥ 7.0 with an explicit error rather than a warning, while 16.x has added TypeScript 7 support outright. These two facts sit awkwardly next to each other: patching 15.x for the CVE and eventually moving to TypeScript 7 are not compatible end states on the same major version.
+
+## Step 1: patch first, decide later
+
+Don't let the TypeScript 7 question delay the security patch. Bump to whichever patch release matches your current major version today:
+
+```bash
+# On the 16.x line
+npm install next@16.3.3
+
+# On the 15.x line
+npm install next@15.5.24
+```
+
+Run your existing test suite and a smoke pass against your critical routes before deploying — patch releases on a framework this central occasionally surface incompatibilities with edge-case middleware or custom server configs, even when the patch itself is narrowly scoped.
+
+## Step 2: check where you actually stand on TypeScript 7
+
+TypeScript 7 is a substantial rewrite of the compiler (moving core logic to native code for a significant speed improvement), and its diagnostics are stricter in a few places than TypeScript 5.x. Before you plan a move, find out whether anything in your codebase depends on the older behavior:
+
+```bash
+# See your current compiler version
+npx tsc --version
+
+# Dry-run a stricter check to surface likely TS7 diagnostics early
+npx tsc --noEmit --strict
+```
+
+If `--strict` surfaces a large new batch of errors your team hasn't triaged, that's your signal to budget real time for the migration rather than treating it as a routine dependency bump.
+
+## Step 3: pick your track deliberately
+
+Given that 15.x now actively blocks TypeScript 7, teams fall into one of two reasonable tracks:
+
+- **Stay on 15.x, stay on TypeScript 5.x.** Fine short-term if you're not blocked on TS7-only features, but you're accumulating a two-part upgrade (framework major + compiler major) that only gets larger the longer it waits.
+- **Move to 16.x first, then adopt TypeScript 7 on your own schedule.** This decouples the two migrations — you get onto the actively developed major version without being forced into a compiler upgrade in the same PR.
+
+We generally recommend the second path for client projects: moving the framework major version while staying on a TypeScript version your team already trusts keeps the change set reviewable, and the TypeScript 7 adoption becomes its own dedicated, lower-risk piece of work once the framework move has settled.
+
+## What we tell clients this week
+
+1. Patch to 16.3.3 or 15.5.24 immediately — treat it like any other critical-severity dependency alert, independent of any other planned work.
+2. Run `tsc --noEmit --strict` now, even if you're not migrating yet, so the TypeScript 7 gap is a known quantity instead of a surprise later.
+3. If you're still on Next.js 15.x, start planning the 16.x move as a separate, scoped piece of work — don't let it get bundled with unrelated feature branches, and don't let the TypeScript 7 rejection on 15.x become the thing that forces a rushed upgrade later.

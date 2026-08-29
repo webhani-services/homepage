@@ -1,0 +1,95 @@
+---
+title: "AI AgentにKubernetes Clusterを触らせる前に —— MCP Serverが標準では用意しないGuardrail"
+description: "Red Hatが開発中のOSS版Kubernetes/OpenShift向けMCP Serverは、AI AssistantがClusterを直接操作できるようにします。本番Clusterに組み込む前に、RBAC Scoping、Audit Trail、Blast Radiusの制限を実際どう設計すべきかを解説します。"
+date: "2026-08-30"
+status: "published"
+tags: ["Kubernetes", "MCP", "AI Agent", "DevOps", "Cloud Security"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-mcp-server-ai-agent-guardrails"
+---
+
+## 何が変わったか
+
+Red HatはKubernetesおよびOpenShift向けのOSS MCP (Model Context Protocol) Server Extensionを開発中です。これにより、AI AssistantがCluster内のResource状態を直接Query・Applyし、通常Platform Engineerが`kubectl`経由で行うOperational Taskを実行できるようになります。これはより大きな流れの一部です。MCPはAI AgentをInfrastructure Toolingへ接続する標準手段になりつつあり、Cluster管理はその中でも特に影響が大きい領域です。誤ったCommandのBlast Radiusは、悪いCode提案ではなく本番障害だからです。
+
+これは間違いなく実用的なCapabilityです。「Pod がCrash Loopしている原因をAgentに聞くと、直接Clusterに問い合わせて診断してくれる」というのは、`kubectl describe`の出力をChat Windowに貼り付ける手間と比べて明確な時短になります。しかし、Cluster状態をReadできるMCP ServerはたいていWriteもできます。「AgentにKubeconfigを渡す」というDefault構成は、ほとんどのTaskが必要とする以上のAccessを与えてしまいます。
+
+## よくある失敗パターン
+
+最も多いミスは、Cluster-AdminのKubeconfigをMCP Serverに直接紐づけることです。Demoを最速で動かす方法としては手っ取り早いのですが、Local kind Clusterならまだしも、本番系に触れる構成では許容できません。理由はCI RunnerにCluster-Adminを渡さないのと同じです。便利だからという理由だけでは正当化できません。AgentはCredentialが持つ権限をすべて継承してしまい、依頼するつもりのないTaskに対してもAccessが開いた状態になります。
+
+## Guardrail 1: ServiceAccountをAgentの用途に合わせてScopingする
+
+MCP ServerのIdentity専用のServiceAccountとRBAC Roleを作成してください。Human OperatorのKubeconfigを流用せず、Cluster-Adminも使いません。
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mcp-agent-readonly
+  namespace: production
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mcp-agent-readonly-binding
+  namespace: production
+subjects:
+  - kind: ServiceAccount
+    name: mcp-agent
+roleRef:
+  kind: Role
+  name: mcp-agent-readonly
+  apiGroup: rbac.authorization.k8s.io
+```
+
+まずはRead-Onlyから始めましょう。診断・調査系のTaskだけで、実際にチームが本番Clusterに求めるNeedsの大半をカバーできます。Read-Only Accessであれば、誤ったCommandやHallucinationが発生してもError、あるいは無害な誤結果として終わり、実害には至りません。
+
+## Guardrail 2: Write Accessは独立したRoleに分離し、Namespace単位で明示的に付与する
+
+Deployment再起動やReplica数変更のようにAgentにChangeを許可したい場合は、そのVerbとResourceだけに絞った2つ目のRoleを用意し、必要なNamespaceにだけBindしてください。Agent Identityに対してCluster-wideのWrite Accessを付与してはいけません。Namespace ScopedなRoleBindingであれば、同一のMCP Server InstanceがTechnical にはStaging/Production両方と通信可能でも、Staging Namespaceでのミスが本番へ波及することはありません。
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mcp-agent-restart-only
+  namespace: staging
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "patch"]
+    resourceNames: [] # Task対象が明確な場合は特定のDeploymentへScopeすることを検討
+```
+
+## Guardrail 3: Agentが行うすべてのWriteをAuditする
+
+Kubernetes Audit Loggingは特定のServiceAccountでFilterできます。つまりAgentが実際に何を行ったかを、Human Operatorの操作と切り分けたClean なTrailとして残せます。これはAgentが引き起こした可能性のあるIncidentのDebugにも、AgentのScopeを段階的に拡大していく際の信頼構築にも欠かせません。
+
+```yaml
+# audit-policy.yaml の抜粋
+- level: RequestResponse
+  users: ["system:serviceaccount:production:mcp-agent"]
+  verbs: ["create", "update", "patch", "delete"]
+```
+
+## Guardrail 4: MCP Server自体をAttack Surfaceとして扱う
+
+MCP ServerのProcessはCredentialを保持し、Agentからのすべての呼び出しを仲介します。もしこのProcess自体がCompromiseされたり設定を誤ったりすれば、ServiceAccountのRBAC Scopingが唯一残るControlになります。専用Namespaceで稼働させ、KubernetesのAPI ServerへのEgressのみを許可するNetworkPolicyを適用し、無関係なWorkloadと同じNetwork Segment上には配置しないでください。
+
+## 導入前に推奨すること
+
+- MCPとClusterの連携は必ずRead-Onlyから始め、Confidenceを積みながら1つずつWrite Scopeを追加する。
+- 「動かすため」であっても、Agent IdentityをCluster-Adminに一時的にでもBindしない。最初のDeploymentからScopeを絞る。
+- Write Accessを付与する前に、Agent ServiceAccountに絞ったAudit Loggingを有効化しておく。最初のIncidentが起きてからでは遅い。
+- MCP ServerのBlast Radiusは、経験豊富なSREに与えるAccessではなく、入社1週間目のJunior Engineerに`kubectl` Accessを与える感覚に揃える。
+
+このCapability自体は導入する価値があります。Cluster状態を理解した上でのAI支援は、診断やRoutine Operationを確実に高速化します。Riskは連携そのものではなく、DemoがTaskに不要なAccessを持つKubeconfigで動いてしまったために、RBAC設計を省略してしまうことにあります。
