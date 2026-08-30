@@ -1,0 +1,63 @@
+---
+title: "Bun 1.4의 Rust 재작성, 무엇이 바뀌었나——Migration 전 확인해야 할 3가지"
+description: "Bun 1.4는 Zig에서 Rust로 전면 재작성된 큰 분기점의 Release입니다. 15개의 새로운 Built-in API, 성능 개선, 그리고 놓치기 쉬운 Breaking Change를 실무 관점에서 정리합니다."
+date: "2026-08-31"
+status: "published"
+tags: ["Bun", "JavaScript", "Runtime", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "bun-1-4-rust-rewrite-migration-guide-2026"
+---
+
+Bun 1.4가 Release되었습니다. 이번 Release의 핵심은 기능 추가가 아니라 내부 구현을 Zig에서 Rust로 전면 재작성했다는 점입니다. 이 과정에서 2,900건 이상의 Issue가 해결되었고, Node.js 호환성 Test도 1,500건 이상 새롭게 통과하게 되었습니다. 단순한 Minor Update가 아니라 Runtime의 기반 자체가 바뀐 Release로 다뤄야 합니다.
+
+## 추가된 Built-in API
+
+Bun 1.4에서는 15개의 새로운 Built-in API가 추가되어, 지금까지 npm Package에 의존하던 기능을 표준 기능으로 대체할 수 있게 되었습니다.
+
+- `Bun.WebView` — Headless Browser 제어를 표준 탑재. Puppeteer로 하던 작업 상당수를 추가 Dependency 없이 처리 가능
+- `Bun.Image` — 이미지 Resize 및 변환 처리
+- `Bun.markdown` — Markdown Render
+- `Bun.cron()` — Cron 형식의 Scheduled Job 등록
+- JSON5, JSONL Native Parsing 지원
+
+```typescript
+import { cron } from "bun";
+
+cron.schedule("0 * * * *", () => {
+  console.log("Runs every hour, no external dependency needed");
+});
+```
+
+이런 기능들은 Prototype 단계에서의 편의성뿐 아니라, 운영 환경에서 Dependency를 줄여 Supply Chain Risk를 낮추는 효과도 있습니다.
+
+## 성능 개선
+
+Rust 재작성의 효과는 수치로도 명확히 드러납니다.
+
+- Idle 상태 CPU 사용률 5분의 1로 감소
+- Memory 사용량 최대 35% 감소
+- Linux 기준 시작 속도 50% 향상
+- 새로운 Global Virtual Store 적용 시 Install 속도 최대 7배 향상(Opt-in)
+
+CI 환경에서 Bun을 사용 중이라면 Install 시간 단축이 Pipeline 전체 실행 시간에 직접적으로 영향을 줍니다. 특히 Package 수가 많은 Monorepo 구성이라면 Global Virtual Store 활성화를 검토해볼 가치가 있습니다.
+
+## 놓치기 쉬운 Breaking Change
+
+Migration 전에 반드시 확인해야 할 변경점이 세 가지 있습니다.
+
+1. **TLS 인증서 검증 강화** — 기존에 통과하던 잘못된 인증서 구성이 Reject될 수 있습니다. 사내 Self-signed 인증서를 사용 중이라면 사전 검증이 필요합니다.
+2. **`Bun.YAML`이 YAML 1.2 규격 준수로 변경** — YAML 1.1 특유의 타입 추론(예: `yes`/`no`를 Boolean으로 해석하는 동작)에 의존하던 설정 파일은 Parsing 결과가 달라집니다.
+3. **`bun`을 `node`로 실행할 때 `.env` 자동 로딩 폐지** — `dotenv` 등으로 명시적으로 환경 변수를 로드하도록 Code를 수정해야 합니다.
+
+## Migration 진행 순서
+
+운영 환경을 바로 전환하기보다는 다음 순서를 권장합니다.
+
+1. CI에서 Bun 1.4를 사용하는 Test Job을 병행 운영하며 기존 Test Suite가 통과하는지 확인
+2. YAML 설정 파일과 TLS 관련 연결 처리를 중점적으로 검증
+3. `.env` 자동 로딩에 의존하는 Script를 찾아 명시적 로딩 방식으로 변경
+
+Rust 재작성처럼 근본적인 변화가 있는 Release에서는 새 기능의 이점보다 Breaking Change의 영향 범위를 먼저 파악하는 것이 우선입니다.
+
+**Source**: Bun Blog (bun.com/blog/bun-v1.4)

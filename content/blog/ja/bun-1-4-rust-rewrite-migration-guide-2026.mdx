@@ -1,0 +1,63 @@
+---
+title: "Bun 1.4のRustリライトで何が変わったか——移行前に確認すべき3つのポイント"
+description: "Bun 1.4はZigからRustへの全面書き換えという大きな節目のReleaseです。15個の新しいBuilt-in API、性能改善、そして見落としやすいBreaking Changeを実務目線で整理します。"
+date: "2026-08-31"
+status: "published"
+tags: ["Bun", "JavaScript", "Runtime", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "bun-1-4-rust-rewrite-migration-guide-2026"
+---
+
+Bun 1.4 がリリースされました。今回の目玉は機能追加以上に、内部実装を Zig から Rust へ全面的に書き換えたことです。2,900 件以上の Issue が解消され、Node.js 互換性の Test も 1,500 件以上が新たに通過するようになりました。単なるマイナー更新ではなく、Runtime の土台そのものが変わった Release として扱う必要があります。
+
+## 追加された Built-in API
+
+Bun 1.4 では 15 個の新しい Built-in API が追加され、これまで npm package に頼っていた処理を標準機能で置き換えられるようになりました。代表的なものを挙げます。
+
+- `Bun.WebView` — Headless Browser 操作を標準搭載。Puppeteer 相当の処理を追加 Dependency なしで実行可能
+- `Bun.Image` — 画像の Resize・変換処理
+- `Bun.markdown` — Markdown の Render
+- `Bun.cron()` — Cron 形式のスケジュールジョブ登録
+- JSON5 / JSONL のネイティブ Parse 対応
+
+```typescript
+import { cron } from "bun";
+
+cron.schedule("0 * * * *", () => {
+  console.log("Runs every hour, no external dependency needed");
+});
+```
+
+これらは「動けばよい」という Prototype 段階だけでなく、本番運用でも Dependency を減らせるという点で Supply Chain のリスク低減にも寄与します。
+
+## 性能面の改善
+
+Rust リライトの効果は数値にも表れています。
+
+- Idle 時の CPU 使用率が 5 分の 1 に低減
+- Memory 使用量が最大 35% 削減
+- Linux での起動速度が 50% 向上
+- 新しい Global Virtual Store により Install が最大 7 倍高速化（Opt-in）
+
+CI 環境で Bun を使っている場合、Install 時間の短縮は Pipeline 全体の実行時間に直結します。特に Monorepo で Package 数が多い構成では、Global Virtual Store の有効化を検討する価値があります。
+
+## 見落としやすい Breaking Change
+
+Migration 前に必ず確認すべき変更点が 3 つあります。
+
+1. **TLS 証明書検証が厳格化** — 従来通っていた不正な証明書構成が Reject されるようになりました。社内向け Self-signed 証明書を使っている場合は事前検証が必要です。
+2. **`Bun.YAML` が YAML 1.2 準拠に変更** — YAML 1.1 特有の型推論（例: `yes`/`no` を Boolean として解釈する挙動）に依存した設定ファイルは Parse 結果が変わります。
+3. **`bun` を `node` として起動した場合、`.env` の自動読み込みが廃止** — 明示的に `dotenv` を読み込む Code に変更する必要があります。
+
+## 移行の進め方
+
+いきなり本番 Environment を切り替えるのではなく、以下の順序を推奨します。
+
+1. CI 上で Bun 1.4 を使った Test Job を並行稼働させ、既存の Test Suite が通ることを確認する
+2. YAML 設定ファイルと TLS 関連の接続処理を重点的に検証する
+3. `.env` 読み込みに依存している Script を洗い出し、明示的な読み込みに書き換える
+
+Rust リライトという大きな変更が入った Release では、機能面の恩恵よりもまず Breaking Change の影響範囲を洗い出すことを優先すべきです。
+
+**Source**: Bun Blog (bun.com/blog/bun-v1.4)
