@@ -1,0 +1,63 @@
+---
+title: "Bun 1.4's Rust Rewrite: What Changed and What to Check Before You Upgrade"
+description: "Bun 1.4 rewrites the runtime's internals from Zig to Rust — a bigger milestone than any single feature. Here's what the 15 new built-in APIs, the performance numbers, and the breaking changes mean in practice."
+date: "2026-08-31"
+status: "published"
+tags: ["Bun", "JavaScript", "Runtime", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "bun-1-4-rust-rewrite-migration-guide-2026"
+---
+
+Bun 1.4 is out, and the headline isn't a feature — it's that the runtime's internals were rewritten from Zig to Rust. Over 2,900 issues got resolved along the way, and more than 1,500 additional Node.js compatibility tests now pass. This is a foundational change to the runtime, not a routine point release, and it deserves to be treated that way.
+
+## New built-in APIs
+
+Bun 1.4 ships 15 new built-in APIs that replace functionality teams typically pulled in as npm packages:
+
+- `Bun.WebView` — headless browser automation built in, covering a lot of what you'd normally reach for Puppeteer to do
+- `Bun.Image` — image resizing and format conversion
+- `Bun.markdown` — Markdown rendering
+- `Bun.cron()` — cron-style scheduled jobs
+- Native JSON5 and JSONL parsing
+
+```typescript
+import { cron } from "bun";
+
+cron.schedule("0 * * * *", () => {
+  console.log("Runs every hour, no external dependency needed");
+});
+```
+
+The value here isn't just convenience in prototypes — fewer runtime dependencies means a smaller supply-chain surface in production, too.
+
+## Performance gains
+
+The Rust rewrite shows up directly in the numbers:
+
+- 5x lower idle CPU usage
+- Up to 35% lower memory usage
+- 50% faster startup on Linux
+- Up to 7x faster installs with the new opt-in global virtual store
+
+If your CI runs on Bun, faster installs translate directly into shorter pipeline times. In monorepos with a lot of packages, enabling the global virtual store is worth testing specifically for that reason.
+
+## Breaking changes to check before migrating
+
+Three changes are easy to miss and worth verifying before you flip the switch:
+
+1. **Stricter TLS certificate verification** — certificate configurations that used to pass may now be rejected. If you're relying on internal self-signed certificates, test this explicitly.
+2. **`Bun.YAML` now follows YAML 1.2** — configs that depended on YAML 1.1's type inference (like `yes`/`no` parsing as booleans) will parse differently.
+3. **No more automatic `.env` loading when Bun is invoked as `node`** — you'll need to load environment variables explicitly with `dotenv` or equivalent.
+
+## A sane migration path
+
+Rather than flipping production over directly, we'd recommend:
+
+1. Run Bun 1.4 as a parallel CI job first and confirm your existing test suite still passes
+2. Specifically re-test YAML config parsing and any TLS-dependent connections
+3. Audit scripts relying on implicit `.env` loading and switch them to explicit loading
+
+For a release with a change this foundational, mapping the blast radius of the breaking changes should come before enjoying the new features.
+
+**Source**: Bun Blog (bun.com/blog/bun-v1.4)
