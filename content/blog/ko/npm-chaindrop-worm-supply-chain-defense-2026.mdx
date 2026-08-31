@@ -1,0 +1,207 @@
+---
+title: "npm의 자기 복제 웜 'CHAINDROP': 2026년 8월 대규모 공급망 침해와 대응"
+description: "keyv 라이브러리 침해로 시작된 434개 이상의 npm 패키지 손상. preinstall 스크립트를 악용한 자기 복제형 웜의 메커니즘과 즉시 적용할 수 있는 방어 전략을 정리합니다."
+date: "2026-09-01"
+status: "published"
+tags: ["보안", "npm", "공급망공격", "DevSecOps", "의존성관리"]
+thumbnail: ""
+author: "webhani"
+slug: "npm-chaindrop-worm-supply-chain-defense-2026"
+---
+
+2026년 8월 4일, 보안 연구기관들(Elastic Security Labs, Microsoft Security, Wiz, Snyk, Datadog 등)이 새로운 npm 자기 복제형 웜을 보고했습니다. "CHAINDROP"이라 불리는 이 공격은 Shai-Hulud 웜 계열의 두 번째 파동이며, 앞선 TanStack Router 사건과는 별개의 훨씬 더 큰 규모의 침해입니다.
+
+## 침해의 규모
+
+**keyv** (key-value 스토리지 라이브러리)의 메인테이너 계정이 침해되면서, 같은 관리 권한을 가진 관련 패키지들이 차례로 손상되었습니다:
+
+- keyv (월 600M 다운로드)
+- flat-cache (월 580M)
+- cacheable-request (월 137M)
+- cacheable (월 30M)
+- cache-manager (월 16M)
+- 그 외 다수
+
+**보고 시점 기준 434개 이상의 패키지, 1,381개 버전이 침해되었으며, 월간 다운로드 규모는 20억을 초과합니다.** 이들은 npm 에코시스템 전체에 깊게 embedded된 transitive dependency들이기 때문에, 직접 의존하지 않는 프로젝트도 영향을 받을 수 있습니다.
+
+## 공격 메커니즘
+
+공격은 npm의 `preinstall` 라이프사이클 훅을 악용합니다:
+
+1. 패키지 설치 시 npm은 자동으로 라이프사이클 스크립트(`preinstall`, `postinstall` 등)를 실행
+2. 악성 코드가 난독화된 loader로 preinstall 훅에 삽입됨
+3. loader가 2차 payload를 다운로드하고 실행
+4. 개발 머신이나 CI 환경의 인증 정보 탈취:
+   - npm publish 토큰
+   - AWS/GCP/Azure 자격 증명
+   - CI/CD 시크릿
+   - IDE 통합 토큰
+   - SSH 키
+5. **여기서 "웜" 부분: 탈취된 npm publish 자격 증명을 사용하여 피해자가 관리하는 다른 패키지를 자동으로 침해 → 자기 복제 확산**
+
+한 명의 메인테이너가 침해되면 그들의 전체 패키지 포트폴리오가 공격 벡터가 됩니다. 공격자가 각각을 개별적으로 침해할 필요가 없습니다. 피해자가 자동으로 해주기 때문입니다.
+
+## 즉시 취해야 할 대응
+
+### 1. package-lock.json 감사
+
+먼저 프로젝트가 침해된 버전을 받았는지 확인합니다:
+
+```bash
+#!/bin/bash
+# check-npm-compromise.sh
+# package-lock.json에서 침해된 패키지 검색
+
+COMPROMISED=(
+  "keyv"
+  "flat-cache"
+  "cacheable-request"
+  "cacheable"
+  "cache-manager"
+)
+
+echo "CHAINDROP 침해 패키지 검색 중..."
+
+for pkg in "${COMPROMISED[@]}"; do
+  if grep -q "\"$pkg\":" package-lock.json 2>/dev/null; then
+    echo ""
+    echo "발견: $pkg"
+    sed -n "/\"$pkg\":/,/\"version\":/p" package-lock.json | head -5
+  fi
+done
+
+# 실시간 체크 (npm list)
+echo ""
+echo "설치된 패키지 확인:"
+npm list 2>/dev/null | grep -E "(keyv|flat-cache|cacheable|cache-manager)" || echo "침해 패키지 미발견 (양호)"
+```
+
+lockfile에서 이들 패키지를 발견했다면, 패치된 버전이 출시될 때까지 새로 `npm install`을 실행하지 마세요.
+
+### 2. 모든 인증 정보 즉시 교체
+
+침해된 버전을 설치한 모든 환경에서:
+
+```bash
+# npm 토큰 폐기 및 새로 발급
+npm logout
+npm login
+
+# 기존 .npmrc 제거
+rm ~/.npmrc
+cat > ~/.npmrc <<EOF
+//registry.npmjs.org/:_authToken=${NEW_NPM_TOKEN}
+EOF
+
+# CI 환경의 모든 시크릿 교체
+# GitHub: Settings → Secrets and variables → Actions
+# AWS: IAM → Users → Security credentials (기존 삭제, 신규 생성)
+# GCP: Console → Service Accounts
+```
+
+클라우드 제공자의 감사 로그에서 비정상 접근을 확인하세요:
+
+```bash
+# AWS CloudTrail 예시
+aws cloudtrail lookup-events \
+  --start-time 2026-08-01 \
+  --end-time 2026-08-05 \
+  --query 'Events[?errorCode != null]'
+```
+
+### 3. install 스크립트를 기본값으로 비활성화
+
+핵심 문제는 npm이 설치 중 임의 코드를 실행한다는 점입니다:
+
+```bash
+# 개발 머신 전역 설정
+npm config set ignore-scripts true
+
+# 또는 ~/.npmrc에 추가
+echo "ignore-scripts=true" >> ~/.npmrc
+
+# CI/CD 파이프라인 (GitHub Actions)
+- name: 스크립트 실행 비활성화 상태로 설치
+  run: npm install --ignore-scripts
+
+# 신뢰할 수 있는 빌드 스크립트만 명시적으로 실행
+- name: 애플리케이션 빌드
+  run: npm run build
+```
+
+**주의**: native module을 컴파일하는 패키지(`node-gyp` 등)에 의존하는 경우, 신뢰할 수 있는 패키지의 스크립트만 화이트리스트로 허용할 수 있습니다:
+
+```bash
+npm install --ignore-scripts
+# 이후 선별된 패키지만 빌드 실행
+```
+
+### 4. CI에 Lockfile 무결성 검사 추가
+
+CI 중에 lockfile이 예상치 못하게 변경되는 것을 방지합니다:
+
+```yaml
+# GitHub Actions
+- name: Lockfile 무결성 검증
+  run: |
+    npm ci --prefer-offline --no-audit
+    if git diff --exit-code package-lock.json; then
+      echo "✓ Lockfile 변경 없음"
+    else
+      echo "✗ npm이 설치 중 lockfile을 수정했습니다"
+      exit 1
+    fi
+```
+
+### 5. CI에 npm audit 통합
+
+모든 빌드에서 보안 스캔을 실행합니다:
+
+```yaml
+- name: 취약점 감사
+  run: npm audit --audit-level=high
+
+# 또는 더 엄격한 검사를 위해 Snyk 사용
+- name: Snyk 보안 스캔
+  uses: snyk/actions/node@master
+  env:
+    SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+```
+
+### 6. Dependabot 또는 Snyk로 지속적 모니터링
+
+자동 의존성 스캔이 문제를 미리 감지합니다:
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "security-team"
+```
+
+## 대응 체크리스트
+
+| 우선순위 | 조치 | 소요시간 |
+|---------|------|--------|
+| 즉시 | package-lock.json에서 침해 패키지 확인 | 5분 |
+| 즉시 | npm/클라우드 인증 정보 교체 | 15분 |
+| 단기 | CI에 `--ignore-scripts` 추가 | 10분 |
+| 단기 | CI에 lockfile 무결성 검사 추가 | 15분 |
+| 지속 | CI 파이프라인에 `npm audit` 추가 | 5분 |
+| 지속 | Dependabot 활성화 | 10분 |
+
+모든 조치를 합쳐도 1시간 이내에 완료할 수 있으며, 이번 사건에서 관찰된 가장 일반적인 공격 벡터를 효과적으로 차단합니다.
+
+## webhani의 평가
+
+CHAINDROP은 npm 에코시스템의 구조적 취약점을 명확히 드러냈습니다. 단 한 명의 메인테이너 계정 침해가 월 20억 다운로드 이상에 달하는 패키지 군을 제어할 수 있다는 현실입니다.
+
+특히 위험한 것은 `preinstall` 스크립트의 무제한 실행입니다. 개발자도 모르는 사이에 신뢰한다고 생각했던 패키지에서 임의 코드가 실행됩니다. 이 구조 자체가 바뀌기 전까지, npm 커뮤니티 전체는 항상 "감염" 위험에 노출되어 있습니다.
+
+webhani는 Node.js 프로젝트의 의존성 감사와 보안 CI/CD 구축을 지원합니다. 먼저 `ignore-scripts` 플래그 도입과 lockfile 무결성 검사부터 시작할 것을 권장합니다.
