@@ -1,0 +1,208 @@
+---
+title: "The npm CHAINDROP Worm: August 2026's Self-Propagating Supply Chain Attack"
+description: "434+ npm packages compromised through a self-propagating worm that exploits preinstall scripts to steal credentials. What CHAINDROP reveals about npm security and how to defend."
+date: "2026-09-01"
+status: "published"
+tags: ["Security", "npm", "Supply Chain", "DevSecOps", "Dependencies"]
+thumbnail: ""
+author: "webhani"
+slug: "npm-chaindrop-worm-supply-chain-defense-2026"
+---
+
+On August 4, 2026, security researchers including Elastic Security Labs, Microsoft Security, Wiz, and others disclosed a large-scale npm supply chain attack. Dubbed "CHAINDROP," it represents a second, far larger wave of the Shai-Hulud worm family—distinct from earlier 2026 incidents like the TanStack Router compromise.
+
+## The Attack's Scope
+
+The maintainer account for **keyv**, a widely-used key-value storage library, was compromised. From there, attackers trojanized other packages in the same monorepo where the attacker had publish rights: `flat-cache`, `cacheable-request`, `cacheable`, `cache-manager`, and others.
+
+**At disclosure: 434+ packages across 1,381 versions confirmed compromised, with combined monthly downloads exceeding 2 billion:**
+
+- keyv: ~600M downloads/month
+- flat-cache: ~580M
+- cacheable-request: ~137M
+- cacheable: ~30M
+- cache-manager: ~16M
+
+These are deep transitive dependencies. Most projects don't directly depend on them, but they're buried inside the dependency trees of thousands of packages. A single compromised library can reach millions of developers.
+
+## How the Worm Works
+
+The attack leverages npm's lifecycle hooks, specifically the `preinstall` script:
+
+1. When npm installs a package, it automatically executes lifecycle scripts (preinstall, postinstall, etc.) before any application code runs.
+2. The malicious package embeds an obfuscated loader in its preinstall hook.
+3. That loader downloads and executes a second-stage payload.
+4. The payload searches the compromised machine for credentials:
+   - npm publish tokens
+   - AWS/GCP/Azure credentials
+   - CI/CD environment secrets
+   - IDE integration tokens
+   - SSH keys
+5. **This is the "worm" part: stolen npm publish credentials are automatically used to backdoor other packages the victim maintains, propagating the attack further.**
+
+Once one maintainer is compromised, their entire portfolio of packages becomes an attack vector. The attacker doesn't need to compromise each one individually—the victims do the work automatically.
+
+## Immediate Response: A Practical Checklist
+
+### 1. Audit Your Lockfile
+
+The first step is determining whether your project has pulled in a compromised version. Use this script:
+
+```bash
+#!/bin/bash
+# check-npm-compromise.sh
+# Scans package-lock.json for known compromised packages
+
+COMPROMISED=(
+  "keyv"
+  "flat-cache"
+  "cacheable-request"
+  "cacheable"
+  "cache-manager"
+)
+
+echo "Scanning package-lock.json for CHAINDROP-compromised packages..."
+
+for pkg in "${COMPROMISED[@]}"; do
+  if grep -q "\"$pkg\":" package-lock.json 2>/dev/null; then
+    echo ""
+    echo "FOUND: $pkg"
+    # Extract version and resolved URL for inspection
+    sed -n "/\"$pkg\":/,/\"version\":/p" package-lock.json | head -5
+  fi
+done
+
+# Alternative: use npm list for a live check
+echo ""
+echo "Runtime check (npm list):"
+npm list 2>/dev/null | grep -E "(keyv|flat-cache|cacheable|cache-manager)" || echo "None found (good sign)"
+```
+
+If you find these packages in your lockfile, stop pulling new installations until patched versions are released. Do not run `npm install` on a fresh clone.
+
+### 2. Rotate All Credentials
+
+Assume any machine that installed a compromised version is exposed:
+
+```bash
+# Revoke old npm token and generate new one
+npm logout
+npm login
+
+# Explicitly remove old .npmrc entries
+rm ~/.npmrc
+cat > ~/.npmrc <<EOF
+//registry.npmjs.org/:_authToken=${NPM_NEW_TOKEN}
+EOF
+
+# For CI systems, rotate all secrets
+# GitHub: Settings → Secrets and variables → Actions
+# AWS: IAM → Users → Security credentials → Delete old, create new
+# GCP: Console → Service Accounts → Delete, re-create with fresh key
+```
+
+Check your cloud provider's audit logs for unauthorized access during the compromise window:
+
+```bash
+# AWS CloudTrail example
+aws cloudtrail lookup-events \
+  --start-time 2026-08-01 \
+  --end-time 2026-08-05 \
+  --query 'Events[?errorCode != null]'
+```
+
+### 3. Disable Install Scripts by Default
+
+The core problem is npm running arbitrary code during install. Disable it:
+
+```bash
+# Global config — your development machine
+npm config set ignore-scripts true
+
+# Or in your ~/.npmrc
+echo "ignore-scripts=true" >> ~/.npmrc
+
+# For CI/CD pipelines (GitHub Actions example)
+- name: Install with script execution disabled
+  run: npm install --ignore-scripts
+
+# Only run build scripts for specific, trusted packages
+- name: Build application
+  run: npm run build
+```
+
+**Note:** If your project depends on packages that compile native modules (like `node-gyp`), you'll need a more nuanced approach. Consider running build scripts only for a whitelist of trusted packages:
+
+```bash
+# Alternative: allow scripts for specific packages only
+npm config set optional-packages "sharp,sqlite3"
+npm install --ignore-scripts
+```
+
+### 4. Add Lockfile Integrity Checks to CI
+
+Prevent unexpected changes to your lockfile during CI:
+
+```yaml
+# GitHub Actions
+- name: Verify lockfile integrity
+  run: |
+    npm ci --prefer-offline --no-audit
+    if git diff --exit-code package-lock.json; then
+      echo "✓ Lockfile unchanged"
+    else
+      echo "✗ npm modified the lockfile during install"
+      exit 1
+    fi
+```
+
+This catches cases where a compromised package might attempt to inject dependencies.
+
+### 5. Run npm audit in CI
+
+Add security scanning to every build:
+
+```yaml
+- name: Audit for vulnerabilities
+  run: npm audit --audit-level=high
+
+# Or use a third-party action for stricter enforcement
+- name: Snyk security scan
+  uses: snyk/actions/node@master
+  env:
+    SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+```
+
+### 6. Enable Dependabot or Snyk Continuous Monitoring
+
+Automatic dependency scanning catches issues before you manually pull them in:
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "security-team"
+```
+
+## Summary: Defense in Layers
+
+CHAINDROP exposes a hard structural reality: npm's `preinstall` hook is a universal backdoor if any package is compromised. No single fix eliminates the risk, but layered defenses make exploitation much harder:
+
+| Layer | Action | Effort |
+|-------|--------|--------|
+| Immediate | Audit lockfile for known packages | 5 min |
+| Immediate | Rotate npm/cloud credentials | 15 min |
+| Short-term | Enable `--ignore-scripts` in CI | 10 min |
+| Short-term | Add lockfile integrity check to CI | 15 min |
+| Ongoing | Add `npm audit` to CI pipeline | 5 min |
+| Ongoing | Enable Dependabot for continuous monitoring | 10 min |
+
+Collectively, these steps take under an hour to implement and eliminate the most common attack vectors observed in this incident.
+
+The ecosystem problem—that a single compromised maintainer can reach 2 billion monthly downloads—requires a larger conversation about package governance, npm's role, and ecosystem health. But until that changes, these defenses are essential.

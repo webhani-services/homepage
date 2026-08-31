@@ -1,0 +1,239 @@
+---
+title: "LLM API Token予算の管理：APIゲートウェイレイヤーで実装する仕組み"
+description: "Google CloudのApigeeなど、APIゲートウェイがToken Quota管理に対応し始めました。本番環境でOpenAI、Anthropic、Gemini APIの予期しない高額請求やService Degradationを防ぐために、ゲートウェイレイヤーで実装すべき Token制御の設計を解説します。"
+date: "2026-09-01"
+status: "published"
+tags: ["API Gateway", "LLM", "Cost Governance", "Production Engineering", "API Management"]
+thumbnail: ""
+author: "webhani"
+slug: "llm-api-token-quota-governance-2026"
+---
+
+APIゲートウェイの役割が変わり始めています。かつてはRate Limitとレイテンシ管理の領域でしたが、LLMが本番システムに組み込まれるようになり、新しい制御が必要になってきました。Token消費量のガバナンスです。
+
+Google CloudがApigee AI Horizonイベント（2026年9月1日、ロンドン開催）で発表した内容に象徴されるように、Token Quota管理はもはやアプリケーション層だけの問題ではなく、インフラストラクチャレイヤーで扱うべき問題になっています。理由は単純です。ユーザー、バグ、あるいは悪意のある呼び出し元が、一度のAPI呼び出しで数百万Tokenを消費し、瞬時に月額予算を枯渇させることができるからです。
+
+## Token制御がアプリケーション層に留まるリスク
+
+多くのチームは現在、Token制限をアプリケーションコードに埋め込んでいます。ユーザー1人あたりの月次予算をDatabaseに記録し、呼び出しごとにチェック。一見合理的ですが、いくつかの問題があります。
+
+**問題1：実装の分散** — Microserviceベースの環境では、複数のBackend Serviceがそれぞれ独立してLLM APIを呼び出します。各Serviceがその予算チェックロジックを個別に実装していれば、コードの重複も多く、1つの実装が違っていれば全体のガバナンスが崩れます。
+
+**問題2：リアルタイム性** — アプリケーションが予算をチェックしている間に、別のServiceから同じユーザーによるAPI呼び出しが発生すると、どちらも「まだ予算がある」と判定してしまう可能性があります。Race Conditionです。
+
+**問題3：遅延制御** — Applicationが予算超過を検出するのは、すでにToken消費が確定した後です。その時点で既にLLM APIへの課金が発生しており、止められません。
+
+ゲートウェイレイヤーに制御を移すとこれらが解決します。
+
+## ゲートウェイレイヤーの2つの役割：Metering と Enforcement
+
+APIゲートウェイが提供する仕組みは、大きく2つに分かれます。
+
+**Metering（計測）** — Responseを受け取った後、実際に消費されたTokenをカウントし、Analyticsデータベースに記録します。これは課金やUsage Reportの基礎です。Application層では参考情報として使えますが、Gatekeeper的には後付けです。
+
+**Enforcement（強制）** — Request前または Requestフロー中に、ユーザーまたはAPI Keyの残り予算をチェックし、予算超過であれば `HTTP 429 Too Many Requests` を返して即座に呼び出しをブロックします。Backend LLM APIへのCallを未然に防ぐことができます。
+
+実装としては、Enforcement Policyを Request Flowに、Metering Policyを Response Flowに配置するのが標準的です。
+
+## Token予算の3層設計
+
+Token制限を効果的に実装するには、複数のGranularityで制御を重ねます。
+
+**層1：User/Subscriber Level** — 個々のEnd Userまたはサブスクリプションごとの月間Token Budget。最も基本的な層です。
+
+**層2：API Product Level** — チームが複数のAPI Product（例：Chatbot Service、Content Generation Service）を提供しており、それぞれ異なる利用パターンを持つ場合、Product単位でToken割り当てを区分します。
+
+**層3：Request-level Throttle** — 単一のRequest内で消費されるTokenの上限を設定します。これは悪意あるユーザーが一度の呼び出しで数百万Token使ってしまう攻撃を防ぎます。
+
+実装では、これら3層すべてをチェックし、いずれかの予算が不足していれば拒否する仕組みにします。
+
+## Node.jsミドルウェアでの実装例
+
+実際のゲートウェイ（NginxやKong、AWS API Gateway等）には高度なToken管理Policyが備わっていますが、理解を深めるため、Node.jsミドルウェアで簡潔なToken Quota制御を実装してみましょう。
+
+```typescript
+// tokenQuotaMiddleware.ts
+import { Request, Response, NextFunction } from 'express';
+
+interface TokenBudget {
+  userId: string;
+  monthlyLimit: number;
+  currentMonth: string; // YYYY-MM
+  tokensConsumed: number;
+}
+
+interface RequestQuotaLimit {
+  requestTokenLimit: number; // 1回のリクエストで許可する最大Token数
+}
+
+// In-memory Store（本番はRedisやDatabaseを使用）
+const budgetStore: Map<string, TokenBudget> = new Map();
+const quotaLimits: Map<string, RequestQuotaLimit> = new Map();
+
+// 現在の月を取得
+function getCurrentMonth(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+}
+
+// ユーザーの予算状況を取得（月初は自動リセット）
+function getUserBudget(userId: string): TokenBudget {
+  const key = userId;
+  let budget = budgetStore.get(key);
+  const currentMonth = getCurrentMonth();
+
+  if (!budget || budget.currentMonth !== currentMonth) {
+    // 新しい月なのでリセット
+    budget = {
+      userId,
+      monthlyLimit: 100_000, // デフォルト月間100k Token
+      currentMonth,
+      tokensConsumed: 0,
+    };
+    budgetStore.set(key, budget);
+  }
+
+  return budget;
+}
+
+// 単一リクエストあたりの上限を取得
+function getRequestLimit(userId: string): RequestQuotaLimit {
+  return quotaLimits.get(userId) || {
+    requestTokenLimit: 10_000, // デフォルト: 1リクエスト最大10k Token
+  };
+}
+
+// Token予算チェック＆確保
+function reserveTokenBudget(userId: string, estimatedTokens: number): boolean {
+  const budget = getUserBudget(userId);
+  const remaining = budget.monthlyLimit - budget.tokensConsumed;
+
+  // 月間予算チェック
+  if (remaining < estimatedTokens) {
+    return false;
+  }
+
+  // リクエストレベルの上限チェック
+  const requestLimit = getRequestLimit(userId);
+  if (estimatedTokens > requestLimit.requestTokenLimit) {
+    return false;
+  }
+
+  // 予算を確保（実際のToken消費はレスポンス後に確定するが、ここでは予約）
+  budget.tokensConsumed += estimatedTokens;
+  return true;
+}
+
+// レスポンス後、実消費したToken数で予算を更新
+function updateTokenConsumption(userId: string, actualTokens: number): void {
+  const budget = getUserBudget(userId);
+  // 予約時の推定値から実値への調整
+  budget.tokensConsumed = Math.max(0, budget.tokensConsumed - 1 + actualTokens);
+}
+
+export function tokenQuotaMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction
+) {
+  const userId = req.headers['x-user-id'] as string;
+
+  if (!userId) {
+    return res.status(401).json({ error: 'Missing x-user-id header' });
+  }
+
+  // リクエストボディからToken推定値を抽出
+  // 例：ChatGPT APIの場合、User Promptの長さから粗く推定
+  const estimatedInputTokens = estimateTokens(req.body.messages || []);
+
+  // 予算確保が失敗した場合
+  if (!reserveTokenBudget(userId, estimatedInputTokens)) {
+    const budget = getUserBudget(userId);
+    const remaining = budget.monthlyLimit - budget.tokensConsumed;
+
+    return res.status(429).json({
+      error: 'Token quota exceeded',
+      details: {
+        monthlyLimit: budget.monthlyLimit,
+        tokensConsumed: budget.tokensConsumed,
+        remaining,
+        message: `You have ${remaining} tokens remaining this month.`,
+      },
+    });
+  }
+
+  // Token使用量をリクエストにアタッチ
+  (req as any).userId = userId;
+  (req as any).estimatedTokens = estimatedInputTokens;
+
+  // LLM APIレスポンス後、実際のToken消費を記録する
+  const originalJson = res.json.bind(res);
+  res.json = function (data: any) {
+    if (data.usage) {
+      // OpenAI、Anthropicなどのレスポンスはusageフィールドにtoken情報を含む
+      const actualTokens = data.usage.total_tokens || 0;
+      updateTokenConsumption(userId, actualTokens);
+
+      // Analytics/Billing用にログ
+      console.log({
+        event: 'token_consumed',
+        userId,
+        estimated: (req as any).estimatedTokens,
+        actual: actualTokens,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    return originalJson(data);
+  };
+
+  next();
+}
+
+// 簡易的なToken推定（本来はより正確なTokenizerを使用）
+function estimateTokens(messages: any[]): number {
+  let total = 0;
+  for (const msg of messages) {
+    total += Math.ceil((msg.content?.length || 0) / 4); // 粗い推定
+  }
+  return total;
+}
+```
+
+このミドルウェアの特徴：
+
+1. **Request前チェック** — LLM APIに呼び出しが到達する前に予算をチェック
+2. **月間予算管理** — 月初に自動リセット
+3. **単一リクエスト制限** — 過度なToken消費の一度の呼び出しを防止
+4. **レスポンス記録** — 実際のToken消費をLogging
+
+本番運用では、このStore部分をRedis（Cluster下でもAtomicな操作が可能）またはDatabaseに置き換え、複数サーバー間での予算共有を実現します。
+
+## アプリケーション層との役割分担
+
+ゲートウェイレイヤーが `Enforcement` の責務を持つなら、アプリケーション層は何をするのか。
+
+**1. Graceful Degradation** — Token Budget Exhaustedになった場合、APIゲートウェイからの429を受け取ったアプリケーションは、キャッシュ結果の返却、簡易版の応答、あるいはユーザーへの分かりやすいメッセージを用意します。
+
+**2. Usage Alert** — 月間予算の80%に達したら、ユーザーまたは管理者にAlert を送信するのはアプリケーションの責務です。
+
+**3. Cost Optimization** — キャッシング、Prompt Engineering（より短いPromptで同等の結果を得る）、Model選択（安価なModelで十分か検証）など、Tokenの効率的な使用法はアプリケーション層の工夫です。
+
+## 実運用のチェックリスト
+
+Token Quota制御を本番稼働させる前に：
+
+- [ ] ゲートウェイレイヤーにToken Enforcement Policyを配置し、Request前に予算チェック
+- [ ] 月間、Product、Request の3層のQuotaを設定
+- [ ] 予算超過時は `HTTP 429` を返す
+- [ ] 実消費Token数をMetricsとして記録し、Billing/Analytics に連携
+- [ ] ユーザーが自分の残りToken数を照会できるEndpointを用意
+- [ ] 月間予算の80%時点でAlert 通知を送信
+- [ ] キャッシュやPrompt最適化など、Application層での効率化も実施
+- [ ] 本番前に、悪意あるユーザーによる大量Token消費のシミュレーション テストを実施
+
+## まとめ
+
+LLM APIの予期しない高額請求は、もはや例外ではなく、多くの本番環境で起きている現実です。ユーザー1人の意図しないバグ、あるいは一度のPrompt Injectionが、月額数千ドルの損失につながることもあります。
+
+APIゲートウェイレイヤーでToken Quota制御を実装することで、この損失を未然に防げます。Application層に頼るのではなく、インフラストラクチャとして一元管理された制御が、シンプルで堅牢な運用を実現します。
