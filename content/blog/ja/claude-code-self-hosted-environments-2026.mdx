@@ -1,0 +1,68 @@
+---
+title: "Claude Codeのセルフホスト実行環境 — 社内に残るのは「実行」だけ、という話"
+description: "Claude CodeのCloud Sessionを自社インフラで実行できるSelf-Hosted Environmentsが公開Betaになりました。実行のSelf-HostingとInferenceのSelf-Hostingは別物です。導入前に押さえておきたい違いを整理します。"
+date: "2026-09-02"
+status: "published"
+tags: ["Claude Code", "エンタープライズ", "セキュリティ", "DevOps", "AIコーディング"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-self-hosted-environments-2026"
+---
+
+## 新しい選択肢であって、新しい製品ではない
+
+Anthropicが最近、Claude CodeのSelf-Hosted Environmentsを公開Betaとして公開しました。要点を一言でいうと、Web・モバイル・デスクトップ・ターミナル・スケジュール実行のいずれから起動したCloud Sessionでも、実際の実行部分を自社で用意したインフラ上で、自社ネットワークの中で走らせられるようになった、ということです。従来はAnthropicのCloud Compute上で実行されていました。
+
+エンタープライズの実コードベースにAgentic Codingツールを向けるのを躊躇していた企業にとっては、意味のある変化です。ただ、見出しだけで理解すると誤解しやすい機能でもあります。この記事では、この機能が実際に何を動かすのか、そして同じくらい重要な「何を動かさないのか」を整理します。顧客とこの話をすると、後者を見落としたまま導入を検討しているケースをよく見かけるためです。
+
+## 通常のCloud Sessionと何が変わるのか
+
+これまでのデフォルト設定では、ターミナル以外（Web、スケジュール実行など）からClaude Codeのセッションを起動すると、リポジトリのCheckout、Buildの実行、Testの実行、ファイルの作成・変更といった作業がAnthropicの管理するCompute上で行われていました。便利ではありますが、リポジトリのCheckoutやBuild成果物、SessionがアクセスするSecret、作成・変更されるファイルは、すべて自社の境界の外側にあるインフラを経由することになります。
+
+Self-Hosted Environmentsを有効にすると、この実行部分が自社が所有・運用するマシン上、つまり自社ネットワークの内側に移ります。SessionはVPN、Firewall、社内CA、Endpoint監視といった既存のセキュリティ管理の内側に、外から訪れるゲストではなく自社環境の一部として置かれることになります。
+
+現時点ではClaude TeamおよびEnterpriseプランの組織が対象で、デフォルトではOffになっています。組織管理者が明示的にOnにする必要があります。
+
+## 一番大事な区別: 実行のSelf-Hosting ≠ InferenceのSelf-Hosting
+
+導入を検討する前に理解しておいてほしいポイントがここです。これはSelf-Hosted「実行」であって、Self-Hosted「Inference」ではありません。
+
+Self-Hosted実行が意味するのは、「実際に手を動かす部分」——リポジトリのClone、Testの実行、社内ファイルシステムへのアクセス、Build用Secretのメモリ上での保持——が自社インフラで行われる、ということです。
+
+一方で、「Model自体」が自社インフラで動くわけではありません。送信したPrompt、Modelの返答、Tool呼び出しの結果、Session Transcriptは引き続きAnthropicに送られます。Inferenceが実際に行われるのはAnthropic側だからです。さらにAnthropicはこのTranscriptを保持する設計になっています。これは、ノートPCで始めたSessionを後からWeb UIやチームメンバーのターミナルから続けられるようにするためです。
+
+つまり、コードそのものとSecretは社内に留まりますが、「コードについての会話」——Modelが推論するために必要なコードの断片、Tool出力、Context内に入るその他の情報——は、Model呼び出しのたびに自社ネットワークを出てAnthropicのServerに届きます。
+
+顧客のCompliance要件が「コードの成果物を社外に出さない」であれば、Self-Hosted実行は確かに有効です。しかし「自社コードベースに関するあらゆる情報を第三者に一切触れさせない」という要件であれば、この機能だけでは満たせません。これは現状どのCloud LLM製品でも同じで、Self-Hosted Environmentsも例外ではありません。この点は導入検討の場で見落とされがちなので、最初に伝えるようにしています。
+
+## 実務で効いてくる場面
+
+顧客対応で実際によく出会う、ネットワーク管理がしっかりしている大企業でのシナリオを挙げます。
+
+- **社内Package Registry**: 社内ネットワークからしかアクセスできないArtifactoryやNexusから依存関係を解決するBuildは、外部のCloud Compute上では成立しません。Self-Hosted実行なら、そのRegistryに実際に到達できる場所でBuildを回せます。
+- **VPN限定の社内API**: 認証Service、Legacy SOAP Endpoint、社内管理APIなど、公開Internetに出ていないServiceを呼ぶIntegration TestやScriptは、そのネットワークにアクセスできる場所で実行する必要があります。ここがまさに埋まる部分です。
+- **社外に出せないSecret**: Build時に使うDatabase資格情報、署名Key、Service AccountのTokenなどを外部Computeに置かないことで、露出リスクの一つのカテゴリを実際に減らせます。これはInferenceの話とは別の論点です。
+- **データの処理場所に規制がある業界**: 金融、医療、公共部門の顧客では、最終的な出力自体が機密でなくとも「どこでコードやBuildを処理したか」に社内規定がある場合が少なくありません。Self-Hosted実行は、実行レイヤーについては「どこで動いたか」に明確な答えを出せますが、Inferenceレイヤーについては完全な答えにはなりません。
+
+## 有効化のイメージ（概念レベル）
+
+正確なFlagやConfigの記法をここで示すことはしません。Betaの間に変わる可能性もあり、正式なDocumentが一次情報です。ただ、概念としては次の2つの決定に分かれます。
+
+1. TeamまたはEnterpriseプランの組織管理者が、組織単位でBetaに参加し、Self-Hosted Environmentsを有効化する。
+2. インフラへのアクセス権を持つ担当者が、Claude Codeのセッションを向けられるCompute——自社ネットワーク内にあり、必要な社内Registry・VPN・Secret Storeへのアクセスのみを持つマシン——を用意・登録する。
+
+これ以降、Self-Hosted実行を使うよう設定されたSessionは、ファイル操作・Build・Tool呼び出しをそのインフラ上で行い、Inference呼び出しは従来どおり自社ネットワークを出てAnthropicに届く、という構成になります。
+
+## webhaniとしての見解
+
+具体的なネットワーク境界の理由でClaude CodeのCloud Sessionが使えずにいた企業には、今すぐ導入を検討する価値があります。社内Registry、VPN配下のService、「第三者のComputeには絶対に置けない」とセキュリティ部門が明言しているSecretなど、明確な技術的ブロッカーがあるチームです。そうしたチームには、まずリスクの低いリポジトリでPilot導入することを勧めています。
+
+一方、「AIにコードを触らせるのが何となく不安」という一般的な感覚が動機であれば、いったん立ち止まる価値があります。Self-Hosted実行はInference時にAnthropicへ流れるデータの経路自体は変えないため、「完全なデータ分離」を前提とするPolicyは満たせません。この場合、機能を有効化するより先に、Anthropicのデータ取り扱い条件がすでに何をカバーしているかをCompliance部門と確認する方が適切な一歩です。
+
+実際のProjectで有効化する前には、次の3点を評価することを勧めています。
+
+- **Inference呼び出しのNetwork Egress Policy**: Self-Hosted実行を使っていても、そのCompute自体はModel呼び出しのたびにAnthropicのAPIへ Outbound アクセスする必要があります。このEgress経路を明示的に許可・監視する設計にしておくこと。
+- **Self-Hosted Compute自体のSecret Scope**: 実行環境が自社ネットワークの内側にある分、Cloud Sandboxよりも到達できる範囲が広くなりがちです。「社内ネットワークだから安全」ではなく、通常のCI Runnerと同じ水準でCredentialとNetworkアクセスを最小権限に絞ること。
+- **Audit Logging**: 自社が所有するインフラで実行されるからこそ、既存のCI/CD Systemと同じ形でLogを残せるという利点があります。ただし、これは誰かが実際に配線しない限り「絵に描いた餅」のCompliance Controlになります。
+
+Self-Hosted Environmentsは、厳格なネットワーク隔離要件を持つ環境でAgentic Codingツールを実用的にする、確かな一歩です。ただしそれ単体で、セキュリティ部門とのデータガバナンスの議論を代替するものではありません。この点は、機能が実際に提供する以上のプライバシーを顧客に期待させないよう、はっきり伝えるようにしています。

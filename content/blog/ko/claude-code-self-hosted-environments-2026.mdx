@@ -1,0 +1,68 @@
+---
+title: "Claude Code Self-Hosted Environments — 사내에 남는 건 '실행'뿐이라는 이야기"
+description: "Claude Code의 Cloud Session을 자체 Infrastructure에서 실행할 수 있는 Self-Hosted Environments가 Public Beta로 공개되었습니다. 실행의 Self-Hosting과 Inference의 Self-Hosting은 다른 이야기입니다. 도입 전에 짚어야 할 차이를 정리합니다."
+date: "2026-09-02"
+status: "published"
+tags: ["Claude Code", "Enterprise", "Security", "DevOps", "AI 코딩"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-self-hosted-environments-2026"
+---
+
+## 새로운 제품이 아니라 새로운 선택지입니다
+
+Anthropic이 최근 Claude Code의 Self-Hosted Environments를 Public Beta로 공개했습니다. 핵심만 말하면, Web·Mobile·Desktop·Terminal·Scheduled Routine 중 어디에서 시작하든 Claude Code Cloud Session의 실제 실행 부분을 자체적으로 준비한 Infrastructure 위에서, 자사 Network 안에서 돌릴 수 있게 되었다는 것입니다. 지금까지는 Anthropic이 관리하는 Cloud Compute에서 실행되었습니다.
+
+Enterprise의 실제 Codebase에 Agentic Coding Tool을 붙이는 것을 주저하던 조직 입장에서는 의미 있는 변화입니다. 다만 제목만 보고 이해하면 오해하기 쉬운 기능이기도 합니다. 이 글에서는 이 기능이 실제로 무엇을 옮기는지, 그리고 그만큼 중요한 "무엇을 옮기지 않는지"를 정리합니다. 고객과 이 주제로 이야기하다 보면 후자를 놓친 채 도입을 검토하는 경우를 자주 보기 때문입니다.
+
+## 일반 Cloud Session과 무엇이 달라지는가
+
+기존 기본 설정에서는 Terminal이 아닌 곳(Web, Scheduled Routine 등)에서 Claude Code Session을 시작하면, Repository Checkout, Build 실행, Test 실행, 파일 생성·수정 같은 작업이 Anthropic이 관리하는 Compute에서 이루어졌습니다. 편리하긴 하지만, Repository Checkout, Build 산출물, Session이 접근하는 Secret, 생성·수정되는 파일이 모두 조직 경계 밖의 Infrastructure를 거치게 됩니다.
+
+Self-Hosted Environments를 활성화하면 이 실행 부분이 조직이 소유·운영하는 머신, 즉 자사 Network 내부로 옮겨갑니다. Session은 VPN, Firewall, 사내 CA, Endpoint 모니터링 같은 기존 Security Control 안쪽에, 외부에서 방문하는 손님이 아니라 자사 환경의 일부로 위치하게 됩니다.
+
+현재는 Claude Team 및 Enterprise Plan을 사용하는 조직에 제공되며, 기본값은 Off입니다. 조직 관리자가 명시적으로 켜야 합니다.
+
+## 가장 중요한 구분: 실행의 Self-Hosting ≠ Inference의 Self-Hosting
+
+도입을 검토하기 전에 꼭 이해해야 할 지점이 여기입니다. 이 기능은 Self-Hosted "실행"이지, Self-Hosted "Inference"가 아닙니다.
+
+Self-Hosted 실행이 의미하는 것은, "실제로 손을 움직이는 부분" — Repository Clone, Test 실행, 사내 File System 접근, Build용 Secret을 Memory에 올려두는 것 — 이 자체 Infrastructure에서 이루어진다는 뜻입니다.
+
+반면 "Model 자체"가 자체 Infrastructure에서 돌아가는 것은 아닙니다. 보낸 Prompt, Model의 응답, Tool 호출 결과, Session Transcript는 여전히 Anthropic으로 전송됩니다. Inference가 실제로 일어나는 곳이 Anthropic이기 때문입니다. 게다가 Anthropic은 이 Transcript를 보관하도록 설계되어 있는데, 노트북에서 시작한 Session을 나중에 Web UI나 팀원의 Terminal에서 이어갈 수 있게 하기 위해서입니다.
+
+정리하면, 코드 자체와 Secret은 사내에 남지만, "코드에 대한 대화" — Model이 추론하기 위해 필요한 코드 조각, Tool 출력, Context에 들어가는 그 밖의 정보 — 는 Model을 호출할 때마다 자사 Network를 벗어나 Anthropic Server에 도달합니다.
+
+고객의 Compliance 요구사항이 "코드 산출물이 사외로 나가면 안 된다"는 것이라면 Self-Hosted 실행이 실제로 도움이 됩니다. 하지만 "우리 Codebase에 관한 어떤 정보도 제3자에 닿아서는 안 된다"는 요구사항이라면, 이 기능만으로는 충족되지 않습니다. 이는 현재 어떤 Cloud LLM 제품도 마찬가지이고, Self-Hosted Environments도 예외가 아닙니다. 도입 논의에서 이 부분이 쉽게 빠지기 때문에 저희는 항상 이 이야기를 먼저 꺼냅니다.
+
+## 실무에서 실제로 의미 있는 상황
+
+Network 통제가 확실한 대기업 고객과 일하면서 자주 마주치는 시나리오입니다.
+
+- **사내 Package Registry**: 사내 Network에서만 접근 가능한 Artifactory나 Nexus에서 의존성을 해결하는 Build는 외부 Cloud Compute에서는 애초에 성공할 수 없습니다. Self-Hosted 실행이면 그 Registry에 실제로 닿을 수 있는 위치에서 Build를 돌릴 수 있습니다.
+- **VPN 전용 내부 API**: 인증 Service, Legacy SOAP Endpoint, 사내 관리자 API처럼 공인 Internet에 노출되지 않은 Service를 호출하는 Integration Test나 Script는 그 Network에 접근 가능한 곳에서 실행되어야 합니다. 바로 이 빈틈을 메워줍니다.
+- **사외로 나갈 수 없는 Secret**: Build 중 사용하는 Database Credential, 서명용 Key, Service Account Token 등을 외부 Compute에 두지 않음으로써 노출 위험의 한 축을 실제로 줄일 수 있습니다. 이는 앞서 언급한 Inference 문제와는 별개의 논점입니다.
+- **데이터 처리 위치에 규제가 있는 산업**: 금융, 의료, 공공 부문 고객은 최종 산출물 자체가 기밀이 아니더라도 "코드와 Build가 어디에서 처리되었는가"에 대한 내부 규정을 두는 경우가 많습니다. Self-Hosted 실행은 실행 계층에 대해서는 "어디서 돌았는가"에 명확한 답을 주지만, Inference 계층에 대해서는 완전한 답이 되지 못합니다.
+
+## 활성화의 개념적 그림
+
+정확한 Flag나 Config 문법을 여기서 제시하지는 않습니다. Beta 기간 중 바뀔 수 있고, 공식 Documentation이 1차 출처이기 때문입니다. 다만 개념적으로는 다음 두 가지 결정으로 나뉩니다.
+
+1. Team 또는 Enterprise Plan의 조직 관리자가 조직 단위로 Beta에 참여하고 Self-Hosted Environments를 활성화합니다.
+2. Infrastructure 접근 권한을 가진 담당자가 Claude Code Session이 연결될 Compute — 자사 Network 내부에 있고, 필요한 사내 Registry·VPN·Secret Store에 대한 접근만 가진 머신 — 를 준비하고 등록합니다.
+
+이후 Self-Hosted 실행을 사용하도록 설정된 Session은 파일 작업, Build, Tool 호출을 해당 Infrastructure에서 수행하고, Inference 호출은 기존과 동일하게 자사 Network를 벗어나 Anthropic으로 전달되는 구조가 됩니다.
+
+## webhani의 견해
+
+구체적인 Network 경계 문제 때문에 Claude Code의 Cloud Session을 쓰지 못하고 있던 조직이라면, 지금 도입을 검토할 가치가 있습니다. 사내 Registry, VPN 뒤의 Service, Security 부서가 "제3자 Compute에는 절대 둘 수 없다"고 못 박은 Secret처럼 명확한 기술적 Blocker가 있는 팀입니다. 이런 팀에는 위험도가 낮은 Repository부터 Pilot으로 도입해볼 것을 권합니다.
+
+반대로 "AI에게 코드를 맡기는 게 왠지 불안하다"는 막연한 감각이 동기라면 한 번 멈춰서 생각해볼 필요가 있습니다. Self-Hosted 실행은 Inference 시점에 Anthropic으로 흘러가는 데이터 경로 자체를 바꾸지 않기 때문에, "완전한 데이터 격리"를 전제로 하는 Policy는 충족시키지 못합니다. 이 경우에는 기능을 켜기보다, Anthropic의 데이터 처리 조건이 이미 무엇을 커버하는지 Compliance 부서와 먼저 확인하는 것이 맞는 다음 단계입니다.
+
+실제 Project에서 활성화하기 전에는 다음 세 가지를 평가하도록 권합니다.
+
+- **Inference 호출에 대한 Network Egress Policy**: Self-Hosted 실행을 쓰더라도 그 Compute 자체는 Model을 호출할 때마다 Anthropic API로 Outbound 접근을 해야 합니다. 이 Egress 경로를 명시적으로 허용하고 모니터링하도록 설계해야 합니다.
+- **Self-Hosted Compute 자체의 Secret Scope**: 실행 환경이 자사 Network 내부에 있는 만큼, Cloud Sandbox보다 닿을 수 있는 범위가 넓어지기 쉽습니다. "사내 Network니까 괜찮다"가 아니라, 일반 CI Runner와 같은 수준으로 Credential과 Network 접근을 최소 권한으로 제한해야 합니다.
+- **Audit Logging**: 자사가 소유한 Infrastructure에서 실행되는 만큼, 기존 CI/CD System과 같은 방식으로 Log를 남길 수 있다는 장점이 있습니다. 다만 이는 누군가 실제로 연결해두지 않으면 서류상의 Compliance Control에 그칩니다.
+
+Self-Hosted Environments는 엄격한 Network 격리 요구사항이 있는 환경에서 Agentic Coding Tool을 실용적으로 만드는 확실한 진전입니다. 하지만 그 자체만으로 Security 부서와의 Data Governance 논의를 대체하지는 못합니다. 기능이 실제로 제공하는 것 이상의 Privacy를 고객이 기대하지 않도록, 저희는 이 부분을 명확히 전달하려고 합니다.
