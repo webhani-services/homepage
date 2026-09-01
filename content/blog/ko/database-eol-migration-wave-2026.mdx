@@ -1,0 +1,74 @@
+---
+title: "2026년, Database EOL이 한꺼번에 몰려오는 해 — PostgreSQL·MySQL·Redis 대응 전략"
+description: "PostgreSQL 14, MySQL 8.0, Redis 7.2/7.4가 2026년 나란히 EOL을 맞이합니다. EOL이 실무적으로 무엇을 의미하는지, 제한된 Engineering 리소스로 어떻게 우선순위를 정해야 하는지 정리합니다."
+date: "2026-09-02"
+status: "published"
+tags: ["PostgreSQL", "MySQL", "Redis", "Database", "Migration"]
+thumbnail: ""
+author: "webhani"
+slug: "database-eol-migration-wave-2026"
+---
+
+Production 인프라를 운영하고 있다면 2026년이 주요 Database 3종의 EOL(End of Life)이 몰려있는 해라는 걸 실감하고 계실 겁니다. PostgreSQL 14는 PostgreSQL 19 출시가 다가오면서 Support 대상에서 밀려나고 있고, 여전히 많은 현장의 기본 선택지인 MySQL 8.0은 2026년 4월 말 이미 EOL을 맞았습니다. Redis도 7.2가 2월에 EOL, 7.4가 11월에 EOL을 앞두고 있습니다. 이 셋 중 둘 이상을 함께 쓰는 팀도 적지 않을 텐데, 이건 "다음 분기 과제"가 아니라 "지금 당장 다뤄야 할 과제"입니다.
+
+저희 webhani도 이런 Migration 작업을 클라이언트와 꾸준히 진행하는데, 현장에서 자주 보는 건 패닉이 아니라 방치입니다. 아무도 Unsupported Database를 일부러 Production에서 돌리려고 하지 않습니다. Feature 개발 우선순위에 밀려 Upgrade가 분기마다 뒤로 밀리다 보니 어느새 달력이 따라잡은 것뿐입니다. 이 글은 그게 Compliance 지적 사항이나 Incident로 번지기 전에 미리 손쓰기 위한 정리입니다.
+
+## 왜 하필 2026년에 몰렸나
+
+특별한 음모가 있는 건 아니고, 단순히 Release Cycle이 겹친 결과입니다. PostgreSQL은 연 1회 Major Version Release를 이어오고 있고, 14는 2021년에 나왔으니 커뮤니티가 통상 유지하는 5년 안팎의 Support 기간이 2026년 9월 전후 PostgreSQL 19 출시와 함께 끝나는 셈입니다. MySQL 8.0은 2018년부터 Long-Term Support 버전으로 취급되어 왔지만, Oracle의 Lifecycle Policy상 2026년 4월 30일이 종료일로 정해져 있었습니다. Redis의 각 EOL 날짜는 프로젝트가 겪은 License 변경 이슈와 맞물려 있고, Fork 이전 버전들의 Maintenance 기간이 자연스럽게 만료되는 시점입니다.
+
+결과적으로 이건 "Data Layer를 한 번에 정비하는 시점"이지, 단발성 위기가 아닙니다. 사내에 흩어진 Version들을 정리할 기회로 삼는 게 건강한 접근입니다.
+
+## EOL이 실무적으로 의미하는 것 (과장 없이)
+
+Vendor들은 EOL을 실제보다 무섭게 포장하곤 하는데, Upgrade 수요를 끌어내기 위한 목적도 있습니다. 실제로는 더 담백하지만 가볍게 볼 사안은 아닙니다.
+
+- **Security Patch가 더 이상 안 나옵니다.** 이게 진짜 Risk입니다. EOL 이후 새로운 CVE가 발견돼도 Upstream에서 수정되지 않습니다. 직접 대응하거나, Vendor의 연장 Support에 비용을 지불하거나, Risk를 안고 가야 합니다.
+- **Bug Fix도 멈춥니다.** Data 손상 Edge Case, Replication Bug, Performance Regression이 발견돼도 Backport되지 않습니다.
+- **Ecosystem이 서서히 멀어집니다.** Extension, Driver, 모니터링 도구들이 오래된 Major Version에 대한 Test를 점점 중단합니다. 이건 뭔가 확실히 망가지기 훨씬 전부터 미묘한 비호환으로 먼저 드러납니다.
+- **Compliance 지적 사항이 됩니다.** SOC 2, ISO 27001 같은 Framework를 따르는 조직이라면, 고객 Data를 다루는 Infrastructure에서 EOL Software를 돌리고 있다는 사실 자체가 기술적 문제 발생 여부와 무관하게 Audit 지적 사항이 되는 경우가 매우 많습니다.
+
+반대로 EOL이 의미하지 않는 것도 있습니다. Support 종료일이 됐다고 Database가 그 순간 멈추지 않습니다. 자동으로 Crash 나는 것도 아닙니다. 바로 이 점이 위험한 이유인데, 강제력이 없다 보니 얼마든지 미룰 수 있게 됩니다.
+
+## PostgreSQL: 14에서 18로, 19는 시야에 두고
+
+지금 PostgreSQL 14를 쓰고 있다면 현실적인 목표는 이미 Release되어 안정된 PostgreSQL 18입니다. Async I/O 관련 개선으로 I/O 위주 Workload에서 실질적인 Throughput 향상을 기대할 수 있고, UUIDv7이 Native로 지원되면서 Application 단에서 직접 구현해온 Time-sortable UUID 생성이 필요 없어집니다. 18을 어디까지나 징검다리로 보고, 9월에 출시되는 19에 곧바로 뛰어들 필요는 없습니다. 특별한 이유가 없다면 한두 Release 정도 안정화되길 기다리는 편이 낫습니다.
+
+Major Version Upgrade에서 팀들이 자주 걸려 넘어지는 지점은 Extension 호환성과 Downtime 허용 범위, 이 두 가지입니다.
+
+- **Extension 점검.** `pg_stat_statements`, PostGIS, pgvector 등 설치된 Extension을 모두 확인하고 Target Version의 Compatibility Matrix와 대조하는 작업을 가장 먼저 해야 합니다. 팀이 의식하지 못한 채 의존하고 있던 Extension이 아직 Target Version용 Build를 내놓지 않은 경우가 Upgrade에서 가장 흔한 함정입니다.
+- **Upgrade 방식 선택.** `pg_upgrade`의 Link Mode는 빠르지만 기존 Cluster와 새 Cluster가 동시에 Traffic을 처리할 수 없어 Maintenance Window가 필요합니다. Logical Replication을 쓰면 새 Version을 Logical Replica로 띄워 따라잡게 한 뒤 전환하는 방식으로 거의 Zero Downtime에 가깝게 갈 수 있지만, Setup 복잡도가 늘고 Large Object, Sequence 동기화, 일부 DDL처럼 Logical Replication이 잘 커버하지 못하는 부분을 별도로 챙겨야 합니다. 어느 쪽이 더 세련되어 보이는지가 아니라, Business가 실제로 감당할 수 있는 Downtime을 기준으로 결정하세요.
+
+## MySQL 8.0: 가장 시급한 항목
+
+MySQL 8.0은 나머지 둘과 달리 이 글을 쓰는 시점에 이미 EOL 날짜가 지났습니다. 아직 쓰고 있다면 지금 이 순간 Patch 미적용, Support 대상 외의 Production Infrastructure를 운영하고 있는 겁니다. "다음 분기에 계획할" 항목이 아니라, 이번 달 제한된 Engineering 리소스를 어디에 먼저 쓸지 고민된다면 최우선으로 처리해야 할 항목입니다.
+
+현실적인 Upgrade 대상은 현재 LTS인 MySQL 8.4이며, 더 앞서가고 싶다면 MySQL 9.x 계열도 검토 대상입니다. MySQL Major Upgrade에서 Test에 집중해야 할 부분은 Authentication Plugin 관련 변경(MySQL은 Version마다 기본 인증 방식을 바꿔왔고, 예상보다 오래된 Client Driver가 여기서 자주 깨집니다), SQL Mode의 엄격화, 그리고 Multi-source 구성이나 Group Replication을 쓰고 있다면 Topology 호환성입니다. 실제 전환 전에 Production과 유사한 Data를 담은 Staging 환경에서 Application Test Suite 전체를 돌려보세요. MySQL의 동작 변화는 PostgreSQL보다 미묘한 경우가 많아서, 명확한 Error가 아니라 "조용히 Query 결과가 달라지는" 형태로 나타나는 일이 잦습니다.
+
+## Redis: 7.2/7.4 EOL과 Valkey라는 선택지
+
+Redis 7.2는 이미 EOL이 지났고 7.4도 11월로 예정돼 있어서, 둘 중 뭘 쓰고 있든 "언젠가 고민할 문제"가 아니라 "지금 결정해야 할 문제"입니다. 선택지는 크게 두 가지로, Redis의 현재 License 하에서 Support되는 Version으로 올리거나, Linux Foundation이 후원하는 Open Source Fork인 Valkey로 옮기는 방법이 있습니다.
+
+Valkey 8.1은 애초에 Redis의 License 변경에 불편함을 느꼈던 팀이나, 앞으로 License 조건을 신경 쓰지 않고 완전한 Open Source Project에 머무르고 싶은 팀에게는 합리적인 기본 선택지입니다. Protocol Level에서는 대부분의 일반적인 사용 패턴에 대해 대체로 Drop-in 교체가 가능하지만, "대체로"라는 단서를 가볍게 넘기면 안 됩니다. RediSearch나 RedisJSON 같은 Module을 쓰고 있거나 Redis 고유의 최신 기능에 크게 의존하고 있다면, 미리 개별적으로 Compatibility를 확인하세요. 모든 사용 패턴에서 Drop-in 호환이 보장되는 건 아닙니다.
+
+단순한 Cache나 Pub/Sub 용도라면 어느 경로를 택해도 Migration Risk는 낮습니다. 반대로 Redis Streams나 Module, Redis 고유의 Clustering 동작에 깊이 의존한 설계라면, 어느 쪽을 택하든 충분한 Test 시간을 확보해야 합니다.
+
+## Database 종류와 무관하게 쓸 수 있는 Upgrade 계획 세우기
+
+PostgreSQL, MySQL, Redis 어느 쪽이든 각 Engine의 특성에 맞게 조금씩 조정할 뿐, 대체로 같은 형태의 Process를 사용합니다.
+
+1. **실제로 의존하고 있는 것을 전수조사합니다.** Extension, Module, Driver Version, ORM 호환성, 명세로 보장되진 않지만 Application이 암묵적으로 의존하고 있는 동작까지 파악합니다.
+2. **먼저 Staging 환경에서 Upgrade를 시도합니다.** 장난감 같은 환경이 아니라 Production과 유사한 Data 규모와 Query Pattern을 가진 환경이어야 합니다. Upgrade 문제 대부분은 현실적인 Load나 Data 형태에서만 드러납니다.
+3. **전환 방식을 의도적으로 선택합니다.** Business가 허용한다면 Maintenance Window 방식(구성이 단순하고 Replication에서 비롯되는 미묘한 Bug Risk도 낮음), 허용하지 않는다면 Replication 기반의 거의 Zero Downtime 전환(구성 요소가 늘어난 만큼 그 자체에 대한 Test가 필요).
+4. **Rollback Plan은 필요해지기 전에 작성해둡니다.** 어떻게 되돌릴지 정확히 파악하고, 그 경로도 Staging에서 Test합니다. 한 번도 실행해보지 않은 Rollback Plan은 계획이 아니라 희망사항일 뿐입니다.
+5. **전환 후에도 계속 지켜봅니다.** Error율, Query Latency Percentile, 해당된다면 Replication Lag를 전환 직후 몇 시간만이 아니라 최소 며칠은 관찰합니다.
+
+## 시간이 부족하다면 어디부터 손대야 하나
+
+Engineering 리소스가 제한적이라 이번 달에 하나만 다룰 수 있다면, MySQL 8.0을 쓰고 있는 경우 그걸 최우선으로 처리하세요. 셋 중 유일하게 이미 명확히 Support 기간을 지났고, 지금 이 순간에도 Security Exposure가 계속 쌓이고 있는 건 MySQL뿐이기 때문입니다. 그다음은 Redis 7.2/7.4인데, Valkey로 옮길지 여부는 한 번 정하면 되돌리기 점점 까다로워지는 Architecture 판단이기 때문입니다. PostgreSQL 14는 실무적으로 여유가 가장 많은 편입니다. 커뮤니티가 정한 명목상 기한을 조금 넘겨도 Support가 실질적으로 유지되는 경우가 많고, 18로의 Upgrade도 비교적 Risk가 낮기 때문입니다. 다만 "여유가 있다"는 게 "서두르지 않아도 된다"는 뜻은 아닙니다. 9월 PostgreSQL 19 출시를 이제 슬슬 계획에 넣는 좋은 계기로 삼으세요.
+
+## Data Layer 통합에 대하여
+
+"전용 Cache나 Queue가 필요했던 Workload를 Extension이나 정교한 Schema 설계를 통해 PostgreSQL로 흡수해서, 전용 Data Store 수를 줄인다"는 접근도 종종 언급됩니다. 어차피 Infrastructure를 건드리는 Migration 시점에 함께 검토할 가치는 있지만, 모두에게 맞는 정답은 아닙니다. Redis 용도가 가벼운 Cache 정도라 PostgreSQL로도 큰 추가 구현 없이 근사할 수 있다면 효과적입니다. 반대로 Redis의 Latency 특성이나 Data 구조 연산이 실제로 필요하거나, 전용 Cache의 운영 비용을 정당화할 만한 규모로 운영 중이라면 잘 맞지 않습니다. EOL 마감에 떠밀려서, 원래는 그 자체의 타당성만으로 판단해야 할 Architecture 변경을 서둘러 결정하지 않도록 주의하세요. 통합 여부는 Upgrade의 시급성과는 별개로, 그 자체의 타당성만으로 평가해야 합니다.
+
+이번 EOL이 겹치는 상황은 패닉의 이유가 아니라 좋은 계기로 받아들이는 게 맞습니다. 언젠가는 필요했던 계획된 Maintenance로 여기고, 달력에 따라잡히기 전에 먼저 움직이시길 바랍니다.

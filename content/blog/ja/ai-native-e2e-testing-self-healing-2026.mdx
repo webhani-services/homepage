@@ -1,0 +1,70 @@
+---
+title: "Testing Pyramid から Testing Diamond へ：2026年の E2E 投資戦略の見直し"
+description: "AI Coding Agent は人間が E2E Test を書くスピードを上回るペースで User Flow を実装していきます。Self-healing な Test Tooling がコスト構造を変えた今、E2E への投資配分をどう見直すべきかを整理します。"
+date: "2026-09-02"
+status: "published"
+tags: ["Testing", "Playwright", "E2E", "AI", "QA"]
+thumbnail: ""
+author: "webhani"
+slug: "ai-native-e2e-testing-self-healing-2026"
+---
+
+## Testing Pyramid が間違っていたわけではない、コストモデルだった
+
+昔ながらの Testing Pyramid——Unit Test を厚く、Integration Test をそこそこ、E2E Test は薄く——は、「どの Test が一番重要か」を語っていたわけではありません。実際は「コスト」の話でした。Unit Test は書くのも実行するのも安い。E2E Test は Real Browser が必要で遅く、誰かが CSS Class を rename したり Button の位置を数 px 動かすだけで簡単に壊れます。だから「検証はできる限り安いレイヤーに寄せ、E2E は最重要な Flow にだけ使う希少資源として扱う」というのが定石でした。
+
+この原則自体は今も間違っていません。変わったのは「高い」という言葉に付いていた数字のほうです。2026年に入って、Client の Project でも Testing Diamond と呼ばれる形——依然として少数の Unit Test、大きく広がった Integration Test 層、そして Pyramid の定石よりもかなり厚くなった E2E 層——にシフトするチームが増えています。きっかけは Testing 理論の変化ではなく、コスト方程式の両側で同時に起きた変化です。
+
+一つ目は、AI Coding Agent が新しい Page、新しい Form Step、新しい Checkout の Variant といった User-facing な Flow を、人間が Playwright Script を書くスピードよりも速く実装・出荷するようになったことです。E2E Suite の成長速度が人間の Typing 速度に縛られていると、Product の変化速度に永久に追いつけません。二つ目は Tooling 自体の維持コストが下がったことです。実行速度の向上、より強力な並列化、そして DOM の小さな変化では簡単に壊れない Test Framework の登場によって、大きな E2E Suite を Green に保ち続けるコストが下がりました。E2E の二大コストである「作成コスト」と「維持コスト」が両方下がった以上、「薄く保て」を無条件のルールとして扱う意味はもうありません。
+
+## Self-healing が実際にもたらすもの
+
+ここは言葉が独り歩きしやすいので正確に書きます。2026年時点でチームが採用している実務的な意味での Self-healing な E2E Tooling は、Page への軽微で非本質的な変更——`div` がもう一段ラップされて Selector がずれた、CSS Refactor で Class 名が変わった、DOM Tree 上の位置が少し動いたが Role や表示 Text では依然として特定できる、といったケース——を許容できる Test Infrastructure を指すのが一般的です。壊れやすい CSS Path よりも Accessible Role や表示 Text を優先する Locator 戦略と組み合わせることで、「実際には何も壊れていないのに Test だけが古くなって落ちる」という、E2E Suite のメンテナンスを面倒にしてきた偽陽性の多くを減らせます。
+
+AI-assisted な E2E 生成は、関連はしていますが別の能力です。「再訪の Customer が Login し、Cart に商品を追加し、保存済みの Card で Checkout を完了する」といった User Flow を平文で説明すると、Test の下書きが返ってくる。これは特に手で書くのが面倒な Flow で、新しい Coverage を素早く立ち上げるのに実際に役立ちます。
+
+ここは Client にも正直に伝えている部分ですが、これらは「何を Assert すべきか」という Engineering Judgment を代替しません。Self-healing な Locator 戦略は、`div` の Refactor が起きても Test が生き残ることを保証しますが、その Test が正しいものを検証しているかどうかには何も答えません。AI が生成した Test が Login Flow を正しく Click で辿ったうえで、「Page が Crash しなかったこと」しか Assert していない、というケースは十分あり得ます。本当に検証すべきなのは、例えば「Login の Redirect を挟んでも Cart の中身が保持されているか」や「Lock された Account に特定の Error Message が表示されるか」といった Business Requirement のはずです。生成された Test は、信頼して使う前に人間が Assertion を確認・修正するパスを必ず挟む必要があります。AI-assisted な生成は「速い初稿」であって「完成品」ではない、という扱いが妥当です。
+
+## 成長する E2E Suite を Page ではなく Flow で構造化する
+
+「E2E が安くなった」を活かそうとして陥りがちな失敗は、Page 単位の Coverage をデフォルトにしてしまうことです——Route ごとに Test を作り、Page が描画されることだけを確認する、というパターンです。コスト低下が本当に活かせるのは、そこではありません。活かせるのは、Suite を破綻させずにより多くの重要な User Journey を End-to-End で Cover できるようになったことです。整理の単位は Page ではなく Flow のままにすべきです。
+
+Next.js の Client Project で実際に採用している構造の一例を、標準的な Playwright API のみで示します。
+
+```typescript
+import { test, expect } from "@playwright/test";
+
+test.describe("returning customer checkout", () => {
+  test("logs in, keeps cart contents, and completes payment with a saved card", async ({ page }) => {
+    await page.goto("/login");
+    await page.getByLabel("Email").fill("returning-customer@example.com");
+    await page.getByLabel("Password").fill("test-password");
+    await page.getByRole("button", { name: "Log in" }).click();
+
+    // この Flow で本当に重要な Assertion: Redirect を跨いでも状態が保持されるか
+    await expect(page.getByTestId("cart-count")).toHaveText("2");
+
+    await page.getByRole("link", { name: "Checkout" }).click();
+    await page.getByRole("radio", { name: /saved card ending in/i }).check();
+    await page.getByRole("button", { name: "Place order" }).click();
+
+    await expect(page.getByRole("heading", { name: "Order confirmed" })).toBeVisible();
+  });
+});
+```
+
+中盤の Assertion——Login の Redirect を跨いでも Cart Count が保持されている——が、この Flow における本当の Business Risk であり、「Button を Click できたかどうか」ではありません。ここは、人間が意図的に加えない限り AI 生成の初稿では抜け落ちやすい種類の Assertion です。
+
+Test は Route ではなく Journey（`onboarding`、`checkout`、`account-recovery`、`subscription-changes` など）で Group 化し、「本番で絶対に壊れてはいけない Journey」と「Cover できると望ましい Journey」を短く明示的なリストとして持つようにしています。このリストは Engineering だけの話ではなく Product との会話であり、Business の実際の Risk 許容度がそこに反映されます。
+
+## webhani の推奨する Test 投資配分
+
+典型的な Next.js/React の Client Project において、2026年時点で推奨しているバランスは次の通りです。
+
+- **純粋な Logic、価格計算 Rule、Data 変換、独立した Component の挙動は高速な Unit Test のまま維持する。** このレイヤーは小さく速いままでよく、Diamond の形は「ここを増やせ」とは主張していません。依然として最も安く最速な Feedback です。
+- **「この Component がこの API Route と正しく連携しているか」の検証の多くは Integration Test に寄せる。** Diamond 形状で実際に一番厚くなるのはこのレイヤーです。Full Browser のオーバーヘッドなしに Component と Route の連携を検証できます。
+- **重要かつ境界を跨ぐ User Journey に絞って E2E Coverage を広げる。** Auth の Redirect、決済 Provider、複数 Step の Form、Navigation を跨いで保持されるべき状態などが対象です。E2E のコスト低下を本当に活かすべきはここであり、書くのが安くなったからといって浅く広い Page 描画確認に予算を使うのは良い使い方ではありません。
+- **AI-assisted な生成は新しい E2E Case の下書きに使い、Merge 前に必ず人間の Review Pass を入れる。** 「Error が出なかったこと」ではなく「Assertion が実際の Business Requirement と一致しているか」を specifically 確認します。AI 生成の Code を扱うのと同じで、有能な初稿であって完成品ではない、という扱いです。
+- **Suite が育っても Flaky Test の発生率を明示的に Track する。** Self-healing な Locator があっても、それは一部の偽陽性を減らすだけで、Flakiness 全体を Tooling が解決してくれるわけではないことを前提にします。
+
+Diamond 形状は Pyramid の論理を否定するものではなく、数年前とは明確に異なるコスト構造に同じ論理を当てはめ直した結果です。この変化から一番価値を得ているチームは、Test を一番多く書いているチームではありません。どの User Journey が今の安くなった E2E Coverage コストに見合うかを意図的に選び、それでも CI で信頼する前に必ず人間の目で Assertion を確認しているチームです。

@@ -1,0 +1,74 @@
+---
+title: "The 2026 Database End-of-Life Pile-Up: PostgreSQL, MySQL, and Redis All at Once"
+description: "PostgreSQL 14, MySQL 8.0, and Redis 7.2/7.4 all hit end-of-life in 2026. Here's what EOL actually means operationally, and a practical framework for prioritizing upgrades when engineering time is limited."
+date: "2026-09-02"
+status: "published"
+tags: ["PostgreSQL", "MySQL", "Redis", "Database", "Migration"]
+thumbnail: ""
+author: "webhani"
+slug: "database-eol-migration-wave-2026"
+---
+
+If you run production infrastructure, 2026 is the year three of the most widely deployed data stores hit end-of-life within months of each other. PostgreSQL 14 is being pushed out of support as PostgreSQL 19 approaches release. MySQL 8.0, still the default choice for a huge share of production deployments, reached end-of-life at the end of April 2026. Redis 7.2 went EOL in February, and Redis 7.4 follows in November. If your stack touches any of these — and most stacks touch at least two — this is not a next-quarter problem, it's a this-quarter problem.
+
+We work on these migrations with clients regularly, and the pattern we see is not panic, it's neglect. Nobody wakes up one day and decides to run an unsupported database on purpose. It happens because the upgrade got deprioritized behind feature work, quarter after quarter, until the calendar caught up. This post is meant to help you get ahead of that before it becomes a compliance finding or an incident.
+
+## Why 2026 specifically
+
+There's no grand conspiracy here — it's mostly coincidental release cadence lining up. PostgreSQL follows an annual major-version cycle, and 14 was released back in 2021; five years is roughly the community's support window, and PostgreSQL 19 landing around September 2026 closes that window. MySQL 8.0 has been the long-term-support version since 2018, and Oracle's own lifecycle policy put its end date at April 30, 2026. Redis's EOL dates trace back to the license changes the project went through — the maintenance window for pre-fork releases is simply running out on its own schedule.
+
+The practical result is a "renew your data layer" moment rather than a single crisis. Treat it as an opportunity to clean up version sprawl across your fleet, not just a deadline to survive.
+
+## What EOL actually means, without the hype
+
+Vendors love to make EOL sound apocalyptic because it drives upgrade revenue. The reality is more mundane but still worth taking seriously:
+
+- **No more security patches.** This is the real risk. A newly discovered CVE in an EOL version will not get fixed upstream. You're on your own, or paying for extended support from a vendor, or exposed.
+- **No bug fixes.** Data corruption edge cases, replication bugs, and performance regressions discovered after EOL simply don't get backported.
+- **Community and ecosystem drift.** Extensions, drivers, and monitoring tools gradually stop testing against old major versions. This shows up as subtle incompatibilities long before anything breaks outright.
+- **Compliance exposure.** If you're subject to SOC 2, ISO 27001, or similar frameworks, running EOL software on infrastructure holding customer data is very often an explicit audit finding, independent of whether anything has actually gone wrong technically.
+
+What EOL does *not* mean: your database doesn't stop working the day support ends. Nothing crashes automatically. This is exactly what makes EOL dangerous — there's no forcing function, so it's easy to let it slide indefinitely.
+
+## PostgreSQL: 14 to 18, with 19 on the horizon
+
+If you're on PostgreSQL 14, the pragmatic target right now is PostgreSQL 18, which is already released and stable. It brought meaningful async I/O improvements that show up as real throughput gains on I/O-bound workloads, plus native UUIDv7 support, which matters if you've been hand-rolling time-sortable UUIDs in application code. Treat 18 as the stepping stone; don't feel obligated to jump straight to 19 the moment it ships in September — let it mature for a release or two unless you have a specific reason to move fast.
+
+Before any major-version jump, the two things that actually bite people are extension compatibility and downtime tolerance:
+
+- **Extensions.** Audit every extension you have installed (`pg_stat_statements`, PostGIS, pgvector, whatever else) against the target version's compatibility matrix before you do anything else. This is the single most common source of upgrade surprises — an extension your team quietly depends on that hasn't shipped a compatible build yet.
+- **Upgrade mechanism.** `pg_upgrade` in link mode is fast but requires a maintenance window, since the old and new clusters can't both serve traffic. Logical replication gets you close to zero downtime — stand up the new version as a logical replica, let it catch up, then cut over — but it costs you more setup complexity and you need to handle schema objects that logical replication doesn't cover well (large objects, sequences syncing, some DDL). Choose based on how much downtime your business actually tolerates, not on which sounds more sophisticated.
+
+## MySQL 8.0: this is the urgent one
+
+MySQL 8.0 is different from the other two in that its EOL date has already passed as of this writing. If you're still running it, you are today running unpatched, unsupported production infrastructure. This is not a "plan for next quarter" item — it should be the thing you triage first if you're deciding where to spend limited engineering time this month.
+
+The realistic upgrade target is MySQL 8.4 (the current LTS) or a look at MySQL 9.x if you want to be further ahead of the curve. Testing focus for MySQL majors tends to concentrate on: authentication plugin changes (MySQL has shifted default auth mechanisms across versions, which breaks old client drivers more often than people expect), SQL mode strictness changes, and replication topology compatibility if you're running multi-source or group replication setups. Run your full application test suite against a staging copy of production data before touching anything live — MySQL's behavioral changes tend to be subtler than Postgres's and show up as silently wrong query results rather than hard failures.
+
+## Redis: 7.2 and 7.4 EOL, and the Valkey question
+
+Redis 7.2 is already past EOL, and 7.4 follows in November — so if you're on either, you have a live decision to make, not a hypothetical one. The obvious options are moving to a currently-supported Redis version under Redis's current licensing terms, or migrating to Valkey, the Linux Foundation-backed open-source fork that maintains strong protocol and API compatibility with Redis.
+
+Valkey 8.1 is a reasonable default recommendation for teams who were uncomfortable with Redis's licensing changes in the first place, or who just want to stay on a fully open-source project without thinking about license terms again. It's largely a drop-in replacement at the protocol level for most common usage patterns — but "largely" is doing real work in that sentence. If you use Redis modules (RediSearch, RedisJSON, etc.) or lean on very recent Redis-only features, verify compatibility explicitly before committing; don't assume drop-in compatibility extends to every corner of your usage.
+
+If your Redis usage is simple caching and basic pub/sub, the migration risk is low either way. If you've built anything sophisticated on top of Redis Streams, modules, or Redis-specific clustering behavior, budget real testing time regardless of which path you pick.
+
+## A sane way to plan the upgrade, regardless of which database
+
+We use roughly the same shape of process across Postgres, MySQL, and Redis migrations, adjusted for each engine's specifics:
+
+1. **Audit what you actually depend on.** Extensions, modules, driver versions, ORM compatibility, any behavior your application quietly relies on that isn't guaranteed by the spec.
+2. **Stand up a staging upgrade first.** Not a toy environment — a copy with production-representative data volume and query patterns. Most upgrade problems only show up under realistic load or data shape.
+3. **Pick your cutover mechanism deliberately.** Maintenance-window upgrade if your business tolerates it (simpler, lower risk of subtle replication bugs). Replication-based near-zero-downtime cutover if it doesn't (more moving parts, needs its own testing).
+4. **Write the rollback plan before you need it.** Know exactly how you'd revert, and test that path in staging too. A rollback plan you've never exercised is a hope, not a plan.
+5. **Cut over, then watch.** Error rates, query latency percentiles, and replication lag (if applicable) for at least a few days post-cutover, not just the first hour.
+
+## Where to spend your time first
+
+If you're short on engineering bandwidth and can only tackle one of these in the next month, do MySQL 8.0 first if you're running it — it's the only one of the three that's unambiguously already past its support window, which means it's the one with active, accumulating security exposure right now. Redis 7.2/7.4 comes next, mainly because the Valkey decision is a one-time architectural choice that gets more annoying to revisit the longer you wait. PostgreSQL 14 has the most breathing room in practice, since 14 support tends to persist a bit past the community's nominal cutoff and the jump to 18 is comparatively low-risk — but "more breathing room" is not "no urgency," and September's PostgreSQL 19 release is a good forcing function to finally schedule it.
+
+## On consolidating your data layer
+
+You'll see this idea floating around: fewer specialized data stores, using PostgreSQL for workloads that used to need a dedicated cache or queue (via extensions or just clever schema design), trading some specialization for a smaller operational surface. It's a legitimate option worth considering during a migration, since you're already touching the infrastructure — but it's not a universal recommendation. It works well when your Redis usage is lightweight caching that Postgres can approximate without much engineering effort. It works poorly when you actually need Redis's latency characteristics, its data structure operations, or you're running at a scale where a dedicated cache is earning its operational cost. Don't let an EOL deadline talk you into an architecture change you weren't already planning to make on its own merits — evaluate consolidation on its own terms, separately from the urgency of the upgrade itself.
+
+The EOL wave is a good forcing function, not a reason to panic. Treat it as scheduled maintenance you were going to need eventually, and get ahead of the calendar rather than reacting to it.

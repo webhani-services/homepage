@@ -1,0 +1,68 @@
+---
+title: "Claude Code Self-Hosted Environments: What Actually Stays in Your Network"
+description: "Anthropic's public beta lets Claude Code cloud sessions execute on infrastructure you control. Here is the execution-vs-inference distinction that matters before you enable it."
+date: "2026-09-02"
+status: "published"
+tags: ["Claude Code", "Enterprise", "Security", "DevOps", "AI Coding"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-self-hosted-environments-2026"
+---
+
+## A new option, not a new product
+
+Anthropic recently opened a public beta for self-hosted environments in Claude Code. In short: a Claude Code cloud session — the kind you can kick off from the web, mobile, desktop, terminal, or a scheduled routine — can now run its actual execution on infrastructure your own team provisions, sitting inside your own network, instead of on Anthropic's cloud compute.
+
+That is a meaningful shift for anyone who has hesitated to point an agentic coding tool at a real enterprise codebase. But it is easy to over-read the headline. This post is about what the feature actually moves, and — just as important — what it does not move, because that second part is where we see clients get the wrong idea.
+
+## What changes from a normal cloud session
+
+In the default setup, when you start a Claude Code session outside your terminal (say, from the web or a scheduled routine), the work — checking out the repo, running builds, executing tests, writing files — happens on compute that Anthropic manages. That is convenient, but it means your repository checkout, build artifacts, any secrets the session touches, and files it creates or modifies all pass through infrastructure outside your organization's boundary.
+
+With self-hosted environments turned on, that execution moves onto machines your organization owns and operates, inside your own network. The session can now sit next to internal services, internal toolchains, and whatever security controls you already run — VPNs, firewalls, internal certificate authorities, endpoint monitoring — because it is physically part of your environment rather than a guest visiting from outside.
+
+This is available today to organizations on Claude Team and Enterprise plans, and it ships off by default — an org admin has to turn it on deliberately.
+
+## The distinction that actually matters: execution vs. inference
+
+Here is the part we want every client to internalize before they get excited: this is self-hosted *execution*, not self-hosted *inference*.
+
+Self-hosted execution means the *doing* — cloning your repo, running your test suite, touching your internal file system, holding your build secrets in memory — happens on your infrastructure.
+
+It does not mean the *model* runs on your infrastructure. The prompts you send, the model's responses, the results of tool calls, and the session transcript still travel to Anthropic, because that is where inference actually happens. Anthropic also retains that transcript, by design, so that a session you started on your laptop can be picked up later from the web UI or a teammate's terminal.
+
+Put plainly: your code and your secrets stay put. The conversation about your code — including snippets of code the model needs to reason about, tool outputs, and anything else that ends up in context — still leaves your network and reaches Anthropic's servers for every model call.
+
+If a client's compliance requirement is "no code artifacts leave our network," self-hosted execution genuinely helps. If the requirement is "nothing about our codebase should ever touch a third party," this feature does not get you there — no cloud-hosted LLM product does today, and self-hosted environments is not an exception dressed up as one. We think this nuance gets lost quickly in adoption conversations, so we lead with it.
+
+## Where this actually matters in practice
+
+A few scenarios we run into regularly with clients, mostly larger organizations with real network controls in place:
+
+- **Internal package registries.** A build that resolves dependencies from an internal Artifactory or Nexus instance, reachable only from inside the corporate network, simply cannot succeed on external cloud compute. Self-hosted execution lets the build run where that registry is actually reachable.
+- **VPN-only internal APIs.** Integration tests or scripts that call an internal service — an auth service, a legacy SOAP endpoint, an internal admin API — that is not exposed to the public internet need to run somewhere with that network access. That's exactly the gap this closes.
+- **Secrets that legally or contractually cannot leave the network.** Database credentials, signing keys, service account tokens used during a build — keeping these off external compute reduces one real category of exposure, separate from the inference question above.
+- **Regulated industries with data residency or processing-location requirements.** Finance, healthcare, and public-sector clients in Japan often have internal policies about where code and build processes may execute, even when the eventual output is not classified data. Self-hosted execution gives you a straightforward answer to "where did this run" for the execution layer, even though it doesn't fully answer it for the inference layer.
+
+## What enabling it conceptually looks like
+
+We are not going to hand you exact flags or config syntax here — Anthropic's own documentation is the source of truth, and it may change during the beta. Conceptually, though, adoption looks like two separate decisions:
+
+1. An organization admin on a Team or Enterprise plan opts the org into the beta and enables self-hosted environments at the org level.
+2. Someone with infrastructure access provisions and registers compute that Claude Code sessions can be routed to — machines inside your network, with whatever access to internal registries, VPNs, and secrets stores those sessions actually need, and nothing more.
+
+From there, sessions that are configured to use self-hosted execution run their file operations, builds, and tool calls on that infrastructure instead of Anthropic's default compute, while inference calls continue to leave your network as usual.
+
+## webhani's take
+
+Self-hosted environments is worth adopting now if you are already blocked from using Claude Code's cloud sessions for a concrete, network-boundary reason — an internal registry, a VPN-gated service, a secret your security team has flatly said cannot sit on third-party compute. For those teams, this closes a real gap, and we'd recommend piloting it on a low-risk repository first.
+
+If your interest is driven by a general "keep AI away from our code" instinct rather than a specific technical blocker, it is worth pausing. Self-hosted execution does not change your inference-time data flow to Anthropic, so it will not satisfy a policy that assumes full data isolation. In that case the right next step is a conversation with your compliance team about what Anthropic's data handling terms already cover, not enabling this feature.
+
+Before flipping it on for any real project, we'd have a client evaluate three things:
+
+- **Network egress policy for inference calls.** Even with self-hosted execution, your self-hosted compute still needs outbound access to Anthropic's API for every model call. That egress path needs to be explicitly allowed and monitored, not left as an afterthought.
+- **Secret scoping on the self-hosted compute itself.** Because the execution environment now lives inside your network, it can plausibly reach more than a cloud sandbox ever could. Scope credentials and network access as tightly as you would for any CI runner — least privilege, not "it's on our network so it's fine."
+- **Audit logging.** You gain a lot from execution happening on infrastructure you own — namely, you can log it the way you already log your CI/CD systems. Make sure someone actually wires that up before treating it as a compliance control on paper.
+
+Self-hosted environments is a genuine step toward making agentic coding tools workable inside networks with real isolation requirements. It is not, on its own, a substitute for a data governance conversation with your security team — and we'd rather tell clients that plainly than let them assume more privacy than the feature delivers.

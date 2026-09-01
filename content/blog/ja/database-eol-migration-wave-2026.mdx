@@ -1,0 +1,74 @@
+---
+title: "2026年、DatabaseのEOLが重なる年——PostgreSQL・MySQL・Redisを同時にどう乗り切るか"
+description: "PostgreSQL 14、MySQL 8.0、Redis 7.2/7.4が2026年に相次いでEOLを迎えます。EOLが実務上何を意味するのか、限られたEngineeringリソースでどう優先順位をつけるべきかを整理します。"
+date: "2026-09-02"
+status: "published"
+tags: ["PostgreSQL", "MySQL", "Redis", "Database", "Migration"]
+thumbnail: ""
+author: "webhani"
+slug: "database-eol-migration-wave-2026"
+---
+
+Production環境を運用している方なら、2026年は主要なDatabase製品のEOL（End of Life）が立て続けに来る年だと感じているはずです。PostgreSQL 14はPostgreSQL 19のリリースが近づくにつれてSupport対象から外れつつあり、依然として多くの現場でデフォルト選択肢であるMySQL 8.0は2026年4月末にEOLを迎えました。Redisも7.2が2月にEOL、7.4が11月にEOLを迎える予定です。この3つのうち複数を使っているチームは少なくないはずで、「来四半期の課題」ではなく「今すぐ手をつけるべき課題」として捉える必要があります。
+
+webhaniでもこうしたMigration案件を継続的にご支援していますが、現場でよく見るのはパニックではなく先延ばしです。誰も意図的にUnsupportedなDatabaseを本番で動かそうとは思っていません。Feature開発の優先度に押されてUpgradeが四半期ごとに後回しにされ続けた結果、気づけばカレンダーに追いつかれている、というのが実態です。この記事は、それがコンプライアンス上の指摘事項やIncidentになる前に手を打つための整理です。
+
+## なぜ2026年に重なったのか
+
+特別な陰謀があるわけではなく、単純にRelease Cycleが重なっただけです。PostgreSQLは年1回のMajor Version Releaseを続けており、14は2021年リリースなので、コミュニティが目安とする約5年のSupport期間が2026年9月前後のPostgreSQL 19登場でちょうど終わります。MySQL 8.0は2018年からLong-Term Supportバージョンとして扱われてきましたが、Oracleのライフサイクルポリシー上2026年4月30日が終了日でした。Redisの各EOL日程は、プロジェクトが経験したLicense変更の経緯に紐づいており、Fork以前のバージョンのMaintenance期間が自然に満了を迎えている形です。
+
+結果として、これは「Data Layerを一斉に刷新するタイミング」であって、単発の危機ではありません。この機会に、社内で乱立しているVersionを整理するチャンスと捉えるのが健全です。
+
+## EOLが実務上意味すること（誇張抜きで）
+
+VendorはEOLを大げさに語りがちですが、それはUpgrade需要を喚起するためでもあります。実態はもっと地味ですが、軽視できない要素です。
+
+- **Security Patchが来なくなる。** これが最大のリスクです。EOL後に新しいCVEが見つかっても、Upstreamで修正されることはありません。自力で対応するか、Vendorの延長Supportに課金するか、リスクを抱え続けるかの選択になります。
+- **Bug Fixも止まる。** Data破損の境界条件やReplicationのBug、Performance Regressionが見つかっても、Backportされません。
+- **Ecosystemが徐々に離れていく。** Extension、Driver、監視ツールが古いMajor Versionでのテストをやめていきます。これは何かが壊れるずっと前から、細かな非互換として表面化します。
+- **Compliance上の指摘事項になる。** SOC 2やISO 27001などのFrameworkに準拠している組織では、顧客Dataを扱うInfrastructureでEOLのSoftwareを動かしていること自体が、技術的な問題の有無にかかわらずAudit上の指摘事項になるケースが非常に多いです。
+
+逆にEOLが意味しないこともあります。SupportがEnd日を迎えた瞬間にDatabaseが停止するわけではありません。何も自動的にはCrashしません。これがまさに厄介な点で、強制力がないために先送りがいくらでも可能になってしまうのです。
+
+## PostgreSQL: 14から18へ、19は視野に入れつつ
+
+現在PostgreSQL 14を使っているなら、現実的なTargetはすでにReleaseされ安定しているPostgreSQL 18です。Async I/O周りの改善により、I/O律速のWorkloadで実際にThroughputの向上が見込めるほか、UUIDv7がNativeでSupportされたことで、Application側で自前実装していたTime-sortable UUID生成が不要になります。18をあくまで踏み台と位置づけ、9月にリリースされる19に急いで飛びつく必要はありません。特別な事情がなければ、1〜2Releaseほど枯れるのを待つ方が無難です。
+
+Major Version UpgradeでチームがよくつまずくのはExtensionの互換性とDowntime許容度の2点です。
+
+- **Extension監査。** `pg_stat_statements`やPostGIS、pgvectorなど、導入しているExtensionをすべて洗い出し、TargetバージョンのCompatibility Matrixと照合してから作業を始めてください。チームが気づかないうちに依存しているExtensionが、Target VersionのBuildをまだ提供していない、というのが最も多いUpgradeのつまずきポイントです。
+- **UpgradeのMechanism選定。** `pg_upgrade`のLink Modeは高速ですが、旧Clusterと新Clusterが同時にTrafficを捌けないためMaintenance Windowが必要です。Logical Replicationを使えば、新Versionを一旦Logical Replicaとして立ち上げてCatch upさせてから切り替えることで、ほぼゼロDowntimeに近づけますが、Setupの複雑さが増し、Large ObjectやSequence同期、一部のDDLなどLogical Replicationがうまくカバーしない部分への対応が必要になります。どちらが「格好いいか」ではなく、Businessが実際に許容できるDowntimeで判断してください。
+
+## MySQL 8.0: 最も急を要する案件
+
+MySQL 8.0は他の2つと違い、この記事執筆時点ですでにEOL日を過ぎています。まだ使っているなら、今この瞬間、Patch未適用・Support対象外のProduction Infrastructureを動かしていることになります。これは「来四半期に計画する」項目ではなく、今月Engineeringリソースをどこに割くか迷ったら最優先で手をつけるべき項目です。
+
+現実的なUpgrade先はMySQL 8.4（現行のLTS）で、さらに先を見据えるならMySQL 9.x系も検討対象になります。MySQLのMajor UpgradeでTestすべきポイントとしては、Authentication Plugin周りの変更（MySQLはVersionごとにDefaultの認証方式を変更しており、古いClient Driverが想定以上に壊れるケースがあります）、SQL Modeの厳格化、そしてMulti-source構成やGroup Replicationを使っている場合のTopology互換性が挙げられます。本番と同等のDataを使ったStaging環境でApplicationのTest Suiteを一通り走らせてから切り替えに進んでください。MySQLの挙動変化はPostgreSQLよりも地味で、明確なErrorではなく「静かにQuery結果が変わる」形で現れることが多いためです。
+
+## Redis: 7.2/7.4のEOLとValkeyという選択肢
+
+Redis 7.2はすでにEOLを過ぎており、7.4も11月に控えているため、どちらを使っていても「いつか考えること」ではなく「今考えること」です。選択肢は大きく2つで、Redisの現行LicenseのもとでSupportされているバージョンに上げるか、Linux Foundationが支援するOpen SourceのForkであるValkeyへ移行するかです。
+
+Valkey 8.1は、そもそもRedisのLicense変更に違和感を持っていたチームや、License条件を今後気にせず完全にOpen Sourceなプロジェクトに乗りたいチームにとって、妥当なDefaultの選択肢です。Protocol Levelでは多くの一般的な用途において概ねDrop-inで置き換えが可能ですが、「概ね」という言葉には注意が必要です。RediSearchやRedisJSONなどのModuleを使っている場合や、Redis独自の最新機能に強く依存している場合は、事前に個別のCompatibility確認を行ってください。すべての利用パターンでDrop-in互換が保証されているわけではありません。
+
+単純なCacheやPub/Sub用途であれば、どちらのPathを選んでもMigrationのRiskは低いです。逆にRedis StreamsやModule、Redis固有のClustering挙動に大きく依存した設計をしている場合は、どちらを選ぶにしてもTestに十分な時間を確保してください。
+
+## Databaseに関係なく使える、まともなUpgrade計画の立て方
+
+PostgreSQL・MySQL・Redisのいずれでも、各Engineの特性に合わせて多少調整しつつ、おおよそ同じ形のProcessを使っています。
+
+1. **実際に依存しているものを棚卸しする。** Extension、Module、Driver Version、ORMの互換性、仕様として保証されているわけではないがApplicationが暗黙に依存している挙動などを洗い出します。
+2. **まずStaging環境でUpgradeを試す。** おもちゃのようなEnvironmentではなく、本番と同等のDataVolumeとQuery Patternを持つEnvironmentで行います。Upgrade上の問題の多くは、現実的なLoadやData形状のもとでしか表面化しません。
+3. **切り替えMechanismを意図的に選ぶ。** Businessが許容できるならMaintenance Windowでの切り替え（構成がシンプルで、Replicationに起因する細かなBugのRiskも低い）。許容できないならReplicationベースのほぼゼロDowntime切り替え（構成要素が増える分、それ自体のTestが必要）。
+4. **Rollback Planは必要になる前に書いておく。** どう戻すかを正確に把握し、そのPathもStagingでTestします。一度も試したことのないRollback Planは、計画ではなく願望に過ぎません。
+5. **切り替えたら、しばらく監視を続ける。** Error率、Query Latencyの各Percentile、該当する場合はReplication Lagを、切り替え直後の数時間だけでなく最低でも数日は見続けます。
+
+## 限られた時間で、どこから手をつけるべきか
+
+Engineeringリソースが限られていて、今月1つしか手をつけられないなら、MySQL 8.0を使っているならそれを最優先にしてください。3つの中で唯一、明確にすでにSupport期間を過ぎており、今この瞬間もSecurity Exposureが蓄積し続けているのはMySQLだけだからです。次にRedis 7.2/7.4で、これはValkeyへ移行するかどうかがArchitecture上の一度きりの判断であり、先延ばしにするほど後から見直しにくくなるためです。PostgreSQL 14は実務上最も余裕があります。コミュニティの名目上の期限を多少過ぎてもSupportが実質的に続くことが多く、18へのUpgradeも比較的低Riskだからです。とはいえ「余裕がある」ことは「急がなくていい」ことを意味しません。9月のPostgreSQL 19リリースを、そろそろ計画に組み込む良いきっかけとして使ってください。
+
+## Data Layerの統合について
+
+「専用のCacheやQueueが必要だったWorkloadを、Extensionや工夫したSchema設計を通じてPostgreSQLに寄せることで、専用のData Storeの数を減らす」という考え方も一部で語られています。すでにInfrastructureに手を入れているMigrationのタイミングで検討する価値はありますが、万人向けの推奨ではありません。Redisの用途が軽量なCacheでPostgreSQLでも大きな追加実装なしに近似できるなら有効です。一方でRedisのLatency特性やData構造の操作が本当に必要な場合、あるいは専用Cacheの運用コストに見合う規模で動いている場合には、うまくいきません。EOLの締め切りに背中を押される形で、本来その是非だけで判断すべきArchitectureの変更を決めてしまわないよう注意してください。統合するかどうかは、Upgradeの緊急性とは切り離して、その是非だけで評価すべきです。
+
+今回のEOLの重なりは、パニックになる理由ではなく、良いきっかけと捉えるべきです。いずれ必要になる計画済みのMaintenanceとして扱い、カレンダーに追いつかれる前に先回りしましょう。
