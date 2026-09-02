@@ -1,0 +1,120 @@
+---
+title: "MVC, MVVM, or Component-Based? Naming What React Server Components Actually Do"
+description: "React Server Components blur the line between classic MVC and MVVM thinking. Here's how webhani maps data-fetching, view, and state responsibilities onto a concrete architecture vocabulary teams can actually use in code review."
+date: "2026-09-03"
+status: "published"
+tags: ["Architecture", "React", "Next.js", "Design Patterns", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "mvc-mvvm-component-architecture-2026"
+---
+
+Ask five engineers on a React/Next.js team whether their frontend follows MVC, MVVM, or "just components," and you'll usually get five different answers, plus a shrug. That's not because the team is disorganized — it's because component-based UI frameworks never fully replaced the older architectural vocabulary, they just made it optional to name. The result is code review conversations where "this component is doing too much" gets no more precise than that, because nobody has agreed on what "too much" means structurally.
+
+This matters in practice: without a shared vocabulary, architectural drift is invisible until a component file is 600 lines long and nobody remembers why the data-fetching logic lives next to the click handler that opens a modal.
+
+## What MVC and MVVM actually separate
+
+Classic MVC splits an application into Model (data and business rules), View (rendering), and Controller (mediates input, updates the model, selects a view). MVVM replaces the Controller with a ViewModel: an object that exposes view-ready state and commands, and the View binds to it — critically, the ViewModel has no reference to the View itself, which is what enables straightforward unit testing of UI logic without rendering anything.
+
+Neither pattern was designed with a component tree in mind. But the responsibilities they name — "where does raw data live," "where does business logic run," "where does UI-only state live," "what actually renders" — don't go away just because you're writing JSX. They just stop having a designated home, which is exactly the problem.
+
+## Mapping the pattern onto Next.js today
+
+In an App Router application using Server Components, the honest mapping looks like this:
+
+```text
+Model        → Database queries, external API calls, and
+               validation logic (Server Actions, route
+               handlers, or a lib/ data-access layer)
+ViewModel    → Custom hooks (useXState) or a Server
+               Component's data-shaping logic before
+               passing props down — the "view-ready state"
+               layer, without JSX
+View         → The presentational Component itself:
+               receives props, renders JSX, minimal logic
+```
+
+The mistake we see most often in client codebases is Model logic leaking directly into a component — a `fetch` call and a validation `if` statement sitting in the same function as a `<div>`. That's not a React-specific mistake; it's the same mistake MVC was designed to prevent 25 years ago, just with a different file extension.
+
+```tsx
+// Anti-pattern: Model + View + ViewModel all in one place
+export default async function InvoiceList() {
+  const res = await fetch("https://api.example.com/invoices");
+  const data = await res.json();
+  const overdue = data.filter((inv: Invoice) => inv.dueDate < Date.now());
+  return (
+    <ul>
+      {overdue.map((inv: Invoice) => (
+        <li key={inv.id}>{inv.customerName}: {inv.amount}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+```tsx
+// lib/invoices.ts — Model: data access + business rule
+export async function getOverdueInvoices(): Promise<Invoice[]> {
+  const res = await fetch("https://api.example.com/invoices");
+  const data: Invoice[] = await res.json();
+  return data.filter((inv) => inv.dueDate < Date.now());
+}
+
+// components/InvoiceList.tsx — View: rendering only
+import { getOverdueInvoices } from "@/lib/invoices";
+
+export default async function InvoiceList() {
+  const overdue = await getOverdueInvoices();
+  return (
+    <ul>
+      {overdue.map((inv) => (
+        <li key={inv.id}>{inv.customerName}: {inv.amount}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+The second version isn't more code — it's the same code with a boundary drawn. That boundary is what makes `getOverdueInvoices` independently testable, reusable from a different component, and reviewable in isolation from rendering concerns.
+
+## Where client-side state needs an explicit ViewModel
+
+Server Components handle the Model-to-View pipeline well for read paths, but interactive client state still benefits from an explicit ViewModel layer — a custom hook that owns state transitions and exposes only what the view needs:
+
+```tsx
+// hooks/useInvoiceFilter.ts — ViewModel: view-ready state, no JSX
+export function useInvoiceFilter(invoices: Invoice[]) {
+  const [query, setQuery] = useState("");
+  const filtered = useMemo(
+    () => invoices.filter((inv) =>
+      inv.customerName.toLowerCase().includes(query.toLowerCase())
+    ),
+    [invoices, query]
+  );
+  return { query, setQuery, filtered };
+}
+
+// components/InvoiceSearch.tsx — View: binds to the ViewModel
+function InvoiceSearch({ invoices }: { invoices: Invoice[] }) {
+  const { query, setQuery, filtered } = useInvoiceFilter(invoices);
+  return (
+    <div>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} />
+      <ul>{filtered.map((inv) => <li key={inv.id}>{inv.customerName}</li>)}</ul>
+    </div>
+  );
+}
+```
+
+`useInvoiceFilter` can be tested with `@testing-library/react-hooks` without ever rendering a `<div>`, exactly the property MVVM was designed to give you.
+
+## What we tell clients in architecture review
+
+We don't ask teams to formally adopt "MVC" or "MVVM" as a label — that's usually more bureaucracy than value for a small team. What we do insist on is the underlying discipline: a component file should not contain both a `fetch`/database call and non-trivial business logic in the same function body as JSX. If you can name which of the three responsibilities a given block of code belongs to, and it doesn't have a home outside the render function, that's the actual finding — not "this file is long."
+
+## Takeaways
+
+- Component-based frameworks didn't eliminate the responsibilities MVC/MVVM named — data access, business logic, view-state, and rendering — they just stopped requiring you to name them, which makes drift invisible.
+- In an App Router app, treat `lib/` data-access functions as your Model, custom hooks as your ViewModel, and components as your View — this alone resolves most "component doing too much" review comments.
+- Use this vocabulary in code review as a diagnostic, not a mandate: the goal is testable, independently reviewable boundaries, not compliance with a named pattern.

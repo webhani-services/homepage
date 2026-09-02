@@ -1,0 +1,120 @@
+---
+title: "MVC인가 MVVM인가, 아니면 Component-based인가? React Server Components가 실제로 하는 일에 이름 붙이기"
+description: "React Server Components의 등장으로 전통적인 MVC와 MVVM의 경계가 흐려졌습니다. webhani가 Data 조회·View·State의 책임을 어떻게 정리하고, Code Review에서 실제로 쓸 수 있는 용어로 정착시키는지 설명합니다."
+date: "2026-09-03"
+status: "published"
+tags: ["Architecture", "React", "Next.js", "Design Pattern", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "mvc-mvvm-component-architecture-2026"
+---
+
+React/Next.js Team의 Engineer 다섯 명에게 "당신 팀의 Frontend는 MVC입니까, MVVM입니까, 아니면 그냥 Component 구성입니까"라고 물으면 보통 다섯 가지 다른 대답과 함께 어깨를 으쓱하는 반응을 받게 됩니다. Team이 체계적이지 않아서가 아니라, Component 기반 UI Framework가 기존 Architecture 용어를 완전히 대체한 게 아니라 그것을 이름 붙이는 일을 선택 사항으로 만들었을 뿐이기 때문입니다. 그 결과 "이 Component는 너무 많은 일을 하고 있다"는 Code Review 지적이 Structural 관점에서 더 구체화되지 못한 채 끝납니다. "너무 많다"는 기준에 아무도 합의하지 않았기 때문입니다.
+
+이건 실무적인 문제입니다. 공유된 용어가 없으면, Component 파일이 600줄까지 늘어나고 왜 Data 조회 Logic이 모달을 여는 Click Handler 옆에 있는지 아무도 기억 못 하는 시점까지 Architecture의 Drift는 눈에 보이지 않습니다.
+
+## MVC와 MVVM이 실제로 분리하는 것
+
+전통적인 MVC는 Application을 Model(Data와 Business Rule), View(렌더링), Controller(입력을 중개하고 Model을 갱신하며 View를 선택)로 나눕니다. MVVM은 Controller를 ViewModel로 대체합니다. ViewModel은 View가 사용할 준비가 된 State와 Command를 노출하는 객체이며, View는 여기에 Bind합니다. 중요한 점은 ViewModel이 View 자체에 대한 참조를 전혀 가지지 않는다는 것으로, 이 덕분에 아무것도 렌더링하지 않고도 UI Logic을 단위로 Test할 수 있습니다.
+
+두 Pattern 모두 Component Tree를 염두에 두고 설계된 것은 아닙니다. 하지만 이들이 이름 붙인 책임 — "원본 Data는 어디에 있는가", "Business Logic은 어디서 실행되는가", "UI 전용 State는 어디에 있는가", "실제로 무엇이 렌더링되는가" — 은 JSX를 쓴다고 해서 사라지지 않습니다. 단지 지정된 자리를 잃을 뿐이며, 그것이 바로 문제의 본질입니다.
+
+## 오늘날 Next.js에 대응시켜 보기
+
+Server Components를 사용하는 App Router Application에서 솔직한 대응 관계는 다음과 같습니다.
+
+```text
+Model        → Database Query, 외부 API 호출,
+               Validation Logic (Server Actions,
+               Route Handler, 또는 lib/의 Data-access 계층)
+ViewModel    → Custom Hook (useXState), 또는 Server
+               Component가 Props를 내려보내기 전에 수행하는
+               Data 가공 Logic — JSX 없이 "View가 바로
+               쓸 수 있는 State" 계층
+View         → 렌더링 자체를 담당하는 Component: Props를
+               받아 JSX를 렌더링하며 Logic은 최소화
+```
+
+Client Codebase에서 가장 자주 보이는 실수는 Model Logic이 Component로 직접 새어 들어가는 것입니다. `fetch` 호출과 Validation `if` 문이 `<div>`와 같은 함수 안에 나란히 있는 경우입니다. 이는 React 특유의 실수가 아니라, 25년 전 MVC가 막으려 했던 것과 같은 실수가 확장자만 바꿔서 되풀이되는 것뿐입니다.
+
+```tsx
+// Anti-pattern: Model + View + ViewModel이 모두 한곳에
+export default async function InvoiceList() {
+  const res = await fetch("https://api.example.com/invoices");
+  const data = await res.json();
+  const overdue = data.filter((inv: Invoice) => inv.dueDate < Date.now());
+  return (
+    <ul>
+      {overdue.map((inv: Invoice) => (
+        <li key={inv.id}>{inv.customerName}: {inv.amount}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+```tsx
+// lib/invoices.ts — Model: Data Access + Business Rule
+export async function getOverdueInvoices(): Promise<Invoice[]> {
+  const res = await fetch("https://api.example.com/invoices");
+  const data: Invoice[] = await res.json();
+  return data.filter((inv) => inv.dueDate < Date.now());
+}
+
+// components/InvoiceList.tsx — View: 렌더링만
+import { getOverdueInvoices } from "@/lib/invoices";
+
+export default async function InvoiceList() {
+  const overdue = await getOverdueInvoices();
+  return (
+    <ul>
+      {overdue.map((inv) => (
+        <li key={inv.id}>{inv.customerName}: {inv.amount}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+두 번째 버전은 Code 양이 늘어난 게 아니라, 같은 Code에 경계선이 그어진 것뿐입니다. 이 경계 덕분에 `getOverdueInvoices`는 독립적으로 Test할 수 있고, 다른 Component에서 재사용할 수 있으며, 렌더링 관심사와 분리해서 Review할 수 있습니다.
+
+## Client 측 State에 명시적인 ViewModel이 필요한 경우
+
+Server Components는 Read 경로에서 Model-to-View 흐름을 잘 처리하지만, Interactive한 Client State에는 여전히 명시적인 ViewModel 계층 — State 전환을 담당하고 View가 필요로 하는 것만 노출하는 Custom Hook — 이 유용합니다.
+
+```tsx
+// hooks/useInvoiceFilter.ts — ViewModel: JSX 없는 View용 State
+export function useInvoiceFilter(invoices: Invoice[]) {
+  const [query, setQuery] = useState("");
+  const filtered = useMemo(
+    () => invoices.filter((inv) =>
+      inv.customerName.toLowerCase().includes(query.toLowerCase())
+    ),
+    [invoices, query]
+  );
+  return { query, setQuery, filtered };
+}
+
+// components/InvoiceSearch.tsx — View: ViewModel에 Bind
+function InvoiceSearch({ invoices }: { invoices: Invoice[] }) {
+  const { query, setQuery, filtered } = useInvoiceFilter(invoices);
+  return (
+    <div>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} />
+      <ul>{filtered.map((inv) => <li key={inv.id}>{inv.customerName}</li>)}</ul>
+    </div>
+  );
+}
+```
+
+`useInvoiceFilter`는 `<div>`를 전혀 렌더링하지 않고도 `@testing-library/react-hooks`로 Test할 수 있습니다. 이것이 바로 MVVM이 주려고 했던 특성입니다.
+
+## webhani가 Architecture Review에서 전달하는 것
+
+Team에게 "MVC"나 "MVVM"이라는 Label을 형식적으로 채택하라고 요구하지는 않습니다. 작은 Team에게는 대개 그 가치보다 Bureaucracy 비용이 더 크기 때문입니다. 우리가 실제로 요구하는 것은 그 밑바탕에 있는 원칙입니다. `fetch`나 Database 호출과, 사소하지 않은 Business Logic이 JSX와 같은 함수 본문 안에 함께 있어서는 안 된다는 것입니다. 어떤 Code Block이 세 가지 책임 중 어디에 속하는지 이름 붙일 수 있고, 그것이 Render 함수 밖에 자리를 갖지 못하고 있다면, 그것이야말로 실제 Finding입니다. "이 File이 길다"가 아닙니다.
+
+## 정리
+
+- Component 기반 Framework는 MVC/MVVM이 이름 붙였던 책임 — Data Access, Business Logic, View State, 렌더링 — 을 없앤 것이 아니라, 그것을 이름 붙일 의무만 없앴을 뿐이며, 그래서 Drift가 눈에 보이지 않게 된다.
+- App Router Application에서는 `lib/`의 Data-access 함수를 Model, Custom Hook을 ViewModel, Component를 View로 다룬다. 이것만으로도 "Component가 너무 많은 일을 한다"는 Review 지적의 대부분이 해결된다.
+- 이 용어는 Code Review에서 진단 도구로 쓰는 것이지, 특정 Pattern 이름에 대한 준수를 강제하기 위한 것이 아니다. 목표는 Test 가능하고 독립적으로 Review 가능한 경계이지, Pattern 이름 자체가 아니다.

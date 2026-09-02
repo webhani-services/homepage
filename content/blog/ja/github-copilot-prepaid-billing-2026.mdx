@@ -1,0 +1,67 @@
+---
+title: "GitHub Copilot、Prepaid Seat制へ移行——2026年9〜10月の調達Playbook"
+description: "GitHubは2026年9月1日にCopilot Business/EnterpriseのSelf-serve申込を再開し、10月1日から全SeatがUpfront支払い制になります。webhaniがClientのCopilot予算とSeat管理をどう見直しているかを解説します。"
+date: "2026-09-03"
+status: "published"
+tags: ["DevOps", "GitHub Copilot", "IT調達", "Developer Tooling", "予算管理"]
+thumbnail: ""
+author: "webhani"
+slug: "github-copilot-prepaid-billing-2026"
+---
+
+GitHubは2026年4月22日、Usage-based Billingへの移行準備として、Copilot BusinessおよびCopilot EnterpriseのSelf-serve新規申込を一時停止しました。2026年9月1日、Credit CardまたはPayPalで支払うCustomerに対して申込が再開されました。ただし予算管理上、本当に重要なのは再開そのものではなく、それに伴うRule変更です。すべての新規Seat割当が、User側のAccess付与前にUpfrontでの支払いを要求するようになり、2026年10月1日からは既存のCard/PayPal Customerも同じUpfront・Cycle単位のBilling Modelへ移行します。
+
+複数のCopilot Seatを管理している組織にとって、これは単なる価格表の脚注ではなく、調達プロセスと社内承認プロセスの変更です。webhaniではClientに対し、実際に何をすべきかを整理して伝えています。
+
+## 仕組み上、何が変わるか
+
+旧Modelでは、AdminがSeatを新規採用者やContractorに即座に割り当てられ、BillingはCycle末に追いつく形でした。新Modelでは、Seatの割当と支払いが結合します。支払いが完了して初めてSeatが有効化されます。標準的なOnboarding Checklistの一環としてCopilot Accessを Provisioningしているチームにとっては、これまでなかったDependencyが生まれます。Seatを割り当てるOnboarding Automationは、即時有効化を前提にはできず、失敗したり遅延したりしうる支払いStepを織り込む必要が出てきます。
+
+```text
+旧Flow:
+  Admin がSeat割当 → Userは即座にAccessを得る →
+  Billing Cycle末にUsageがInvoiceへ反映
+
+新Flow（2026年10月1日以降）:
+  Admin がSeat割当 → 支払いがUpfrontで実行 →
+  支払い完了 → Userにaccessが付与される
+```
+
+GitHub API経由でCopilot SeatをProvisioningするScriptやTerraform管理のProcessがある場合、次回の採用Batchの前にSandbox Orgで一度Testしておく価値があります。Silent な支払い失敗は、もはや後で整理すればいいBillingの不一致ではなく、Developerの作業をBlockする問題になります。
+
+## 予算面への影響: SeatはPrepaidのCommitmentになる
+
+Prepaid・Cycle単位のBillingは、CopilotのBudget上の見え方を変えます。Cycle途中のSeat利用状況に応じて増減する変動費的なMonthly Lineではなく、各Cycleの開始時点でSeat数をCommitする形になります。Cycle途中で退職者のSeatをDeprovisioningしても、そのCycle分の課金はRefundされません。これは多くのPrepaid Seat型SaaSと同じ仕組みです（Slack、Zoomなど同種のPer-seat SaaS Toolはすでにこの方式でBillingしているため、扱うOperational筋力は御社のFinance Teamにすでに備わっている可能性が高く、ギャップは通常Financeの能力ではなくITとFinance間のCommunicationにあります）。
+
+Clientには、Copilot Seat数を他のPrepaid Seat型SaaSと同じ扱いにすることを推奨しています。つまり、Invoiceの不一致に誰かが気づいてから対応するのではなく、毎月定期的に在籍中のHeadcountと照合することです。
+
+```yaml
+# 例: 月次Seat照合Checklist
+copilot_seat_audit:
+  frequency: monthly
+  steps:
+    - compare_active_seats_to: hris_active_employee_list
+    - flag: seats_assigned_to_terminated_accounts
+    - flag: seats_unused_in_last_30_days  # 回収候補
+    - action: deprovision_before_next_billing_cycle_start
+```
+
+最後の行がもっとも重要です。課金がUpfront・Cycle単位であるため、実際にCostを削減するのはCycle途中ではなくCycle開始前のDeprovisioningです。30日Cycleの15日目にSeatを削除しても、そのCycle分の全額は既に発生しています。
+
+## 一時停止を待っていた場合の対応
+
+4月からのSelf-serve申込停止によりCopilot Business/Enterpriseの導入を先送りしていた組織にとっては、9月1日の再開でそのBlockerは解消されます。しかし、Seatがもはや低摩擦で随時調整できるResourceではなくなった以上、規模を拡大してOnboardingする前にSeat割当Modelを決めておくことを推奨します。具体的には以下を事前に決めます。
+
+- どのRoleが常時Copilot Accessを持ち、どのRoleがProject単位でProvisioningされるか
+- 月次照合を誰が担当するか（通常はEngineering Managerではなく、HRISのFeedを受けたIT部門）
+- 同じPrepaid Costが在籍期間に関わらず発生する以上、Contractorや一時的なSeatに対して正社員Seatより短いReview Cycleを設けるかどうか
+
+## まとめ
+
+- 2026年10月1日以降、GitHub Copilot Business/Enterprise SeatはCycle単位でUpfront課金される。Cycle途中のDeprovisioningではそのCycle分がRefundされないため、Seat整理のTimingが直接Costへ影響する。
+- Seat ProvisioningがAutomation化されている場合、実際のOnboardingで頼る前に、支払い→Access付与というDependencyをSandboxでTestしておく。支払い失敗は今や将来のInvoice上の問題ではなく、Developerの作業をBlockする問題になる。
+- 在籍中のHeadcount Listに対する月次Seat照合を今のうちに整備する。運用Patternとしては、他の多くのPrepaid Seat型SaaS Toolですでにチームが行っているものと同じである。
+
+---
+
+*参考: [Upcoming changes to GitHub Copilot policies and billing](https://github.blog/changelog/2026-08-28-upcoming-changes-to-github-copilot-policies-and-billing/), [Pausing new self-serve signups for GitHub Copilot Business](https://github.blog/changelog/2026-04-22-pausing-new-self-serve-signups-for-github-copilot-business/)*

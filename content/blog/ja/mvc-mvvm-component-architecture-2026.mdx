@@ -1,0 +1,120 @@
+---
+title: "MVCかMVVMか、それともComponent-based？React Server Componentsが実際にやっていることに名前をつける"
+description: "React Server Componentsの登場で、従来のMVCとMVVMの境界は曖昧になりました。webhaniがData取得・View・Stateの責務をどう整理し、Code Reviewで実際に使えるVocabularyに落とし込んでいるかを解説します。"
+date: "2026-09-03"
+status: "published"
+tags: ["Architecture", "React", "Next.js", "Design Pattern", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "mvc-mvvm-component-architecture-2026"
+---
+
+React/Next.jsのTeamに「あなたたちのFrontendはMVCですか、MVVMですか、それとも単なるComponent構成ですか」と5人のEngineerに聞くと、大抵5通りの答えとともに肩をすくめられます。これはTeamがDisorganizedだからではなく、Component-baseのUI Frameworkが従来のArchitecture Vocabularyを完全に置き換えたわけではなく、単にそれを名付けることを任意にしただけだからです。結果として、「このComponentはやりすぎている」というCode Reviewの指摘が、Structural観点でそれ以上具体化されないまま終わります。誰も「やりすぎ」の基準に合意していないからです。
+
+これは実務上の問題です。共有Vocabularyがなければ、Componentファイルが600行に膨れ、なぜData取得Logicがモーダルを開くClick Handlerの隣に置かれているのか誰も覚えていない、という状態になるまでArchitectureのDriftは可視化されません。
+
+## MVCとMVVMが実際に分離しているもの
+
+古典的なMVCは、ApplicationをModel（DataとBusiness Rule）、View（描画）、Controller（入力を仲介しModelを更新しViewを選択する）に分割します。MVVMはControllerをViewModelに置き換えます。ViewModelはView向けにReady状態のStateとCommandを公開するObjectで、ViewはそれにBindします。重要なのは、ViewModelがView自体への参照を一切持たないことです。これによって、何も描画せずにUI Logicを単体でUnit Testできるようになります。
+
+どちらのPatternもComponent Treeを念頭に設計されたわけではありません。しかし、それらが名付けている責務——「生のDataはどこにあるか」「Business Logicはどこで実行されるか」「UI専用のStateはどこにあるか」「実際に何が描画されるか」——は、JSXを書いているからといって消えるわけではありません。ただ、指定された置き場所を失うだけであり、それこそが問題の本質です。
+
+## 今日のNext.jsへのMapping
+
+Server Componentsを使うApp Router Applicationにおいて、正直なMappingは次のようになります。
+
+```text
+Model        → Database Query、外部API呼び出し、
+               Validation Logic（Server Actions、
+               Route Handler、あるいはlib/のData-access層）
+ViewModel    → Custom Hook（useXState）、あるいは
+               Server ComponentがPropsを渡す前に
+               行うData整形Logic — JSXを含まない
+               「View向けにReadyなState」の層
+View         → 描画自体を担うComponent: Propsを受け取り
+               JSXを描画するのみで、Logicは最小限
+```
+
+Client CodebaseでもっともよくあるMistakeは、Model LogicがComponentへ直接漏れ出すことです。`fetch`呼び出しとValidationの`if`文が、`<div>`と同じ関数の中に同居しています。これはReact特有のMistakeではなく、25年前にMVCが防ごうとしていたのと同じMistakeが、拡張子だけを変えて再発しているだけです。
+
+```tsx
+// Anti-pattern: Model + View + ViewModelがすべて同じ場所に
+export default async function InvoiceList() {
+  const res = await fetch("https://api.example.com/invoices");
+  const data = await res.json();
+  const overdue = data.filter((inv: Invoice) => inv.dueDate < Date.now());
+  return (
+    <ul>
+      {overdue.map((inv: Invoice) => (
+        <li key={inv.id}>{inv.customerName}: {inv.amount}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+```tsx
+// lib/invoices.ts — Model: Data Access + Business Rule
+export async function getOverdueInvoices(): Promise<Invoice[]> {
+  const res = await fetch("https://api.example.com/invoices");
+  const data: Invoice[] = await res.json();
+  return data.filter((inv) => inv.dueDate < Date.now());
+}
+
+// components/InvoiceList.tsx — View: 描画のみ
+import { getOverdueInvoices } from "@/lib/invoices";
+
+export default async function InvoiceList() {
+  const overdue = await getOverdueInvoices();
+  return (
+    <ul>
+      {overdue.map((inv) => (
+        <li key={inv.id}>{inv.customerName}: {inv.amount}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+2つ目のVersionはCode量が増えているわけではなく、同じCodeにBoundaryが引かれているだけです。このBoundaryのおかげで、`getOverdueInvoices`は独立してTest可能になり、別のComponentから再利用でき、描画の関心事から切り離してReviewできるようになります。
+
+## Client側のStateに明示的なViewModelが必要な場面
+
+Server ComponentsはRead経路のModelからViewへの流れをうまく処理しますが、Interactive なClient StateにはやはりViewModel層——State遷移を管理し、Viewが必要とするものだけを公開するCustom Hook——が有効です。
+
+```tsx
+// hooks/useInvoiceFilter.ts — ViewModel: JSXを含まない、View向けState
+export function useInvoiceFilter(invoices: Invoice[]) {
+  const [query, setQuery] = useState("");
+  const filtered = useMemo(
+    () => invoices.filter((inv) =>
+      inv.customerName.toLowerCase().includes(query.toLowerCase())
+    ),
+    [invoices, query]
+  );
+  return { query, setQuery, filtered };
+}
+
+// components/InvoiceSearch.tsx — View: ViewModelにBindする
+function InvoiceSearch({ invoices }: { invoices: Invoice[] }) {
+  const { query, setQuery, filtered } = useInvoiceFilter(invoices);
+  return (
+    <div>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} />
+      <ul>{filtered.map((inv) => <li key={inv.id}>{inv.customerName}</li>)}</ul>
+    </div>
+  );
+}
+```
+
+`useInvoiceFilter`は`<div>`を一切描画せずに`@testing-library/react-hooks`でTestできます。これはまさにMVVMが与えようとしていたPropertyそのものです。
+
+## webhaniがArchitecture Reviewで伝えていること
+
+Teamに対して形式的に「MVC」や「MVVM」というLabelの採用を求めることはしません。小さなTeamにとっては大抵、価値よりBureaucracyのほうが大きくなるからです。私たちが実際に求めているのは、その根底にあるDiscipline——`fetch`やDatabase呼び出しと、些細でないBusiness Logicが、JSXと同じ関数本体の中に同居しない、ということです。あるCode Blockが3つの責務のうちどれに属するかを名指しでき、それがRender関数の外に居場所を持っていないなら、それこそが実際のFindingです。「このFileは長い」ではありません。
+
+## まとめ
+
+- Component-baseのFrameworkは、MVC/MVVMが名付けていた責務——Data Access、Business Logic、View State、描画——を消し去ったわけではなく、単にそれらを名付ける義務をなくしただけであり、それがDriftを不可視化する。
+- App Router Applicationでは、`lib/`のData-access関数をModel、Custom HookをViewModel、ComponentをViewとして扱う。これだけで「Componentがやりすぎている」というReviewコメントの大半が解決する。
+- このVocabularyはCode ReviewでのDiagnosticとして使うのであって、特定のPattern名への準拠を強制するためのMandateではない。目標はTest可能で独立してReview可能なBoundaryであること。
