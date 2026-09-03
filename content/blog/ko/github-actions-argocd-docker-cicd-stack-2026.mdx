@@ -1,0 +1,98 @@
+---
+title: "2026년 실전 CI/CD Stack: GitHub Actions + ArgoCD + Docker"
+description: "2026년에 처음부터 CI/CD를 구성한다면, CI는 GitHub Actions, Image Build는 Docker, Kubernetes로의 Delivery는 ArgoCD로 하는 조합이 기본 권장안으로 자리잡고 있습니다. 이 조합이 잘 맞는 이유와 맞지 않는 경우를 정리합니다."
+date: "2026-09-04"
+status: "published"
+tags: ["CI/CD", "GitHub Actions", "ArgoCD", "Docker", "Kubernetes"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-argocd-docker-cicd-stack-2026"
+---
+
+## 기본 Stack이 정리되었다
+
+"어떤 CI/CD Tool을 써야 하는가"는 오랫동안 열려 있던 질문이었습니다. Jenkins, CircleCI, GitLab CI, Travis 등이 각자 나름의 근거를 갖고 있었습니다. 하지만 2026년, Kubernetes 위에 구축하는 팀들 사이에서는 이 질문이 대체로 정리되었습니다. Build와 Test는 GitHub Actions, Image Packaging은 Docker, Kubernetes로의 GitOps 기반 Deployment는 ArgoCD라는 조합입니다.
+
+전체 설치 기반으로 보면 Jenkins가 여전히 가장 큰 점유율을 유지하고 있습니다. 합리적인 추정치로는 CI/CD 시장의 약 44%, 개발자 수로는 약 1,100만 명 규모이며, 대부분 Migration 비용이 큰 Legacy Enterprise 도입분입니다. 하지만 신규 Project로 한정하면, OSS와 Startup Project에서 가장 흔한 CI 조합은 GitHub Actions + Docker이고, CD 쪽을 ArgoCD와 묶는 것이 Kubernetes로 Deploy하는 팀들의 기본 권장안이 되었습니다.
+
+이 글은 홍보성 글이 아니라, 이 조합이 왜 잘 맞는지 — 그리고 어떤 경우에는 다른 선택을 권하는지를 실무적으로 짚어보는 내용입니다.
+
+## 이 조합이 잘 맞는 이유
+
+**CI로서의 GitHub Actions**가 강점을 갖는 건 기능이 많아서라기보다, 특정 범주의 운영 비용을 통째로 없애주기 때문입니다. CI Infrastructure를 직접 운영하거나 Patch할 필요가 없습니다. Jenkins Controller를 Upgrade할 일도, Plugin 호환성 Matrix를 관리할 일도 없습니다. 전담 Platform Engineer가 없는 팀에게는 단순한 편의가 아니라 실질적인 비용 절감입니다.
+
+**Image Build로서의 Docker**는 이제 사실상 선택의 대상이 아니라, Stack 전체가 전제로 삼는 교환 Format입니다. 남아 있는 실질적인 질문은 표준 Docker Build 경로를 쓸지, 더 빠른 방식(BuildKit Caching, Remote Builder)을 쓸지 정도이고, Artifact Format 자체는 어느 쪽이든 동일합니다.
+
+**CD로서의 ArgoCD**는 단순히 실행 위치를 바꾸는 것을 넘어, Deployment가 동작하는 방식 자체를 바꾸는 부분입니다. CI Pipeline이 직접 `kubectl apply`로 Cluster에 변경을 반영하는 대신(Push 기반 Deployment), ArgoCD는 Cluster에서 실제로 동작 중인 상태와 Git Repository에 선언된 상태를 지속적으로 대조합니다(Pull 기반 Deployment). Cluster는 "진실의 원천"의 *대상*이고, Git이 곧 진실의 원천입니다.
+
+## Pipeline의 실제 모습
+
+대표적이면서도 최소한의 분리는 다음과 같습니다.
+
+```yaml
+# .github/workflows/ci.yml — CI는 GitHub Actions에 둔다
+name: build-and-push
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and push image
+        run: |
+          docker build -t registry.example.com/app:${{ github.sha }} .
+          docker push registry.example.com/app:${{ github.sha }}
+      - name: Update manifest repo
+        run: |
+          # GitOps Repository의 Image Tag를 갱신하면 ArgoCD가 그 변경을 감지한다.
+          git clone https://github.com/example/gitops-manifests.git
+          cd gitops-manifests
+          sed -i "s|image: registry.example.com/app:.*|image: registry.example.com/app:${{ github.sha }}|" apps/app/deployment.yaml
+          git commit -am "deploy: app@${{ github.sha }}"
+          git push
+```
+
+이 CI Job이 *하지 않는* 일에 주목하세요. Kubernetes API에 직접 말을 걸지 않습니다. Image를 Build하고 Push한 뒤, Git Repository의 Manifest를 갱신할 뿐입니다. Cluster 안에서 동작하는 ArgoCD가 Manifest 변경을 감지하고, CI가 Push하는 대신 변경을 Pull해서 Cluster 상태를 일치시킵니다.
+
+```yaml
+# argocd-application.yaml — ArgoCD가 추적할 대상을 선언한다
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/example/gitops-manifests.git
+    targetRevision: main
+    path: apps/app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+`selfHeal: true`는 특히 눈여겨볼 부분입니다. 누군가 Cluster 내 Resource를 수동으로 수정하면(선의의 `kubectl edit` Hotfix라 하더라도), ArgoCD는 다음 Reconciliation 시점에 이를 Git 상태로 되돌립니다. 이는 버그가 아니라 의도된 제약입니다. Git을 단순한 제안이 아니라 실제 진실의 원천으로 만드는 것이 바로 이 동작입니다.
+
+## 이 Stack이 맞지 않는 경우
+
+몇 가지 구체적인 상황에서는 이 기본 구성 대신 다른 선택을 권합니다.
+
+- **강한 On-premise 또는 망분리 환경.** GitHub Actions의 Hosted Runner는 GitHub로의 Outbound 연결을 전제로 합니다. Self-hosted Runner로 동작시킬 수는 있지만, 애초에 피하려던 운영 부담의 일부가 다시 돌아옵니다.
+- **여러 팀에 걸친 복잡한 승인 Workflow.** 고도로 Customize된, 여러 팀에 걸친 승인 Chain이 GitHub Actions의 단순한 Model에 깔끔하게 맞지 않는다면, Jenkins의 성숙한 Plugin Ecosystem과 Pipeline-as-Code의 유연성이 여전히 우위에 있습니다.
+- **Kubernetes 이외의 Deploy 대상.** ArgoCD는 설계상 Kubernetes Native입니다. VM, Serverless Platform, 혹은 그 혼합 형태로 Deploy한다면, Push 기반 CD Tool(또는 해당 Platform의 Native Deployment 방식)이 원래 설계되지 않은 Infrastructure에 GitOps를 억지로 끼워 맞추는 것보다 단순한 경우가 많습니다.
+
+## webhani의 권장
+
+2026년 신규(Greenfield) Kubernetes Project라면, GitHub Actions + Docker + ArgoCD는 합리적인 기본값이며, 신규 고객에게 이로부터 벗어나려면 구체적인 이유가 필요하다고 봅니다. 핵심 가치는 개별 Tool이 아니라 Push/Pull의 분리에 있습니다. CI는 의도(새 Image, 새 Manifest)를 Build해서 공개하고, CD는 그 의도를 향해 독립적으로 Cluster를 Reconcile합니다. 이 분리 덕분에 Rollback, Drift 감지, Self-healing이, "Pipeline이 모든 걸 처리하는" 단일 구성에서는 어려운 방식으로 가능해집니다.
+
+---
+
+*참고: 2026년 CI/CD Tooling 현황 보도(Jenkins 시장 점유율 추정치, OSS·Startup의 GitHub Actions 도입 Data 포함)*
