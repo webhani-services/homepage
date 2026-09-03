@@ -1,0 +1,98 @@
+---
+title: "A Practical 2026 CI/CD Stack: GitHub Actions, ArgoCD, and Docker"
+description: "For teams starting a CI/CD setup from scratch in 2026, GitHub Actions for CI, Docker for image builds, and ArgoCD for Kubernetes delivery has become the default recommendation. Here's why that combination works and where it doesn't."
+date: "2026-09-04"
+status: "published"
+tags: ["CI/CD", "GitHub Actions", "ArgoCD", "Docker", "Kubernetes"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-argocd-docker-cicd-stack-2026"
+---
+
+## The default stack has settled
+
+For years, "which CI/CD tool should we use" was a genuinely open question — Jenkins, CircleCI, GitLab CI, Travis, and a dozen others all had reasonable claims. That question has largely settled for teams building on Kubernetes in 2026: GitHub Actions for build and test, Docker for image packaging, and ArgoCD for GitOps-based deployment to Kubernetes.
+
+Jenkins still holds the largest overall install base — reasonable estimates put it around 44% of the CI/CD market, translating to roughly 11 million developers, largely from legacy enterprise adoption that's expensive to migrate off. But for new projects, GitHub Actions plus Docker is now the most common CI combination for open-source and startup projects, and pairing it with ArgoCD for the CD half is the recommended default for teams shipping to Kubernetes.
+
+This post is a practical walkthrough of why that combination works, not a sales pitch — including where we'd still recommend something else.
+
+## Why this combination, specifically
+
+**GitHub Actions for CI** wins less on features than on removing a category of operational cost entirely. You don't run or patch CI infrastructure — no Jenkins controller to upgrade, no plugin compatibility matrix to manage. For a team without a dedicated platform engineer, that's a real cost saving, not just convenience.
+
+**Docker for image builds** isn't really a decision anymore — it's the interchange format the rest of the stack assumes. The only live question is whether you're building with the standard Docker build path or something faster (BuildKit caching, remote builders); the artifact format stays the same either way.
+
+**ArgoCD for CD** is the part that actually changes how deployments work, not just where they run. Instead of your CI pipeline directly `kubectl apply`-ing changes to a cluster (push-based deployment), ArgoCD continuously reconciles what's running in the cluster against what's declared in a Git repository (pull-based deployment). The cluster is the source of truth's *target*; Git is the source of truth.
+
+## What the pipeline actually looks like
+
+A minimal but representative split:
+
+```yaml
+# .github/workflows/ci.yml — CI stays in GitHub Actions
+name: build-and-push
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and push image
+        run: |
+          docker build -t registry.example.com/app:${{ github.sha }} .
+          docker push registry.example.com/app:${{ github.sha }}
+      - name: Update manifest repo
+        run: |
+          # Bump the image tag in the GitOps repo; ArgoCD picks up the change.
+          git clone https://github.com/example/gitops-manifests.git
+          cd gitops-manifests
+          sed -i "s|image: registry.example.com/app:.*|image: registry.example.com/app:${{ github.sha }}|" apps/app/deployment.yaml
+          git commit -am "deploy: app@${{ github.sha }}"
+          git push
+```
+
+Notice what the CI job does *not* do: it never talks to the Kubernetes API directly. It builds an image, pushes it, and updates a manifest in a Git repository. ArgoCD, running inside the cluster, detects the manifest change and reconciles the cluster state to match — pulling the change in rather than having CI push it.
+
+```yaml
+# argocd-application.yaml — declares what ArgoCD should track
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/example/gitops-manifests.git
+    targetRevision: main
+    path: apps/app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+`selfHeal: true` is the detail worth pausing on: if someone manually edits a resource in the cluster (a well-intentioned hotfix via `kubectl edit`), ArgoCD reverts it back to match Git on the next reconciliation. That's a deliberate constraint, not a bug — it's what makes Git the actual source of truth instead of a suggestion.
+
+## Where this stack falls short
+
+We'd steer clients away from this default in a few specific cases:
+
+- **Heavy on-prem or air-gapped environments.** GitHub Actions' hosted runners assume outbound connectivity to GitHub; self-hosted runners work but reintroduce some of the operational burden you were trying to avoid.
+- **Complex approval workflows spanning many teams.** Jenkins' mature plugin ecosystem and pipeline-as-code flexibility still has an edge for highly customized, multi-team approval chains that don't map cleanly onto GitHub Actions' simpler model.
+- **Non-Kubernetes deployment targets.** ArgoCD is Kubernetes-native by design. If you're deploying to VMs, serverless platforms, or a mix, a push-based CD tool (or your platform's native deployment mechanism) is often simpler than forcing GitOps onto infrastructure it wasn't designed for.
+
+## Our recommendation
+
+For a greenfield Kubernetes project in 2026, GitHub Actions + Docker + ArgoCD is a reasonable default, and we'd need a specific reason to deviate from it for new clients. The bigger value isn't any single tool — it's the push/pull split: CI builds and publishes an intent (a new image, a new manifest), and CD reconciles the cluster toward that intent independently. That separation is what makes rollbacks, drift detection, and self-healing possible in a way that a monolithic "pipeline does everything" setup doesn't.
+
+---
+
+*References: 2026 CI/CD tooling landscape reporting, including Jenkins market share estimates and GitHub Actions adoption data for open-source and startup projects*

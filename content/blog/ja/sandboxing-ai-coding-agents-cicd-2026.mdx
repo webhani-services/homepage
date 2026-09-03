@@ -1,0 +1,78 @@
+---
+title: "自律コーディングAgentをKubernetes/CIでどう隔離するか"
+description: "自律型AgentがPipeline内でコードを生成し、パッケージをインストールし、Toolを呼び出すようになった今、Container単位の隔離だけでは足りません。2026年のCI/CDとKubernetesにおけるVM級の隔離境界を実務的に整理します。"
+date: "2026-09-04"
+status: "published"
+tags: ["Security", "Kubernetes", "CI/CD", "AI Agents", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "sandboxing-ai-coding-agents-cicd-2026"
+---
+
+## Pipelineに現れた新しい主体
+
+従来のCI/CDセキュリティモデルは、Build Stepを実行する主体が予測可能であることを前提にしています。バージョン管理されたスクリプト群であり、マージ前にレビュー済みという前提です。この前提が崩れつつあります。2026年、Pipeline内の活動のうち、自律型Agentが起点になるものが増えています。タスクの説明を読み、どのパッケージをインストールするか判断し、コードを書き、人間が各ステップを承認しないままShell Commandを実行するツールです。
+
+これは仮定の話ではありません。セキュリティベンダーは、この変化を前提にした製品を出し始めています。Agentがインストールしたコードが実行される前に、悪意あるOSSパッケージをEndpoint側でブロックする機能や、On-callエンジニアを呼ぶ前にAIがKubernetesの障害を診断・修正するPlatformなどです。こうした製品の成熟度をどう評価するかは別として、前提そのものは妥当です。Pipeline内のAgentは新しい信頼境界であり、多くのチームのContainerセキュリティ体制は、人間と静的スクリプトを前提に設計されており、実行途中で「これを`pip install`しよう」と思いついて実行するプロセスを想定していません。
+
+## 「Containerだから十分」ではなくなった理由
+
+標準的なContainer隔離(Namespace、cgroups、絞り込んだDockerfile)は、予測可能なWorkloadを封じ込め、既知の障害モード — Processのクラッシュ、リソースリーク、人間がDiffをレビューした上でBuild時に混入した脆弱な依存関係 — からの被害範囲を限定するために設計されました。自律型Agentは、脅威モデルを3つの点で変えます。
+
+1. **実行しうるコマンドの集合が事前に固定されていない。** Deployスクリプトのように特定のShell Commandをallowlist化することはできません。Agentの価値そのものが、文脈に応じて何を実行するかを判断することにあるためです。
+2. **実行時に自分で依存関係をインストールできる。** Build Step内で実行される、汚染された・幻覚によるパッケージ名は、人間の`package.json`変更ではなく、Agent自身が持ち込むSupply Chainリスクです。
+3. **人間のレビューループより速く動く。** 人間がAgentの予期しない挙動に気づく頃には、すでに数ターン先まで進んでいることがあります。
+
+だからこそ、業界の議論はAgentが実行するコードに対する「VM級」の隔離へと向かっています。Container自体が壊れているからではなく、その中で動くWorkloadがContainerの前提に合わなくなっているためです。
+
+## VM級隔離の実務的な形
+
+CI/CD内、あるいは稼働中のKubernetes Clusterに対してAgentを動かすチームでは、いくつかのパターンが標準になりつつあります。
+
+**1. Agentのタスクごとに使い捨ての隔離環境を用意する。** Agentが複数のタスクにわたって再利用する長寿命のRunnerではなく、タスクごとに新規かつ隔離された実行環境を立ち上げ、終わったら破棄します。1回の誤った判断が及ぼす被害を限定し、Agentが複数の実行にまたがって悪用できる永続状態を排除します。
+
+```yaml
+# 簡略化した例: Agentのタスクは共有の長寿命CI Runnerではなく、
+# スコープが絞られた使い捨てSandboxで実行する。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: agent-task-run
+spec:
+  ttlSecondsAfterFinished: 0
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: agent-sandbox
+          image: agent-runtime:isolated
+          resources:
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+```
+
+**2. Networkの送信先はデフォルト開放ではなくAllowlist化する。** 任意のHostに到達できるAgentは、Dataの持ち出しや任意コードの取得が可能になります。タスクが本当に必要とする特定のPackage RegistryやAPIにEgressを絞り、そのAllowlist外への接続試行はWarningではなくIncidentとしてログに残します。
+
+**3. 常設の認証情報を持たせない。** Agent Sandboxは、長寿命のService Account Tokenをマウントするのではなく、OIDC連携などのJust-in-time機構を通じて、そのタスク専用の短命でスコープの絞られた認証情報を要求すべきです。実行中にAgentのSandboxが侵害されても、被害範囲はそのタスク分のAccessに限定され、永続的なSecretには及びません。
+
+**4. 本番に触れる前に人間によるゲートを置く。** 隔離は実行中の被害を限定しますが、リリース前のレビューの代わりにはなりません。Infrastructure、Deploy設定、本番のKubernetes Resourceに対するAgent発の変更も、人間発の変更と同じ承認ゲートを通すべきです — 障害モードがまだ十分に理解されていない段階では、むしろより厳しいゲートが妥当でしょう。
+
+## Agentic CI/CDを導入するチームへ
+
+Build Pipeline内や稼働中のKubernetes Clusterに対して自律型Agentを試験導入・本番導入しているなら、Sandbox設計を後付けではなく導入計画の一部として最初から扱ってください。
+
+- 現在のCI Runnerが、人間のContributorより多くの常設Accessを Agentに与えていないか監査する。
+- 「Agentは読み取って提案できる」と「Agentは実行してMergeできる」を別のPermission階層として分離し、デフォルトは前者にする。
+- Sandbox Infrastructure(使い捨てCompute、スコープ付き認証情報、Egress制御)のコストを、Incident発生後の後付けではなく、Agent導入コストの一部として最初から見込む。
+
+Pipeline内の自律型Agentは、隔離モデルが実際の脅威モデルに合っていれば生産性の向上につながります。現時点では多くのチームでそこが合っていません。放置すれば、そのギャップこそが次の世代のCI/CD Incidentの発生源になります。
+
+---
+
+*参考: Fal.con 2026におけるSupply Chainセキュリティ関連の発表; AgenticなKubernetes修復Platformに関する業界報道、2026年9月*

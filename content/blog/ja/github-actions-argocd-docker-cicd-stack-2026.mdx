@@ -1,0 +1,98 @@
+---
+title: "2026年の実用CI/CDスタック: GitHub Actions + ArgoCD + Docker"
+description: "2026年にゼロからCI/CDを組むなら、GitHub ActionsでCI、DockerでImage Build、ArgoCDでKubernetesへのDeliveryという構成がデフォルトの推奨になりつつあります。この組み合わせが機能する理由と、機能しないケースを整理します。"
+date: "2026-09-04"
+status: "published"
+tags: ["CI/CD", "GitHub Actions", "ArgoCD", "Docker", "Kubernetes"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-argocd-docker-cicd-stack-2026"
+---
+
+## デファクトスタンダードが定まってきた
+
+「どのCI/CDツールを使うべきか」は、長年オープンな問いでした。Jenkins、CircleCI、GitLab CI、Travisなど、それぞれに一理ありました。しかし2026年、Kubernetes上に構築するチームにとって、この問いはおおむね決着しています。BuildとTestはGitHub Actions、Image PackagingはDocker、KubernetesへのGitOpsベースのDeploymentはArgoCD、という組み合わせです。
+
+全体の導入数ではJenkinsが依然として最大シェアを保っています。妥当な推計ではCI/CD市場の約44%、開発者数にして約1,100万人規模とされ、その多くはMigrationコストの高いレガシーなEnterprise導入です。しかし新規プロジェクトに限れば、OSSやStartupのプロジェクトで最も多いCIの組み合わせはGitHub Actions + Dockerであり、CD側をArgoCDと組み合わせるのがKubernetesにDeployするチームのデフォルトの推奨になっています。
+
+本稿はセールストークではなく、この組み合わせがなぜ機能するのか — そして、どこでは別の選択肢を薦めるか — を実務的に整理するものです。
+
+## この組み合わせが機能する理由
+
+**CIとしてのGitHub Actions**が優れているのは、機能の豊富さよりも、あるカテゴリの運用コストをまるごと取り除ける点です。CI Infrastructureを自分たちで動かしたりPatchを当てたりする必要がありません。Jenkins Controllerのアップグレードも、Pluginの互換性マトリクスの管理も不要です。専任のPlatform Engineerがいないチームにとって、これは単なる利便性ではなく実質的なコスト削減です。
+
+**Image BuildとしてのDocker**は、もはや選択の対象というより、他のスタック全体が前提とする交換フォーマットです。生きている論点は、標準のDocker Buildパスを使うか、より高速な方法(BuildKitのCache、リモートBuilder)を使うかだけで、Artifactのフォーマット自体はどちらでも変わりません。
+
+**CDとしてのArgoCD**は、単に動かす場所を変えるだけでなく、Deploymentの動き方そのものを変える部分です。CI Pipelineが直接`kubectl apply`でClusterに変更を反映する(Push型のDeployment)のではなく、ArgoCDはClusterで実際に動いているものと、Gitリポジトリで宣言されているものを継続的に照合します(Pull型のDeployment)。Clusterは「真実の情報源」の*対象*であり、Gitが真実の情報源そのものです。
+
+## Pipelineの実際の姿
+
+代表的で最小限の分割は次のようになります。
+
+```yaml
+# .github/workflows/ci.yml — CIはGitHub Actionsに留める
+name: build-and-push
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and push image
+        run: |
+          docker build -t registry.example.com/app:${{ github.sha }} .
+          docker push registry.example.com/app:${{ github.sha }}
+      - name: Update manifest repo
+        run: |
+          # GitOpsリポジトリのImage Tagを更新すると、ArgoCDがその変更を検知する。
+          git clone https://github.com/example/gitops-manifests.git
+          cd gitops-manifests
+          sed -i "s|image: registry.example.com/app:.*|image: registry.example.com/app:${{ github.sha }}|" apps/app/deployment.yaml
+          git commit -am "deploy: app@${{ github.sha }}"
+          git push
+```
+
+このCI Jobが*していないこと*に注目してください。Kubernetes APIに直接話しかけることは一切ありません。Imageをbuildしてpushし、Gitリポジトリ内のManifestを更新するだけです。Cluster内で動いているArgoCDがManifestの変更を検知し、CIがPushするのではなく、変更をPullする形でClusterの状態を一致させます。
+
+```yaml
+# argocd-application.yaml — ArgoCDが追跡する対象を宣言する
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/example/gitops-manifests.git
+    targetRevision: main
+    path: apps/app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+`selfHeal: true`は特に注目に値します。誰かがCluster内のResourceを手動で編集した場合(善意の`kubectl edit`によるHotfixであっても)、ArgoCDは次回のReconciliationでGitの状態に戻します。これは意図された制約であり、バグではありません。Gitを「単なる提案」ではなく、実際の真実の情報源にしているのはこの挙動です。
+
+## このスタックが機能しないケース
+
+いくつかの具体的なケースでは、この既定の構成を薦めません。
+
+- **強いOn-premや隔離Networkの環境。** GitHub ActionsのHosted RunnerはGitHubへのOutbound接続を前提としています。Self-hosted Runnerで動かすことは可能ですが、避けたかったはずの運用負担の一部が戻ってきます。
+- **多数のチームにまたがる複雑な承認フロー。** 高度にカスタマイズされた、多チーム間の承認チェーンがGitHub Actionsのシンプルなモデルにきれいに収まらない場合、Jenkinsの成熟したPluginエコシステムとPipeline-as-Codeの柔軟性には依然として優位性があります。
+- **Kubernetes以外のDeploy先。** ArgoCDは設計上Kubernetes Nativeです。VM、Serverless Platform、あるいはその混在にDeployするなら、Push型のCDツール(あるいはPlatform Native のDeployment機構)のほうが、設計されていないInfrastructureにGitOpsを無理に当てはめるより単純なことが多いです。
+
+## webhaniとしての推奨
+
+2026年のGreenfieldなKubernetesプロジェクトであれば、GitHub Actions + Docker + ArgoCDは妥当なデフォルトであり、新規顧客に対してこれから逸脱するには具体的な理由が必要だと考えています。価値の中心は個々のツールではなく、Push/Pullの分離です。CIは意図(新しいImage、新しいManifest)をBuildして公開し、CDはその意図に向けてClusterを独立してReconcileします。この分離があるからこそ、Rollback、Drift検知、Self-healingが、「Pipelineが全部やる」モノリシックな構成では実現しにくい形で可能になります。
+
+---
+
+*参考: 2026年のCI/CDツールランドスケープに関する報道(Jenkinsの市場シェア推計、OSS・StartupにおけるGitHub Actions採用データを含む)*
