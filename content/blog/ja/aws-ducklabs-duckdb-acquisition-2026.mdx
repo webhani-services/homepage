@@ -1,0 +1,87 @@
+---
+title: "AWSがDuckLabsを買収：In-Process Analyticsはどこへ向かうのか"
+description: "AWSが1日300万Downloadを誇るIn-process OLAP DatabaseのDuckDBを開発するDuckLabsを買収しました。DuckDB自体はMIT LicenseのままOpen Sourceを維持しますが、この買収はS3 Native Analyticsの今後を示唆しています。"
+date: "2026-09-05"
+status: "published"
+tags: ["Database", "AWS", "DuckDB", "Analytics", "Cloud Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-ducklabs-duckdb-acquisition-2026"
+---
+
+Amazonが、DuckDBを開発するAmsterdamの約30人規模の企業DuckLabsを買収すると発表しました。DuckDBは1日300万Download以上を記録するIn-process OLAP Databaseです。Dealは8月末にCloseし、Teamは2026年9月1日付けでAWSに合流しました。買収金額は非公開です。DuckDBの共同創業者であるHannes Mühleisen氏とMark Raasveldt氏は引き続きTechnical DirectionをLeadし、TeamはAmsterdamで開発を継続します。
+
+重要なのは、DuckDB・DuckLake・QuackはすべてMIT LicenseのOpen Sourceのまま、独立したDuckDB Foundationが管理を続ける点です。これはRedisのようなRe-licensingの動きではありません。むしろdbt、AirbyteのConnector、MotherDuck、そして「Dataのすぐ隣でAnalyticsを実行する」系の多くのToolがすでに依存している、モダンなData Stackの中核を担うProjectのTeamとRoadmapへの影響力をAWSが買った、と捉えるのが近いです。
+
+## この買収以前のDuckDBの立ち位置
+
+DuckDBのコンセプトは一貫してシンプルです。「Analytics版のSQLite」。Server不要、Cluster不要、単一のBinary（あるいはPython/Node/Wasmへの埋め込み）だけで、Parquet・CSV・独自Formatに対してColumnarなOLAP Queryを直接実行できます。多くの場合、対象はS3上のFileです。
+
+```python
+import duckdb
+
+# Warehouseを立てずにS3上のParquet Fileに直接Queryする
+result = duckdb.sql("""
+    SELECT
+        region,
+        date_trunc('month', order_date) AS month,
+        sum(amount) AS revenue
+    FROM read_parquet('s3://sales-data/orders/*.parquet')
+    WHERE order_date >= '2026-01-01'
+    GROUP BY region, month
+    ORDER BY month
+""").df()
+```
+
+webhaniが手がけるClientのReportingやData Exploration作業の多くで、これは実際のQuery量に対してOverspecなRedshiftやSnowflakeのWarehouseを置き換える手段になっています。Clusterの事前Provisioningも不要、Idle時のCompute課金もなく、Queryはコードが動く場所（Lambda、Laptop、CI Job）でそのまま実行できます。
+
+## なぜAWSは買収したのか
+
+The Registerの分析はAWSのRoadmapから予想されるものと一致しています。S3を単なるStorageではなく「AnalyticsするPlace」にするというAmazonの方針に合致する動きだ、というものです。AWSはすでにS3上のServerless SQLとしてAthenaを提供していますが、AthenaはNetwork越しに呼び出すManaged Serviceです。一方DuckDBはApplication Processに直接埋め込まれる、根本的に異なるIntegration Pointであり、これまでAWSが持っていなかったものです。
+
+DuckDB Teamを傘下に収めることで、AWSは以下を手に入れます。
+
+- SDK・Lambda Runtime・BedrockのData-prep Pipelineに埋め込める信頼性の高いIn-process Query Engine。
+- Lakehouse Architecture向けのDuckDBの新しいOpen Table FormatであるDuckLakeへの影響力。DatabricksのDelta LakeやIcebergエコシステムへの直接的な対抗軸です。
+- VCによる希薄化や過去のBuyoutの影響を受けていない、業界屈指の効率的なColumnar Engineを5年かけて作り上げたEngineer Teamの獲得。
+
+## Architecture判断への実務的な影響
+
+既存のWarehouseを剥がせと言っているわけではありません。実務上のTakeawayはもう少し限定的です。
+
+1. **DuckDBは長期的に「より安全な選択肢」になった。** DuckDBをProductionに組み込む際によく出る反論が「5年後も誰がMaintainするのか」でした。AWSが後ろ盾になり、Amsterdamでの開発継続性が確保されたMIT License Projectは、独立系の5年目Startupだった頃より説得力のある回答になります。
+2. **Service Wrapperではなく、より密なS3統合が来る可能性が高い。** `s3://` URLとAuth設定を手動で組む代わりに、DuckDBからのS3上のPartitioned Datasetの読み取りが、Native SDK（boto3やAWS SDK）でCredential-awareなFirst-class Operationになることを想定しておくべきです。
+3. **「これにWarehouseが本当に必要か」を再検討する価値がある。** Analytics Workloadがバースト的、中小規模、あるいはApplicationに埋め込まれている（Dashboard、Reporting API、ETLのValidation Stepなど）場合、S3上のParquetに対するDuckDBは、常時稼働するWarehouse Clusterよりも安価かつシンプルなことが多いです。
+4. **Lakehouse ProjectではDuckLakeを注視する価値がある。** 新しいLakehouse構築でIcebergとDelta Lakeを比較検討している場合、DuckLakeは今やAWSの暗黙的な後ろ盾を得ています。数年単位のArchitecture判断ではこれを考慮に入れるべきです。
+
+## 実際に使っている具体的なPattern
+
+Warehouseを正当化できないScheduled ReportingのJobに対して、webhaniが現在採用しているDefaultです。
+
+```typescript
+// Serverless ReportingのJob：Warehouseなし、Idle Clusterなし
+import duckdb from "duckdb";
+
+const db = new duckdb.Database(":memory:");
+const con = db.connect();
+
+con.all(
+  `SELECT customer_id, sum(amount) AS total
+   FROM read_parquet('s3://reports-bucket/transactions/2026/*.parquet')
+   GROUP BY customer_id
+   HAVING sum(amount) > 10000`,
+  (err, rows) => {
+    if (err) throw err;
+    // rows をReporting DashboardやAlerting Pipelineに渡す
+  }
+);
+```
+
+これをScheduled LambdaやSmall Containerで実行すれば、「Infrastructure」は起動してS3にQueryを投げて終了する単一Processだけになります。常時WarmにしておくClusterもIdle課金もありません。
+
+## まとめ
+
+- DuckDB自体はOpen SourceかつMIT Licenseのまま。買収が変えるのは「開発企業」であり、Licenseではありません。
+- 緊急対応と捉える必要はなく、あくまでSignalとして受け止める。既存のDuckDB利用を今すぐ変える必要はありませんが、新しいS3 Analyticsの判断ではAWSの投資拡大を考慮に入れるべきです。
+- 新規ProjectでWarehouseかEmbedded Query Engineかを選ぶ際、DuckDBのRisk Profileは改善したと言えます。
+- LakehouseのTable Format選定では、Open Table Formatの背後にいるVendorが誰かという長期的な影響を持つ論点として、DuckLakeの動向を注視してください。
