@@ -1,0 +1,114 @@
+---
+title: "AI Testing SaaS 없이도 Flaky Test가 CI를 막지 못하게 만드는 법"
+description: "2026년의 Flaky Test Tool들은 모두 같은 아이디어로 수렴합니다. 실행 이력으로 계산하는 Probabilistic Flakiness Score입니다. 이미 사용 중인 CI 위에서 직접 경량 버전을 만드는 방법을 정리합니다."
+date: "2026-09-05"
+status: "published"
+tags: ["Testing", "CI/CD", "Flaky Tests", "GitHub Actions", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "flaky-test-detection-probabilistic-score-2026"
+---
+
+Flaky Test 대응 Tooling은 2026년 들어 조용히 하나의 Product Category가 되었습니다. AI 기반 Test Intelligence Platform들이 잇달아 등장해 Flaky Test 탐지, Quarantine, 원인 분석을 자동화하겠다고 내세우고 있습니다. 대부분의 내부 Mechanism은 동일합니다. 모든 Test의 Execution History를 수집하고, 각 실행 결과를 해당 Test 자신의 과거 행동 패턴과 비교해 Pass/Fail 이진값이 아닌 안정성 Metric을 계산하는 방식입니다. 여러 Vendor가 이를 "Probabilistic Flakiness Score"라고 부르기 시작했습니다.
+
+이 가치의 대부분은 Platform을 구매하지 않아도 얻을 수 있습니다. CI가 이미 Test 결과를 Artifact로 저장하고 있다면(저장해야 합니다), 이 기법의 핵심은 이미 생성 중인 Data 위에 수백 줄의 Script를 얹는 것으로 충분합니다.
+
+## 이진 Flaky 탐지가 실패하는 이유
+
+"Test가 실패했다가 Retry에서 Pass하면 Flaky로 표시"라는 단순한 접근에는 두 가지 문제가 있습니다.
+
+1. 사후 대응이 된다. Test는 최소 한 번 개발자 눈앞에서 실패해야 Flag가 붙는다.
+2. Signal을 버린다. 200번 중 1번 실패하는 Test와 5번 중 1번 실패하는 Test는 행동 양상이 전혀 다른데, 이진 Log에서는 동일하게 보인다.
+
+Probabilistic Score는 대신 Test별 결과를 Rolling Window로 추적해 연속적인 값을 산출합니다.
+
+```python
+# flakiness_score.py — Test별 rolling flakiness score 계산
+from collections import deque
+from dataclasses import dataclass, field
+
+WINDOW_SIZE = 50          # 최근 N회 실행 대상
+FLAKY_THRESHOLD = 0.08    # 불일치율 8% 초과 시 Flaky 판정
+
+@dataclass
+class TestHistory:
+    outcomes: deque = field(default_factory=lambda: deque(maxlen=WINDOW_SIZE))
+
+    def record(self, passed: bool) -> None:
+        self.outcomes.append(passed)
+
+    def flakiness_score(self) -> float:
+        if len(self.outcomes) < 10:
+            return 0.0  # 이력 부족으로 판단 불가
+        transitions = sum(
+            1 for a, b in zip(self.outcomes, list(self.outcomes)[1:]) if a != b
+        )
+        # Window Size 대비 Pass<->Fail 전환 횟수가 많을수록 Flaky
+        return transitions / (len(self.outcomes) - 1)
+
+    def is_flaky(self) -> bool:
+        return self.flakiness_score() > FLAKY_THRESHOLD
+```
+
+단순 Failure Rate 대신 전환 횟수를 쓰는 것은 의도적인 설계입니다. 항상 일관되게 실패하는 Test(Flaky가 아니라 그냥 고장 난 Feature)는 Failure Rate가 높아도 Transition 횟수는 낮습니다. 반대로 실행마다 Pass와 Fail을 오가는 Test는 Transition 횟수가 높은데, 이것이야말로 단순히 "가끔 실패한다"가 아니라 Flakiness 자체의 신호입니다.
+
+## GitHub Actions에 연결하기
+
+History는 여러 번의 실행을 넘어 지속되는 곳에 저장해야 합니다. Cache 안의 작은 JSON Blob이든 가벼운 외부 Store든 모두 가능합니다. 여기서는 추가 Infrastructure가 필요 없는 Cache 방식을 소개합니다.
+
+```yaml
+# .github/workflows/test.yml
+name: test
+on: [pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore test history
+        uses: actions/cache@v4
+        with:
+          path: .test-history.json
+          key: test-history-${{ github.repository }}
+          restore-keys: test-history-
+
+      - run: npm ci
+      - run: npm test -- --json --outputFile=results.json
+        continue-on-error: true
+
+      - name: Update flakiness scores
+        run: python scripts/flakiness_score.py --results results.json --history .test-history.json
+
+      - name: Fail build only on non-flaky failures
+        run: python scripts/gate.py --results results.json --history .test-history.json
+```
+
+핵심 설계 판단은 `gate.py`에 있습니다. 어떤 Test의 실패가 Merge를 막는 것은 해당 Test의 Flakiness Score가 임계값보다 "낮을" 때, 즉 간헐적이지 않고 일관되게 실패할 때뿐입니다. 임계값을 넘는 Test는 조용히 사라지는 대신 별도의 Blocking하지 않는 Report로 Quarantine됩니다. 이 "보이지만 Block하지 않는다, 삭제하지 않는다"는 구분이 중요합니다. 조용히 Skip된 Flaky Test는 언젠가 Production에서 다시 발견하게 될 Bug입니다. Quarantine된 Test는 누군가의 할 일 목록에 남아 있습니다.
+
+## 증상이 아니라 Root Cause를 다루기
+
+Flakiness Score는 "무엇이 Flaky한가"는 알려주지만 "왜인가"는 알려주지 않습니다. 실무에서는 거의 모든 경우가 다섯 가지 원인으로 귀결됩니다. Timing에 대한 잘못된 가정(실제 대기 조건 대신 `sleep(500)`), Test 간 공유되는 Mutable State, Mock 처리되지 않은 Network 호출, E2E Suite의 취약한 DOM/CSS Selector, 그리고 단독으로는 통과하지만 전체 실행에서는 실패하는 Test 간 순서 의존성입니다.
+
+```typescript
+// Before: Timing에 대한 잘못된 가정 — 전형적인 Flaky Pattern
+await page.click("#submit");
+await sleep(500);
+expect(page.locator(".success-banner")).toBeVisible();
+
+// After: 고정 Delay 대신 실제 조건을 대기
+await page.click("#submit");
+await page.locator(".success-banner").waitFor({ state: "visible" });
+```
+
+수정 노력을 어디에 쓸지 알려주는 것이 바로 이 Score입니다. 단독으로 봤을 때의 Flaky 정도가 아니라, 해당 Test가 Merge를 얼마나 자주 막는지로 우선순위를 정해야 합니다. 주 1회만 실행되는 Flakiness Score 15% Test보다, 매 PR마다 실행되는 Score 5% Test가 더 큰 영향을 미칩니다.
+
+## 정리
+
+1. 대부분의 Flaky Test Product에서 "AI"의 정체는 Execution History에 대한 Rolling Statistical Model입니다. Transition 기반 Scoring과 수백 줄의 Script로 핵심 가치를 근사할 수 있습니다.
+2. 삭제가 아니라 Quarantine. Suite에서 조용히 사라진 Flaky Test는 중요한 순간이 되어서야 발견하게 될 Coverage Gap입니다.
+3. 간헐적 실패가 아니라 일관된 실패에만 Merge를 Gate합니다. 다만 Flaky Test는 무한정 방치되지 않도록 Dashboard나 Report에서 계속 보이게 유지해야 합니다.
+4. Test 단위가 아니라 Category 단위(Timing, 공유 State, Network, Selector, 순서 의존성)로 Root Cause를 수정합니다. 대부분의 Flaky Suite는 이 중 두세 개 Category에 집중되어 있습니다.
+
+Flaky Test의 Noise에 파묻혀 있는 팀이라면, 무언가를 구매하기 전에 먼저 측정부터 시작하세요. 기존 CI Artifact 위에 만든 Rolling Flakiness Score만으로도 1주일이면 Tooling 문제인지 Test 설계 문제인지가 드러납니다.

@@ -1,0 +1,114 @@
+---
+title: "You Don't Need an AI Testing SaaS to Stop Flaky Tests From Blocking CI"
+description: "2026's flaky-test tools all converge on the same idea: a probabilistic flakiness score built from execution history. Here's how to build a lightweight version of that yourself, on top of the CI you already run."
+date: "2026-09-05"
+status: "published"
+tags: ["Testing", "CI/CD", "Flaky Tests", "GitHub Actions", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "flaky-test-detection-probabilistic-score-2026"
+---
+
+Flaky test tooling has quietly become its own product category in 2026 — a wave of AI-driven test intelligence platforms now promise to detect, quarantine, and root-cause flaky tests automatically. The mechanism behind most of them is the same: collect execution history for every test, compare each run against that test's own past behavior, and compute a stability metric instead of treating every result as a fresh pass/fail. Several vendors now describe this as a "probabilistic flakiness score" rather than a binary flaky/not-flaky label.
+
+You don't need to buy a platform to get most of the value. If your CI already stores test results as artifacts (and it should), the core of this technique is a few hundred lines of scripting on top of data you're already producing.
+
+## Why Binary Flaky Detection Fails
+
+The naive approach — "if a test failed and then passed on retry, mark it flaky" — has two problems:
+
+1. It reacts after the fact. A test has to fail in front of a developer at least once before it's flagged.
+2. It throws away signal. A test that fails 1 time in 200 runs behaves very differently from one that fails 1 time in 5, but both look identical in a binary log.
+
+A probabilistic score instead tracks a rolling window of outcomes per test and produces a continuous value.
+
+```python
+# flakiness_score.py — compute a rolling flakiness score per test
+from collections import deque
+from dataclasses import dataclass, field
+
+WINDOW_SIZE = 50          # last N runs considered
+FLAKY_THRESHOLD = 0.08    # >8% inconsistent outcome rate = flaky
+
+@dataclass
+class TestHistory:
+    outcomes: deque = field(default_factory=lambda: deque(maxlen=WINDOW_SIZE))
+
+    def record(self, passed: bool) -> None:
+        self.outcomes.append(passed)
+
+    def flakiness_score(self) -> float:
+        if len(self.outcomes) < 10:
+            return 0.0  # not enough history to judge
+        transitions = sum(
+            1 for a, b in zip(self.outcomes, list(self.outcomes)[1:]) if a != b
+        )
+        # more pass<->fail transitions relative to window size = more flaky
+        return transitions / (len(self.outcomes) - 1)
+
+    def is_flaky(self) -> bool:
+        return self.flakiness_score() > FLAKY_THRESHOLD
+```
+
+The transition-count approach is a deliberate choice over a simple failure rate: a test that fails consistently (broken feature, not flaky) has a *low* transition count even with a high failure rate. A test that flips between pass and fail run to run has a high transition count — that's the actual signature of flakiness, not just "sometimes fails."
+
+## Wiring It Into GitHub Actions
+
+The history has to live somewhere durable across runs. A small JSON blob in a cache or a lightweight external store both work; here's the cache-based version since it needs no extra infrastructure.
+
+```yaml
+# .github/workflows/test.yml
+name: test
+on: [pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore test history
+        uses: actions/cache@v4
+        with:
+          path: .test-history.json
+          key: test-history-${{ github.repository }}
+          restore-keys: test-history-
+
+      - run: npm ci
+      - run: npm test -- --json --outputFile=results.json
+        continue-on-error: true
+
+      - name: Update flakiness scores
+        run: python scripts/flakiness_score.py --results results.json --history .test-history.json
+
+      - name: Fail build only on non-flaky failures
+        run: python scripts/gate.py --results results.json --history .test-history.json
+```
+
+The key design decision is in `gate.py`: a test failure only blocks the merge if that test's flakiness score is *below* the threshold — meaning it fails consistently, not intermittently. Tests above the threshold get quarantined into a separate, non-blocking report instead of silently disappearing. That distinction — visible but non-blocking, not deleted — matters. A quietly skipped flaky test is a bug you'll rediscover in production; a quarantined one stays on someone's list.
+
+## Handling Root Causes, Not Just Symptoms
+
+A flakiness score tells you *what* is flaky, not *why*. In practice, we've found five causes account for nearly all of it: timing assumptions (`sleep(500)` instead of an actual wait condition), shared mutable state between tests, unmocked network calls, brittle DOM/CSS selectors in E2E suites, and order dependency between tests that pass in isolation but fail in a full run.
+
+```typescript
+// Before: timing assumption — the classic flaky pattern
+await page.click("#submit");
+await sleep(500);
+expect(page.locator(".success-banner")).toBeVisible();
+
+// After: wait for the actual condition, not a fixed delay
+await page.click("#submit");
+await page.locator(".success-banner").waitFor({ state: "visible" });
+```
+
+The score is what tells you *where* to spend that fixing effort — prioritize by how often a test blocks a merge, not by how flaky it looks in isolation. A test with a 15% flakiness score that runs once a week matters less than one with a 5% score that runs on every PR.
+
+## Takeaways
+
+1. The "AI" in most flaky-test products is a rolling statistical model over execution history — you can approximate the core value with a scored, transition-based metric and a couple hundred lines of scripting.
+2. Quarantine, don't delete. A flaky test that silently vanishes from the suite is a coverage gap you won't notice until it matters.
+3. Gate merges on consistent failures, not intermittent ones — but keep flaky tests visible in a dashboard or report so they get fixed, not ignored indefinitely.
+4. Fix root causes by category (timing, shared state, network, selectors, ordering) rather than test by test; most flaky suites cluster around two or three of these.
+
+If your team is drowning in flaky test noise, start by measuring before buying anything — a rolling flakiness score built on your existing CI artifacts will tell you in a week whether you have a tooling problem or a test-design problem.
