@@ -1,0 +1,62 @@
+---
+title: "OpenTelemetryがCNCF Graduationを達成 — 本当に重要なのは新しい「Blueprints」かもしれない"
+description: "OpenTelemetryは2026年5月にCNCF Graduationを達成し、Observabilityの標準としての地位を確立しました。しかしより実務的に重要なのは、Teamごとの計装のバラつきというGraduationでは解決しない課題に取り組む新しい「Blueprints」の取り組みです。"
+date: "2026-09-06"
+status: "published"
+tags: ["Observability", "OpenTelemetry", "DevOps", "Monitoring", "Cloud Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "opentelemetry-blueprints-observability-2026"
+---
+
+OpenTelemetryは、第三者によるSecurity AuditとGovernance Reviewを経て、2026年5月にCNCF Graduated Projectとなりました。このMilestoneは、多くのTeamがすでに現場で感じていたことを裏付けるものです。つまり、OTelはTrace・Metrics・LogsにおいてもはやOne of Optionではなく、事実上のDefaultだということです。JavaScript・Python各APIパッケージの月間Downloadはそれぞれ単独で10億回を超えており、Observability市場のVendor各社にとってもOTel Native Ingestion対応は当たり前の前提になっています。
+
+Graduationは、GovernanceとMaturityのSignalです。実務的により興味深いのは、それより小さく新しい動き——Graduationでは解決しない課題に取り組む**Blueprints**という取り組みです。標準を採用すること自体は、全Teamが同じやり方でInstrumentationするということを意味しません。
+
+## Blueprintsが対応しようとしている課題
+
+OTelが提供するのはSDK・Collector・Wire Protocolです。10個のMicroserviceにまたがってResource属性をどう構造化するか、6ヶ月後にTrace検索が本当に使い物になるようSpan名をどう一貫させるか、HealthCheck Endpointの100%のTraceを保存Costとして払わないためにSamplingをどう設定するか——こうした点は意図的に規定されていません。各Teamがそれぞれ独立してこの問いに答えることになり、その結果OTelのSetupはTeamごとに微妙に異なります。そしてその「微妙な違い」は、異なるTeamがOwnするServiceが数個を超えたあたりから、悪い形で積み重なっていきます。
+
+これはPluggableな標準にありがちなFailure Modeです。導入自体は簡単でも、一貫性を保つことこそが難しい部分です。BlueprintsはCNCFによる取り組みで、各Teamが同じConventionと同じ間違いをそれぞれ独立して再発見するのではなく、規範的でOpinionatedなReference ArchitectureとConfig Patternを公開しようというものです。
+
+## 実際のSetupでどう見えるか
+
+たとえばNode.js Serviceにおける最小限だが一貫したInstrumentationのBaselineは、各Serviceが独自に選ぶのではなく、少数の判断を事前に標準化するところから始まります。
+
+```ts
+// otel.ts — 共有Bootstrap、各Serviceのentrypointで最初にimport
+import { NodeSDK } from "@opentelemetry/sdk-node";
+import { getNodeAutoInstrumentations } from "@opentelemetry/auto-instrumentations-node";
+import { resourceFromAttributes } from "@opentelemetry/resources";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+
+const sdk = new NodeSDK({
+  resource: resourceFromAttributes({
+    "service.name": process.env.SERVICE_NAME,
+    "service.version": process.env.SERVICE_VERSION,
+    "deployment.environment": process.env.NODE_ENV,
+  }),
+  traceExporter: new OTLPTraceExporter({
+    url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+  }),
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+
+sdk.start();
+```
+
+Code自体が難しいわけではありません——Auto Instrumentationがほとんどをカバーしてくれます。難しいのは、`service.name`・`deployment.environment`・Sampling PolicyがTeamをまたいで全Serviceで同じ形になっているという組織的な合意であり、それがあって初めて3つのServiceをまたぐTraceを読むのに3つの異なるMental Modelが不要になります。これこそBlueprintsが狙っているLayerです。SDKのAPIではなく、その周りのConventionです。
+
+## 共有Conventionがないと起きがちな問題
+
+**Resource属性の不整合。** あるTeamは`env`を使い、別のTeamは`environment`を使い、さらに別のTeamはSemantic Convention的に正しい`deployment.environment`を使う——というように、Dashboard・Alert Ruleが特定のNamingを前提に作られていると、別のNamingを使うServiceとは静かに噛み合わなくなります。
+
+**Serviceごとにその場しのぎで決めるSampling。** 共有Defaultがないと、あるServiceはすべてTraceする（Costが高く、Signalがノイズに埋もれる）一方、別のServiceはほとんどTraceしない（安いが、Incident発生時にまさに必要なTraceがない）ことになります。Collector Levelで一度だけ設定する共有のTail-basedまたはHead-based Sampling Policyがあれば、両方のFailure Modeを避けられます。
+
+**Grepできないほど不明瞭なSpan名。** 内部の関数名をそのままSpan名にしてしまうと、Instrumentationを書いた本人が別のProjectに移ってしまった6ヶ月後には、Trace検索が実質的に使い物にならなくなります。
+
+**Collectorの乱立。** 各TeamがそれぞれCollector Config・Sidecar Pattern・Export Pipelineを独自に立てると、小さく未文書化な違いを持った同じYAMLが量産されます。これはCopy-pasteされたまま少しずつ乖離していったCodeのAutomation版のようなものです。
+
+## 実際に推奨すること
+
+3〜4個以上のServiceにまたがってOTelを計装しているなら、各TeamにBootstrap Configを個別にOwnさせないことです。Resource属性のSchema、Sampling Policy、Collector Pipeline Configを共有PackageあるいはSharedなInfrastructure Moduleとして一元化し、独自にConventionをゼロから発明するのではなく、OTel BlueprintsのReference Patternを出発点として使ってください。SDKとの統合自体はほぼ解決済みの問題であり、実際にLeverageがあるのはその周りの組織的な規律の部分です。そしてそれは、4つ目のServiceを作る前に確立しておく方が、12個目のServiceの後で作り直すよりもずっと安く済みます。

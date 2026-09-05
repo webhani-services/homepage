@@ -1,0 +1,62 @@
+---
+title: "OpenTelemetry, CNCF Graduation 달성 — 진짜 중요한 건 새로운 'Blueprints'일지도"
+description: "OpenTelemetry는 2026년 5월 CNCF Graduation을 달성하며 Observability 표준으로서의 지위를 굳혔습니다. 하지만 실무적으로 더 중요한 것은, Team마다 제각각인 계측 방식이라는 Graduation으로는 해결되지 않는 문제를 다루는 새로운 'Blueprints' 이니셔티브입니다."
+date: "2026-09-06"
+status: "published"
+tags: ["Observability", "OpenTelemetry", "DevOps", "Monitoring", "Cloud Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "opentelemetry-blueprints-observability-2026"
+---
+
+OpenTelemetry는 제3자 Security Audit와 공식 Governance Review를 거쳐 2026년 5월 CNCF Graduated Project가 되었습니다. 이 Milestone은 많은 Team이 현장에서 이미 체감하고 있던 사실을 뒷받침합니다. 즉 OTel은 Trace, Metrics, Logs 영역에서 더 이상 여러 선택지 중 하나가 아니라 사실상의 기본값이라는 것입니다. JavaScript와 Python 각 API Package는 개별적으로 월간 Download가 10억 회를 넘겼고, Observability 시장의 Vendor들 입장에서도 OTel Native Ingestion 지원은 당연한 전제가 되었습니다.
+
+Graduation은 Governance와 성숙도를 보여주는 Signal입니다. 실무적으로 더 흥미로운 것은 그보다 작고 새로운 움직임인 **Blueprints**입니다. 이는 Graduation만으로는 해결되지 않는 문제, 즉 표준을 채택한다고 해서 모든 Team이 같은 방식으로 계측하게 되는 것은 아니라는 문제를 다룹니다.
+
+## Blueprints가 대응하려는 문제
+
+OTel이 제공하는 것은 SDK, Collector, Wire Protocol입니다. 10개의 Microservice에 걸쳐 Resource 속성을 어떻게 구조화할지, 6개월 뒤에도 Trace 검색이 실제로 쓸모 있도록 Span 이름을 어떻게 일관되게 지을지, Health Check Endpoint의 Trace 100%를 저장하는 Cost를 지불하지 않도록 Sampling을 어떻게 설정할지는 의도적으로 정해져 있지 않습니다. 각 Team이 이 질문에 독립적으로 답하게 되고, 그 결과 OTel Setup은 Team마다 조금씩 달라집니다. 그리고 이 "조금씩 다름"은, 서로 다른 Team이 소유한 Service가 몇 개를 넘어가는 순간부터 나쁜 방향으로 누적됩니다.
+
+이는 Pluggable한 표준에서 흔히 나타나는 실패 패턴입니다. 도입 자체는 쉽지만, 일관성을 유지하는 것이 어려운 부분입니다. Blueprints는 각 Team이 같은 Convention과 같은 실수를 각자 독립적으로 재발견하는 대신, CNCF가 규범적이고 Opinionated한 Reference Architecture와 Config Pattern을 공개하려는 시도입니다.
+
+## 실제 Setup에서는 어떤 모습인가
+
+예를 들어 Node.js Service의 최소한이지만 일관된 계측 Baseline은, 각 Service가 제각각 선택하게 두는 대신 몇 가지 핵심 결정을 미리 표준화하는 데서 시작합니다.
+
+```ts
+// otel.ts — 공유 Bootstrap, 각 Service의 entrypoint에서 가장 먼저 import
+import { NodeSDK } from "@opentelemetry/sdk-node";
+import { getNodeAutoInstrumentations } from "@opentelemetry/auto-instrumentations-node";
+import { resourceFromAttributes } from "@opentelemetry/resources";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+
+const sdk = new NodeSDK({
+  resource: resourceFromAttributes({
+    "service.name": process.env.SERVICE_NAME,
+    "service.version": process.env.SERVICE_VERSION,
+    "deployment.environment": process.env.NODE_ENV,
+  }),
+  traceExporter: new OTLPTraceExporter({
+    url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+  }),
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+
+sdk.start();
+```
+
+Code 자체는 어렵지 않습니다. Auto Instrumentation이 대부분을 처리해 줍니다. 어려운 부분은 `service.name`, `deployment.environment`, Sampling Policy가 Team을 넘어 모든 Service에서 같은 형태를 갖는다는 조직적 합의이며, 이것이 있어야 세 Service를 넘나드는 Trace를 읽는 데 세 가지 다른 Mental Model이 필요하지 않게 됩니다. 바로 이 Layer가 Blueprints가 겨냥하는 지점입니다. SDK API가 아니라 그 주변의 Convention입니다.
+
+## 공유 Convention이 없을 때 흔히 생기는 문제
+
+**Resource 속성의 불일치.** 어떤 Team은 `env`를, 다른 Team은 `environment`를, 또 다른 Team은 Semantic Convention 상 올바른 `deployment.environment`를 사용합니다. 특정 Naming을 전제로 만들어진 Dashboard와 Alert Rule은 다른 Naming을 쓰는 Service와는 조용히 어긋나 버립니다.
+
+**Service마다 임시방편으로 정해지는 Sampling.** 공유 기본값이 없으면 어떤 Service는 모든 것을 Trace하고(비용이 높고 Signal이 Noise에 묻힘), 어떤 Service는 거의 Trace하지 않습니다(저렴하지만 정작 Incident 때 필요한 Trace가 없음). Collector 단계에서 한 번만 설정하는 공유 Tail-based 또는 Head-based Sampling Policy는 두 실패 모두를 피하게 해 줍니다.
+
+**Grep이 안 되는 Span 이름.** 내부 함수 이름을 그대로 Span 이름으로 쓰면, Instrumentation을 작성한 사람이 다른 Project로 옮겨간 6개월 뒤에는 Trace 검색이 사실상 쓸모없어집니다.
+
+**Collector의 난립.** 각 Team이 각자 Collector Config, Sidecar Pattern, Export Pipeline을 세우면, 작고 문서화되지 않은 차이를 가진 같은 YAML이 여러 벌 생겨납니다. 이는 Copy-paste된 채로 조금씩 어긋나 버린 Code의 Automation 버전이라 할 수 있습니다.
+
+## 실제로 권하는 방식
+
+세 개 이상의 Service에 걸쳐 OTel을 계측하고 있다면, 각 Team이 Bootstrap Config를 개별적으로 소유하게 두지 마십시오. Resource 속성 Schema, Sampling Policy, Collector Pipeline Config를 공유 Package나 공유 Infrastructure Module로 일원화하고, 처음부터 독자적인 Convention을 만드는 대신 OTel Blueprints의 Reference Pattern을 출발점으로 삼으십시오. SDK 통합 자체는 거의 해결된 문제이고, 실제 Leverage는 그 주변의 조직적 규율에 있습니다. 그리고 이는 네 번째 Service를 만들기 전에 정해두는 편이, 열두 번째 Service 이후에 되돌려 고치는 것보다 훨씬 저렴합니다.

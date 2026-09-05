@@ -1,0 +1,80 @@
+---
+title: "Node.js Runs TypeScript Natively Now — Here's What That Actually Changes"
+description: "Type stripping has been on by default in Node.js since 22.18, letting you run .ts files with zero build step. Here's how it works, what it doesn't support, and when you still need a real compiler."
+date: "2026-09-06"
+status: "published"
+tags: ["Node.js", "TypeScript", "Web Development", "Developer Tooling"]
+thumbnail: ""
+author: "webhani"
+slug: "nodejs-native-typescript-type-stripping-2026"
+---
+
+Since Node.js 22.18, running a `.ts` file no longer requires `ts-node`, `tsx`, or a build step of any kind. Type stripping — removing type annotations and running what's left — is on by default. `node app.ts` just works. It's a small change in surface area but a real change in how you'd set up a new backend service, a CLI tool, or a script today.
+
+It's worth being precise about what this is and isn't, because "Node.js supports TypeScript now" oversells it slightly, and the gap between the marketing version and the actual behavior is exactly where teams get surprised in CI.
+
+## What type stripping actually does
+
+Node.js uses a module called `amaro`, which wraps the SWC engine, to strip erasable TypeScript syntax — type annotations, interfaces, type-only imports — and execute the remaining JavaScript directly. Critically, it does **not** type-check anything. There's no diagnostic pass, no error if you pass a `string` where a `number` is expected. It's a syntax transform, not a compiler in the traditional sense.
+
+```ts
+// greet.ts
+interface Greeting {
+  name: string;
+  times: number;
+}
+
+function greet({ name, times }: Greeting): void {
+  for (let i = 0; i < times; i++) {
+    console.log(`Hello, ${name}`);
+  }
+}
+
+greet({ name: "webhani", times: 2 });
+```
+
+```bash
+node greet.ts
+# Hello, webhani
+# Hello, webhani
+```
+
+No config, no flag, no `tsconfig.json` required for this to run. Node strips `: Greeting` and `: void`, replaces them with whitespace so line numbers in stack traces stay accurate, and runs the rest as plain JS.
+
+## What it deliberately doesn't handle
+
+Type stripping only works on syntax that can be erased without changing runtime behavior. That excludes:
+
+- **Enums** — `enum Status { Active, Inactive }` compiles to actual runtime code, not just types.
+- **Parameter properties** — `constructor(private name: string)` generates a class field assignment; it isn't erasable.
+- **Namespaces with runtime values** — legacy `namespace Foo { export const x = 1 }` patterns generate real objects.
+- **Decorators** — still a TC39 Stage 3 proposal, and any decorator usage needs a real transform.
+- **JSX** — `.tsx` isn't covered by stripping; JSX syntax has to become actual `React.createElement` calls somewhere.
+
+For any of these, you fall back to `--experimental-transform-types`, which pulls in a fuller transform, or you keep `tsc`/`SWC`/`esbuild` in the loop as before. That decision point is where teams need to be deliberate: mixing "some files run via native stripping, some need the flag, some need a bundler" without a clear rule creates the exact kind of inconsistency that used to justify a build step in the first place.
+
+## What this changes in practice
+
+For scripts, CLI tools, and small backend services that don't lean on enums or decorators, the build step genuinely disappears. That's not a minor convenience — it removes an entire category of "works locally, breaks in the Docker image because the build step wasn't run" failures, and it means a `.ts` file behaves like a `.js` file for anyone who just wants to run it.
+
+For larger applications, the honest framing is: **type stripping replaces the *execution* step, not the *type-checking* step.** You still want `tsc --noEmit` (or your editor's language server) running in CI to catch type errors before merge, because Node running your file successfully tells you nothing about type correctness — it never checked. A CI pipeline that drops `tsc --noEmit` because "Node runs TypeScript now" is trading a build step for a false sense of safety.
+
+A reasonable setup looks like this:
+
+```json
+{
+  "scripts": {
+    "dev": "node --watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "start": "node src/index.ts"
+  }
+}
+```
+
+Development and production both run the source directly. `typecheck` stays a separate, required CI step. No bundler in the loop unless you're shipping to a browser or need a single-file artifact for deployment.
+
+## Where we'd still reach for a real compiler
+
+If a project uses decorators (NestJS-style dependency injection is the common case), relies on TypeScript enums as part of its domain model, or needs to emit to older JavaScript targets for a specific runtime constraint, native stripping isn't the right tool yet. Framework choice, not team preference, should decide this — check whether your framework's idioms line up with what's erasable before assuming you can drop the build step wholesale.
+
+For everything else — API services, internal tooling, scripts, Lambda-style functions — this is worth adopting now. The main migration cost isn't code changes; it's confirming your CI still runs a real type-check step once the build step that used to imply one is gone.
