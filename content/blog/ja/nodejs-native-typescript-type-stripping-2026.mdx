@@ -1,0 +1,80 @@
+---
+title: "Node.jsがTypeScriptをそのまま実行できる時代に — Type Strippingで実際に変わること"
+description: "Node.js 22.18以降、Type StrippingがDefaultで有効になり、Build Stepなしで.tsファイルをそのまま実行できるようになりました。仕組み、対応していない構文、それでもCompilerが必要になる場面を整理します。"
+date: "2026-09-06"
+status: "published"
+tags: ["Node.js", "TypeScript", "Web Development", "Developer Tooling"]
+thumbnail: ""
+author: "webhani"
+slug: "nodejs-native-typescript-type-stripping-2026"
+---
+
+Node.js 22.18以降、`.ts`ファイルを実行するのに`ts-node`も`tsx`もBuild Stepも不要になりました。Type Stripping（型注釈を取り除いて残りをそのまま実行する仕組み）がDefaultで有効になっており、`node app.ts`がそのまま動きます。地味な変化に見えますが、新しいBackend Service・CLI Tool・Scriptを今日どうSetupするかという点では、実質的な変化です。
+
+ここは正確に理解しておく価値があります。「Node.jsがTypeScriptに対応した」という言い方は少し盛りすぎで、実際の挙動とのGapがまさにCIで足をすくわれるポイントだからです。
+
+## Type Strippingが実際にやっていること
+
+Node.jsはSWC Engineをラップした`amaro`というModuleを使い、消去可能なTypeScript構文（型注釈、Interface、Type-only Import）を取り除いて、残ったJavaScriptをそのまま実行します。重要なのは、**型Checkは一切行わない**という点です。診断Passはなく、`string`を渡すべきところに`number`を渡してもErrorにはなりません。従来的な意味でのCompilerではなく、構文Transformです。
+
+```ts
+// greet.ts
+interface Greeting {
+  name: string;
+  times: number;
+}
+
+function greet({ name, times }: Greeting): void {
+  for (let i = 0; i < times; i++) {
+    console.log(`Hello, ${name}`);
+  }
+}
+
+greet({ name: "webhani", times: 2 });
+```
+
+```bash
+node greet.ts
+# Hello, webhani
+# Hello, webhani
+```
+
+これを動かすのにConfigもFlagも`tsconfig.json`も不要です。Nodeは`: Greeting`や`: void`を取り除き、Stack TraceのLine Numberがずれないよう空白に置き換えたうえで、残りを純粋なJSとして実行します。
+
+## 意図的に対応していないもの
+
+Type Strippingは、実行時の挙動を変えずに消去できる構文にしか対応していません。具体的には次のものが対象外です。
+
+- **Enum** — `enum Status { Active, Inactive }`は単なる型ではなく実際のRuntime Codeにコンパイルされます。
+- **Parameter Properties** — `constructor(private name: string)`はClass Fieldの代入を生成するため、消去できません。
+- **Runtime値を持つNamespace** — 従来型の`namespace Foo { export const x = 1 }`は実際のObjectを生成します。
+- **Decorator** — まだTC39 Stage 3のProposalであり、利用する場合は本格的なTransformが必要です。
+- **JSX** — `.tsx`はStrippingの対象外です。JSX構文はどこかで実際の`React.createElement`呼び出しにならなければなりません。
+
+これらに該当する場合は、より広範なTransformを取り込む`--experimental-transform-types`にFallbackするか、これまで通り`tsc`・`SWC`・`esbuild`をLoopに残すことになります。ここが判断のしどころで、「一部のFileはNative Strippingで動き、一部はFlagが必要、一部はBundlerが必要」という状態を明確なRuleなしに混在させると、そもそもBuild Stepを正当化していたのと同じ種類の不整合が再発します。
+
+## 実務で何が変わるか
+
+EnumやDecoratorに依存しないScript・CLI Tool・小規模なBackend Serviceであれば、Build Stepは文字通りなくなります。これは些細な利便性の話ではなく、「ローカルでは動くのにDocker ImageではBuild Stepを忘れて動かない」というCategoryのFailureをまるごと消せるということであり、実行するだけの人にとって`.ts`Fileが`.js`Fileと同じように振る舞うということです。
+
+より大きなApplicationについて正直に言うと、**Type Strippingが置き換えるのは「実行」Stepであって、「型Check」Stepではありません。** CIでは引き続き`tsc --noEmit`（あるいはEditorのLanguage Server）をMerge前に走らせる必要があります。Nodeがそのファイルを正常に実行できたという事実は、型の正しさについては何も保証していないからです。「Node.jsがTypeScriptを実行できるようになったから」という理由で`tsc --noEmit`をCIから外すのは、Build Stepを偽の安心感と交換しているだけです。
+
+現実的なSetupはこのようになります。
+
+```json
+{
+  "scripts": {
+    "dev": "node --watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "start": "node src/index.ts"
+  }
+}
+```
+
+DevelopmentもProductionもSourceを直接実行します。`typecheck`はCIで必須の独立したStepとして残します。Browserへの配信や単一FileでのDeploymentが必要でない限り、BundlerはLoopに入れません。
+
+## それでも本格的なCompilerが必要な場面
+
+NestJS的なDependency InjectionのようにDecoratorを使っているProject、TypeScriptのEnumをDomain Modelの一部として使っているProject、特定のRuntime制約により古いJavaScript Targetへの出力が必要なProjectでは、Native Strippingはまだ適切な選択肢ではありません。これはTeamの好みではなくFrameworkの選択が決めるべきことなので、Build Stepを丸ごとなくせると決めつける前に、使っているFrameworkのIdiomが消去可能な範囲に収まっているか確認してください。
+
+それ以外——APIサービス、社内Tooling、Script、Lambda的なFunctionなど——については、今から採用する価値があります。移行コストの本体はCodeの変更ではなく、Build Stepが暗黙的に担っていた型Checkが、Build Stepの消滅とともに消えていないかをCIで確認することです。
