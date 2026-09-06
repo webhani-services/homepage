@@ -1,0 +1,112 @@
+---
+title: "2026년 CI/CD Stack 선택 — GitHub Actions + ArgoCD + Docker 실전 패턴"
+description: "2026년 시점에서 처음부터 구축한다면 어떤 CI/CD Stack이 적절할까요. GitHub Actions·ArgoCD·Docker를 조합한 실전 패턴을 Webhani가 정리합니다."
+date: "2026-09-07"
+status: "published"
+tags: ["CI/CD", "DevOps", "Docker", "Kubernetes", "GitHub Actions"]
+thumbnail: ""
+author: "webhani"
+slug: "cicd-stack-2026-github-actions-argocd-docker"
+---
+
+## 지금 CI/CD Stack을 다시 살펴볼 이유
+
+2026년 현재도 CI/CD Tool 선택지는 여전히 다양합니다. Jenkins는 여전히 CI/CD 시장에서 높은 점유율을 유지하고 있지만, 새 Project를 처음부터 구축할 때는 GitHub Actions·Docker·ArgoCD를 조합한 구성이 우선 고려할 만한 기본 선택지로 자리 잡았습니다.
+
+Webhani는 고객사의 Infra 구축을 지원하면서 "우선 무엇을 선택해야 하는가"라는 질문을 자주 받습니다. 이번 글에서는 처음부터 구축할 경우 적절하다고 판단하는 Stack과 그 근거를 정리합니다.
+
+## 추천 Stack 구성
+
+역할별로 나누면 다음과 같습니다.
+
+- **CI(Build·Test)**: GitHub Actions
+- **Image Build**: Docker
+- **CD(Kubernetes 배포)**: ArgoCD(GitOps 방식)
+
+이 조합이 선택되는 이유는 명확합니다. Code가 GitHub에 있다면 CI 설정과 실행 환경이 같은 Platform 위에서 완결되어 운영 학습 비용을 줄일 수 있습니다. 반면 여러 Team과 복잡한 Pipeline을 가진 Enterprise 조직이라면 Jenkins + ArgoCD 구성도 여전히 현실적인 선택지입니다 — 이는 절대적인 정답이 아니라 새로 시작할 때의 합리적인 기본값일 뿐입니다.
+
+## GitHub Actions로 Docker Image Build하기
+
+CI 부분의 최소 구성입니다.
+
+```yaml
+# .github/workflows/build.yml
+name: Build and Push
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+Point는 `cache-from`/`cache-to`로 GitHub Actions의 Cache를 활용하는 부분입니다. Docker Image Build 시간은 전체 CI의 병목이 되기 쉬우므로, Layer Cache를 적극 활용하는 것이 실무에서 중요합니다.
+
+## ArgoCD로 GitOps 배포 구성하기
+
+CD는 ArgoCD의 Application Resource로 Git 위에서 선언적으로 관리합니다.
+
+```yaml
+# argocd/application.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/example/my-app-manifests
+    targetRevision: main
+    path: overlays/production
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+GitHub Actions의 CI는 Image를 Build·Push한 뒤 Manifest Repository의 Image Tag를 갱신하는 부분까지만 담당하고, 실제 Cluster 적용은 ArgoCD의 Sync 처리에 맡깁니다. 이렇게 분리하면 "누가 무엇을 승인해 배포했는지"가 모두 Git History에 남는 GitOps의 장점을 얻을 수 있습니다.
+
+## Tekton이라는 선택지
+
+Kubernetes Native Pipeline을 지향하는 Team이라면 CNCF의 Tekton도 검토 대상에 오릅니다. Pipeline 전체를 Kubernetes Resource로 표현할 수 있다는 점이 특징이지만, 학습 비용과 Ecosystem 성숙도를 고려하면 대부분의 Team에게는 GitHub Actions + ArgoCD 조합이 더 도입하기 쉽다는 것이 Webhani의 평가입니다. Tekton은 이미 Kubernetes 운영에 익숙한 Platform Team이 Pipeline 자체를 더 세밀하게 제어하고 싶을 때 고려할 위치라고 봅니다.
+
+## 도입 시 주의할 점
+
+### Secret 관리를 처음부터 설계한다
+
+자동 발급되는 `GITHUB_TOKEN`뿐 아니라 외부 Registry나 Cloud Provider 인증 정보를 어떻게 관리할지 초기 단계에서 설계해야 합니다. GitHub Actions의 `secrets`와 Kubernetes의 `Secret` Resource를 혼용할 경우 책임 범위를 명확히 하십시오.
+
+### ArgoCD의 SelfHeal이 의도치 않은 동작을 일으킬 수 있다
+
+`selfHeal: true`는 Cluster 위에서 수동 변경이 발생해도 Git 위의 정의로 자동 복원하는 기능인데, 긴급 대응으로 일시적인 수동 변경이 필요한 상황에서는 오히려 불편할 수 있습니다. 운영 규칙으로 긴급 시 절차를 미리 마련해두는 것을 권장합니다.
+
+## Webhani의 견해
+
+CI/CD Stack에 절대적인 정답은 없지만, GitHub을 Code Hosting으로 사용하는 Team이라면 GitHub Actions + Docker + ArgoCD 조합이 학습 비용과 운영 효율의 균형이 좋은 선택입니다. Webhani는 고객의 기존 Infra와 Team 구성에 맞춰 Jenkins에서의 Migration 지원이나 ArgoCD 기반 GitOps 구축을 진행하고 있습니다. Tool 선택 자체보다 "배포 책임 범위를 어떻게 가시화할지"를 우선해 설계하는 것을 권장합니다.
+
+---
+
+*참고: [Refonte Learning: DevOps Engineering in 2026 - CI/CD Tools](https://www.refontelearning.com/blog/devops-engineering-in-2026-top-ci-cd-tools-trends-and-best-practices-github-actions-vs-jenkins)*
