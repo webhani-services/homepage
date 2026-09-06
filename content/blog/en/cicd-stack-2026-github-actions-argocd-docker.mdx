@@ -1,0 +1,110 @@
+---
+title: "Picking a CI/CD Stack in 2026: GitHub Actions + ArgoCD + Docker"
+description: "If you were building a CI/CD pipeline from scratch today, what stack actually makes sense? A practical look at GitHub Actions, ArgoCD, and Docker together."
+date: "2026-09-07"
+status: "published"
+tags: ["CI/CD", "DevOps", "Docker", "Kubernetes", "GitHub Actions"]
+thumbnail: ""
+author: "webhani"
+slug: "cicd-stack-2026-github-actions-argocd-docker"
+---
+
+## Why this is still worth revisiting
+
+CI/CD tooling in 2026 is still a crowded field. Jenkins remains a heavyweight by market share, but for teams starting a new project from scratch, a GitHub Actions + Docker + ArgoCD combination has settled into being the default answer worth considering first.
+
+We get this question constantly from clients standing up new infrastructure: what should we actually pick? Here's the stack we recommend by default, and why.
+
+## The stack, by role
+
+- **CI (build and test)**: GitHub Actions
+- **Image build**: Docker
+- **CD (deploy to Kubernetes)**: ArgoCD (GitOps)
+
+The appeal is straightforward: if your code already lives on GitHub, CI configuration and execution stay on the same platform, cutting the operational learning curve. For enterprises running multiple teams and more complex pipelines, Jenkins + ArgoCD remains a reasonable alternative — this isn't a universal recommendation, just the sane default for a fresh start.
+
+## Building and pushing a Docker image with GitHub Actions
+
+A minimal CI setup:
+
+```yaml
+# .github/workflows/build.yml
+name: Build and Push
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+The `cache-from`/`cache-to` pair matters more than it looks — Docker build time is usually the biggest bottleneck in the whole pipeline, and reusing GitHub Actions' own cache for layers is a cheap, effective fix.
+
+## Wiring up GitOps deployment with ArgoCD
+
+CD is defined declaratively in Git as an ArgoCD Application resource:
+
+```yaml
+# argocd/application.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/example/my-app-manifests
+    targetRevision: main
+    path: overlays/production
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+The GitHub Actions CI job's job ends at building and pushing the image, then bumping the image tag in the manifests repo. Applying it to the cluster is ArgoCD's sync process. That separation is the point of GitOps: every deploy decision is traceable through Git history, not buried in a CI log.
+
+## What about Tekton?
+
+Teams already deep into Kubernetes-native tooling sometimes consider Tekton, the CNCF's Kubernetes-native pipeline framework, which lets you express the entire pipeline as Kubernetes resources. In our experience, the learning curve and smaller ecosystem make GitHub Actions + ArgoCD the more approachable choice for most teams. Tekton makes more sense for platform teams that already run Kubernetes at scale and want finer-grained control over the pipeline itself.
+
+## A few things to get right early
+
+### Design secrets management up front
+
+Beyond the auto-issued `GITHUB_TOKEN`, you'll need a clear plan for registry and cloud provider credentials. If you're mixing GitHub Actions secrets with Kubernetes `Secret` resources, be explicit about which system owns which credential.
+
+### Watch out for ArgoCD's selfHeal surprising you
+
+`selfHeal: true` automatically reverts any manual change made directly on the cluster back to what's defined in Git — which is exactly the point of GitOps, but it can bite you during an incident when you need a quick manual fix. Document the emergency procedure ahead of time so nobody's improvising it during an outage.
+
+## Our take
+
+There's no single correct CI/CD stack, but for teams already on GitHub, GitHub Actions + Docker + ArgoCD offers a good balance of low learning curve and solid operational leverage. We help clients migrate off Jenkins where it makes sense, and build out GitOps foundations with ArgoCD from the ground up. The tool choice matters less than getting deploy accountability — who approved what, and when — visible and auditable from day one.
+
+---
+
+*Sources: [Refonte Learning: DevOps Engineering in 2026 - CI/CD Tools](https://www.refontelearning.com/blog/devops-engineering-in-2026-top-ci-cd-tools-trends-and-best-practices-github-actions-vs-jenkins)*
