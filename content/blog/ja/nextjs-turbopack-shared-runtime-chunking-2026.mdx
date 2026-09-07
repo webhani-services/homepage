@@ -1,0 +1,84 @@
+---
+title: "Next.jsのTurbopack共有ランタイムと粒度別チャンキングでナビゲーションを速くする"
+description: "Next.js 16.3以降で使えるTurbopackの共有ランタイムと粒度別チャンキングの仕組みを解説し、ページ遷移のパフォーマンス改善を実際の設定例で確認します。"
+date: "2026-09-08"
+status: "published"
+tags: ["Next.js", "Turbopack", "パフォーマンス", "Web開発", "フロントエンド"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-turbopack-shared-runtime-chunking-2026"
+---
+
+## ページ遷移のたびに何が起きているか
+
+Next.jsアプリでページ遷移を繰り返すと、ブラウザは遷移のたびに複数のJavaScriptチャンクを読み込みます。これまでのTurbopackは、ページごとに個別のランタイムコードを持たせる構造だったため、遷移のたびに実質的に重複したコードが読み込まれていました。
+
+Next.js 16.3以降では、この構造に手が入りました。Turbopackの共有ランタイムと、より粒度の細かいチャンキング戦略により、遷移のたびに発生していた無駄なブロッキングリクエストとJavaScript転送量を削減できます（参考: [Next.js公式ブログ: How Turbopack chunks your JavaScript](https://nextjs.org/blog/turbopack-chunking)）。
+
+webhaniのようにNext.jsをベースに複数ページのサイトを構築する立場からすると、これは地味ながら効果の大きい改善です。本稿では仕組みと設定方法、そして本サイト（webhani自体もNext.js 16構成）での考え方を整理します。
+
+## 従来の課題：ページごとのランタイム
+
+Turbopackは高速なビルドツールですが、これまでは各ページのエントリーポイントごとに独自のランタイムを生成していました。ページAからページBへ遷移すると、ページBのランタイムコードは（ページAのものと中身がほぼ同じであっても）改めて読み込まれる構造になっていました。
+
+これはビルド速度には有利でも、ナビゲーション体験には不利でした。特にページ数が多いマーケティングサイトやブログのようなアプリケーションでは、遷移のたびに小さくないオーバーヘッドが積み重なります。
+
+## 共有ランタイムで何が変わるか
+
+`experimental.turbopackSharedRuntime` を有効にすると、ページ個別のランタイムではなく、アプリ全体で共有される単一のランタイムが使われるようになります。公式の説明によると、初回訪問以降のナビゲーションで、ブロッキングリクエスト1本と約10KBのクライアントサイドJavaScriptが節約されます（参考: [Next.js公式ブログ](https://nextjs.org/blog/turbopack-chunking)）。
+
+```js
+// next.config.js
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  experimental: {
+    turbopackSharedRuntime: true,
+  },
+};
+
+module.exports = nextConfig;
+```
+
+10KBというと小さく聞こえますが、これは「遷移のたびに」節約される量です。1セッションで5ページ遷移するユーザーがいれば、単純計算で50KB分の重複読み込みを避けられることになります。
+
+## 粒度別チャンキングによる重複コードの削減
+
+もう一つの改善が、複数の共有チャンクを生成する粒度別チャンキング戦略です。従来の「1つの大きな共有チャンク」ではなく、依存関係の使われ方に応じて複数の小さなチャンクに分割することで、あるエントリーポイントに不要な（あるいは他ページと重複した）コードが含まれる量を最小化します（参考: [web.dev: Improved Next.js and Gatsby page load performance with granular chunking](https://web.dev/articles/granular-chunking-nextjs)）。
+
+CSSについても同様の考え方が適用されています。`cssChunking` オプションを使うと、CSSファイルを分割・並べ替えて、各ルートがそのページに必要な分だけを読み込むように制御できます。
+
+```js
+// next.config.js
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  experimental: {
+    cssChunking: "strict", // または "loose"（デフォルト）
+  },
+};
+
+module.exports = nextConfig;
+```
+
+`strict` はCSSの読み込み順序をインポート順に厳密に保つ代わりにチャンク数が増える傾向があり、`loose` はチャンクをまとめてリクエスト数を減らす代わりに順序の保証が緩くなります。サイトの規模とCSSの依存構造に応じて選ぶ必要があります。
+
+## 実際に試す際の進め方
+
+これらは実験的機能のため、本番導入前に次のような手順で検証することを推奨します。
+
+1. **Lighthouseやnext build --profileで現状のベースラインを取得する**：導入前後で比較できるよう、主要なページ遷移パターンのJS転送量を記録しておきます。
+2. **段階的に有効化する**：`turbopackSharedRuntime` と `cssChunking` は独立した設定なので、一つずつ有効化して効果を切り分けます。
+3. **実際のナビゲーションパターンで計測する**：合成ベンチマークだけでなく、実ユーザーがよく辿る遷移経路（例: トップページ→サービス詳細→問い合わせ）で計測することが重要です。
+
+## webhaniのサイトへの適用を考える
+
+本サイトはNext.js 16 + App Routerで構築されており、トップページから各セクション、ブログ記事への遷移が主要な導線です。ブログ記事数が増えるほど、共有ランタイムと粒度別チャンキングの恩恵は大きくなると見ています。特に日英韓の3言語対応ページでは、言語切り替えを含むナビゲーションの体感速度が、そのままCore Web Vitalsとユーザー体験に直結します。
+
+一方で実験的機能である以上、Next.jsのマイナーバージョンアップで挙動が変わる可能性は常にあります。導入する場合は、CIでのビルド確認と本番投入前のステージング環境での検証を組み合わせることを勧めます。
+
+## まとめ
+
+Turbopackの共有ランタイムと粒度別チャンキングは、派手な新機能ではありませんが、ページ数が多いサイトほど効いてくる地道な改善です。webhaniでは、こうした基盤レベルの最適化を継続的に評価し、顧客サイトのパフォーマンス改善に反映させていきます。
+
+---
+
+*参考: [How Turbopack chunks your JavaScript (Next.js公式ブログ)](https://nextjs.org/blog/turbopack-chunking), [Improved Next.js and Gatsby page load performance with granular chunking (web.dev)](https://web.dev/articles/granular-chunking-nextjs), [next.config.js: cssChunking (Next.js公式ドキュメント)](https://nextjs.org/docs/app/api-reference/config/next-config-js/cssChunking)*
