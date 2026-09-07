@@ -1,0 +1,84 @@
+---
+title: "Next.js Turbopack 공유 Runtime과 세분화 Chunking으로 Navigation 속도 개선하기"
+description: "Next.js 16.3부터 사용 가능한 Turbopack 공유 Runtime과 세분화 Chunking 구조를 설명하고, 실제 설정 예제로 Page 전환 성능 개선을 확인합니다."
+date: "2026-09-08"
+status: "published"
+tags: ["Next.js", "Turbopack", "성능", "Web 개발", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-turbopack-shared-runtime-chunking-2026"
+---
+
+## Page 전환마다 무슨 일이 일어나는가
+
+Next.js Application에서 Page 전환을 반복하면 Browser는 전환할 때마다 여러 JavaScript Chunk를 다시 불러옵니다. 지금까지 Turbopack은 Page마다 개별 Runtime Code를 갖는 구조였기 때문에, 전환할 때마다 사실상 중복된 Code가 다시 로드되고 있었습니다.
+
+Next.js 16.3부터는 이 구조에 개선이 들어갔습니다. Turbopack의 공유 Runtime과 더 세분화된 Chunking 전략을 통해, 전환마다 발생하던 불필요한 Blocking Request와 JavaScript 전송량을 줄일 수 있습니다 ([Next.js 공식 Blog: How Turbopack chunks your JavaScript](https://nextjs.org/blog/turbopack-chunking)).
+
+webhani처럼 Next.js 기반의 다중 Page Site를 구축하는 입장(저희 Site 역시 Next.js 16 구성입니다)에서는, 눈에 띄지는 않지만 효과가 큰 개선입니다. 이 글에서는 구조와 설정 방법, 그리고 실제 적용 방식을 정리합니다.
+
+## 기존 문제: Page별 Runtime
+
+Turbopack은 빌드 속도가 빠른 Tool이지만, 지금까지는 각 Page의 Entry Point마다 독자적인 Runtime을 생성했습니다. Page A에서 Page B로 전환하면, Page B의 Runtime Code는 (내용이 Page A와 거의 동일하더라도) 다시 로드되는 구조였습니다.
+
+이는 빌드 속도에는 유리하지만 Navigation 경험에는 불리합니다. 특히 Page 수가 많은 Marketing Site나 Blog 같은 Application에서는 전환할 때마다 작지 않은 Overhead가 누적됩니다.
+
+## 공유 Runtime이 바꾸는 것
+
+`experimental.turbopackSharedRuntime`을 활성화하면 Page별 Runtime 대신 Application 전체에서 공유되는 단일 Runtime이 사용됩니다. 공식 설명에 따르면 첫 방문 이후의 Navigation에서 Blocking Request 1개와 약 10KB의 Client Side JavaScript가 절약됩니다 ([Next.js 공식 Blog](https://nextjs.org/blog/turbopack-chunking)).
+
+```js
+// next.config.js
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  experimental: {
+    turbopackSharedRuntime: true,
+  },
+};
+
+module.exports = nextConfig;
+```
+
+10KB는 작아 보이지만 이는 "전환할 때마다" 절약되는 양입니다. 한 Session에서 5개 Page를 이동하는 User가 있다면 단순 계산으로 50KB의 중복 다운로드를 피할 수 있습니다.
+
+## 세분화 Chunking으로 중복 Code 줄이기
+
+또 다른 개선은 여러 개의 공유 Chunk를 생성하는 세분화 Chunking 전략입니다. 기존의 "하나의 큰 공유 Chunk" 대신, 의존성이 실제로 사용되는 방식에 따라 여러 개의 작은 Chunk로 분할함으로써, 특정 Entry Point에 불필요하거나 다른 Page와 중복된 Code가 포함되는 양을 최소화합니다 ([web.dev: Improved Next.js and Gatsby page load performance with granular chunking](https://web.dev/articles/granular-chunking-nextjs)).
+
+CSS에도 같은 개념이 적용됩니다. `cssChunking` Option을 사용하면 CSS File을 분할·재정렬하여 각 Route가 해당 Page에 필요한 만큼만 로드하도록 제어할 수 있습니다.
+
+```js
+// next.config.js
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  experimental: {
+    cssChunking: "strict", // 또는 "loose"(기본값)
+  },
+};
+
+module.exports = nextConfig;
+```
+
+`strict`는 CSS 로드 순서를 Import 순서대로 엄격히 유지하는 대신 Chunk 수가 늘어나는 경향이 있고, `loose`는 Chunk를 묶어 Request 수를 줄이는 대신 순서 보장이 느슨해집니다. Site 규모와 CSS 의존 구조에 따라 선택해야 합니다.
+
+## 실제 도입 시 진행 방법
+
+두 기능 모두 실험적(Experimental) 기능이므로, Production 도입 전 다음과 같은 절차로 검증하는 것을 권장합니다.
+
+1. **Lighthouse나 `next build --profile`로 현재 Baseline을 확보합니다.** 도입 전후를 비교할 수 있도록 주요 Page 전환 경로의 JS 전송량을 기록해 둡니다.
+2. **단계적으로 활성화합니다.** `turbopackSharedRuntime`과 `cssChunking`은 독립된 설정이므로 하나씩 활성화하여 효과를 분리해서 확인합니다.
+3. **실제 Navigation 경로로 측정합니다.** 합성 Benchmark뿐 아니라 실제 User가 자주 이동하는 경로(예: 홈 → Service 상세 → 문의)에서 측정하는 것이 중요합니다.
+
+## webhani Site에 적용하는 관점
+
+저희 Site는 Next.js 16 + App Router로 구축되어 있고, 홈에서 각 Section, Blog 게시글로의 전환이 주요 동선입니다. Blog 게시글 수가 늘어날수록 공유 Runtime과 세분화 Chunking의 효과는 더 커질 것으로 보입니다. 특히 일본어·영어·한국어 3개 Locale을 지원하는 Page에서는 언어 전환을 포함한 Navigation 체감 속도가 곧바로 Core Web Vitals와 User 경험에 직결됩니다.
+
+다만 실험적 기능인 만큼 Next.js Minor Version Update에 따라 동작이 바뀔 가능성은 항상 있습니다. 도입할 경우 CI Build 확인과 Production 투입 전 Staging 환경 검증을 함께 진행하는 것을 권장합니다.
+
+## 마무리
+
+Turbopack의 공유 Runtime과 세분화 Chunking은 화려한 신기능은 아니지만, Page 수가 많은 Site일수록 효과가 누적되는 실속 있는 개선입니다. webhani는 이러한 기반 수준의 최적화를 지속적으로 검토하여 고객 Site의 성능 개선에 반영해 나가겠습니다.
+
+---
+
+*참고: [How Turbopack chunks your JavaScript (Next.js 공식 Blog)](https://nextjs.org/blog/turbopack-chunking), [Improved Next.js and Gatsby page load performance with granular chunking (web.dev)](https://web.dev/articles/granular-chunking-nextjs), [next.config.js: cssChunking (Next.js 공식 문서)](https://nextjs.org/docs/app/api-reference/config/next-config-js/cssChunking)*

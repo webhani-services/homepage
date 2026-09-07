@@ -1,0 +1,88 @@
+---
+title: "Semantic Caching for LLMs with Redis LangCache: Cutting Cost and Latency Together"
+description: "How Redis's managed semantic caching service, LangCache, reduces LLM call cost and latency — with an implementation pattern and threshold-tuning caveats."
+date: "2026-09-08"
+status: "published"
+tags: ["Redis", "Caching", "LLM", "AI Applications", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "redis-langcache-semantic-caching-llm-2026"
+---
+
+## Stop paying for the same question twice
+
+Run an LLM-backed chatbot or support tool long enough and you'll notice something: a large share of user questions are phrased differently but mean the same thing. "How do I return an item?" and "I want to return a product, what's the process?" are different strings but the same question. A standard key-value cache treats them as unrelated.
+
+Redis's LangCache is a managed semantic caching service built for exactly this gap. It uses embedding-based similarity search to detect when an incoming question is semantically close to one already answered, returns the cached response, and only calls the LLM when there's no match ([Redis docs: Redis LangCache](https://redis.io/docs/latest/develop/ai/context-engine/langcache/)).
+
+## How it differs from a normal cache
+
+A conventional cache (Redis string keys, for instance) only hits on exact matches. Semantic caching converts each query into an embedding vector and treats it as a hit once the similarity to a stored query crosses a threshold.
+
+```text
+Question A: "How do I return an item?"
+Question B: "I want to return a product, what's the process?"
+
+→ Different strings, exact-match miss
+→ High embedding similarity
+→ Hit under semantic caching
+```
+
+LangCache runs the embedding generation and vector search as a managed REST service, which removes the work of wiring together a vector database and a caching layer yourself ([Redis blog: What is semantic caching?](https://redis.io/blog/what-is-semantic-caching/)).
+
+## A minimal implementation pattern
+
+Here's the basic pattern for semantic caching using Redis's RedisVL library, following the approach in Redis's own documentation:
+
+```python
+from redisvl.extensions.llmcache import SemanticCache
+
+cache = SemanticCache(
+    name="support_cache",
+    redis_url="redis://localhost:6379",
+    distance_threshold=0.15,  # similarity threshold
+)
+
+def answer_question(question: str) -> str:
+    cached = cache.check(prompt=question)
+    if cached:
+        return cached[0]["response"]
+
+    response = call_llm(question)  # actual LLM call
+    cache.store(prompt=question, response=response)
+    return response
+```
+
+A smaller `distance_threshold` restricts hits to questions that are very close in meaning; a larger one casts a wider net. Tuning this value correctly is the crux of running semantic caching well ([Redis LangCache docs](https://redis.io/docs/latest/develop/ai/redisvl/0.6.0/user_guide/llmcache/)).
+
+## Where threshold tuning goes wrong
+
+The biggest risk with semantic caching is a false positive hit. Set the threshold too loose and subtly different questions — "I want to return this" vs. "the return window has passed, can I still return it?" — can match the same cached answer, handing a user incorrect information.
+
+A few practical guardrails:
+
+1. **Start conservative.** Run with a tight `distance_threshold` initially and monitor both cache hit rate and user complaints before loosening it.
+2. **Vary the threshold by category.** Generic FAQ-style questions can tolerate a looser threshold; anything touching pricing, contracts, or legal terms should stay strict.
+3. **Set a TTL on cached entries.** Without an expiration, a pricing change or policy update can leave stale answers being served indefinitely.
+
+## What it actually saves
+
+A cache hit skips the LLM call entirely, eliminating both token cost and latency for that request. Support workloads dominated by FAQ-style questions tend to have high hit rates, which is where the savings compound the most.
+
+The tradeoff: embedding generation and vector search aren't free either. The gain only holds if a vector lookup is meaningfully cheaper and faster than an LLM call — an assumption that weakens for highly varied queries or latency-critical paths where even a vector search adds unwanted overhead.
+
+## Our take
+
+When webhani designs an AI chatbot or support automation for a client, we treat semantic caching as an optimization for workloads with a skewed question distribution — not a universal speedup. Before adopting it, we recommend:
+
+- Analyzing historical support logs to quantify how much semantic duplication actually exists in real traffic
+- Excluding cache lookups (or adding a human review step) for domains where a false hit is unacceptable — legal, medical, or financial responses
+- Tracking both cache hit rate and user satisfaction on an ongoing dashboard, not just at launch
+
+## Wrap-up
+
+Semantic caching, as implemented by services like Redis LangCache, is now practical enough to meaningfully cut LLM cost and latency. But its payoff depends heavily on your traffic's question distribution, and a poorly tuned threshold trades cost savings for the risk of wrong answers. webhani factors this tradeoff into the AI applications we help clients build.
+
+---
+
+*Sources: [Redis LangCache (Redis docs)](https://redis.io/docs/latest/develop/ai/context-engine/langcache/), [What is semantic caching? (Redis blog)](https://redis.io/blog/what-is-semantic-caching/), [Semantic Caching for LLMs (RedisVL docs)](https://redis.io/docs/latest/develop/ai/redisvl/0.6.0/user_guide/llmcache/)*

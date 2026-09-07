@@ -1,0 +1,84 @@
+---
+title: "Faster Navigations in Next.js with Turbopack's Shared Runtime and Granular Chunking"
+description: "Next.js 16.3+ ships a Turbopack shared runtime and granular chunking strategy that cut redundant JavaScript on every page navigation. Here's how it works and how to configure it."
+date: "2026-09-08"
+status: "published"
+tags: ["Next.js", "Turbopack", "Performance", "Web Development", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-turbopack-shared-runtime-chunking-2026"
+---
+
+## What happens on every page transition
+
+Every client-side navigation in a Next.js app loads a set of JavaScript chunks. Until recently, Turbopack generated a separate runtime for each page entry point, which meant that navigating between pages re-loaded runtime code that was, in practice, nearly identical across pages.
+
+Next.js 16.3 and later address this directly. A shared Turbopack runtime combined with a more granular chunking strategy cuts the redundant blocking requests and JS payload that used to accumulate with every navigation ([Next.js blog: How Turbopack chunks your JavaScript](https://nextjs.org/blog/turbopack-chunking)).
+
+For a company like webhani that builds and maintains multi-page Next.js sites (our own site included, on Next.js 16), this is an unglamorous but meaningful improvement. Here's how it works, how to turn it on, and how we think about applying it.
+
+## The old problem: a runtime per page
+
+Turbopack builds fast, but historically it emitted a dedicated runtime for each page's entry point. Navigating from page A to page B meant loading page B's runtime again — even though its contents were nearly the same as page A's.
+
+That's fine for build performance but costly for navigation. On sites with many routes — marketing pages, blogs, documentation — that overhead adds up across a session.
+
+## What the shared runtime changes
+
+Enabling `experimental.turbopackSharedRuntime` switches from a per-page runtime to a single runtime shared across the whole app. According to Next.js, this saves one blocking request and roughly 10 KB of client-side JavaScript on every navigation after the first ([Next.js blog](https://nextjs.org/blog/turbopack-chunking)).
+
+```js
+// next.config.js
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  experimental: {
+    turbopackSharedRuntime: true,
+  },
+};
+
+module.exports = nextConfig;
+```
+
+10 KB sounds small until you multiply it by every navigation in a session. A user who clicks through five pages avoids roughly 50 KB of redundant downloads.
+
+## Granular chunking cuts duplicate code
+
+The second piece is a granular chunking strategy that emits multiple shared chunks instead of one large one. By splitting chunks based on how dependencies are actually used across routes, it minimizes the amount of unneeded or duplicate code bundled into any single entry point ([web.dev: Improved Next.js and Gatsby page load performance with granular chunking](https://web.dev/articles/granular-chunking-nextjs)).
+
+The same idea applies to CSS. The `cssChunking` option lets you split and reorder CSS files so a route loads close to only the CSS it needs:
+
+```js
+// next.config.js
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  experimental: {
+    cssChunking: "strict", // or "loose" (default)
+  },
+};
+
+module.exports = nextConfig;
+```
+
+`strict` preserves import order at the cost of more chunks; `loose` bundles chunks together to reduce request count at the cost of looser ordering guarantees. Which one fits depends on your site's scale and how tangled your CSS dependency graph is.
+
+## How to roll this out safely
+
+Both features are experimental, so validate before shipping to production:
+
+1. **Establish a baseline first.** Record JS payload sizes for your key navigation paths using Lighthouse or `next build --profile` before enabling anything, so you have something to compare against.
+2. **Enable one flag at a time.** `turbopackSharedRuntime` and `cssChunking` are independent settings — toggle them separately to isolate their effect.
+3. **Measure real navigation paths, not just synthetic ones.** Test the routes users actually follow — home → service detail → contact — rather than relying solely on lab benchmarks.
+
+## Applying this to our own site
+
+Our site runs on Next.js 16 with the App Router, and the primary navigation flow goes from the homepage through service sections to blog posts. As the blog archive grows, the shared runtime and granular chunking should matter more, not less. With three locales (ja/en/ko), the perceived speed of locale-switching navigation feeds directly into Core Web Vitals and user experience.
+
+That said, these are experimental flags — behavior can shift across Next.js minor versions. If you adopt them, pair the rollout with CI build checks and staging verification before production.
+
+## Takeaway
+
+The Turbopack shared runtime and granular chunking aren't flashy features, but they compound on sites with many routes. webhani keeps evaluating these platform-level optimizations and folding them into the performance work we do for client sites.
+
+---
+
+*Sources: [How Turbopack chunks your JavaScript (Next.js blog)](https://nextjs.org/blog/turbopack-chunking), [Improved Next.js and Gatsby page load performance with granular chunking (web.dev)](https://web.dev/articles/granular-chunking-nextjs), [next.config.js: cssChunking (Next.js docs)](https://nextjs.org/docs/app/api-reference/config/next-config-js/cssChunking)*
