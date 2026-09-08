@@ -1,0 +1,76 @@
+---
+title: "Ruby 4.0のZJIT — 新しいJIT CompilerはRailsのPerformanceに何をもたらすか"
+description: "Ruby 4.0にはYJITの後継として一から設計されたJIT Compiler「ZJIT」が搭載されました。YJITとの違い、有効化方法、Production導入前に確認すべき点を解説します。"
+date: "2026-09-09"
+status: "published"
+tags: ["Ruby", "Rails", "Performance", "JIT Compiler", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "ruby-4-0-zjit-compiler-performance-2026"
+---
+
+Ruby 4.0にZJIT（Zero-overhead JIT）というJust-In-Time Compilerが搭載されました。これはYJITへの小さな改良ではなく、後継として一から設計されたものです。Rails をProduction運用しているTeamにとって、Defaultになる前に理解しておく価値があります。YJITが壊れていたわけではなく、ZJITのDesignがYJIT自体のArchitectureに起因する特定のTradeoffに対応しているためです。
+
+## なぜYJITの改良ではなく新規のJITなのか
+
+YJITはlazy basic block versioningという手法でRuby BytecodeをMachine Codeにcompileします。効果的ではありますが、Programの各地点で観測されたTypeに基づいて積極的にSpecializeするため、生成されるMachine Codeの量が多くなるという構造的なCostがあります。実行時には高速ですが、Memoryを消費しやすく、このSpecialization戦略自体が、大きな再設計なしに一部のOptimizationを追加しにくくしています。
+
+ZJITはこれとは異なるApproachを取ります。Ruby ComplierがMachine Code生成前に解析・最適化できる、より伝統的なIntermediate Representation（IR）を中心に設計されています。実務上の効果としては、時間の経過とともにOptimizationの余地が広がることと、Workloadによってはホットパスにおいて同等のYJITよりMemory Footprintが小さくなることが挙げられます。
+
+## 有効化方法
+
+ZJITは4.0でYJITと並んで搭載されていますが、まだDefaultではありません。明示的に有効化する必要があります。
+
+```bash
+ruby --zjit app.rb
+```
+
+Rails Appでは、Server起動Commandか、Process Managerが渡すEnvironment変数経由で設定します。
+
+```bash
+RUBYOPT="--zjit" bundle exec puma -C config/puma.rb
+```
+
+実行時に有効になっているかは次で確認できます。
+
+```ruby
+RubyVM::ZJIT.enabled? # => true
+```
+
+## 実際に何を計測すべきか
+
+JIT Compilerは、Hot(頻繁に実行される)かつ長時間動き続けるCode Pathで効果を発揮します。ProcessがLiveであり続けるほど、実際のInput形状に基づいてSpecializeする機会が増え、効果が積み上がっていくためです。つまりZJITを正しく評価するには、数秒で終了する`rails runner`のような単発Scriptではなく、Production相当のLoadの下で検証する必要があります。
+
+現実的な評価Approachの例です。
+
+```ruby
+# config/initializers/jit_metrics.rb
+if RubyVM::ZJIT.enabled?
+  Rails.logger.info("ZJIT stats: #{RubyVM::ZJIT.stats}")
+end
+```
+
+既存のLoad Test Suite(あるいはStaging環境へのShadow Traffic Replay)を、YJIT有効時とZJIT有効時それぞれで実行し、起動直後だけでなく持続的な時間帯でp50/p95のResponse TimeとRSS Memoryを比較してください。1分後の時点では同じに見えるJITでも、両方のCompilerがSpecializeする時間を得た30分後には明確な差が出ることがあります。
+
+## Rails Appにおいて特に意味を持つ点
+
+Rails のWorkloadは、数値計算のTight Loopではなく、ActiveRecordのQuery構築、Serialization、View Renderingが中心になることがほとんどです。そのため、計算負荷の高いRuby Scriptとは効果の出方が異なります。1分間に何千回も同じCode Pathを実行するController Action — Access頻度の高いJSON API Endpointや、頻繁にRenderされるPartial — は、JIT Compilerが最もSpecializeする機会が多く、効果が出やすい箇所です。逆にほとんどAccessされないAdmin Pageでは、どちらを使っても目立った差は出ないでしょう。
+
+Puma上で複数Worker Processを立ててRailsを動かしている場合、各WorkerがそれぞれJIT Compileを行うことに注意してください。ZJITが狙うMemory削減効果は、Worker数を掛け合わせた分だけ、むしろ小さくではなく大きく効いてきます。
+
+## 導入の進め方
+
+これはMinor Version Upの範囲を超えたCompiler Backendそのものの変更であるため、Runtime Levelの変更として扱うことを推奨します。
+
+1. まずStaging環境で、現実的なLoadの下、最低でも数日間有効化する。
+2. Performanceだけでなく、Error Rateも比較する。新しいCompiler Backendは、Native ExtensionやMetaprogrammingの特殊なPatternに潜む問題を表面化させやすい変更です。
+3. Deployment構成がProcess単位でのCanaryをSupportしているなら、全面切り替え前にProductionの一部Workerにのみ導入する。
+4. ZJITが少なくとも1回のFull Deploy Cycleを問題なく通過するまでは、`ruby --yjit`をDocument化されたFallbackとして残しておく。
+
+## まとめ
+
+- ZJITはYJITの高速版ではなく、YJITよりOptimizationの余地が広く、Memory Footprintも小さくなるよう一から設計されたJIT Compilerです。
+- Ruby 4.0に搭載されていますがまだDefaultではありません。`--zjit`で明示的に有効化し、`RubyVM::ZJIT.enabled?`で確認してください。
+- 短命なScriptでは効果が見えないため、持続的でProduction相当のLoadの下で評価してください。
+- Rails WorkloadではHotなCode Path(API Endpointや頻出Partialなど)で最も効果が出やすく、Accessの少ないPageでは差が出にくいです。
+- 通常のRuntime変更と同様に扱い、Stagingで検証し、Canaryで展開し、実Trafficで検証が済むまではYJITをFallbackとして残してください。

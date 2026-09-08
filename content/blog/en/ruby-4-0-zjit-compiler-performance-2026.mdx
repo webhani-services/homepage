@@ -1,0 +1,76 @@
+---
+title: "Ruby 4.0's ZJIT: What the New JIT Compiler Means for Rails Performance"
+description: "Ruby 4.0 ships ZJIT, a from-scratch JIT compiler built to replace YJIT's tradeoffs. Here's how it differs from YJIT, how to enable it, and what to check before relying on it in production."
+date: "2026-09-09"
+status: "published"
+tags: ["Ruby", "Rails", "Performance", "JIT Compiler", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "ruby-4-0-zjit-compiler-performance-2026"
+---
+
+Ruby 4.0 shipped with ZJIT (Zero-overhead JIT), a new just-in-time compiler built as a successor to YJIT rather than an incremental update to it. For teams running Rails in production, this is worth understanding before it becomes the default — not because YJIT was broken, but because ZJIT's design addresses specific tradeoffs YJIT had baked in from its own architecture.
+
+## Why a New JIT Instead of Improving YJIT
+
+YJIT compiles Ruby bytecode to machine code using a technique called lazy basic block versioning, which is effective but has a structural cost: it generates a lot of machine code, because it specializes aggressively based on the types it observes at each point in the program. That's fast at runtime but expensive in memory, and the specialization strategy makes some optimizations hard to layer on without a redesign.
+
+ZJIT takes a different approach, built around a more traditional intermediate representation (IR) that Ruby's compiler can analyze and optimize before generating machine code. The practical effect: better optimization headroom over time, and — depending on workload — a smaller memory footprint than YJIT for the same hot paths.
+
+## Enabling It
+
+ZJIT ships alongside YJIT in 4.0; it isn't the default yet. Enable it explicitly:
+
+```bash
+ruby --zjit app.rb
+```
+
+For a Rails app, set it via the server startup command or an environment variable your process manager passes through:
+
+```bash
+RUBYOPT="--zjit" bundle exec puma -C config/puma.rb
+```
+
+Check that it's active at runtime:
+
+```ruby
+RubyVM::ZJIT.enabled? # => true
+```
+
+## What to Actually Measure
+
+JIT compilers pay off on hot, long-running code paths — the benefit compounds as a process stays alive and the compiler gets more chances to specialize based on real input shapes. That means the honest way to evaluate ZJIT is under production-like load, not a cold `rails runner` script that exits after a few seconds.
+
+A reasonable evaluation approach:
+
+```ruby
+# config/initializers/jit_metrics.rb
+if RubyVM::ZJIT.enabled?
+  Rails.logger.info("ZJIT stats: #{RubyVM::ZJIT.stats}")
+end
+```
+
+Run your existing load test suite (or a shadow-traffic replay against a staging instance) with YJIT and again with ZJIT, and compare p50/p95 response times and RSS memory over a sustained window — not just at startup. A JIT that looks identical at the 1-minute mark can diverge meaningfully by the 30-minute mark once both compilers have had time to specialize.
+
+## Where This Matters for a Rails App Specifically
+
+Rails workloads are usually dominated by ActiveRecord query building, serialization, and view rendering rather than tight numeric loops, so the payoff profile looks different than it would for, say, a Ruby script doing heavy computation. Controller actions that run the same code path thousands of times per minute — a hot JSON API endpoint, a frequently rendered partial — are where a JIT compiler has the most opportunity to specialize and pay off. A rarely-hit admin page won't show a meaningful difference either way.
+
+If you're running Rails behind Puma with multiple worker processes, be aware that each worker JIT-compiles independently — the memory savings ZJIT is designed to provide matter more, not less, once you multiply by worker count.
+
+## Rollout Approach
+
+Given this is a new compiler backend, not a minor version bump, we'd recommend treating it the way you'd treat any runtime-level change:
+
+1. Enable it in staging first, under realistic load, for at least a few days.
+2. Compare error rates, not just performance — a new compiler backend is exactly the kind of change that can surface latent bugs in native extensions or unusual metaprogramming patterns.
+3. Roll out to a subset of production workers before a full switch, if your deployment setup supports canarying at the process level.
+4. Keep YJIT as the documented fallback (`ruby --yjit`) until ZJIT has run cleanly through at least one full deploy cycle without regressions.
+
+## Takeaways
+
+- ZJIT is a from-scratch JIT built to have better optimization headroom and a smaller memory footprint than YJIT, not just a faster version of the same design.
+- It ships in Ruby 4.0 but isn't default yet — enable explicitly with `--zjit` and verify with `RubyVM::ZJIT.enabled?`.
+- Evaluate under sustained, production-like load — short-lived scripts won't show the compounding benefit a long-running server process gets.
+- Rails workloads benefit most on hot, frequently-executed code paths (API endpoints, common partials), not rarely-hit pages.
+- Treat the switch like any runtime change: stage it, canary it, and keep YJIT as a documented fallback until you've validated it under real traffic.

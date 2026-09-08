@@ -1,0 +1,74 @@
+---
+title: "2026년의 Agentic Coding — Claude Code와 Spec-Driven Development, 개발 Team은 어떻게 병행해야 하는가"
+description: "2026년 AI 개발 Tool에는 두 가지 흐름이 있습니다. Claude Code 같은 Agent-First 방식과 AWS Kiro 같은 Spec-Driven 방식입니다. 실제 Delivery Pipeline에서 이 둘을 어떻게 결합해야 하는지 정리합니다."
+date: "2026-09-09"
+status: "published"
+tags: ["Claude Code", "AI", "Agentic Coding", "Developer Tooling", "Spec-Driven Development"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-spec-driven-agentic-coding-2026"
+---
+
+2026년 들어 AI 지원 개발에는 뚜렷하게 구분되는 두 가지 철학이 자리 잡았습니다. 하나는 Agent-First 방식으로, Claude Code처럼 Terminal에서 Codebase를 읽고 File을 수정하고 Command를 실행하며 자율적으로 Task를 진행하는 Type입니다. 다른 하나는 Spec-First 방식으로, Code를 작성하기 전에 Requirements Document, Architecture Design, 구현 Plan을 먼저 생성하는 것을 중시하는 Type입니다. 둘 다 실무의 실제 문제를 해결하지만, 대부분의 Delivery Team에게 정답은 "둘 중 하나를 고르는 것"이 아니라 두 방식을 결합하는 것이라고 생각합니다.
+
+## Agent-First — 빠르지만 Guardrail에 결과가 좌우됨
+
+Claude Code의 Model은 단순합니다. 자연어로 Task를 주면 Repository를 탐색하고 변경을 가한 뒤 Test를 실행하고 결과를 보고합니다. Scope가 명확한 Task — 실패한 Test 수정, 작은 Feature 추가, 여러 호출 지점에 걸친 Function Signature Refactoring — 라면 매우 빠릅니다. 정식 Spec이 없어도 Codebase 자체가 Context가 되기 때문입니다.
+
+문제는 규모가 큰 Task에서 나타납니다. Scope에 대한 공통된 이해 없이 Agent가 편집을 시작하면, "Technical으로는 동작하지만 Architecture적으로는 틀린" 결과가 나오기 쉽습니다. "Checkout Flow를 개선해줘" 같은 모호한 Task Description과 "Checkout API에 `discountCode` Field를 추가하고 Promotions Table로 Validation하라"는 구체적인 Description은 결과물의 품질에서 명확한 차이를 만듭니다.
+
+## Spec-First — Scope는 명확하지만 착수가 느림
+
+Spec-Driven 방식의 Tool은 이 순서를 뒤집습니다. Requirements와 Design을 먼저 작성해 Review를 받고, 그 Plan에 따라 Agent 또는 사람이 구현합니다. 공유 API, Data Model, 여러 Service에 걸친 변경에서는 Code가 존재하기 전에 Scope와 Architecture 문제를 미리 발견할 수 있다는 장점이 있습니다.
+
+다만 Overhead도 무시할 수 없습니다. 한 줄짜리 Config 변경에 정식 Spec을 작성하는 것은 명백한 낭비이며, 이 Pattern을 모든 곳에 과도하게 적용하면 Code보다 계획 Document가 더 많은 Team이 되어버립니다.
+
+## 현실적인 절충안
+
+webhani의 Engagement에서 가장 잘 작동한 Workflow는, 가벼운 Spec-First 방식과 Agent-First 실행을 결합한 것이었습니다.
+
+1. **정식 Spec 대신 짧은 Plan File을 작성합니다.** Goal, 변경이 예상되는 File, 제약 조건을 간단히 정리한 Markdown이면 대부분 충분합니다.
+2. **Agent에게 원본 Request가 아니라 Plan File을 기준으로 실행하게 합니다.** 여러 Step에 걸친 Task에서도 Scope가 흔들리지 않습니다.
+3. **Process가 아니라 Diff를 Review합니다.** Plan File은 방향이 틀릴 Risk를 줄여주지만, 최종적으로 이를 잡아내는 것은 여전히 Diff Review입니다.
+
+실제 Plan File은 다음과 같은 형태입니다.
+
+```markdown
+# Task: Checkout에 할인 Code 지원 추가
+
+## Goal
+Checkout API에서 Optional한 `discountCode`를 받아 `promotions`
+Table과 대조해 해당 할인을 적용한다.
+
+## 변경이 예상되는 File
+- src/app/api/checkout/route.ts
+- src/lib/promotions.ts (신규)
+- src/types/checkout.ts
+
+## 제약 조건
+- 기존 Client 호환성을 위해 Checkout Response 구조는 변경하지 않는다.
+- 잘못된 Code라도 Request 자체를 실패시키지 않고 무시한 뒤 Log만 남긴다.
+```
+
+이런 File을 Agent에게 전달하면 탐색 범위를 좁히고, 스스로의 작업을 검증할 수 있는 구체적인 기준을 제공할 수 있습니다.
+
+```bash
+claude "plan.md를 읽고 구현해줘. 완료되면 기존 Checkout Test를 실행하고
+변경된 File 목록을 보고해줘."
+```
+
+Design Review만큼의 수고는 아니고, 몇 분 정도의 사전 작업이지만, Agent에게 한 줄짜리 Request를 바로 전달하는 것보다 훨씬 작고 Review하기 쉬운 Diff가 나옵니다.
+
+## Approval Gate를 실제로 두어야 할 곳
+
+신중하게 판단해야 할 부분은 사람의 확인 없이 Agent에게 무엇을 허용할 것인가입니다. Read-Only 탐색이나 Local File 수정은 Risk가 낮습니다. 반면 Production Data, Deployment, 외부 Service에 손대는 작업은 반드시 Human Review에서 멈춰야 합니다. Agent를 신뢰할 수 없어서가 아니라, 되돌리기 어렵고 System을 이해하는 사람이 잠깐만 봐도 막을 수 있는 실수가 있기 때문입니다.
+
+구체적으로 Client Project에서는 Agent가 만든 변경도 반드시 Branch에서 진행하고 전체 Test Suite를 통과시킨 뒤, 최종 PR은 다른 PR과 동일한 기준으로 Review합니다. Agent가 작성했다고 지름길을 두지 않습니다. 여기서도 Plan File이 유용한데, Reviewer는 Code만 보고 의도를 역추적하는 대신 명시된 Goal과 Diff를 대조해서 확인할 수 있습니다.
+
+## 정리
+
+- Agent-First 방식의 Tool은 Scope가 명확한 단일 Repo 내 Task에 적합합니다. 불필요한 Process Overhead를 더할 필요는 없습니다.
+- 공유 API, Data Model, 여러 Service에 영향을 주는 Task라면, 정식 Spec이 아니더라도 짧은 Plan을 먼저 작성해야 합니다.
+- Agent에게는 원본 Request가 아니라 Plan File을 보여주어 Scope를 고정시킵니다.
+- Production System에 대한 쓰기 권한은 누가 Code를 작성했는지와 무관하게 항상 Human Approval 뒤에 둡니다.
+- 최종 Diff는 일반 PR과 동일한 기준으로 Review합니다. Plan은 Risk를 줄여줄 뿐 Review를 대체하지 않습니다.

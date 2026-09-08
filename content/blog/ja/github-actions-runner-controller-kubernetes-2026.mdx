@@ -1,0 +1,91 @@
+---
+title: "ARCでKubernetes上にSelf-Hosted GitHub Actions Runnerを構築する"
+description: "Actions Runner Controller（ARC）は、Kubernetes上でAutoscaling・Ephemeralに動くGitHub Actions Runnerを構築するための標準的な選択肢になりました。Architectureと実際のSetup、導入すべきCaseを解説します。"
+date: "2026-09-09"
+status: "published"
+tags: ["GitHub Actions", "Kubernetes", "CI/CD", "DevOps", "Self-Hosted Runners"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-runner-controller-kubernetes-2026"
+---
+
+すでにKubernetesを運用しているTeamの間で、GitHub-Hosted RunnerのMinute課金や、静的なSelf-Hosted VM Fleetの維持に代えて、CI Runnerを同じCluster上に移す動きが増えています。これを実用的にしたのがActions Runner Controller（ARC）です。RunnerのLifecycleをKubernetes Resourceとして管理し、Idle Capacityを常時抱える代わりに、Queueに積まれたJob数に応じてPodをScaleさせます。
+
+## 静的Runnerとの違い
+
+ARC以前のSelf-Hosted GitHub Actions Runnerは、多くの場合RepositoryやOrganizationに登録された固定数のLong-lived VMやContainerでした。動作はしますが、2つの問題が繰り返し発生します。Idle Capacityが常にCostとしてかかることと、Long-lived RunnerがJobをまたいでState（Cacheされた認証情報、残存するBuild Artifact、Toolのインストール差分）を蓄積してしまうことです。これはCostだけでなくSecurity上の懸念にもなります。
+
+ARCはこの両方に対応します。Runner PodはDefaultでEphemeralであり、1つのJobのために起動し、終了後に破棄されます。ControllerもGitHubから報告される実際のQueue深度に基づいてPool数をScaleさせるため、固定Replica数を人手で見積もる必要がありません。
+
+## 全体の構成
+
+ARCは大きく2つの要素で構成されます。GitHub上のQueued Workflow Runを監視するController本体と、Workflowの`runs-on`で指定するLabelに対応する1つ以上の`RunnerScaleSet` Resourceです。
+
+Helmを使った最小構成のInstallは次のとおりです。
+
+```bash
+helm install arc \
+  --namespace arc-systems --create-namespace \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
+
+helm install arc-runner-set \
+  --namespace arc-runners --create-namespace \
+  --set githubConfigUrl="https://github.com/webhani-services/homepage" \
+  --set githubConfigSecret.github_token="${GITHUB_TOKEN}" \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+```
+
+Workflow側からの参照はLabelを一致させるだけです。
+
+```yaml
+# .github/workflows/ci.yml
+jobs:
+  test:
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm test
+```
+
+Jobがキューに積まれると、ControllerがRunner Podを作成し、Jobが実行され、完了後にPodは削除されます。次のJobにStateが引き継がれることはなく、Build間でCapacityがIdleのまま残ることもありません。
+
+## 実際に効果があるCase
+
+ARCは全てのTeamにとって正解というわけではありません。GitHub-Hosted Runnerが隠蔽してくれていたRunner Pool自体のUpgrade、Resource制限、TroubleshootingといったKubernetes特有のOperational面を、自分たちで持つことになります。CI利用が少ない小規模Projectであれば、1分あたりのCostが多少高くてもGitHub-Hosted Runnerの方がEngineering Costとしてはシンプルで、結果的に安く済むことが多いでしょう。
+
+導入を検討する価値があるのは、次のようなCaseです。
+
+- すでにApp本体をDeployしているKubernetes Clusterを運用しており、新規Node Poolを立てずに既存のNode PoolにRunner Podを組み込める場合。
+- CI利用量が多く、GitHub-Hosted Minuteが無視できないCost項目になっている場合。
+- Private Registryや内部API、Cluster内からしかアクセスできないDatabaseなど、非公開のInternal Resourceに直接アクセスする必要があり、いずれにせよSelf-Hosted Runnerが必要な場合。
+- Compliance要件上、Build環境を自社管理下のInfrastructureの外に出せない場合。
+
+## Resource制限はGitHub-Hosted Runnerより重要になる
+
+Runner Podは実際のWorkloadと同じClusterを共有するため、Resource Requestを無制限にしておくのは実質的なRiskです。Memory Leakや暴走Processを起こすCI Jobが、Production Podと同じNodeのCapacityを奪い合う可能性があります。Runner Podには明示的なLimitを設定してください。
+
+```yaml
+# Runner Scale Set用のvalues.yaml
+template:
+  spec:
+    containers:
+      - name: runner
+        resources:
+          requests:
+            cpu: "1"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+```
+
+ClusterのCapacityに余裕がない場合は、Production Workloadと混在させず、TaintをかけたDedicated Node PoolでCIを実行する方が、Setupの手間をかける価値があります。
+
+## まとめ
+
+- ARCのEphemeral-by-defaultなModelは、静的Self-Hosted Runnerが抱えるIdle Capacity CostとJobをまたいだState漏洩の両方を解消します。
+- Controllerは推測でのReplica数管理ではなく、実際のQueue深度に基づいてScaleします。
+- 自分たちでTarget Clusterを運用しており、CI利用量が多い、あるいはJobがInternal Resourceへのアクセスを必要とする場合は、Operational Overheadを払う価値があります。
+- Runner PodにはResource Request/Limitを明示的に設定し、可能であればDedicated Node Poolを検討してください。CI WorkloadがProductionと無制限に競合すべきではありません。
+- CI利用量が少ないProjectでは、GitHub-Hosted Runnerの方がまだSimpleなDefaultです。使えるからといってARCを導入する必要はありません。

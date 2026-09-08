@@ -1,0 +1,91 @@
+---
+title: "Self-Hosted GitHub Actions Runners on Kubernetes with ARC"
+description: "Actions Runner Controller (ARC) has become the standard way to run autoscaling, ephemeral GitHub Actions runners inside Kubernetes. Here's the architecture, a working setup, and when it's actually worth adopting."
+date: "2026-09-09"
+status: "published"
+tags: ["GitHub Actions", "Kubernetes", "CI/CD", "DevOps", "Self-Hosted Runners"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-runner-controller-kubernetes-2026"
+---
+
+Teams already running Kubernetes are increasingly moving CI runners onto the same cluster instead of paying for GitHub-hosted minutes or maintaining a separate fleet of static self-hosted VMs. Actions Runner Controller (ARC) is the tool that made this practical — it manages runner lifecycle as Kubernetes resources, scaling pods up and down based on queued jobs instead of keeping idle capacity around.
+
+## Why This Over Static Runners
+
+Before ARC, self-hosting GitHub Actions runners usually meant a fixed pool of long-lived VMs or containers registered to a repo or org. That works, but it has two recurring problems: idle capacity costs money around the clock, and long-lived runners accumulate state — cached credentials, leftover build artifacts, installed tooling drift — between jobs, which is both a cost and a security concern.
+
+ARC addresses both. Runner pods are ephemeral by default — spun up for a single job and torn down after — and the controller scales the pool based on the actual queue depth reported by GitHub, not a fixed replica count.
+
+## How It Fits Together
+
+ARC has two main pieces: the controller itself, which watches GitHub for queued workflow runs, and one or more `RunnerScaleSet` resources, each representing a pool of runners tied to a specific label used in your workflow's `runs-on`.
+
+A minimal install via Helm:
+
+```bash
+helm install arc \
+  --namespace arc-systems --create-namespace \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
+
+helm install arc-runner-set \
+  --namespace arc-runners --create-namespace \
+  --set githubConfigUrl="https://github.com/webhani-services/homepage" \
+  --set githubConfigSecret.github_token="${GITHUB_TOKEN}" \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+```
+
+And referencing it from a workflow is just a label match:
+
+```yaml
+# .github/workflows/ci.yml
+jobs:
+  test:
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm test
+```
+
+Under the load of a queued job, the controller creates a runner pod, the job executes, and the pod is deleted. No job leaves state behind for the next one, and no capacity sits idle between builds.
+
+## Where This Actually Pays Off
+
+ARC isn't the right answer for every team. It adds a Kubernetes-shaped operational surface — you now own upgrades, resource limits, and troubleshooting for the runner pool itself, which GitHub-hosted runners abstract away entirely. For a small project with light CI usage, GitHub-hosted minutes are simpler and probably cheaper in engineering time even if the per-minute cost is nominally higher.
+
+It's worth adopting when:
+
+- You already operate the Kubernetes cluster your app deploys to, and can fold runner pods into existing node pools rather than provisioning a new one.
+- CI usage is high enough that GitHub-hosted minutes are a meaningful cost line.
+- Jobs need access to internal, non-public resources (a private registry, an internal API, a database only reachable inside the cluster) that would otherwise require a self-hosted runner anyway.
+- Compliance requirements mean build environments can't leave infrastructure you control.
+
+## Resource Limits Matter More Here Than on GitHub-Hosted Runners
+
+Because runner pods share the cluster with your actual workloads, unbounded resource requests are a real risk — a CI job that leaks memory or spawns a runaway process competes with production pods for the same nodes. Set explicit limits on the runner pod spec:
+
+```yaml
+# values.yaml for the runner scale set
+template:
+  spec:
+    containers:
+      - name: runner
+        resources:
+          requests:
+            cpu: "1"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+```
+
+Running CI on a dedicated node pool with taints, rather than mixed in with production workloads, is worth the extra setup if your cluster is capacity-sensitive.
+
+## Takeaways
+
+- ARC's ephemeral-by-default model removes both idle-capacity cost and cross-job state leakage that static self-hosted runners carry.
+- The controller scales on actual queue depth, not a guessed replica count — no manual capacity planning.
+- It's worth the operational overhead when you already run the target cluster, CI volume is high, or jobs need access to internal resources.
+- Set explicit resource requests/limits on runner pods and consider a dedicated node pool — CI workloads shouldn't compete unbounded with production.
+- For low-volume projects, GitHub-hosted runners remain the simpler default. Don't adopt ARC just because it's available.
