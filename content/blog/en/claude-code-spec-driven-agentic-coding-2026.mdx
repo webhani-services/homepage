@@ -1,0 +1,74 @@
+---
+title: "Agentic Coding in 2026: What Claude Code and Spec-Driven Workflows Mean for Delivery Teams"
+description: "Two philosophies are shaping AI-assisted development in 2026 — agent-first tools like Claude Code and spec-driven tools like AWS Kiro. Here's how to combine both in a real delivery pipeline."
+date: "2026-09-09"
+status: "published"
+tags: ["Claude Code", "AI", "Agentic Coding", "Developer Tooling", "Spec-Driven Development"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-spec-driven-agentic-coding-2026"
+---
+
+Two distinct philosophies for AI-assisted development have become clear in 2026. One is agent-first: tools like Claude Code run in your terminal, read the codebase, edit files, execute commands, and iterate on their own until a task is done. The other is spec-first: tools built around generating a requirements document, an architecture design, and an implementation plan *before* any code gets written. Both approaches solve a real problem, and for most delivery teams the right answer isn't picking one — it's combining them.
+
+## Agent-First: Fast, but Only as Good as Its Guardrails
+
+Claude Code's model is straightforward: give it a task in natural language, and it explores the repo, makes changes, runs tests, and reports back. This is fast for well-scoped work — fixing a failing test, adding a small feature, refactoring a function signature across call sites. The tool doesn't need a formal spec; the codebase itself is the context.
+
+The risk shows up on larger tasks. An agent that starts editing without a shared understanding of scope can produce a technically working but architecturally wrong result — the right output for the wrong problem. We've seen this most often when a task description is vague ("improve the checkout flow") rather than concrete ("add a `discountCode` field to the checkout API and validate it against the promotions table").
+
+## Spec-First: Clear Scope, Slower Start
+
+Spec-driven tools flip the order: write the requirements and design first, get them reviewed, then let an agent (or a human) implement against that plan. This catches scope and architecture problems before any code exists, which is valuable for anything touching shared APIs, data models, or multiple services.
+
+The tradeoff is overhead. Writing a full spec for a one-line config change is wasted effort, and teams that over-apply this pattern end up with more planning documents than code.
+
+## A Practical Middle Ground
+
+In our own engagements, the workflow that has worked best is a lightweight version of spec-first, paired with agent-first execution:
+
+1. **Write a short plan file, not a formal spec.** A markdown checklist with the goal, the files likely to change, and any constraints is usually enough.
+2. **Let the agent execute against the plan, not against the raw request.** This keeps the agent's scope anchored even on multi-step tasks.
+3. **Review the diff, not the process.** The plan reduces the chance of a wrong-direction result, but the diff review is still what catches it.
+
+A plan file for a real task might look like this:
+
+```markdown
+# Task: Add discount code support to checkout
+
+## Goal
+Accept an optional `discountCode` on the checkout API and apply the
+matching discount from the `promotions` table.
+
+## Files likely to change
+- src/app/api/checkout/route.ts
+- src/lib/promotions.ts (new)
+- src/types/checkout.ts
+
+## Constraints
+- Do not change the checkout response shape for existing clients.
+- Invalid codes should not fail the request — ignore and log instead.
+```
+
+Pointing an agent at a file like this narrows its exploration and gives it something concrete to check its own work against:
+
+```bash
+claude "Read plan.md and implement the task. Run the existing checkout
+tests when done, and report which files changed."
+```
+
+This is a small amount of upfront writing — a few minutes, not a design review — but it consistently produces smaller, more reviewable diffs than handing the agent a one-line request directly.
+
+## Where the Approval Gate Actually Matters
+
+The part worth being deliberate about is what the agent is allowed to do without a human in the loop. Read-only exploration and local file edits are low risk. Anything that touches production data, deployment, or external services should stop and wait for review — not because the agent is unreliable, but because some mistakes are expensive to reverse and cheap to catch with a five-second glance from a person who understands the system.
+
+Concretely, for client projects we run agent-driven changes on a branch, require the full test suite to pass, and treat the resulting PR like any other PR — no shortcuts because an agent wrote it. The plan file becomes useful again here: reviewers can check the diff against the stated goal instead of reverse-engineering intent from the code alone.
+
+## Takeaways
+
+- Agent-first tools are excellent for well-scoped, single-repo tasks — don't add process overhead they don't need.
+- For anything touching shared APIs, data models, or multiple services, write a short plan first. It doesn't need to be a formal spec.
+- Point the agent at the plan, not the raw request, to keep its scope anchored.
+- Gate write access to production systems behind human approval regardless of how the code was written.
+- Review the resulting diff the same way you'd review any PR — the plan reduces risk, it doesn't replace review.

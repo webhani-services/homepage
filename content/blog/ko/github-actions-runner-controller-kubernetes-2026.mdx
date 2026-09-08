@@ -1,0 +1,91 @@
+---
+title: "ARC로 Kubernetes 위에 Self-Hosted GitHub Actions Runner 구축하기"
+description: "Actions Runner Controller(ARC)는 Kubernetes에서 Autoscaling되고 Ephemeral하게 동작하는 GitHub Actions Runner를 구축하는 표준적인 선택지가 되었습니다. Architecture와 실제 Setup, 도입할 만한 상황을 정리합니다."
+date: "2026-09-09"
+status: "published"
+tags: ["GitHub Actions", "Kubernetes", "CI/CD", "DevOps", "Self-Hosted Runners"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-runner-controller-kubernetes-2026"
+---
+
+이미 Kubernetes를 운영 중인 Team들 사이에서, GitHub-Hosted Runner의 분당 과금이나 정적인 Self-Hosted VM Fleet 유지 대신, CI Runner를 같은 Cluster로 옮기는 흐름이 늘고 있습니다. 이를 실용적으로 만든 것이 Actions Runner Controller(ARC)입니다. Runner Lifecycle을 Kubernetes Resource로 관리하며, Idle Capacity를 항상 대기시키는 대신 Queue에 쌓인 Job 수에 맞춰 Pod를 늘리고 줄입니다.
+
+## 정적 Runner와의 차이
+
+ARC 이전의 Self-Hosted GitHub Actions Runner는 대개 Repository나 Organization에 등록된 고정 개수의 Long-Lived VM이나 Container였습니다. 동작은 하지만 반복적으로 두 가지 문제가 발생합니다. Idle Capacity가 항상 Cost로 나간다는 점과, Long-Lived Runner가 Job 사이에 State(Cache된 인증 정보, 남은 Build Artifact, 설치된 Tool의 Version Drift)를 누적한다는 점입니다. 이는 Cost 문제이면서 동시에 Security 우려이기도 합니다.
+
+ARC는 이 두 가지를 모두 해결합니다. Runner Pod는 기본적으로 Ephemeral하여 하나의 Job을 위해 생성되고 완료 후 삭제됩니다. Controller 역시 고정된 Replica 수가 아니라 GitHub가 보고하는 실제 Queue 깊이에 따라 Pool을 Scale합니다.
+
+## 전체 구조
+
+ARC는 크게 두 요소로 구성됩니다. GitHub의 Queue된 Workflow Run을 감시하는 Controller 본체와, Workflow의 `runs-on`에서 지정하는 Label에 대응하는 하나 이상의 `RunnerScaleSet` Resource입니다.
+
+Helm을 이용한 최소 구성 Install은 다음과 같습니다.
+
+```bash
+helm install arc \
+  --namespace arc-systems --create-namespace \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
+
+helm install arc-runner-set \
+  --namespace arc-runners --create-namespace \
+  --set githubConfigUrl="https://github.com/webhani-services/homepage" \
+  --set githubConfigSecret.github_token="${GITHUB_TOKEN}" \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+```
+
+Workflow 쪽에서 참조하는 방법은 Label만 맞추면 됩니다.
+
+```yaml
+# .github/workflows/ci.yml
+jobs:
+  test:
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm test
+```
+
+Job이 Queue에 쌓이면 Controller가 Runner Pod를 생성하고, Job이 실행된 뒤 완료되면 Pod가 삭제됩니다. 다음 Job에 State가 넘어가는 일도 없고, Build 사이에 Capacity가 Idle 상태로 남는 일도 없습니다.
+
+## 실제로 효과가 있는 상황
+
+ARC가 모든 Team에게 정답은 아닙니다. GitHub-Hosted Runner가 가려주던 Runner Pool 자체의 Upgrade, Resource 제한, Troubleshooting이라는 Kubernetes 특유의 운영 부담을 직접 떠안게 됩니다. CI 사용량이 적은 소규모 Project라면, 분당 Cost가 다소 높더라도 GitHub-Hosted Runner 쪽이 Engineering Cost 측면에서 더 단순하고 결과적으로 저렴한 경우가 많습니다.
+
+다음과 같은 상황이라면 도입을 검토할 가치가 있습니다.
+
+- 이미 App을 Deploy하는 Kubernetes Cluster를 운영 중이며, 새 Node Pool을 따로 만들지 않고 기존 Node Pool에 Runner Pod를 얹을 수 있는 경우.
+- CI 사용량이 많아 GitHub-Hosted Minute이 무시할 수 없는 Cost 항목인 경우.
+- Private Registry, 내부 API, Cluster 안에서만 접근 가능한 Database 등 비공개 Internal Resource에 직접 접근해야 해서 어차피 Self-Hosted Runner가 필요한 경우.
+- Compliance 요건상 Build 환경을 자체 관리 Infrastructure 밖으로 내보낼 수 없는 경우.
+
+## Resource 제한이 GitHub-Hosted Runner보다 더 중요해짐
+
+Runner Pod는 실제 Workload와 같은 Cluster를 공유하기 때문에, Resource Request를 무제한으로 두는 것은 실질적인 Risk입니다. Memory Leak이 있거나 폭주하는 Process를 만드는 CI Job이 Production Pod와 같은 Node의 Capacity를 두고 경쟁할 수 있습니다. Runner Pod에는 명시적인 Limit을 설정해야 합니다.
+
+```yaml
+# Runner Scale Set용 values.yaml
+template:
+  spec:
+    containers:
+      - name: runner
+        resources:
+          requests:
+            cpu: "1"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+```
+
+Cluster의 Capacity에 여유가 없다면, Production Workload와 섞지 않고 Taint를 건 전용 Node Pool에서 CI를 실행하는 편이 추가 Setup 수고를 들일 가치가 있습니다.
+
+## 정리
+
+- ARC의 Ephemeral-by-Default Model은 정적 Self-Hosted Runner가 갖고 있던 Idle Capacity Cost와 Job 간 State 누출을 모두 해소합니다.
+- Controller는 추측이 아니라 실제 Queue 깊이를 기준으로 Scale합니다.
+- 이미 대상 Cluster를 직접 운영하고, CI 사용량이 많거나, Job이 Internal Resource에 접근해야 한다면 운영 Overhead를 감수할 가치가 있습니다.
+- Runner Pod에는 Resource Request/Limit을 명시적으로 설정하고, 가능하다면 전용 Node Pool을 고려하세요. CI Workload가 Production과 무제한으로 경쟁해서는 안 됩니다.
+- CI 사용량이 적은 Project라면 여전히 GitHub-Hosted Runner가 더 단순한 기본값입니다. 쓸 수 있다는 이유만으로 ARC를 도입할 필요는 없습니다.
