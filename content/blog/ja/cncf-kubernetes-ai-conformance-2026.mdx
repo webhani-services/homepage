@@ -1,0 +1,87 @@
+---
+title: "CNCF Kubernetes AI適合性プログラム — AIワークロードの『動く場所を選ばない』基盤づくり"
+description: "CNCFのCertified Kubernetes AI Conformance Programが認定プラットフォームを拡大し、v1.35のAgentワークロード対応を取り込みました。この標準化が現場の設計に何をもたらすかを整理します。"
+date: "2026-09-10"
+status: "published"
+tags: ["Kubernetes", "クラウドインフラ", "CNCF", "AI基盤", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "cncf-kubernetes-ai-conformance-2026"
+---
+
+## 「どこでも同じように動く」が失われつつあった領域
+
+Kubernetesはコンテナオーケストレーションの事実上の標準として、クラウドを移動してもワークロードの挙動が大きく変わらないという価値を提供してきました。しかしAI/MLワークロードに関しては、この前提が崩れがちでした。GPUスケジューリングの実装がベンダーごとに異なり、推論サービングの構成もプラットフォームごとにバラバラで、あるクラウドで動いた構成が別のクラウドではそのまま動かない、という状況が珍しくありませんでした。
+
+CNCFが主導するCertified Kubernetes AI Conformance Programは、この断片化に対する業界としての回答です。2026年に入り、認定プラットフォーム数がほぼ倍増し、OVHcloud、SpectroCloud、JD Cloud、China Unicomクラウドなどが新たに加わりました。本稿では、このプログラムが何を標準化しようとしているのか、そしてWebhaniが顧客のAI基盤設計にどう反映しているかを解説します。
+
+## プログラムが定義する「適合性」の中身
+
+このプログラムの本質は、AIワークロードをKubernetes上で動かす際の技術的な共通言語を定義することです。2026年のアップデートでは、特にKubernetes v1.35との整合が重視されています。
+
+```text
+v1.35との整合における主要ポイント
+├─ Stable In-Place Pod Resizing
+│    推論モデルの再起動なしにリソースを調整可能
+├─ Workload-Aware Scheduling
+│    分散学習時のリソースデッドロックを回避
+└─ Agentワークロードの検証範囲拡大
+     コンテナと同じ信頼済みサンドボックスモデルを
+     Agentの実行にも適用し、割り当てられた
+     範囲を超えないよう制約
+```
+
+特に注目すべきは、Agentワークロードが検証対象に加わった点です。AIエージェントが自律的にタスクを実行する構成が一般化する中で、「エージェントの実行範囲をKubernetesレベルでどう制約するか」という問いに、業界標準として答えを出そうとしています。
+
+## In-Place Pod Resizingが実務に効く理由
+
+推論ワークロードは、トラフィックの変動に応じてリソース要求が大きく変わります。従来、Podのリソース変更にはPodの再作成が必要で、推論サービングにおいてはこれがダウンタイムやレイテンシスパイクの原因になっていました。
+
+```yaml
+# 概念的な例: In-Place Resizing対応のPod定義
+apiVersion: v1
+kind: Pod
+metadata:
+  name: inference-server
+spec:
+  containers:
+    - name: model-server
+      resources:
+        requests:
+          cpu: "2"
+          memory: "8Gi"
+        limits:
+          cpu: "4"
+          memory: "16Gi"
+      resizePolicy:
+        - resourceName: cpu
+          restartPolicy: NotRequired
+        - resourceName: memory
+          restartPolicy: NotRequired
+```
+
+`restartPolicy: NotRequired`により、トラフィック急増時にPodを再作成せずリソースを引き上げられます。推論サービングのように可用性が重視されるワークロードにとって、これは実務上大きな差になります。
+
+## Webhaniが顧客に伝えていること
+
+AI基盤の構築を検討する顧客に対し、Webhaniは次の点を伝えています。
+
+### 1. 「動く」ではなく「適合している」を基準に選ぶ
+
+特定のクラウドやディストリビューションでAIワークロードが動くことを確認するだけでなく、CNCF認定を取得しているかどうかを選定基準に加えることで、将来のマルチクラウド移行やベンダーロックインのリスクを下げられます。
+
+### 2. Agentワークロードのサンドボックス化を前提に設計する
+
+自律型AIエージェントを本番環境で動かす計画があるなら、コンテナと同じ隔離モデルの上でエージェントを実行できる基盤かどうかを、初期の技術選定段階で確認すべきです。後から隔離を追加するのは、最初から組み込むより遥かにコストがかかります。
+
+### 3. GPUスケジューリングの成熟度を過信しない
+
+プログラムが「タフなルール」をv1.35向けに追加しているという事実は、裏を返せばこれまでの適合性検証がまだ発展途上だったことを示しています。Workload-Aware Schedulingのような機能が認定要件に入ったのは最近のことであり、既存の構成がこの水準を満たしているか、実際に検証することをWebhaniでは推奨しています。
+
+## まとめ
+
+CNCFのKubernetes AI適合性プログラムは、AIワークロードの実行基盤における「移植性」という、これまで曖昧だった領域に具体的な基準を持ち込む取り組みです。In-Place Pod ResizingやAgentワークロードのサンドボックス化といった技術的な進展は、AI基盤を複数のクラウドにまたがって運用しようとする企業にとって、選定基準を明確にする助けになります。Webhaniでは、顧客のAI/MLインフラ設計において、このプログラムの認定状況を評価軸のひとつとして組み込むことを提案しています。
+
+---
+
+*参考: [CNCF Nearly Doubles Certified Kubernetes AI Platforms (CNCF)](https://www.cncf.io/announcements/2026/03/24/cncf-nearly-doubles-certified-kubernetes-ai-platforms/), [CNCF Launches Certified Kubernetes AI Conformance Program (HPCwire)](https://www.hpcwire.com/off-the-wire/cncf-launches-certified-kubernetes-ai-conformance-program-to-standardize-ai-workloads-on-kubernetes/)*
