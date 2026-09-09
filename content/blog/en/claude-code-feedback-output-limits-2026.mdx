@@ -1,0 +1,72 @@
+---
+title: "Claude Code's September 2026 Update: SendFeedback and Larger Output Limits Change How You Operate Agents"
+description: "Claude Code shipped a SendFeedback tool and raised bashOutputMaxChars/taskOutputMaxChars up to 128K. Here's what these operational changes mean for teams running agentic coding in production."
+date: "2026-09-10"
+status: "published"
+tags: ["Claude Code", "AI coding", "agent operations", "developer tools", "productivity"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-feedback-output-limits-2026"
+---
+
+## Two quiet but useful changes
+
+In September 2026, Claude Code picked up two operational updates. First, a `SendFeedback` tool that drafts a feedback report when something goes wrong mid-session, which you review and send via `/feedback`. Second, higher ceilings on `bashOutputMaxChars` and `taskOutputMaxChars`, letting up to 128K characters of command and background-task output flow inline to the model instead of being truncated to a file.
+
+Neither is a headline feature. But for teams that run agentic coding as part of their daily workflow, these are exactly the kind of unglamorous improvements that compound. Here's webhani's read on what changed and where it matters.
+
+## What SendFeedback actually fixes
+
+Until now, if something felt off mid-session — a tool call behaving unexpectedly, a plan drifting from what you asked for — reporting it meant manual work: screenshotting, copying logs, filing an issue separately from the session that produced the problem.
+
+`SendFeedback` closes that gap. When Claude detects something worth flagging, it drafts a feedback report on its own, and you review and edit it before sending through `/feedback`.
+
+```text
+Something unexpected happens mid-session
+        ↓
+Claude drafts a feedback report
+  - what happened
+  - what you expected instead
+  - relevant session context
+        ↓
+You review and edit
+        ↓
+Send via /feedback
+```
+
+The design is worth noting: Claude drafts, but a human decides whether to send. That split — autonomy for the low-stakes part, a human checkpoint before anything leaves the session — is the same pattern webhani recommends whenever we design agentic workflows for clients. Reporting is close to irreversible once sent, so it deserves a review step even when drafting is automated.
+
+## Why the output limit increase matters more than it looks
+
+The second change is subtler but arguably more consequential day-to-day. Command output and background-task output used to get truncated past a certain size, with only a summary or partial excerpt reaching the model. Raising `bashOutputMaxChars` and `taskOutputMaxChars` to 128K means much longer logs — full test failure output, verbose dependency resolution — can now be passed inline.
+
+```bash
+# A long test-suite failure log, for example
+npm test 2>&1 | tee test-output.log
+# Before: output got truncated; Claude only saw a summary
+# Now: up to 128K characters can flow inline, so Claude sees the actual failure
+```
+
+This directly reduces a specific failure mode: Claude reasoning from a partial view of the evidence and guessing wrong as a result. Debugging accuracy tracks closely with how much raw signal the model actually sees, so this is a quiet but real improvement to diagnostic quality.
+
+## Where this shows up in practice
+
+In webhani's client engagements, we expect these two changes to matter most in:
+
+- **Incident triage**: full CI failure logs or build errors can now be handed over without worrying that summarization drops the one line that mattered.
+- **Institutionalizing feedback**: `SendFeedback` gives engineers a low-friction way to flag odd agent behavior the moment they notice it, instead of relying on someone remembering to mention it later. That turns anecdote into a record you can actually act on.
+- **Monorepo-scale tasks**: builds and tests spanning multiple packages produce long output. Not being forced into a summary makes it easier to reason from what actually happened.
+
+## Operational caveats
+
+Larger output limits mean more tokens flowing into the model, and that has real cost and latency implications. We recommend reserving the higher limits for situations where accuracy matters more than efficiency — debugging and incident investigation — rather than defaulting every workflow to the maximum. Use it where it earns its cost.
+
+The same discipline applies to `SendFeedback`: don't turn "review before sending" into a rubber stamp. The value of the feedback loop depends entirely on whether anyone actually reads the draft before it goes out.
+
+## Takeaway
+
+This update isn't a new capability so much as an upgrade to observability around running agents. `SendFeedback` lowers the barrier to reporting problems; the output limit increase raises the ceiling on diagnostic accuracy. Both are the unglamorous infrastructure work that agentic coding needs before it can run reliably in production. webhani will keep tracking these operational changes as we help clients scale their AI coding practices.
+
+---
+
+*Source: [Claude Code Updates by Anthropic - September 2026 (Releasebot)](https://releasebot.io/updates/anthropic/claude-code)*

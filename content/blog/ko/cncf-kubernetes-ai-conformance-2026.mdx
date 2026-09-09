@@ -1,0 +1,85 @@
+---
+title: "CNCF Kubernetes AI Conformance Program — AI Workload가 '어디서나 동일하게 동작'하는 기반 만들기"
+description: "CNCF의 Certified Kubernetes AI Conformance Program이 인증 Platform 수를 거의 두 배로 늘리고 v1.35의 Agent Workload 지원을 반영했습니다. 이 표준화가 실무 설계에 어떤 의미를 갖는지 정리합니다."
+date: "2026-09-10"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "CNCF", "AI Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "cncf-kubernetes-ai-conformance-2026"
+---
+
+## "어디서나 동일하게 동작"이 흔들리던 영역
+
+Kubernetes는 Container Orchestration의 사실상 표준으로서, Cloud를 옮겨도 Workload 동작이 크게 달라지지 않는다는 가치를 제공해왔습니다. 하지만 AI/ML Workload에 관해서는 이 전제가 흔들리는 경우가 많았습니다. GPU Scheduling 구현이 Vendor마다 다르고, Inference Serving 구성도 Platform마다 제각각이어서, 특정 Cloud에서 동작하던 구성이 다른 Cloud에서는 그대로 동작하지 않는 상황이 드물지 않았습니다.
+
+CNCF가 주도하는 Certified Kubernetes AI Conformance Program은 이런 파편화에 대한 업계 차원의 대응입니다. 2026년 들어 인증 Platform 수가 거의 두 배로 늘었고, OVHcloud, SpectroCloud, JD Cloud, China Unicom Cloud 등이 새롭게 추가되었습니다. 이번 글에서는 이 Program이 무엇을 표준화하려 하는지, 그리고 webhani가 고객의 AI 기반 설계에 어떻게 반영하는지 설명합니다.
+
+## Program이 정의하는 "적합성"의 내용
+
+이 Program의 본질은 AI Workload를 Kubernetes 위에서 실행할 때의 기술적 공통 언어를 정의하는 것입니다. 2026년 Update에서는 특히 Kubernetes v1.35와의 정합성이 강조됩니다.
+
+```text
+v1.35 정합성의 핵심 항목
+├─ Stable In-Place Pod Resizing
+│    Inference Model 재시작 없이 Resource 조정 가능
+├─ Workload-Aware Scheduling
+│    분산 학습 시 Resource Deadlock 회피
+└─ Agent Workload 검증 범위 확대
+     Container와 동일한 신뢰된 Sandbox Model을
+     Agent 실행에도 적용해, 할당된 범위를
+     벗어나지 않도록 제약
+```
+
+특히 주목할 점은 Agent Workload가 검증 대상에 포함되었다는 것입니다. AI Agent가 자율적으로 Task를 실행하는 구성이 일반화되는 가운데, "Agent의 실행 범위를 Kubernetes Level에서 어떻게 제약할 것인가"라는 질문에 업계 표준으로 답을 내려는 시도입니다.
+
+## In-Place Pod Resizing이 실무에 중요한 이유
+
+Inference Workload는 Traffic 변동에 따라 Resource 요구량이 크게 달라집니다. 기존에는 Pod의 Resource 변경에 Pod 재생성이 필요했고, Inference Serving에서는 이것이 Downtime이나 Latency Spike의 원인이 되었습니다.
+
+```yaml
+# 개념적 예시: In-Place Resizing을 지원하는 Pod 정의
+apiVersion: v1
+kind: Pod
+metadata:
+  name: inference-server
+spec:
+  containers:
+    - name: model-server
+      resources:
+        requests:
+          cpu: "2"
+          memory: "8Gi"
+        limits:
+          cpu: "4"
+          memory: "16Gi"
+      resizePolicy:
+        - resourceName: cpu
+          restartPolicy: NotRequired
+        - resourceName: memory
+          restartPolicy: NotRequired
+```
+
+`restartPolicy: NotRequired`를 통해 Traffic 급증 시 Pod를 재생성하지 않고 Resource를 늘릴 수 있습니다. Inference Serving처럼 가용성이 중요한 Workload에서는 이것이 실무적으로 큰 차이를 만듭니다.
+
+## webhani가 고객에게 전달하는 내용
+
+### 1. "동작한다"가 아니라 "적합성을 갖췄다"를 기준으로 선정
+
+특정 Cloud나 Distribution에서 AI Workload가 동작하는 것을 확인하는 데 그치지 않고, CNCF 인증 여부를 선정 기준에 추가함으로써 향후 Multi-cloud 이전이나 Vendor Lock-in Risk를 줄일 수 있습니다.
+
+### 2. Agent Workload의 Sandbox화를 전제로 설계
+
+자율형 AI Agent를 Production 환경에서 운영할 계획이라면, Container와 동일한 격리 Model 위에서 Agent를 실행할 수 있는 기반인지를 초기 기술 선정 단계에서 확인해야 합니다. 격리를 나중에 추가하는 것은 처음부터 반영하는 것보다 훨씬 많은 Cost가 듭니다.
+
+### 3. GPU Scheduling 성숙도를 과신하지 않기
+
+Program이 v1.35를 대상으로 "더 엄격한 규칙"을 추가하고 있다는 사실은, 거꾸로 말하면 지금까지의 적합성 검증이 아직 발전 중이었다는 의미이기도 합니다. Workload-Aware Scheduling 같은 기능이 인증 요건에 포함된 것은 최근의 일이므로, 기존 구성이 이 수준을 충족하는지 실제로 검증할 것을 webhani는 권장합니다.
+
+## 마치며
+
+CNCF의 Kubernetes AI Conformance Program은 AI Workload 실행 기반의 "이식성"이라는, 지금까지 모호했던 영역에 구체적인 기준을 제시하는 시도입니다. In-Place Pod Resizing이나 Agent Workload Sandbox화 같은 기술적 진전은, AI 기반을 여러 Cloud에 걸쳐 운영하려는 기업에게 선정 기준을 명확히 해주는 도움이 됩니다. webhani는 고객의 AI/ML Infrastructure 설계에서 이 Program의 인증 현황을 평가 축의 하나로 포함할 것을 제안합니다.
+
+---
+
+*참고: [CNCF Nearly Doubles Certified Kubernetes AI Platforms (CNCF)](https://www.cncf.io/announcements/2026/03/24/cncf-nearly-doubles-certified-kubernetes-ai-platforms/), [CNCF Launches Certified Kubernetes AI Conformance Program (HPCwire)](https://www.hpcwire.com/off-the-wire/cncf-launches-certified-kubernetes-ai-conformance-program-to-standardize-ai-workloads-on-kubernetes/)*

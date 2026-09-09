@@ -1,0 +1,89 @@
+---
+title: "AI Agent에게 '신원'을 부여하다 — 2026년 Agent ID 관리라는 과제"
+description: "자율적으로 동작하는 AI Agent가 늘어나면서 기존 IAM 모델로는 대응이 어려워지고 있습니다. Agent Identity 설계 Pattern과 구현 시 주의점을 webhani의 관점에서 정리합니다."
+date: "2026-09-10"
+status: "published"
+tags: ["Security", "IAM", "AI Agent", "Access Control", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "ai-agent-identity-access-management-2026"
+---
+
+## "누가"가 아니라 "어느 Agent가"
+
+Web Service의 Access Control을 설계할 때, 지금까지는 "사람 User"와 "Service Account" 두 종류만 고려하면 대체로 충분했습니다. 하지만 2026년 현재, 이 전제가 흔들리고 있습니다.
+
+업무 System에 내장된 자율 AI Agent가 사람의 승인을 매번 기다리지 않고 API를 호출하고, Database를 조작하고, 다른 Agent에게 Task를 위임합니다. 이런 구성이 일반화되면서 기업 내 Non-Human Identity(Service Account, Workload, 그리고 AI Agent)의 수가 사람 Account 수의 약 50배에 달한다는 조사도 있습니다. 이번 글에서는 이 "Agent Identity 관리"라는 새로운 과제를, webhani가 고객 System을 설계할 때의 관점으로 정리합니다.
+
+## 기존 IAM Model이 작동하지 않는 이유
+
+기존 IAM(Identity and Access Management)은 다음과 같은 전제 위에서 성립했습니다.
+
+- Identity는 장기간 안정적이다 (직원 Account는 몇 년 단위로 유지된다)
+- 권한 위임은 명시적이며 경로 추적이 쉽다
+- "누가" "언제" 조작했는지가 하나의 Identity에 명확히 매핑된다
+
+AI Agent는 이 전제를 모두 무너뜨립니다. Agent는 수 초에서 수 시간 단위의 짧은 Lifecycle로 생성·소멸될 수 있고, 한 Agent가 다른 Agent에게 Task를 위임하고, 그 Agent가 또 다른 Tool을 호출하는 다단계 위임이 발생합니다. 결과적으로 "누구의 권한으로 무엇이 실행되었는지" 추적하는 것 자체가 어려워집니다.
+
+## 2026년 정착 중인 4가지 Architecture Pattern
+
+현재 Agent Security 구현은 크게 4가지 Pattern으로 나뉩니다.
+
+```text
+1. User-delegated (사용자 위임형)
+   Agent가 명시적인 사용자 동의 하에 해당 사용자로 동작
+
+2. Autonomous (자율형)
+   Agent 자체가 고유한 Identity를 가지며 직접 인가 대상이 됨
+
+3. Hybrid orchestrated (혼합 편성형)
+   하나의 Agent가 다른 Agent에게 Task를 위임
+
+4. Scoped impersonation (범위 제한 대행형)
+   Agent가 특정 Scope로 한정해 사용자를 대행
+```
+
+어떤 Pattern을 선택할지는 Agent가 무엇을 대행하는지, 어느 수준의 권한을 부여할지에 따라 달라집니다. 중요한 것은 이들을 명확한 경계 없이 혼용해서 설계하면, Audit 시점에 어떤 조작이 어떤 권한 Model로 실행되었는지 판별할 수 없게 된다는 점입니다.
+
+## 구현 시 확인해야 할 3가지
+
+webhani가 고객사의 Agent 통합을 설계할 때 가장 먼저 확인하는 항목입니다.
+
+### 1. Agent를 "1급 Identity"로 다루기
+
+Agent 전용 Service Account를 사람 Account의 연장선으로 다루지 않고, 독자적인 Lifecycle·권한 Scope·Audit Log를 가진 주체로 정의합니다.
+
+```yaml
+# 개념적 예시: Agent Identity 최소 구성
+agent_identity:
+  id: "agent-invoice-processor-01"
+  type: "autonomous"
+  scope:
+    - "read:invoices"
+    - "write:payment-status"
+  lifespan: "ephemeral"      # Session 종료 시 만료
+  delegated_by: null          # 자율형이므로 위임 주체 없음
+  audit_trail: true
+```
+
+### 2. 위임 Chain을 가시화하기
+
+Agent A가 Agent B에게 Task를 위임할 경우, 이 위임 관계를 Log로 남기지 않으면 이후 Incident를 추적할 수 없습니다. 위임이 발생할 때마다 "누가, 누구에게, 어떤 권한을, 언제까지" 전달했는지 기록하는 설계가 필수입니다.
+
+### 3. Scope는 최소 권한, 유효기간 포함
+
+사람의 API Key라면 "일단 넓은 권한을 주고 나중에 줄이는" 운영이 허용되는 경우도 있지만, Agent는 사람보다 훨씬 높은 빈도와 속도로 조작을 실행하기 때문에 과도한 권한의 Risk가 상대적으로 큽니다. 단명 Token과 Task 단위 Scope를 조합하는 것이 기본 방침입니다.
+
+## webhani의 견해
+
+Agent Identity 관리는 아직 Vendor마다 구현 Pattern이 갈리는 발전 중인 영역입니다. Microsoft Entra Agent ID 같은 대형 Platform의 Native 기능부터 Aembit 같은 전문 Vendor의 IAM Broker까지 선택지는 늘고 있습니다. 하지만 공통 원칙은 변하지 않습니다. "Agent를 사람의 연장으로 취급하지 않는다", "위임 Chain을 추적 가능하게 만든다", "권한을 단명하고 최소로 유지한다"는 세 가지입니다.
+
+새로운 Vendor 제품을 도입하기 전에, 먼저 자사의 Agent 운영이 어떤 Architecture Pattern에 해당하는지 정리할 것을 webhani는 권장합니다. Pattern이 불명확한 상태로 제품을 선정하면, 이후 권한 Model을 다시 설계해야 하는 경우가 적지 않습니다.
+
+## 마치며
+
+AI Agent 도입이 늘어날수록 "누가 조작했는가"를 추적하는 구조의 중요성은 커집니다. Agent Identity 설계는 나중에 고칠 수 있는 부분과, 처음에 정해두지 않으면 손실이 큰 부분이 함께 존재하는 영역입니다. webhani는 Agent 통합을 검토하는 고객에게 기능 구현과 동시에 IAM 설계를 초기 Phase에 포함할 것을 제안합니다.
+
+---
+
+*참고: [What's shaping the AI agent security market in 2026 (Palo Alto Networks)](https://www.paloaltonetworks.com/blog/identity-security/whats-shaping-the-ai-agent-security-market-in-2026/), [2026 IAM Vendors: Comparing Top Agentic Security Firms (Aembit)](https://aembit.io/blog/ranking-the-top-10-ai-agent-identity-security-vendors-for-2026/)*

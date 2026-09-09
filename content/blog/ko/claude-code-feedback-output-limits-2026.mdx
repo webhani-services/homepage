@@ -1,0 +1,72 @@
+---
+title: "Claude Code 2026년 9월 업데이트 — SendFeedback와 출력 한도 확대가 바꾸는 Agent 운영"
+description: "Claude Code에 SendFeedback Tool과 bashOutputMaxChars/taskOutputMaxChars 한도 확대(최대 128K)가 추가되었습니다. Agent 운영의 가시성이라는 관점에서 변경 사항과 실무 적용법을 정리합니다."
+date: "2026-09-10"
+status: "published"
+tags: ["Claude Code", "AI 코딩", "Agent 운영", "개발 도구", "생산성"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-feedback-output-limits-2026"
+---
+
+## 눈에 띄지 않지만 효과가 큰 변경
+
+2026년 9월, Claude Code에 두 가지 운영 관련 업데이트가 추가되었습니다. 하나는 Session 중 문제가 발생했을 때 Feedback Report를 초안으로 작성해주는 `SendFeedback` Tool이고, 다른 하나는 Command 실행 및 Background Task의 출력을 Model에 Inline으로 전달할 수 있는 한도를 최대 128K Character까지 늘린 `bashOutputMaxChars` / `taskOutputMaxChars` 설정입니다.
+
+화려한 신규 기능은 아닙니다. 하지만 Agentic Coding을 일상 업무에 통합한 팀 입장에서는, 이런 눈에 띄지 않는 개선이 오히려 실질적인 차이를 만듭니다. 이번 글에서는 webhani의 관점에서 이 두 변경이 실무에 어떤 의미를 갖는지 정리합니다.
+
+## SendFeedback Tool이 해결하는 문제
+
+지금까지는 Claude Code Session 중 "이건 예상과 다른 동작인데"라고 느껴도, 이를 보고할 방법이 제한적이었습니다. Screenshot을 찍거나 Log를 복사해 별도로 Issue를 등록하는 수작업이 필요했습니다.
+
+`SendFeedback`은 Session 중 문제를 감지하면 Claude가 스스로 Feedback Report 초안을 작성하고, 사용자가 내용을 검토한 뒤 `/feedback`을 통해 전송하는 구조입니다.
+
+```text
+Session 중 예상치 못한 동작 감지
+        ↓
+Claude가 Feedback 초안 생성
+  - 무엇이 발생했는지
+  - 기대했던 동작은 무엇인지
+  - 관련 Session Context
+        ↓
+사용자가 내용 검토·수정
+        ↓
+/feedback으로 전송
+```
+
+핵심은 "초안은 Claude가 작성하지만, 전송 여부는 사람이 판단한다"는 설계입니다. Agent에게 자율성을 부여하되, 외부로 보고하는 비가역적인 작업에는 사람의 승인을 거치도록 한 것입니다. 이 설계 원칙은 webhani가 고객사의 AI Coding 운영을 설계할 때 일관되게 권장하는 패턴과 정확히 일치합니다.
+
+## 출력 한도 확대가 의미하는 것
+
+또 다른 변경은 지엽적으로 보이지만 실무적으로는 더 중요할 수 있습니다. 지금까지 Command 실행 결과나 Background Task 출력은 일정 길이를 넘으면 Truncate되어, Model에는 요약이나 일부만 전달되었습니다. `bashOutputMaxChars`와 `taskOutputMaxChars` 한도가 128K까지 확대되면서, 더 긴 Log나 Test 출력을 그대로 Model Context에 전달할 수 있게 되었습니다.
+
+```bash
+# 예: Test Suite 실패 Log가 긴 경우
+npm test 2>&1 | tee test-output.log
+# 이전: 출력이 잘려서 Claude는 요약 정보만 확인 가능
+# 현재: 128K까지 Inline 전달이 가능해 실패 지점을 직접 참조 가능
+```
+
+이는 "Log의 일부만 보고 잘못된 추론을 하는" 실패 사례를 줄여줍니다. Debugging 정확도는 Model이 얼마나 많은 원본 정보에 접근할 수 있는지에 직결되기 때문에, 이번 한도 확대는 눈에 띄지 않아도 진단 품질에 직접적으로 기여하는 개선입니다.
+
+## 실무 적용 포인트
+
+webhani가 고객 프로젝트에서 Claude Code를 운영하며 이 두 변경이 효과를 발휘할 것으로 예상하는 지점은 다음과 같습니다.
+
+- **장애 조사 초기 단계**: CI 실패나 Build Error의 상세 Log를 그대로 전달할 수 있어, 요약으로 인한 정보 손실을 걱정하지 않고 조사를 요청할 수 있습니다.
+- **Feedback Loop의 제도화**: `SendFeedback`을 통해 현장 Engineer가 "Claude의 동작이 이상하다"고 느끼는 순간, 부담 없이 기록을 남길 수 있습니다. 구두 보고에 의존하지 않고 개선을 위한 1차 자료가 축적됩니다.
+- **대규모 Monorepo Task 실행**: 여러 Package에 걸친 Build나 Test의 출력은 길어지기 마련입니다. 한도 확대로 요약에 의존하지 않고 실제 출력을 기반으로 판단하기 쉬워집니다.
+
+## 운영상 주의할 점
+
+출력 한도 확대는 Model에 전달되는 Input Token 양의 증가를 의미합니다. Cost와 Latency에 대한 영향은 무시할 수 없습니다. webhani는 긴 출력을 그대로 전달하는 설정을 "Debugging이나 장애 조사처럼 정확도가 우선되는 상황"으로 한정하고, 일반적인 개발 Flow에서는 기본 한도를 유지할 것을 권장합니다. 모든 상황에서 최대값을 사용하기보다, 용도에 맞춰 구분해서 적용하는 것이 현실적입니다.
+
+`SendFeedback` 역시 초안 내용을 검토 없이 반사적으로 전송하는 운영은 지양해야 합니다. Feedback의 품질은 팀의 개선 Cycle 품질과 직결되므로, 전송 전 검토 단계를 생략하지 않는 것이 중요합니다.
+
+## 마치며
+
+Claude Code의 2026년 9월 업데이트는 신규 기능 추가라기보다 "Agent 운영의 가시성"을 높이는 개선입니다. SendFeedback은 문제 보고의 장벽을 낮추고, 출력 한도 확대는 진단 정확도를 높입니다. 둘 다 Agentic Coding을 Production에 안정적으로 올리기 위해 필요한, 눈에 띄지 않지만 필수적인 Infrastructure 정비라 할 수 있습니다. webhani는 이러한 운영 측면의 개선을 지속적으로 추적하며 고객의 AI Coding 도입을 지원해 나가겠습니다.
+
+---
+
+*참고: [Claude Code Updates by Anthropic - September 2026 (Releasebot)](https://releasebot.io/updates/anthropic/claude-code)*
