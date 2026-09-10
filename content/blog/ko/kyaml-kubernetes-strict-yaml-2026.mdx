@@ -1,0 +1,78 @@
+---
+title: "KYAML — Kubernetes Manifest의 YAML 사고를 줄이는 새로운 방언"
+description: "Kubernetes 생태계에서 더 엄격한 YAML 방언인 KYAML 도입이 늘고 있습니다. 암묵적 타입 변환과 들여쓰기로 인한 실수를 어떻게 막는지 실제 Manifest 예시로 설명합니다."
+date: "2026-09-11"
+status: "published"
+tags: ["Kubernetes", "YAML", "Cloud Infrastructure", "DevOps", "Configuration Management"]
+thumbnail: ""
+author: "webhani"
+slug: "kyaml-kubernetes-strict-yaml-2026"
+---
+
+## YAML은 편리하지만 사고가 잦다
+
+Kubernetes Manifest를 작성해 본 Engineer라면 YAML 특유의 문제를 한 번쯤 겪어봤을 것입니다. 들여쓰기가 틀어져 Nested 구조가 무너지거나, `yes`/`no`가 문자열이 아닌 Boolean으로 해석되거나, 버전 번호 `1.20`이 숫자로 해석되어 끝자리 0이 사라지는 문제입니다.
+
+이런 "YAML의 변덕스러운 Type 추론"은 오랫동안 Kubernetes Community의 골칫거리였습니다. 이런 상황에서 등장한 것이 더 엄격한 문법을 가진 YAML 방언, KYAML입니다. 이번 글에서는 KYAML이 실제로 무엇을 해결하는지, 그리고 도입 시 고려해야 할 실무적인 사항을 정리합니다.
+
+## KYAML이 해결하는 구체적인 문제
+
+### 1. 모호한 Type 변환 제거
+
+표준 YAML Parser는 따옴표 없는 값을 문맥에 따라 Type 추론합니다. 이 과정에서 의도치 않은 변환이 발생할 수 있습니다.
+
+```yaml
+# 표준 YAML에서 흔한 사고 예시
+metadata:
+  labels:
+    version: 1.20  # 숫자로 해석되어 "1.2"가 될 수 있음
+    enabled: yes   # Boolean true로 해석됨
+    country: NO    # 노르웨이 국가 코드였지만 false로 해석됨
+```
+
+KYAML은 이런 모호한 변환을 허용하지 않고, 문자열로 취급되어야 할 값에는 명시적인 따옴표를 요구하는 방향으로 사양을 정리하고 있습니다.
+
+```yaml
+# KYAML 방식 작성 예시
+metadata:
+  labels:
+    version: "1.20"
+    enabled: "yes"
+    country: "NO"
+```
+
+### 2. 들여쓰기 일관성 검증
+
+YAML은 들여쓰기로 구조를 표현하기 때문에, Tab과 Space가 섞이거나 미묘한 들여쓰기 폭 차이가 Syntax Error 없이 구조만 깨뜨리는 경우가 있습니다. KYAML은 Parsing 시점에 더 엄격한 들여쓰기 검증을 수행하여, 모호한 구조를 Error로 감지합니다.
+
+### 3. 예측 가능한 Merge 동작
+
+여러 Manifest나 Kustomize Overlay를 겹쳐 적용할 때, YAML의 Merge 동작이 직관과 다른 결과를 만들어내는 경우가 있습니다. KYAML은 Merge 시 우선순위와 배열 처리 방식을 더 명시적으로 정의하여 이런 종류의 예측 불가능성을 줄이려 합니다.
+
+## 도입을 검토할 때 고려할 점
+
+KYAML은 기존 YAML과 완전히 호환되지는 않기 때문에, 도입에는 몇 가지 단계가 필요합니다.
+
+1. **기존 Manifest 검증**: 기존 YAML 파일을 KYAML Validator에 통과시켜, 암묵적 Type 변환에 의존하고 있는 부분을 찾아냅니다. 대부분의 경우 `yes`/`no` 같은 Boolean 값의 따옴표 누락이 먼저 발견됩니다.
+
+```bash
+# 예시: 기존 Manifest 호환성 확인 (예시 코드)
+kyaml validate --strict ./manifests/*.yaml
+```
+
+2. **CI Pipeline에 통합**: 신규 Manifest에 대해서는 CI에서 KYAML 준수 Lint를 필수로 적용하여, 모호한 표기가 Merge되는 것을 방지합니다.
+3. **단계적 마이그레이션**: 한 번에 모든 Manifest를 전환하기보다, 신규 작성분부터 적용하고 기존 Manifest는 수정 시점에 맞춰 순차적으로 대응하는 것이 현실적입니다.
+
+## webhani의 견해
+
+Kubernetes 운영 중 YAML로 인한 장애를 경험한 팀은 적지 않습니다. 특히 `enabled: no`라고 작성한 의도가 문자열 "no"가 아니라 Boolean false로 처리되어, 의도와 반대되는 설정이 적용되는 경우는 Review에서도 놓치기 쉬운 대표적인 사례입니다.
+
+KYAML 같은 엄격한 방언 도입이 즉각적이고 극적인 효과를 가져오지는 않지만, 이런 "알아차리기 어려운 설정 실수"를 사람의 주의력이 아니라 구조적으로 방지한다는 점에서 장기적인 운영 안정성에 기여합니다. webhani는 이런 신규 Tool에 대한 평가를 포함해 Kubernetes 운영의 Configuration Management 견고화를 지원합니다.
+
+## 마무리
+
+KYAML은 Kubernetes Manifest에서 YAML의 모호한 Type 추론과 들여쓰기로 인한 사고를 줄이기 위한 더 엄격한 방언입니다. 기존 자산과의 호환성을 고려하면서 CI 검증을 중심으로 단계적으로 도입하는 것이 현실적인 접근입니다. 설정 실수로 인한 장애는 재현이 어렵고 원인 파악에 시간이 걸리는 경우가 많기 때문에, 이런 예방적 장치에 대한 투자는 충분히 가치가 있습니다.
+
+---
+
+*참고: [The State of Kubernetes and Container Orchestration in 2026](https://ernie55ernie.github.io/infrastructure/2026/08/21/kubernetes.html)*
