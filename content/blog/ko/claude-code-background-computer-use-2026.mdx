@@ -1,0 +1,69 @@
+---
+title: "Claude Code의 Background Computer Use: Agentic 개발 워크플로우에 주는 의미"
+description: "2026년 9월, Anthropic이 Claude Cowork와 Claude Code에 macOS용 Background Computer Use를 추가했습니다. 무엇이 달라졌고 실제 개발 워크플로우 어디에 적용할 수 있는지, 안전한 도입 방법과 함께 정리합니다."
+date: "2026-09-12"
+status: "published"
+tags: ["Claude", "AI", "Claude Code", "Automation", "Agentic Workflow"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-background-computer-use-2026"
+---
+
+Computer Use — AI 모델이 API 호출 대신 실제 Desktop을 클릭하고 입력하며 조작하는 기능 — 에는 지금까지 실무적으로 뚜렷한 한계가 하나 있었습니다. 화면을 통째로 점유한다는 점입니다. 작업을 시작하면 마우스를 내주고 끝날 때까지 기다려야 했습니다. 2026년 9월 초, Anthropic은 Claude Cowork와 Claude Code에 "Background Computer Use"를 추가하며 macOS의 Pro/Max Plan 사용자에 한해 이 제약을 없앴습니다.
+
+새로운 모델이나 추상적인 새 능력이 생긴 것은 아닙니다. Scheduling과 UX의 변화이고, 실제로 팀의 일하는 방식을 바꾸는 것은 대체로 이런 종류의 업데이트입니다.
+
+## 무엇이 달라졌나
+
+기존 Computer Use는 Claude가 조작하는 동안 자신의 컴퓨터를 쓸 수 없었습니다 — 사실상 본인 PC를 원격 조작당하는 것과 비슷한 경험이었습니다. Background 실행에서는 Claude가 백그라운드 창에서 앱을 열고 조작하는 동안, 사용자는 Foreground에서 타이핑하고 브라우징하며 계속 작업할 수 있습니다. 작업 도중 마우스나 키보드를 가로채지 않으며, 사용자가 타이핑 중이면 일시 정지합니다. 전체 화면이 정말로 필요한 작업일 때만 권한을 요청하는데, 이 경우에도 세션당 한 번만 묻습니다.
+
+설정은 Settings → General → Computer use에 있으며, 기본값은 꺼져 있는 Opt-in 방식입니다.
+
+## Agentic 워크플로우 어디에 맞아떨어지나
+
+webhani에서는 Agentic Tool을 "무엇을 자동화하는가"뿐 아니라 "사람의 Critical Path에서 무엇을 제거하는가"라는 관점으로도 평가합니다. Background Computer Use가 겨냥하는 것은 명확한 공백 — API가 존재하지 않는 작업입니다. 사내 관리자 Dashboard, Legacy 업무 System, 수동 QA용 모바일 Simulator 등은 Client 환경에서 흔히 보이는 사례이며, 지금까지는 사람이 계속 화면을 클릭하며 처리할 수밖에 없던 작업입니다.
+
+실제로는 이런 패턴이 됩니다. 개발자가 "이 사내 CRM을 조작해서 지난 분기 Account List를 CSV로 Export해줘"라는 Background Task를 시작하고, 그대로 Foreground에서 Feature Branch 작업을 이어갑니다. 두 작업이 화면 Focus를 두고 경쟁하지 않습니다.
+
+## 권한 설정에 대한 개념적 예시
+
+Claude Code의 `settings.json`은 이미 Tool Access에 allow/deny 방식의 권한 모델을 사용하고 있습니다. 자율적이거나 Background 실행이 가능한 Tool을 활성화할 때도, 포괄적인 허용이 아니라 동일하게 명시적이고 범위가 좁은 승인 절차를 거쳐야 합니다.
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "ComputerUse(app:internal-crm)"
+    ],
+    "deny": [
+      "ComputerUse(app:*)"
+    ]
+  }
+}
+```
+
+이는 어디까지나 개념적인 예시입니다. 이런 Interface는 변화가 빠르므로, 설정 전 반드시 Anthropic의 최신 문서에서 정확한 Key 이름을 확인하시기 바랍니다.
+
+## 고려해야 할 위험 요소
+
+Background Automation은 편의성 이상으로 관리·감독의 중요성을 높입니다. Client의 Machine에서 활성화하기 전 최소한 다음 세 가지는 지켜야 합니다.
+
+- **권한을 좁게 부여합니다.** Desktop 전체가 아니라 특정 Application에만 Access를 허용합니다.
+- **전용 Profile 또는 전용 Machine을 사용합니다.** Production Credential이나 관계없는 민감한 Session을 가진 환경과는 분리합니다.
+- **실행 후에는 매번 Action Log를 확인합니다.** Background Task는 던져놓고 잊어버리기 쉬운 형태입니다. 사람의 검토 없이 장시간 방치하지 않아야 합니다.
+
+## Client Team을 위한 실무적 Use Case
+
+- 개발자가 코딩을 계속하는 동안 로컬 File을 기반으로 경쟁사 조사를 정리
+- 자동화된 Test Suite가 잡아내지 못하는 UX Regression을 찾기 위해 모바일 Simulator에서 수동 QA Pass 실행
+- 공식 API가 없는 사내 Dashboard나 특화된 업무 Software 조작 (법률·의료·금융 Client에서 흔한 사례)
+
+## webhani의 추천
+
+이 기능은 기존 API를 대체하는 것이 아니라, API가 없는 반복적인 Desktop 작업에 한정해서 쓰는 Tool로 접근해야 한다고 봅니다. Script화하거나 SDK를 통해 처리할 수 있는 작업이라면 여전히 그쪽이 신뢰성과 감사(Audit) 측면에서 더 나은 방법입니다. Background Computer Use는 그런 대안이 존재하지 않는 영역에서만 제 가치를 발휘합니다.
+
+Sandbox 환경에서 위험도가 낮은 Workflow 하나로 먼저 시작하고, 약 1주일간 Log를 관찰한 뒤 적용 범위를 넓힐지 판단하는 것을 권장합니다.
+
+## 마무리
+
+Background Computer Use는 능력 면의 도약이라기보다 UX 면의 변화에 가깝지만, 기능이 실제로 쓰이는지 여부를 결정하는 것은 대개 이런 UX 변화입니다. Agentic Development를 하는 Team 입장에서는 API가 없는 Enterprise Tool이라는 실질적인 공백을 메워주는 업데이트이며, Desktop 수준의 Access 권한을 가진 다른 Tool과 동일한 수준의 범위 관리를 전제로 도입한다면 충분히 가치 있는 Update입니다.

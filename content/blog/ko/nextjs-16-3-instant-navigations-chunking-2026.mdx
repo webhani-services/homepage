@@ -1,0 +1,80 @@
+---
+title: "Next.js 16.3: Turbopack Chunking을 조정해 더 빠르고 일관된 Navigation 만들기"
+description: "Next.js 16.3에는 Component 단위 Chunking, Graph 기반 CSS Chunking, staleTimes까지 세 가지 실험적 기능이 추가되었습니다. 각 Flag의 역할과 언제 활성화할 가치가 있는지 정리합니다."
+date: "2026-09-12"
+status: "published"
+tags: ["Next.js", "React", "Turbopack", "Performance", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-3-instant-navigations-chunking-2026"
+---
+
+Next.js 16.3은 Instant Navigations와 함께 Turbopack의 Chunking을 제어하는 실험적 Option들을 함께 출시했습니다. 주목받는 것은 Instant Navigations이지만, 실제 Component Tree를 가진 Application에서 Navigation이 정말 "즉각적으로" 느껴지는지를 좌우하는 것은 그 아래의 Chunking 제어 기능들입니다. 단순한 Demo Route가 아니라 실제 Application에서 효과가 드러납니다.
+
+## 이 Flag들이 해결하는 문제
+
+Route 단위 Chunking — Route 경계마다 JavaScript와 CSS를 묶는 방식 — 은 여러 무관한 Page에서 공유되는 Component나, 여러 Component가 동시에 Render되어야만 의미를 갖는 Style이 존재할 때 한계를 드러냅니다. Production 환경에서 흔히 나타나는 증상은 두 가지입니다. 어떤 Page로 Navigation해서 들어갔을 때와 그 Page를 직접 새로고침했을 때 서로 다른 CSS가 로드되어 화면이 어긋나는 문제, 그리고 Runtime이 Page 단위로만 Chunk를 인식하기 때문에 무엇을 Fetch해야 할지 똑똑하게 판단하지 못하는 문제입니다.
+
+Next.js 16.3은 이 두 가지를 더 세밀한 단위에서 해결합니다.
+
+## Component 단위 Chunking
+
+`generateComponentChunks`는 Turbopack이 Route 경계뿐 아니라 Component 단위로도 Chunk를 인식하도록 만듭니다. 이를 통해 Runtime은 이미 Cache된 내용을 기반으로 무엇을 Fetch할지 결정할 수 있게 되며, 공유 Component의 작은 변경을 위해 Route 전체 분량의 JavaScript를 다시 받아오는 낭비가 줄어듭니다.
+
+```js
+// next.config.js
+module.exports = {
+  experimental: {
+    generateComponentChunks: true,
+  },
+};
+```
+
+이 효과는 Design System이나, Chart·Table 같은 공유 Component를 많이 사용하는 Dashboard처럼 공유 UI Layer가 큰 Application에서 특히 크게 나타납니다. Route 단위 Chunking으로는 중복 Download가 발생하기 쉬웠던 영역입니다.
+
+## Graph 기반 CSS Chunking
+
+`cssChunking: "graph"`는 Route Tree로부터 추측하는 대신, Application 전체에서 실제로 함께 Render되는 Component를 기준으로 Style을 Grouping합니다. 이는 "Navigation으로 들어갔을 때와 새로고침했을 때 화면이 다르게 보인다"는 유형의 버그를 직접 겨냥한 대책이며, 대부분의 원인은 공유 Style이 중복되거나 Page 고유 Style과의 로딩 순서가 예측 불가능해지는 데 있습니다.
+
+```js
+// next.config.js
+module.exports = {
+  experimental: {
+    cssChunking: "graph",
+  },
+};
+```
+
+## staleTimes 조정하기
+
+`staleTimes`는 Client가 Page의 메모리 내 Copy를 얼마나 오래 신뢰하고 다시 Fetch하지 않을지를 제어합니다. 완전히 Prefetch된 Page를 위한 `static`(기본값 5분)과, 그 외 나머지를 위한 `dynamic`(기본값 0, 즉 항상 재요청)입니다. Instant Navigations와 함께 사용하면, 자주 바뀌지 않는 Page에 대해 약간의 Staleness를 감수하는 대신 Network Round-trip을 의미 있게 줄일 수 있습니다.
+
+```js
+// next.config.js
+module.exports = {
+  experimental: {
+    staleTimes: {
+      dynamic: 30,
+      static: 300,
+    },
+  },
+};
+```
+
+`dynamic`을 30초 정도로 설정하는 것은, 자주는 아니지만 주기적으로 갱신되는 Content — 사내 Dashboard나 Catalog Page 등 — 에는 합리적인 출발점입니다.
+
+## 활성화를 고려할 때
+
+이 Flag들은 아직 실험적이며, 이는 단순한 형식적 문구가 아닙니다. Minor Version 사이에도 동작이 바뀔 수 있습니다. 저희가 활성화를 검토하는 경우는 다음과 같습니다.
+
+- Application에 여러 Route에서 재사용되는 대규모 공유 Component나 Design System Layer가 있을 때
+- Navigation 시와 새로고침 시의 CSS 불일치를 추측이 아니라 실제로 관찰했을 때
+- Navigation Performance가 가설이 아니라 Core Web Vitals나 User Feedback을 통해 실측된 문제일 때
+
+## Migration 시 주의사항
+
+세 Flag를 한 번에 활성화하지 말고, Staging 환경에서 하나씩 활성화하세요. 문제가 발생했을 때 어떤 설정이 원인인지 파악할 수 있어야 합니다. 활성화 전후로 Bundle Analyzer 결과를 확인하는 것도 중요합니다. Component 단위 Chunking은 중복 Download를 줄이는 동시에 전체 Chunk 개수 자체는 늘어날 수 있는데, 이는 Application마다 실제로 확인해야 할 Trade-off입니다.
+
+## webhani의 시각
+
+Next.js 기반 Project를 진행할 때, 실험적 Flag는 Application 전체에 일괄 적용하기보다 트래픽이 많은 Route 하나에서 먼저 시험해야 한다고 봅니다. Style 불일치를 실제로 겪고 있다면 `cssChunking: "graph"`를 최우선으로 검토할 가치가 있습니다. User에게 직접 보이는 버그 유형을 실질적으로 해결해주기 때문입니다. Component Chunking과 `staleTimes` 조정은, Navigation Payload 크기나 데이터의 Staleness가 실제 병목이라는 Data가 확보된 뒤에 도입하는 것이 바람직하며, 추측만으로 활성화하는 것은 피해야 합니다.

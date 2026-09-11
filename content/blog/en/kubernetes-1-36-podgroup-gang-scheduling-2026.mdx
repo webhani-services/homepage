@@ -1,0 +1,69 @@
+---
+title: "Kubernetes 1.36's PodGroup API: Gang Scheduling for AI and Batch Workloads"
+description: "Kubernetes 1.36 splits gang scheduling into a static Workload template and a runtime PodGroup API, with Job controller integration for distributed training and batch jobs. Here's what it fixes and how to evaluate it."
+date: "2026-09-12"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "DevOps", "AI Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-36-podgroup-gang-scheduling-2026"
+---
+
+Distributed training jobs and tightly coupled batch workloads share a failure mode that the default Kubernetes scheduler has never handled well: partial scheduling. If a job needs eight pods and the cluster can only place five right now, the default scheduler happily places those five and leaves the rest pending — burning GPU reservations on pods that can't do useful work alone. Kubernetes 1.36 addresses this directly with gang scheduling built on a new PodGroup API.
+
+## The Problem: All-or-Nothing Workloads
+
+Distributed AI training is the clearest example. A training job split across eight GPU nodes is useless with only five nodes running — the job can't proceed, but the five allocated GPUs sit reserved and idle, unavailable to other workloads that could actually use them. Multiply that across a shared cluster running several training jobs and the waste compounds fast.
+
+Gang scheduling's answer is simple in concept: schedule the group as a unit, or not at all. Either the cluster can fit the whole group (or a defined minimum), or none of the pods get bound to a node.
+
+## Two APIs, Not One
+
+Kubernetes 1.36 splits this into two objects with different lifecycles: **Workload** is a static scheduling policy template, and **PodGroup** is the runtime object pods actually reference during scheduling. Separating the "policy" from the "runtime instance" mirrors a pattern already familiar from Deployments and ReplicaSets — the template describes intent, the runtime object tracks actual state.
+
+## Job Controller Integration
+
+The part most teams will actually touch is the Job controller integration. When the `WorkloadWithJob` feature gate is enabled, the Job controller automatically creates a Workload and a corresponding PodGroup for qualifying Jobs, sets `.spec.schedulingGroup` on every pod the Job creates, and owns the generated objects. In other words, a Job representing a tightly coupled parallel application — distributed training being the canonical case — gets gang-scheduled without any extra tooling or a third-party scheduler plugin.
+
+Conceptually, a training Job opts in by referencing a scheduling group, roughly:
+
+```yaml
+# Illustrative — confirm exact fields against current Kubernetes docs,
+# this API is still evolving across 1.36/1.37.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: distributed-training
+spec:
+  parallelism: 8
+  completions: 8
+  template:
+    spec:
+      schedulingGroup:
+        minCount: 8
+      containers:
+        - name: trainer
+          image: your-training-image:latest
+```
+
+Treat the YAML above as a conceptual sketch, not a copy-paste manifest — this is an actively evolving alpha/beta API, and field names have already shifted between KEP revisions.
+
+## Preemption Also Becomes Group-Aware
+
+Before this change, preemption could evict some pods from a distributed workload while leaving others running — a state that's often worse than evicting the whole group, since the remaining pods can't make progress but still hold resources. Kubernetes 1.36 treats PodGroups as a single unit for preemption decisions too, so the scheduler either preempts the whole group or none of it.
+
+## Practical Implications
+
+For teams running AI/ML training or tightly coupled batch pipelines on managed Kubernetes (EKS, GKE, AKS), this closes a gap that previously required a third-party scheduler like Volcano or Kueue just to get correct gang-scheduling behavior. That doesn't make those tools obsolete — they still offer richer queueing and fair-share policies — but for teams whose only requirement was correct all-or-nothing scheduling, native support removes a dependency.
+
+## webhani's Recommendation
+
+This is still a fast-moving feature area. Before adopting it for production AI workloads:
+
+- Confirm which feature gates your managed Kubernetes provider has actually enabled — availability lags upstream releases.
+- Pilot with a non-critical batch job first, and verify preemption behavior under real contention, not just the happy path.
+- If you're already running Volcano, Kueue, or a similar scheduler, evaluate whether native PodGroup support actually simplifies your stack, or whether your existing tooling's queueing features are still doing work the native API doesn't yet cover.
+
+## Takeaways
+
+Native gang scheduling in Kubernetes 1.36 solves a real, expensive problem for AI and batch workloads: wasted GPU reservations from partial scheduling. It's not a reason to rip out an existing third-party scheduler on day one, but for teams evaluating their AI infrastructure stack now, it's a meaningful reduction in what you need to bolt on to get correct behavior.
