@@ -1,0 +1,69 @@
+---
+title: "Kubernetes 1.36의 PodGroup API: AI·Batch Workload를 위한 Gang Scheduling"
+description: "Kubernetes 1.36은 Gang Scheduling을 정적 Template인 Workload와 Runtime Object인 PodGroup API로 분리했습니다. 분산 학습과 Batch Job에 미치는 영향, 도입 전 확인해야 할 점을 정리합니다."
+date: "2026-09-12"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "DevOps", "AI Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-36-podgroup-gang-scheduling-2026"
+---
+
+분산 학습 Job이나 긴밀하게 결합된 Batch Workload에는 Kubernetes 기본 Scheduler가 오랫동안 제대로 다루지 못한 공통된 실패 유형이 있습니다. 바로 "부분 Scheduling"입니다. 어떤 Job이 8개의 Pod를 필요로 하는데 Cluster가 지금 당장 5개만 배치할 수 있다면, 기본 Scheduler는 그 5개를 그대로 배치하고 나머지는 Pending 상태로 남겨둡니다. 단독으로는 쓸모없는 Pod를 위해 GPU 예약 자원만 낭비되는 것입니다. Kubernetes 1.36은 새로운 PodGroup API를 기반으로 한 Gang Scheduling으로 이 문제를 정면으로 다룹니다.
+
+## 문제: All-or-Nothing Workload
+
+분산 AI 학습이 가장 명확한 예시입니다. 8개의 GPU Node에 분산된 학습 Job은 5개 Node만 동작해서는 사실상 쓸모가 없습니다. Job은 진행할 수 없는데도, 이미 할당된 5개의 GPU는 예약된 채 Idle 상태로 남아 실제로 그것을 사용할 수 있었던 다른 Workload에서는 쓸 수 없게 됩니다. 여러 학습 Job이 공존하는 공유 Cluster에서는 이 낭비가 빠르게 누적됩니다.
+
+Gang Scheduling의 발상은 개념적으로 단순합니다. Group 단위로 Scheduling하거나, 아예 하지 않거나. Cluster가 전체 Group(또는 정의된 최소 개수)을 수용할 수 있을 때만 Pod가 배치되고, 그렇지 않으면 하나도 배치되지 않습니다.
+
+## 하나가 아닌 두 개의 API
+
+Kubernetes 1.36은 이를 Lifecycle이 다른 두 Object로 분리합니다. **Workload**는 정적인 Scheduling Policy Template이고, **PodGroup**은 Pod가 실제 Scheduling 시점에 참조하는 Runtime Object입니다. "Policy"와 "Runtime Instance"를 분리하는 이 설계는 Deployment와 ReplicaSet 관계에서도 익숙한 패턴입니다. Template이 의도를 기술하고, Runtime Object가 실제 상태를 추적합니다.
+
+## Job Controller와의 통합
+
+대부분의 Team이 실제로 접하게 될 부분은 이 Job Controller 통합입니다. `WorkloadWithJob` Feature Gate를 활성화하면, Job Controller는 조건에 맞는 Job에 대해 Workload와 그에 대응하는 PodGroup을 자동으로 생성하고, 해당 Job이 만드는 모든 Pod에 `.spec.schedulingGroup`을 설정하며, 생성된 Object들의 Owner가 됩니다. 즉, 분산 학습을 대표 사례로 하는 긴밀하게 결합된 병렬 Application을 나타내는 Job은 추가 Tool이나 Third-party Scheduler Plugin 없이도 Gang Scheduling됩니다.
+
+개념적으로, 학습용 Job은 Scheduling Group을 참조하는 방식으로 opt-in합니다.
+
+```yaml
+# 개념을 보여주는 예시입니다. 정확한 Field는 최신 Kubernetes 문서에서 확인하세요.
+# 이 API는 1.36/1.37에 걸쳐 아직 변화하고 있습니다.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: distributed-training
+spec:
+  parallelism: 8
+  completions: 8
+  template:
+    spec:
+      schedulingGroup:
+        minCount: 8
+      containers:
+        - name: trainer
+          image: your-training-image:latest
+```
+
+위 YAML은 그대로 복사해 쓸 수 있는 Manifest가 아니라 개념을 보여주는 Sketch로 받아들이시기 바랍니다. 이 API는 여전히 활발하게 진화 중인 Alpha/Beta 수준이며, KEP Revision 사이에서 Field 이름이 이미 여러 차례 바뀌었습니다.
+
+## Preemption도 Group 단위로
+
+이전에는 Preemption(강제 퇴출)이 분산 Workload의 일부 Pod만 퇴출시키고 나머지는 그대로 두는 경우가 있었습니다. 남은 Pod는 작업을 진행할 수 없는데도 자원은 계속 점유하고 있어, 차라리 Group 전체를 퇴출시키는 것보다 상황이 나빠지기도 했습니다. Kubernetes 1.36은 Preemption 판단에서도 PodGroup을 하나의 단위로 취급하므로, Scheduler는 Group 전체를 퇴출시키거나 전혀 퇴출시키지 않는 방식으로만 동작합니다.
+
+## 실무적 시사점
+
+EKS, GKE, AKS 등 Managed Kubernetes에서 AI/ML 학습이나 긴밀하게 결합된 Batch Pipeline을 운영하는 Team 입장에서는, 지금까지 올바른 Gang Scheduling 동작을 얻기 위해서만 Volcano나 Kueue 같은 Third-party Scheduler가 필요했던 공백이 메워지게 됩니다. 그렇다고 이런 Tool들이 불필요해지는 것은 아닙니다. 더 정교한 Queueing과 Fair-share Policy는 여전히 그쪽의 강점이지만, 필요했던 것이 단지 정확한 All-or-Nothing Scheduling뿐이었던 Team이라면 의존성을 하나 줄일 수 있습니다.
+
+## webhani의 추천
+
+이 기능 영역은 아직 변화가 빠른 단계입니다. Production AI Workload에 도입하기 전 다음을 확인하시기 바랍니다.
+
+- 사용 중인 Managed Kubernetes Provider가 실제로 어떤 Feature Gate를 활성화했는지 확인합니다. Provider마다 Upstream Release 반영 속도에 차이가 있습니다.
+- 중요도가 낮은 Batch Job으로 먼저 Pilot 도입하고, Happy Path뿐 아니라 실제 자원 경합 상황에서의 Preemption 동작을 검증합니다.
+- 이미 Volcano나 Kueue 같은 Scheduler를 운영 중이라면, Native PodGroup 지원이 실제로 Stack을 단순화해주는지, 아니면 기존 Tool의 Queueing 기능이 여전히 Native API가 다루지 못하는 부분을 맡고 있는지 판단합니다.
+
+## 마무리
+
+Kubernetes 1.36의 Native Gang Scheduling은 AI·Batch Workload에서 실제로 비용이 드는 문제 — 부분 Scheduling으로 인한 GPU 예약 낭비 — 를 해결합니다. 기존 Third-party Scheduler를 당장 걷어낼 이유는 아니지만, 지금 AI Infrastructure Stack을 재검토하고 있는 Team이라면 올바른 동작을 얻기 위해 추가로 쌓아야 할 것을 확실히 줄여주는 변화입니다.
