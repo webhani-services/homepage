@@ -1,0 +1,78 @@
+---
+title: "Vue 3.6's Vapor Mode Is Feature-Complete: What It Actually Buys You"
+description: "Vue 3.6 RC ships Vapor Mode feature-complete — components that compile straight to DOM operations with no virtual DOM. Here's how the opt-in model works, where the performance gains actually come from, and how to think about adopting it incrementally."
+date: "2026-09-13"
+status: "published"
+tags: ["Vue.js", "web performance", "frontend", "JavaScript", "compilers"]
+thumbnail: ""
+author: "webhani"
+slug: "vue-3-6-vapor-mode-2026"
+---
+
+Vue 3.6 entered release-candidate status this summer with Vapor Mode declared feature-complete, and a stable release is expected this autumn. Vapor Mode is a second compilation target for Vue single-file components: instead of compiling a template into a virtual DOM render function, it compiles directly to imperative DOM operations, skipping the virtual DOM entirely. It's opt-in, per-component, and reported to bring Vapor-only components into the same performance range as Solid.js and Svelte 5 — a notable claim given Vue's reactivity model wasn't originally designed around this.
+
+The interesting part for teams running production Vue apps isn't the benchmark number, it's the opt-in, component-level granularity — which means the adoption question isn't "should we rewrite the app," it's "which components actually benefit enough to be worth touching."
+
+## Why skipping the virtual DOM helps here specifically
+
+Vue's standard compilation target already does a lot of work to avoid unnecessary virtual DOM diffing — compile-time optimizations mark static parts of a template so the runtime skips re-checking them. Vapor Mode goes further: instead of generating a virtual DOM tree that then gets diffed against the previous one, the compiler emits code that updates real DOM nodes directly when reactive state changes, using Vue's reactivity system (rebuilt in 3.6 on top of `alien-signals` for lower overhead) to know exactly which DOM node needs which update.
+
+The practical effect is less object allocation and no diffing pass per reactive update — the kind of overhead that shows up as dropped frames in components that re-render frequently: live data grids, drag interactions, canvas-adjacent UI, anything updating on scroll or pointer movement.
+
+## What Vapor Mode components look like
+
+The API surface is deliberately close to normal Vue — Vapor Mode supports `<script setup>` SFCs and template-only SFCs, not the Options API:
+
+```vue
+<!-- LiveTicker.vue — compiled in Vapor mode -->
+<script setup vapor>
+import { ref, onMounted } from "vue";
+
+const price = ref(0);
+
+onMounted(() => {
+  connectToPriceStream((next) => {
+    price.value = next;
+  });
+});
+</script>
+
+<template>
+  <span class="price">{{ price.toFixed(2) }}</span>
+</template>
+```
+
+The `vapor` attribute on `<script setup>` is what tells the compiler to target direct DOM operations for this component instead of the virtual DOM path. Everything else — reactive refs, lifecycle hooks, template syntax — reads like ordinary Vue.
+
+## The interop boundary is the actual migration story
+
+A full-app rewrite isn't the recommended path, and for most existing codebases it isn't necessary. Vapor and virtual-DOM components can be mixed in the same tree — a Vapor component can be a child of a standard component and vice versa, with Vue handling the boundary between the two rendering strategies. That means the realistic adoption pattern looks like:
+
+```vue
+<!-- Dashboard.vue — standard virtual-DOM component -->
+<template>
+  <AppShell>
+    <!-- Hot path: re-renders on every price tick -->
+    <LiveTicker vapor />
+    <!-- Everything else stays as-is -->
+    <PortfolioSummary />
+    <SettingsPanel />
+  </AppShell>
+</template>
+```
+
+Identify the specific components with a measured performance problem — a chart re-rendering on every data point, a list re-rendering on every keystroke of a filter box — and convert those in isolation. The rest of the app keeps its existing virtual-DOM components, unchanged.
+
+## Where we'd actually recommend it
+
+Vapor Mode fits two situations well: a genuinely performance-sensitive view inside an existing app (a live dashboard, a data-heavy table, a canvas-based editor) where profiling has already identified the virtual DOM diff as the bottleneck, and small new applications built Vapor-first from the start, where the API subset restriction (no Options API, more limited third-party component library support at this stage) isn't a migration cost because there's nothing to migrate.
+
+We wouldn't recommend a blanket conversion of an existing app's component tree. Reported bundle size reductions of 20-50% apply to Vapor-only components specifically — an app that mixes both compilation strategies pays for both runtimes, so the size win only materializes if a meaningful share of the app is actually Vapor. And a component library ecosystem built primarily against the standard Vue reactivity and slot model needs time to catch up; check third-party component compatibility before committing a client project to Vapor Mode for anything beyond isolated, custom-built components.
+
+## Takeaways
+
+Vapor Mode's value is that it's a targeted tool, not a required migration: a way to remove virtual DOM overhead from the specific components where profiling shows it matters, while leaving the rest of an app untouched. Profile first, convert the components that are actually the bottleneck, and treat the reported Solid.js/Svelte-level benchmarks as an upper bound for Vapor-only code rather than an expectation for a mixed app.
+
+---
+
+*References: [Vue 3.6 RC: Vapor Mode complete — no virtual DOM (Forkbyte)](https://forkbyte.nl/en/blog/vue-36-vapor-mode-rc), [Vue Vapor Mode's Real Breakthrough Is the Migration Boundary (d4b)](https://www.d4b.dev/blog/2026-07-25-vue-vapor-mode-migration-boundary), [vuejs/core releases (GitHub)](https://github.com/vuejs/core/releases)*

@@ -1,0 +1,63 @@
+---
+title: "Sakana AI의 Fugu Ultra v2 — '더 큰 Model'이 아니라 'Orchestration의 제품화'"
+description: "Sakana AI의 Fugu Ultra v2는 단일 Frontier Model이 아니라, 고정된 Specialized Model Pool에 Task를 Routing하고 자기 자신을 재귀적으로 호출하는 Orchestration Engine입니다. 이미 자체 Multi-model Routing 계층을 운영 중인 팀에게 이 Architecture가 어떤 의미인지 정리합니다."
+date: "2026-09-13"
+status: "published"
+tags: ["AI", "LLM", "Multi-agent Orchestration", "AI Architecture", "Sakana AI"]
+thumbnail: ""
+author: "webhani"
+slug: "sakana-fugu-ultra-v2-multi-agent-orchestration-2026"
+---
+
+도쿄에 기반을 둔 Sakana AI가 2026년 9월 11일 Fugu Max와 Fugu Ultra v2를 출시했습니다. 흥미로운 부분은 Benchmark 수치가 아니라 Architecture입니다. Fugu Ultra v2는 하나의 OpenAI 호환 API로 제공되며, Input/Output 100만 Token당 $5/$30, Context Window는 100만 Token이지만, 그 API 안에 있는 것은 단일 Model이 아닙니다. 이것은 Orchestration Engine으로, 고정된 Open-weight·Specialized Model Pool에 Task를 Routing하고, 필요하면 자기 자신의 Instance를 재귀적으로 호출해 문제를 Sub-task로 쪼개도록 Training된 Model입니다.
+
+이는 "더 큰 Transformer"와는 명확히 다른 Design 방향이며, 이미 자체 Multi-model Routing Logic을 갖춘 Project 입장에서 이것이 실제로 무언가를 바꾸는지 판단하기 전에 Tradeoff를 이해해둘 가치가 있습니다.
+
+## "Orchestration 자체를 Model로 제공한다"는 것의 의미
+
+현재 Multi-model Routing을 하는 많은 팀은 이를 직접 구축합니다. 들어오는 Request를 분류하는 얇은 Router를 두고, 시각적 추론은 특정 Model로, Code 생성은 다른 Model로, 저렴한 Classification Task는 작고 빠른 Model로 보낸 뒤 결과를 조합합니다. Fugu Ultra v2는 이 Pattern을 단일 API 호출 뒤에 Packaging한 것입니다. Request 하나만 보내면, Routing과 Sub-task 분해, Specialized Model로의 재귀적 위임이 자신의 Code가 아니라 Endpoint 내부에서 일어납니다.
+
+주목받은 Benchmark 결과는 시각적 추론과 Data 해석 Benchmark인 Chartography에서 나왔는데, Fugu Ultra v2는 48.3을 기록한 반면 Opus 5는 27.3, Fable 5는 29.5였습니다. 이 격차가 그럴듯해 보이는 이유는 정확히, 이것이 순수한 Model 성능 간의 공정한 비교가 아니기 때문입니다. "하나의 Model이 모든 것을 처리하는" 구성과 "시각적 추론이라는 Sub-task를 실제로 그 일에 강한 Pool 내 Model에게 넘기는 Routing 계층"을 비교하고 있을 뿐입니다. Specialized Sub-task로 잘 분해되는 Task에서는, Orchestration 계층이 더 크고 똑똑한 Base Model 없이도 단일 Model을 이길 수 있습니다.
+
+## Build-vs-Buy 경계선은 실제로 어디에 있는가
+
+이미 다음과 같은 Router를 자체 운영 중인 팀을 생각해봅니다.
+
+```python
+def route_request(request):
+    task_type = classify(request)  # 저렴하고 빠른 Model
+
+    if task_type == "visual_reasoning":
+        return call_model("vision-specialist", request)
+    elif task_type == "code_generation":
+        return call_model("code-specialist", request)
+    else:
+        return call_model("general-purpose", request)
+```
+
+Fugu Ultra v2는 이 Routing Logic과 더 어려운 부분들, 즉 재귀적 분해, Sub-task 결과 취합, Pool 내 특정 Model이 오류를 반환했을 때의 Failure Handling을 사내 Infrastructure로 직접 유지하기보다 Managed Capability로 구매할 가치가 있다는 데 거는 Bet입니다.
+
+```python
+response = client.chat.completions.create(
+    model="sakana/fugu-ultra-v2",
+    messages=[{"role": "user", "content": complex_multi_part_task}],
+    tools=tool_definitions,
+)
+```
+
+API 표면은 단일 Model을 호출하는 것과 구분되지 않습니다. 실질적인 Value Proposition은 Pool 구성, Routing Logic, 재귀 호출 Budget을 Sakana가 소유하기 때문에 그 계층을 직접 유지하지 않아도 된다는 점입니다. 그 대가로 Pool에 어떤 Specialized Model이 포함되는지, Routing 판단이 어떻게 이뤄지는지, 특정 Sub-task에 Orchestration 계층이 잘못된 Specialist를 선택했을 때 어떻게 Debug할지에 대한 Control을 잃게 됩니다.
+
+## 이 Pattern을 도입하기 전에 실제로 확인해야 할 것
+
+- **재귀 호출 시 Cost 동작.** Task를 분해하기 위해 자기 자신을 재귀적으로 호출할 수 있는 Model은 단일 호출 Model보다 Cost Profile 예측이 어렵습니다. 예상보다 많은 Sub-task로 분해되는 Task는 단순한 Request당 Budget이 예상하지 못한 방식으로 Cost를 증폭시킬 수 있습니다. Cost에 민감한 Pipeline에 도입하기 전에, 공개된 Token 단가가 아니라 실제 자사 Task 분포에 대해 Test해야 합니다.
+- **Orchestration Hop으로 인한 Latency.** 특정 Specialized Model로 Routing한 뒤 Sub-task를 다시 다른 Model로 재귀적으로 Routing하는 구성은 단일 Model 호출에는 없는 Round Trip을 추가합니다. Latency에 민감한 Interactive Use Case라면 Throughput뿐 아니라 현재 구성 대비 End-to-end 응답 시간을 측정해야 합니다.
+- **Routing이 잘못됐을 때의 Debug 가능성.** 자체 Router가 Request를 잘못 Routing하면 Classification Logic을 직접 확인하고 수정할 수 있습니다. Fugu Ultra v2 내부 Routing이 특정 Sub-task를 잘못된 Specialist로 보냈다면, 내부를 통제할 수 없는 Black Box를 상대로 Debug해야 합니다.
+- **어디에서 우위가 성립할 수 있는가.** 시각적·Data 해석 추론과 여러 형식의 Document 분석을 결합하는 것처럼 실제로 명확한 Specialized Sub-problem으로 분해되는 Task야말로 Orchestration-native Model이 단일 범용 Model 대비 구조적 우위를 가질 수 있는 Workload 유형입니다. 일반적인 Chat이나 단일 영역 Coding Task는 Orchestration Overhead에 걸맞은 이득을 얻기 어려울 가능성이 높습니다.
+
+## webhani의 견해
+
+Fugu Ultra v2는 더 넓은 흐름을 보여주는 하나의 Data Point로 이해하는 것이 적절합니다. Base Model 간 Capability 차이가 좁혀질수록, 흥미로운 경쟁의 무대는 Model 위에 얹히는 Orchestration 계층, 즉 Task가 어떻게 분해·Routing·재조합되는지로 옮겨가고 있습니다. 자체 Routing 계층을 유지하는 대신 Orchestration-as-a-product를 도입할지는, 실제 자사 Workload가 Specialized Sub-task로 잘 분해되는지, 그리고 Routing에 대한 Control과 Debug 가능성을 직접 유지하지 않아도 되는 Infrastructure와 맞바꿀 의향이 있는지에 달려 있습니다. 공개된 Benchmark 수치를 자사 Use Case의 대표값으로 여기기 전에, 실제 Task 분포와 Cost Profile에 대해 직접 Benchmark해야 합니다.
+
+---
+
+*참고: [Sakana AI Launches Fugu Max and Fugu Ultra v2 — MarkTechPost](https://www.marktechpost.com/2026/09/10/sakana-ai-launches-fugu-max-and-fugu-ultra-v2-for-cheaper-stronger-multi-agent-orchestration/), [Fugu Ultra v2 — API Pricing & Providers (OpenRouter)](https://openrouter.ai/sakana/fugu-ultra-v2), [Sakana AI Ships Fugu Ultra v2.0 (The Robotics Media)](https://theroboticsmedia.com/article/sakana-ai-fugu-ultra-v2-0-1m-context-multi-agent-orchestration-september-11-2026)*

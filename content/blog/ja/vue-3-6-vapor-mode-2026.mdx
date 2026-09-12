@@ -1,0 +1,78 @@
+---
+title: "Vue 3.6のVapor ModeがFeature Complete — 実際に何が得られるのか"
+description: "Vue 3.6 RCでVapor ModeがFeature Completeとなりました。Virtual DOMを介さずDOM操作へ直接Compileされるこの仕組みが実際どう動くのか、性能向上の源泉、そして段階的に導入するための考え方を整理します。"
+date: "2026-09-13"
+status: "published"
+tags: ["Vue.js", "Web Performance", "Frontend", "JavaScript", "Compiler"]
+thumbnail: ""
+author: "webhani"
+slug: "vue-3-6-vapor-mode-2026"
+---
+
+Vue 3.6はこの夏Release Candidateへ入り、Vapor ModeがFeature Completeと宣言されました。Stable Releaseはこの秋を予定しています。Vapor Modeは、Vue Single-file Componentに対する2つ目のCompile対象です。TemplateをVirtual DOM Render関数へCompileするのではなく、DOM操作へ直接Compileし、Virtual DOMを完全に経由しません。これはOpt-inで、Component単位で適用でき、Vapor-only ComponentはSolid.jsやSvelte 5と同水準のPerformance Rangeに入ると報告されています。Vueの元々のReactivity Modelがこの方式を前提に設計されていなかったことを考えると、これは注目に値するClaimです。
+
+Productionで動くVue Appを運用しているチームにとって重要なのはBenchmarkの数値そのものではなく、Opt-in かつ Component単位という粒度です。つまり導入の問いは「Appを丸ごとRewriteすべきか」ではなく、「実際に触るだけの価値がある恩恵を得られるComponentはどれか」になります。
+
+## なぜここでVirtual DOMを飛ばすことが効くのか
+
+Vueの標準Compile対象はすでに、不要なVirtual DOM Diffingを避けるために多くの工夫をしています。Compile時にTemplateの静的な部分をMarkし、RuntimeがそれらのRe-checkをSkipできるようにしています。Vapor Modeはさらに踏み込みます。Virtual DOM Treeを生成して以前のTreeとDiffするのではなく、Reactive Stateが変化した際にどのDOM Nodeがどう更新されるべきかを、3.6で`alien-signals`をベースに書き直され低Overhead化されたVueのReactivity Systemを使って正確に把握し、実際のDOM Nodeを直接更新するCodeをCompilerが出力します。
+
+実際の効果として、Reactive Updateごとに発生していたObject割り当てとDiffing Passがなくなります。これはLive Data Grid、Drag操作、Canvas隣接のUI、ScrollやPointer移動のたびに更新されるものなど、頻繁にRe-renderが発生するComponentでFrame落ちとして現れがちなOverheadです。
+
+## Vapor Mode Componentの見た目
+
+API表面は通常のVueに意図的に近く保たれています。Vapor Modeは`<script setup>`のSFCとTemplate-onlyのSFCをSupportしますが、Options APIはSupportしません。
+
+```vue
+<!-- LiveTicker.vue — Vapor ModeでCompileされる -->
+<script setup vapor>
+import { ref, onMounted } from "vue";
+
+const price = ref(0);
+
+onMounted(() => {
+  connectToPriceStream((next) => {
+    price.value = next;
+  });
+});
+</script>
+
+<template>
+  <span class="price">{{ price.toFixed(2) }}</span>
+</template>
+```
+
+`<script setup>`に付けた`vapor`属性が、このComponentに対してCompilerがVirtual DOM経路ではなく直接DOM操作をTargetとするよう指示します。それ以外、Reactive Ref、Lifecycle Hook、Template構文は通常のVueと変わりません。
+
+## 実際のMigrationの鍵はInterop境界にある
+
+App全体のRewriteは推奨される経路ではなく、多くの既存Codebaseにとっては必要でもありません。VaporとVirtual DOMのComponentは同じTree内で混在でき、Vapor ComponentがStandard Componentの子であってもその逆であっても、Vueが両者のRendering戦略の境界を処理します。つまり現実的な導入Patternは次のようになります。
+
+```vue
+<!-- Dashboard.vue — 標準のVirtual DOM Component -->
+<template>
+  <AppShell>
+    <!-- Hot Path: Priceが更新されるたびにRe-render -->
+    <LiveTicker vapor />
+    <!-- それ以外はそのまま -->
+    <PortfolioSummary />
+    <SettingsPanel />
+  </AppShell>
+</template>
+```
+
+実測でPerformance上の問題が確認されている具体的なComponent、たとえばDataが1件更新されるたびにRe-renderするChartや、Filter入力のKeystrokeごとにRe-renderするListを特定し、それらだけを個別にConvertします。App内の残りのComponentは既存のVirtual DOM Componentのまま変更しません。
+
+## 実際にどこで推奨するか
+
+Vapor Modeは2つの場面によく合います。ひとつは、Profilingによってすでにボトルネックがvirtual DOM Diffだと特定されている、既存App内の本当にPerformance Sensitiveな画面(Live Dashboard、Data量の多いTable、Canvas Based Editor)。もうひとつは、最初からVapor-firstで構築する小規模な新規Appで、この段階でのAPI Subsetの制約(Options API非対応、Third-party Component Libraryの対応がまだ限定的)がMigration Costにならないケースです。移行対象がそもそも存在しないためです。
+
+既存Appの Component Tree全体を一律でConvertすることは推奨しません。報告されている20〜50%のBundle Size削減は、あくまでVapor-onlyのComponentに対するものです。両方のCompile戦略を混在させるAppは両方のRuntimeのCostを負担するため、Sizeのメリットが実際に出るのは、Appのかなりの割合が実際にVaporである場合に限られます。また、標準のVue Reactivity ModelとSlot Modelを前提に構築されたComponent Library Ecosystemが追いつくには時間がかかります。個別にBuildしたComponent以外にVapor Modeを本格採用する前に、Third-party Componentとの互換性を確認してください。
+
+## まとめ
+
+Vapor Modeの価値は、必須のMigrationではなくTargetを絞ったToolであるという点にあります。Profilingで実際にVirtual DOM Overheadが問題になっていると分かった特定のComponentからそれを取り除きつつ、Appの残りはそのままにしておけます。まずProfilingを行い、実際にボトルネックであるComponentだけをConvertし、報告されているSolid.js/Svelte水準のBenchmarkは、混在するAppに対する期待値ではなくVapor-onlyのCodeに対する上限値として捉えてください。
+
+---
+
+*参考: [Vue 3.6 RC: Vapor Mode complete — no virtual DOM (Forkbyte)](https://forkbyte.nl/en/blog/vue-36-vapor-mode-rc), [Vue Vapor Mode's Real Breakthrough Is the Migration Boundary (d4b)](https://www.d4b.dev/blog/2026-07-25-vue-vapor-mode-migration-boundary), [vuejs/core releases (GitHub)](https://github.com/vuejs/core/releases)*

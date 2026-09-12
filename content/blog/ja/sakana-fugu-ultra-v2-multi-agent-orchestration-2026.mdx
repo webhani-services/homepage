@@ -1,0 +1,63 @@
+---
+title: "Sakana AIのFugu Ultra v2 — 「より大きなModel」ではなく「Orchestration自体を製品化」する発想"
+description: "Sakana AIのFugu Ultra v2は単一のFrontier Modelではなく、固定されたSpecialized Model群にTaskをRoutingし、自分自身を再帰的に呼び出すOrchestration Engineです。すでに自前のMulti-model Routing層を持つチームにとってこのArchitectureが何を意味するのか整理します。"
+date: "2026-09-13"
+status: "published"
+tags: ["AI", "LLM", "Multi-agent Orchestration", "AI Architecture", "Sakana AI"]
+thumbnail: ""
+author: "webhani"
+slug: "sakana-fugu-ultra-v2-multi-agent-orchestration-2026"
+---
+
+東京拠点のSakana AIは2026年9月11日、Fugu MaxとFugu Ultra v2を発表しました。面白いのはBenchmarkの数値ではなくArchitectureのほうです。Fugu Ultra v2は単一のOpenAI互換APIとして提供され、Input/Output 100万Tokenあたり$5/$30、Context Window 100万Tokenという仕様ですが、そのAPIの内側にあるのは単一のModelではありません。これはOrchestration Engineであり、固定されたOpen-weight・Specialized Model群へTaskをRoutingし、必要に応じて自分自身のInstanceを再帰的に呼び出してProblemをSub-taskへ分解するようTrainingされたModelです。
+
+これは「もっと大きなTransformer」とは明確に異なるDesignの方向性であり、すでに自前のMulti-model Routing Logicを持つProjectにとってこれが何かを変えるのかどうかを判断する前に、Tradeoffを理解しておく価値があります。
+
+## 「Orchestration自体をModelとして提供する」とはどういうことか
+
+現在Multi-model Routingを行っている多くのチームは、それを自前で構築しています。受信したRequestを分類する薄いRouterを用意し、視覚的推論はあるModelへ、Code生成は別のModelへ、安価なClassification Taskは小さく高速なModelへ振り分け、結果を組み立てます。Fugu Ultra v2は、そのPatternを単一のAPI呼び出しの裏側にPackageしたものです。1つのRequestを送るだけで、RoutingとSub-taskへの分解、Specialized Modelへの再帰的なDelegationが、自分のCodeではなくEndpointの内側で行われます。
+
+注目を集めたBenchmark結果は、視覚的推論とData解釈のBenchmarkであるChartographyでのもので、Fugu Ultra v2が48.3を記録したのに対し、Opus 5は27.3、Fable 5は29.5でした。このGapがもっともらしく見えるのはまさに、これが生のModel性能同士の公平な比較ではないからです。「1つのModelが何もかもこなす」構成と、「視覚的推論というSub-taskを実際にそれが得意なPool内のModelへ振り分けるRouting層」を比較しているにすぎません。Orchestration層は、Specialized Sub-taskへうまく分解できるTaskにおいては、より大きく賢いBase Modelを必要とせず、単一のModelに勝てる場合があります。
+
+## Build-vs-Buyの境界線は実際どこにあるか
+
+すでに自前で次のようなRouterを運用しているチームを考えます。
+
+```python
+def route_request(request):
+    task_type = classify(request)  # 安価で高速なModel
+
+    if task_type == "visual_reasoning":
+        return call_model("vision-specialist", request)
+    elif task_type == "code_generation":
+        return call_model("code-specialist", request)
+    else:
+        return call_model("general-purpose", request)
+```
+
+Fugu Ultra v2は、このRouting LogicとさらにDifficultな部分、再帰的な分解、Sub-task結果の集約、Pool内のあるModelがErrorを返した際のFailure Handlingを、社内Infrastructureとして維持するのではなくManaged Capabilityとして買う価値があるという賭けです。
+
+```python
+response = client.chat.completions.create(
+    model="sakana/fugu-ultra-v2",
+    messages=[{"role": "user", "content": complex_multi_part_task}],
+    tools=tool_definitions,
+)
+```
+
+API表面は単一Modelを呼ぶ場合と見分けがつきません。実質的なValue Propositionは、Poolの構成・Routing Logic・再帰呼び出しのBudgetをSakanaが所有するため、その層を自社で維持しなくて済む点にあります。その代わりに、Pool内にどのSpecialized Modelが含まれるか、Routingの判断がどう行われるか、あるSub-taskに対してOrchestration層が誤ったSpecialistを選んだ場合にどうDebugするか、といったControlを失うことがCostになります。
+
+## このPatternを導入する前に実際に確認すべきこと
+
+- **再帰時のCost挙動。** Taskを分解するために自分自身を再帰的に呼び出せるModelは、単一呼び出しのModelよりCost Profileの予測が難しくなります。予想以上に多くのSub-taskへ分解されるTaskは、単純なRequestあたりのBudgetが想定しない形でCostを増幅させる可能性があります。Cost敏感なPipelineに組み込む前に、公称のToken単価ではなく自社の実際のTask分布に対してTestしてください。
+- **Orchestration Hopによるlatency。** あるSpecialized ModelへRoutingし、さらにSub-taskを別のModelへ再帰的にRoutingする構成は、単一Model呼び出しにはないRound Tripを追加します。Latencyに敏感なInteractive Use Caseでは、Throughputだけでなく現行構成に対するEnd-to-endの応答時間を測定してください。
+- **Routingが誤った際のDebug可能性。** 自前のRouterがRequestを誤ってRoutingした場合、Classification Logicを直接確認・修正できます。Fugu Ultra v2の内部RoutingがあるSub-taskを誤ったSpecialistへ送った場合、内部を制御できないBlack Boxを相手にDebugすることになります。
+- **どこで優位性が成立しうるか。** 視覚的・Data解釈の推論と多形式のDocument解析を組み合わせるような、実際に明確なSpecialized Sub-problemへ分解できるTaskこそ、Orchestration-native なModelが単一の汎用Modelに対して構造的な優位性を持ちうるWorkload Classです。一般的なChatや単一領域のCoding Taskでは、Orchestrationのオーバーヘッドに見合う恩恵は得にくいでしょう。
+
+## webhaniの見解
+
+Fugu Ultra v2は、より広いShiftを示す1つのData Pointとして捉えるのが妥当です。Base Model同士のCapability差が縮まるにつれ、興味深い競争の場はModelの上に乗るOrchestration層、つまりTaskがどう分解・Routing・再統合されるかへ移っています。自前のRouting層を維持する代わりにOrchestration-as-a-productを採用すべきかどうかは、自社の実際のWorkloadがSpecialized Sub-taskへうまく分解できるか、そしてRoutingのControlとDebug可能性を、自分で維持しなくて良いInfrastructureと引き換えにする覚悟があるかにかかっています。公開されているBenchmark数値を自社Use Caseの代表値とみなす前に、自社のTask分布とCost Profileに対して実際にBenchmarkしてください。
+
+---
+
+*参考: [Sakana AI Launches Fugu Max and Fugu Ultra v2 — MarkTechPost](https://www.marktechpost.com/2026/09/10/sakana-ai-launches-fugu-max-and-fugu-ultra-v2-for-cheaper-stronger-multi-agent-orchestration/), [Fugu Ultra v2 — API Pricing & Providers (OpenRouter)](https://openrouter.ai/sakana/fugu-ultra-v2), [Sakana AI Ships Fugu Ultra v2.0 (The Robotics Media)](https://theroboticsmedia.com/article/sakana-ai-fugu-ultra-v2-0-1m-context-multi-agent-orchestration-september-11-2026)*

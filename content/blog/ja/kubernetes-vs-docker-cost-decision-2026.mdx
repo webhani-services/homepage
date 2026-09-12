@@ -1,0 +1,96 @@
+---
+title: "Kubernetes vs 素のDocker、2026年版Cost視点の意思決定Framework"
+description: "2026年のDevOps界隈では「不要なKubernetesを剥がしたらCostが下がった」という話が繰り返し話題になります。webhaniがClientにKubernetesを勧める前に実際に確認しているChecklistを整理します。"
+date: "2026-09-13"
+status: "published"
+tags: ["Kubernetes", "Docker", "DevOps", "Cloud Infrastructure", "Cost最適化"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-vs-docker-cost-decision-2026"
+---
+
+2026年のInfrastructure界隈で繰り返し登場するTopicのひとつが、Kubernetes導入を巻き戻すチームの事例です。EKS Clusterを削除し、少数のDocker Compose HostやManaged Container Serviceへ移行して、CostとOperationの両方で有意な削減を報告する、というものです。これはKubernetesそのものへの反論ではなく、多くのチームが本当に必要になる前にKubernetesを導入していたことのEvidenceです。有用な問いは「Kubernetesを使うか使わないか」ではなく、自分たちが実際に抱えている制約、Trafficの形、Team規模、Deployment Topology、のうちどれをKubernetesが解決しようとしているのか、そしてよりSimpleな構成でも同じ問題を低いOperational Costで解決できないか、です。
+
+## Kubernetesが実際に買っているもの
+
+Kubernetesは、複数Nodeにまたがる弾力的なScaling、異種混在Serviceを共有Hardware上へ効率的に詰め込むScheduling、Health Check駆動の自動Rollbackを伴うRolling Deployment、Multi-regionあるいはMulti-cluster Failover、そしてControl Planeを所有・運用できるPlatform Teamの存在、といった要素のうち複数を同時に必要とする場面でComplexityに見合う価値を発揮します。これらのうち2〜3個が必要でありながらPlatform Teamを持たない場合、etcdのUpgrade、CNI Pluginの選定、RBAC設定、Control PlaneのPatch適用、あるいはManaged Control Planeの月額料金といったOperational Costを、その恩恵を十分に受けないまま支払うことになります。
+
+一方、少数のHostで`docker compose`を動かす、あるいはManagedなService単位のSingle-node構成といった素のDockerは、実際の要件が「Dynamic Bin-packingやNodeを跨ぐSchedulingを必要とせず、N個のServiceをM台のMachineで確実に動かす」ことである場合に、そのSimplicityが真価を発揮します。
+
+## 具体的な比較
+
+小規模なMulti-service Appを両Modelで表すと次のようになります。Docker Composeの場合。
+
+```yaml
+# docker-compose.yml
+services:
+  api:
+    image: registry.example.com/api:${TAG}
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  worker:
+    image: registry.example.com/worker:${TAG}
+    restart: unless-stopped
+    depends_on:
+      - api
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+```
+
+同等のものをKubernetesで表すには、DeploymentとService、環境変数用のConfigMapまたはSecret、そして弾力性が目的ならHorizontalPodAutoscalerが通常必要になり、同じ3つのServiceを表すのに4〜5個のYAML FileとAPI Objectが必要です。
+
+```yaml
+# deployment.yaml（抜粋。実際の構成にはService、
+# ConfigMap/Secret、通常はHPAも必要）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      containers:
+        - name: api
+          image: registry.example.com/api:1.4.0
+          resources:
+            limits: { memory: "512Mi" }
+          envFrom:
+            - secretRef: { name: api-env }
+```
+
+どちらが客観的に優れているという話ではありません。Kubernetes版はDeclarativeなRolling Update、Multi-node Cluster全体での自己修復的なRestart、Autoscalingへの道筋をCompose版にはない形で提供します。問題は、Control Planeの運用・Patch適用（あるいはManaged Control Planeへの支払い）とYAMLの分量を正当化できるほど、それらを本当に必要としているかどうかです。
+
+## webhaniが実際にClientと確認しているChecklist
+
+Kubernetesをよりシンプルな構成より優先して推奨する前に、以下を確認しています。
+
+- **Trafficの形。** 安定して予測可能なLoadは、Kubernetes級のAutoscalingをほぼ必要としません。本当にSpike的で予測しづらいLoadこそ、Horizontal Pod AutoscalingやCluster Autoscalingがそのコストに見合う場面です。
+- **Team規模とOn-call体制。** 1〜2名のInfra担当がProduct開発と並行してKubernetes Clusterを維持するのは、Product自体とは無関係なControl PlaneやCNIのIssueで深夜Pageが鳴る典型的な原因になります。Managed Control Plane（EKS、GKE、AKS）はこれを軽減しますが、なくすわけではありません。
+- **独立してDeployされるServiceの数。** 2〜3個のServiceでは、KubernetesのSchedulingやService Discoveryの仕組みから得られる恩恵はほとんどありません。異なるScalingやResource Profileを持つServiceが10以上になってくると、話が変わってきます。
+- **実際のMulti-regionまたはFailover要件。** BusinessとしてActive-activeなMulti-region Failoverを本当に必要としているならKubernetesのFederationやMulti-cluster Toolingは実際の課題を解決します。「Multi-region」が滅多にTestされないDisaster Recovery Runbookを指しているだけなら、よりSimpleなReplicated構成のほうが、実際に動き続けさせるCostは通常低くなります。
+- **表面上のCostではなく総Cost。** Managed Control Planeの料金とNode Costを、Compose/Managed Container Serviceの構成のCompute Costと比較するだけでなく、KubernetesのUpgrade、Security Patch適用、YAML保守に費やすEngineering工数も加味します。多くの場合、後者のほうが大きな数字になります。
+
+## 実務上の推奨
+
+初期段階のProductやほとんどの社内Toolについては、少数のHost上のDocker Compose、あるいはKubernetes APIを露出しないScheduling機構を持つManaged Container Platform（ECS、Cloud Runなど）から始めることを推奨しています。Kubernetesの再検討は、独立にScalingされるServiceが二桁に達した、本当にMulti-regionを必要としている、あるいはそれを専属で所有するPlatform Teamが存在する、といった具体的な閾値を越えた時点で行い、「いずれ必要になるだろう」という想定だけで最初から導入することは避けています。
+
+## まとめ
+
+Kubernetesは、そのScheduling・Autoscaling・Multi-node Resilienceが、将来抱えるかもしれない課題ではなく今実際に抱えている課題に対応している場合に正しい選択になります。2026年に見られるKubernetes導入を巻き戻してCostを削減する動きは、Kubernetes自体が悪いToolであることを示すものではなく、主に早すぎた導入の是正です。どちらを選ぶにせよ、自社の実際の数字に対してTrafficの形・Team規模・Service数のChecklistを当てはめてから判断し、その数字が変化するたびに再評価してください。Serviceが3個のMVPにとっての正解と、Serviceが40個のPlatformにとっての正解は、通常異なります。
+
+---
+
+*参考: [Kubernetes vs Plain Docker in 2026 — Stackademic](https://blog.stackademic.com/kubernetes-vs-plain-docker-in-2026-i-deleted-our-eks-cluster-and-saved-184k-heres-what-nobody-d583d762bfa3), [Docker vs Kubernetes in 2026 — Tech Insider](https://tech-insider.org/docker-vs-kubernetes-2026/)*
