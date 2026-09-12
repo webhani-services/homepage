@@ -1,0 +1,96 @@
+---
+title: "2026년 Kubernetes vs 순수 Docker — Cost 중심 의사결정 Framework"
+description: "2026년 DevOps 업계에서는 불필요한 Kubernetes를 걷어내고 Cost를 줄였다는 사례가 계속 화제가 되고 있습니다. webhani가 Client에게 Kubernetes를 권하기 전에 실제로 확인하는 Checklist를 정리합니다."
+date: "2026-09-13"
+status: "published"
+tags: ["Kubernetes", "Docker", "DevOps", "Cloud Infrastructure", "Cost 최적화"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-vs-docker-cost-decision-2026"
+---
+
+2026년 Infrastructure 관련 논의에서 반복적으로 등장하는 주제 중 하나는 Kubernetes 도입을 되돌리는 팀들의 사례입니다. EKS Cluster를 삭제하고 소수의 Docker Compose Host나 Managed Container Service로 옮긴 뒤, Cost와 운영 양쪽에서 의미 있는 절감을 보고하는 식입니다. 이는 Kubernetes 자체에 대한 반박이 아니라, 많은 팀이 실제로 필요해지기 전에 Kubernetes를 도입했다는 증거입니다. 유용한 질문은 "Kubernetes를 쓸 것인가 말 것인가"가 아니라, 실제로 안고 있는 제약, 즉 Traffic 패턴, Team 규모, Deployment Topology 중 무엇을 Kubernetes가 해결해주는지, 그리고 더 단순한 구성으로도 같은 문제를 더 낮은 운영 Cost로 해결할 수 있는지입니다.
+
+## Kubernetes가 실제로 주는 것
+
+Kubernetes는 여러 Node에 걸친 탄력적인 Scaling, 이질적인 Service를 공유 Hardware 위에 효율적으로 배치하는 Scheduling, Health Check 기반 자동 Rollback을 동반한 Rolling Deployment, Multi-region 또는 Multi-cluster Failover, 그리고 Control Plane을 직접 소유하고 운영할 수 있는 Platform Team, 이 중 여러 가지를 동시에 필요로 할 때 그 복잡도만큼의 가치를 냅니다. 이 중 2~3가지가 필요하지만 Platform Team이 없다면, etcd Upgrade, CNI Plugin 선택, RBAC 설정, Control Plane Patch 적용, 혹은 Managed Control Plane의 월 요금 같은 운영 Cost를 그 혜택을 충분히 누리지 못한 채 지불하게 됩니다.
+
+반면 소수의 Host에서 `docker compose`를 실행하거나 Service 단위의 Managed Single-node 구성 같은 순수 Docker는, 실제 요구사항이 "Dynamic Bin-packing이나 Node 간 Scheduling 없이 N개의 Service를 M대의 Machine에서 안정적으로 실행하는 것"일 때 그 단순함이 진가를 발휘합니다.
+
+## 구체적인 비교
+
+작은 Multi-service App을 두 Model로 표현하면 다음과 같습니다. 먼저 Docker Compose입니다.
+
+```yaml
+# docker-compose.yml
+services:
+  api:
+    image: registry.example.com/api:${TAG}
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  worker:
+    image: registry.example.com/worker:${TAG}
+    restart: unless-stopped
+    depends_on:
+      - api
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+```
+
+동일한 것을 Kubernetes로 표현하려면 Deployment와 Service, 환경 변수를 위한 ConfigMap 또는 Secret, 그리고 탄력성이 목적이라면 보통 HorizontalPodAutoscaler까지 필요합니다. 같은 3개 Service를 표현하는 데 4~5개의 YAML File과 API Object가 필요한 셈입니다.
+
+```yaml
+# deployment.yaml (일부 발췌 — 실제 구성에는 Service,
+# ConfigMap/Secret, 보통 HPA도 필요)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      containers:
+        - name: api
+          image: registry.example.com/api:1.4.0
+          resources:
+            limits: { memory: "512Mi" }
+          envFrom:
+            - secretRef: { name: api-env }
+```
+
+어느 쪽이 객관적으로 우월하다는 이야기가 아닙니다. Kubernetes 버전은 Declarative한 Rolling Update, Multi-node Cluster 전체에 걸친 자가 복구형 Restart, Autoscaling으로 가는 경로를 Compose 버전에는 없는 형태로 제공합니다. 문제는 Control Plane 운영·Patch 적용(또는 Managed Control Plane 비용 지불)과 YAML 분량을 정당화할 만큼 그것들을 실제로 필요로 하느냐입니다.
+
+## webhani가 Client와 실제로 확인하는 Checklist
+
+더 단순한 구성 대신 Kubernetes를 권하기 전에 다음을 확인합니다.
+
+- **Traffic의 형태.** 안정적이고 예측 가능한 Load는 Kubernetes 수준의 Autoscaling을 거의 필요로 하지 않습니다. 정말로 급격하고 예측하기 어려운 Load일 때 Horizontal Pod Autoscaling과 Cluster Autoscaling이 그 Cost만큼의 가치를 냅니다.
+- **Team 규모와 On-call 여력.** 1~2명의 Infra 담당자가 Product 개발과 병행해서 Kubernetes Cluster를 유지하는 것은, Product 자체와는 무관한 Control Plane이나 CNI 문제로 새벽에 Page가 울리는 흔한 원인이 됩니다. Managed Control Plane(EKS, GKE, AKS)이 이를 줄여주긴 하지만 없애주지는 않습니다.
+- **독립적으로 Deploy되는 Service의 수.** 2~3개 Service로는 Kubernetes의 Scheduling과 Service Discovery 기능에서 얻는 이득이 거의 없습니다. Scaling과 Resource Profile이 서로 다른 Service가 10개 이상으로 늘어나면 이야기가 달라지기 시작합니다.
+- **실제 Multi-region 또는 Failover 요구사항.** Business상 진짜 Active-active Multi-region Failover가 필요하다면 Kubernetes의 Federation이나 Multi-cluster Tooling은 실제 문제를 해결합니다. "Multi-region"이 거의 Test되지 않는 재해 복구 Runbook을 의미할 뿐이라면, 더 단순한 복제 구성이 실제로 계속 동작하게 유지하는 데 드는 Cost가 보통 더 낮습니다.
+- **표면적 Cost가 아닌 총 Cost.** Managed Control Plane 요금과 Node Cost를 Compose/Managed Container Service 구성의 Compute Cost와 비교하는 것에 더해, Kubernetes Upgrade, Security Patch 적용, YAML 유지보수에 들어가는 Engineering 시간도 함께 따져야 합니다. 대개는 후자가 더 큰 숫자입니다.
+
+## 실무에서의 권장 사항
+
+초기 단계 Product나 대부분의 사내 Tool에는 소수의 Host 위 Docker Compose, 혹은 Kubernetes API를 노출하지 않고 Scheduling을 처리해주는 Managed Container Platform(ECS, Cloud Run 등)에서 시작할 것을 권합니다. Kubernetes 재검토는 독립적으로 Scaling되는 Service가 두 자릿수에 이르렀거나, 진짜 Multi-region이 필요하거나, 그것을 전담으로 소유할 Platform Team이 존재하는 등 구체적인 Threshold를 넘었을 때 진행하며, "언젠가는 필요할 것"이라는 가정만으로 처음부터 도입하는 것은 지양합니다.
+
+## 요약
+
+Kubernetes는 그 Scheduling·Autoscaling·Multi-node Resilience가 나중에 생길 수도 있는 문제가 아니라 지금 실제로 안고 있는 문제에 부합할 때 올바른 선택이 됩니다. 2026년에 나타나는, Kubernetes 도입을 되돌려 Cost를 줄이는 흐름은 Kubernetes 자체가 나쁜 Tool이라는 신호라기보다는 대부분 너무 이른 도입에 대한 교정입니다. 어느 쪽을 선택하든 자사의 실제 숫자에 대해 Traffic 형태·Team 규모·Service 수 Checklist를 적용한 뒤 판단하고, 그 숫자가 바뀔 때마다 다시 평가해야 합니다. Service가 3개인 MVP에 맞는 답과 Service가 40개인 Platform에 맞는 답은 대개 다릅니다.
+
+---
+
+*참고: [Kubernetes vs Plain Docker in 2026 — Stackademic](https://blog.stackademic.com/kubernetes-vs-plain-docker-in-2026-i-deleted-our-eks-cluster-and-saved-184k-heres-what-nobody-d583d762bfa3), [Docker vs Kubernetes in 2026 — Tech Insider](https://tech-insider.org/docker-vs-kubernetes-2026/)*

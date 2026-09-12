@@ -1,0 +1,78 @@
+---
+title: "Vue 3.6 Vapor Mode, Feature-Complete가 실제로 의미하는 것"
+description: "Vue 3.6 RC에서 Vapor Mode가 Feature-Complete로 선언됐습니다. Virtual DOM 없이 DOM 조작으로 직접 Compile되는 이 방식이 실제로 어떻게 동작하는지, 성능 향상의 근원, 그리고 점진적으로 도입하는 방법을 정리합니다."
+date: "2026-09-13"
+status: "published"
+tags: ["Vue.js", "Web Performance", "Frontend", "JavaScript", "Compiler"]
+thumbnail: ""
+author: "webhani"
+slug: "vue-3-6-vapor-mode-2026"
+---
+
+Vue 3.6은 올여름 Release Candidate 단계에 진입하며 Vapor Mode가 Feature-Complete로 선언됐고, Stable Release는 올가을로 예정되어 있습니다. Vapor Mode는 Vue Single-file Component를 위한 두 번째 Compile Target입니다. Template을 Virtual DOM Render 함수로 Compile하는 대신, DOM 조작 Code로 직접 Compile하여 Virtual DOM을 완전히 거치지 않습니다. 이는 Opt-in이며 Component 단위로 적용할 수 있고, Vapor-only Component는 Solid.js나 Svelte 5와 같은 수준의 성능 범위에 든다고 보고되고 있습니다. Vue의 원래 Reactivity Model이 이 방식을 전제로 설계되지 않았다는 점을 생각하면 주목할 만한 주장입니다.
+
+Production에서 Vue App을 운영하는 팀 입장에서 중요한 것은 Benchmark 수치 자체가 아니라 Opt-in이면서 Component 단위라는 세밀함입니다. 즉 도입 질문은 "App을 통째로 Rewrite해야 하는가"가 아니라 "실제로 손댈 가치가 있을 만큼 이득을 보는 Component는 어디인가"가 됩니다.
+
+## 왜 여기서 Virtual DOM을 건너뛰는 것이 효과적인가
+
+Vue의 표준 Compile Target은 이미 불필요한 Virtual DOM Diffing을 피하기 위해 많은 작업을 합니다. Compile 시점에 Template의 정적인 부분을 표시해 Runtime이 그 부분의 재확인을 건너뛰게 합니다. Vapor Mode는 여기서 한 걸음 더 나아갑니다. Virtual DOM Tree를 생성해서 이전 Tree와 Diffing하는 대신, Reactive State가 바뀔 때 어떤 DOM Node가 어떻게 업데이트되어야 하는지를 3.6에서 `alien-signals` 기반으로 재작성되어 Overhead가 낮아진 Vue의 Reactivity System을 이용해 정확히 파악하고, 실제 DOM Node를 직접 갱신하는 Code를 Compiler가 생성합니다.
+
+실질적인 효과는 Reactive Update마다 발생하던 Object 할당과 Diffing Pass가 사라진다는 점입니다. 이는 Live Data Grid, Drag 상호작용, Canvas에 가까운 UI, Scroll이나 Pointer 이동마다 갱신되는 화면처럼 자주 Re-render되는 Component에서 Frame Drop으로 나타나기 쉬운 Overhead입니다.
+
+## Vapor Mode Component의 모습
+
+API 표면은 의도적으로 일반 Vue와 가깝게 유지됩니다. Vapor Mode는 `<script setup>` SFC와 Template-only SFC를 지원하지만 Options API는 지원하지 않습니다.
+
+```vue
+<!-- LiveTicker.vue — Vapor Mode로 Compile됨 -->
+<script setup vapor>
+import { ref, onMounted } from "vue";
+
+const price = ref(0);
+
+onMounted(() => {
+  connectToPriceStream((next) => {
+    price.value = next;
+  });
+});
+</script>
+
+<template>
+  <span class="price">{{ price.toFixed(2) }}</span>
+</template>
+```
+
+`<script setup>`에 붙은 `vapor` 속성이 바로 이 Component에 대해 Compiler가 Virtual DOM 경로 대신 직접 DOM 조작을 Target으로 하도록 지시하는 부분입니다. 그 외 Reactive Ref, Lifecycle Hook, Template 문법은 일반 Vue와 동일하게 읽힙니다.
+
+## 실제 Migration의 핵심은 Interop 경계에 있다
+
+전체 App Rewrite는 권장되는 경로가 아니며, 대부분의 기존 Codebase에는 필요하지도 않습니다. Vapor Component와 Virtual DOM Component는 같은 Tree 안에서 섞어 쓸 수 있고, Vapor Component가 Standard Component의 자식이든 그 반대든 Vue가 두 Rendering 전략 사이의 경계를 처리해줍니다. 즉 현실적인 도입 Pattern은 다음과 같습니다.
+
+```vue
+<!-- Dashboard.vue — 표준 Virtual DOM Component -->
+<template>
+  <AppShell>
+    <!-- Hot Path: 가격이 갱신될 때마다 Re-render -->
+    <LiveTicker vapor />
+    <!-- 나머지는 그대로 -->
+    <PortfolioSummary />
+    <SettingsPanel />
+  </AppShell>
+</template>
+```
+
+실측으로 성능 문제가 확인된 구체적인 Component, 예를 들어 Data가 하나 들어올 때마다 Re-render되는 Chart나 Filter 입력의 Keystroke마다 Re-render되는 List를 특정해서 그것만 개별적으로 Convert합니다. App 내 나머지 Component는 기존 Virtual DOM Component 그대로 둡니다.
+
+## 실제로 어디에 권장하는가
+
+Vapor Mode는 두 상황에 잘 맞습니다. 하나는 Profiling을 통해 이미 Virtual DOM Diff가 병목으로 확인된, 기존 App 안의 진짜 성능에 민감한 화면(Live Dashboard, Data 많은 Table, Canvas 기반 Editor)이고, 다른 하나는 처음부터 Vapor-first로 만드는 소규모 신규 App으로, 이 단계의 API Subset 제약(Options API 미지원, 아직 제한적인 Third-party Component Library 지원)이 Migration Cost가 되지 않는 경우입니다. 애초에 옮길 대상이 없기 때문입니다.
+
+기존 App의 Component Tree 전체를 일괄 Convert하는 것은 권장하지 않습니다. 보고된 20~50%의 Bundle Size 감소는 Vapor-only Component에 한정된 수치입니다. 두 Compile 전략을 함께 쓰는 App은 두 Runtime의 Cost를 모두 부담하므로, Size 이득은 App의 상당 부분이 실제로 Vapor일 때만 실현됩니다. 또한 표준 Vue Reactivity Model과 Slot Model을 전제로 만들어진 Component Library Ecosystem이 따라잡으려면 시간이 필요합니다. 직접 만든 Component 이외의 범위로 Vapor Mode를 본격 도입하기 전에 Third-party Component와의 호환성을 확인해야 합니다.
+
+## 요약
+
+Vapor Mode의 가치는 필수 Migration이 아니라 목표가 뚜렷한 Tool이라는 점에 있습니다. Profiling으로 실제 Virtual DOM Overhead가 문제로 확인된 특정 Component에서만 그것을 제거하고, App의 나머지는 그대로 둘 수 있습니다. 먼저 Profiling을 하고, 실제로 병목인 Component만 Convert하며, 보고된 Solid.js/Svelte 수준 Benchmark는 혼합된 App에 대한 기대치가 아니라 Vapor-only Code의 상한선으로 받아들여야 합니다.
+
+---
+
+*참고: [Vue 3.6 RC: Vapor Mode complete — no virtual DOM (Forkbyte)](https://forkbyte.nl/en/blog/vue-36-vapor-mode-rc), [Vue Vapor Mode's Real Breakthrough Is the Migration Boundary (d4b)](https://www.d4b.dev/blog/2026-07-25-vue-vapor-mode-migration-boundary), [vuejs/core releases (GitHub)](https://github.com/vuejs/core/releases)*
