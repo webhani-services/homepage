@@ -1,0 +1,53 @@
+---
+title: "Claude Code의 Background Compute — 화면을 빼앗지 않고 움직이는 Agent가 바꾸는 것"
+description: "Anthropic이 Claude Code와 Claude Cowork에 Background Computer Use 기능을 추가했습니다. Agent를 활용한 실무 Workflow가 어떻게 바뀌는지, 그리고 사람의 Review가 여전히 필요한 지점이 어디인지 정리합니다."
+date: "2026-09-14"
+status: "published"
+tags: ["Claude", "AI 코딩", "Claude Code", "자동화", "개발 도구"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-background-compute-2026"
+---
+
+## 조용하지만 중요한 권한 변화
+
+2026년 9월 2일, Anthropic은 macOS 대상으로 Claude Cowork와 Claude Code에 Background Computer Use 기능을 배포했습니다. 지금까지 Agent에게 컴퓨터 조작을 맡긴다는 것은 Mouse와 Keyboard를 통째로 넘겨준다는 의미였습니다. Agent가 Foreground를 점유하고, 사람은 작업이 끝나기를 기다릴 수밖에 없었습니다. 새로운 Mode에서는 Agent가 Background에서 클릭·입력·App 전환을 수행하는 동안, 사용자 본인의 Foreground 작업은 그대로 이어집니다.
+
+이 기능은 Opt-in 방식이며 Pro·Max 구독자로 한정되고, 기본값은 꺼짐(Off)입니다. Agent가 화면 전체를 필요로 하는 상황 — 다른 방법으로는 닫을 수 없는 Modal Dialog 등 — 에서는 먼저 확인을 요청합니다. 작업 중 자리를 비워도 Agent는 멈추지 않고 Task를 계속 진행합니다.
+
+문서상으로는 작은 UX 변화처럼 보이지만, 실무에서는 Computer Use Agent를 일상 업무에 쓰는 데 있어 가장 큰 마찰 요인 — "Agent를 쓴다는 것이 곧 자신의 컴퓨터를 못 쓴다는 것"을 의미했던 문제 — 을 제거하는 변화입니다.
+
+## "Foreground 점유"가 진짜 병목이었던 이유
+
+Computer Use Agent는 예전부터 존재했지만, 일상 업무에서 실용성을 가로막은 것은 대개 Model의 능력이 아니라 "독점"이라는 제약이었습니다. Staging 환경에서의 QA 순회, 관리 콘솔에서의 반복적인 Data Entry, API가 없는 Third-party Dashboard의 클릭 조작 — 이런 작업들은 Agent가 잘하는 일인 동시에, 누구도 20분씩 붙어서 지켜보고 싶지 않은 일이기도 합니다.
+
+Background 실행은 이 비용 구조를 바꿉니다. 예전에는 작업 시간 내내 자신의 Machine을 점유해야 했던 Task가, 이제는 본인의 작업과 병행해서 돌아갑니다. "가끔 자동화할 가치가 있던 일"이 더 넓은 범위의 Task에서 "기본적으로 자동화할 가치가 있는 일"로 바뀌는 것입니다.
+
+## 실무에서는 어디에 효과가 있을까
+
+Webhani가 진행하는 것과 같은 Client Project — 사내 Tool 구축·유지보수, 제대로 된 API가 없는 SaaS 관리 화면 연동, Release 전 UI Regression 확인 — 에서 Background Compute는 Agent에게 맡길 수 있는 범위 자체를 넓힙니다. 구체적인 예시는 다음과 같습니다.
+
+- **Regression 확인**: Deploy 이후 Staging 환경에서 핵심 User Flow(가입, 결제, 설정 변경)를 Agent가 클릭으로 순회하는 동안, 변경 사항을 배포한 Engineer는 다음 Ticket으로 넘어갈 수 있습니다.
+- **관리 콘솔 정리 작업**: UI만 제공하는 Vendor Dashboard에서의 권한 설정, User Role 정리, Report Export 같은 일괄 작업을 사람의 오후 시간을 쓰는 대신 Background Task로 Agent에게 맡깁니다.
+- **탐색적 UI Test**: "User가 이렇게 조작하면 어떻게 되는가"라는 일련의 Scenario를 새 Feature Branch에 대해 돌리면서, 동시에 다음 Feature의 구현을 진행합니다.
+
+이들 모두 새로운 종류의 작업은 아닙니다. 새로운 것은 "진짜 작업"을 하는 사람과 같은 화면을 두고 경쟁하지 않게 되었다는 점입니다.
+
+## Governance 문제는 사라지지 않습니다
+
+Background 실행이 감독의 필요성을 없애주지는 않습니다. 형태가 바뀔 뿐입니다. Team 단위로 이 기능을 켜기 전에 정해두면 좋을 것들이 있습니다.
+
+1. **대상 환경을 제한합니다**: Background Agent는 기본적으로 Staging이나 Sandbox 처리된 Account를 대상으로 해야 하며, Task의 내용과 영향 범위가 충분히 파악되지 않은 이상 결제 권한이 있는 Production 콘솔을 대상으로 삼아서는 안 됩니다.
+2. **기록을 남깁니다**: 지켜보지 않는 사이 Agent가 무엇을 했는지는 나중에 확인할 수 있어야 합니다. 최소한 Screenshot, Action Log, 요약 정도는 남겨야 합니다. "회의 중에 돌아가고 있었다"는 Audit Trail이 될 수 없습니다.
+3. **전체 화면 요청 Prompt를 진짜 Gate로 취급합니다**: Agent가 주의를 요청하는 유일한 순간은, 바로 평소 동작 범위를 벗어난 무언가가 발생한 순간입니다. Team이 이 Prompt를 반사적으로 승인하도록 습관화되면 그 존재 의미가 사라집니다.
+4. **공유 Account에서 Agent의 행동에 대한 책임 소재를 정합니다**: Agent가 회사를 대신해 Support Ticket을 등록하거나, 권한을 변경하거나, Form을 제출한다면, 그 행동은 동료의 행동과 마찬가지로 누군가가 책임져야 합니다.
+
+## Webhani의 시각
+
+이번 Release에서 흥미로운 부분은 기술적 구현 방식 자체보다, Anthropic이 권한 경계를 기능 자체만큼이나 세심하게 설계했다는 점입니다. 기본값 Off, 특정 OS와 구독 Plan으로의 한정, 전체 화면 조작에 대한 명시적 확인 Gate. 사람 없이 동작하는 기능치고는 올바른 순서라고 봅니다.
+
+이 기능을 도입할지 검토하는 Team에게 드리는 조언은, 무인으로 동작하는 범위를 넓히는 다른 모든 Agent 기능에 대한 것과 같습니다. "사람이 지켜보지 않는 상태에서 실행해도 되는 범위"를 자신의 환경에 맞춰 먼저 언어화한 뒤 의존해야지, 의존한 뒤에 언어화해서는 안 됩니다. Background Compute는 실무 Operation 업무에서 Agent를 진짜로 유용하게 만들어 줍니다. 동시에 그 편의성만큼 Review의 규율도 함께 끌어올려야 합니다.
+
+---
+
+*참고: [AI News Sept 4: GPT-6 Astra, AI Outage, Claude Background](https://artificiallyintimidating.com/p/ai-brief-september-4-2026)*
