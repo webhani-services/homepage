@@ -1,0 +1,65 @@
+---
+title: "DeepSeek V4.1 Flash — 저렴한데 더 좋은 Model이 나온다는 것"
+description: "DeepSeek가 2026년 9월 10일 출시한 V4.1 Flash는 상위 Model인 V4 Pro보다 저렴하면서도 대부분의 Benchmark에서 더 나은 결과를 보입니다. 시간대별로 달라지는 Pricing과 V4 Pro의 사실상 은퇴가 의미하는 바를 정리합니다."
+date: "2026-09-15"
+status: "published"
+tags: ["LLM", "DeepSeek", "AI", "비용 최적화"]
+thumbnail: ""
+author: "webhani"
+slug: "deepseek-v4-1-flash-pricing-2026"
+---
+
+## 품질과 비용 중 하나를 고르게 하지 않는 Release
+
+대부분의 Model Release는 품질과 비용 사이의 Trade-off를 사용자에게 떠넘깁니다. 품질을 택하려면 비싼 Model을, 비용을 아끼려면 다소 부족한 Model을 써야 하는 식입니다. 그런데 2026년 9월 10일 출시된 DeepSeek의 V4.1 Flash는 이 Trade-off 자체를 무너뜨렸습니다. officechai와 Benchmark 집계 Site인 llm-stats.com의 보도에 따르면, V4.1 Flash는 상위 Model인 V4 Pro 대비 대부분의 Agentic·Coding Benchmark에서 동등하거나 더 나은 성적을 냅니다 — DeepSWE v1.1에서는 V4 Pro의 62.7 대비 74.2, Terminal-Bench 2.1에서는 87.9 대비 90.6을 기록했습니다. 반면 HLE 같은 지식 중심 Benchmark(42.7 대비 36.8)에서는 뒤처지는데, 이는 "Flash"가 Agentic 작업과 Tool 호출의 처리 속도에 최적화된 파생 Model이라는 점과 맞아떨어집니다.
+
+실무 관점에서 더 흥미로운 부분은 Pricing입니다. Off-peak 시간대에는 Cache되지 않은 Input Token 100만 개당 $0.15, Output Token은 $0.60입니다. Yotta Labs의 글에 따르면 평일 UTC 01:00~04:00, 06:00~10:00의 Peak 시간대에는 두 요금 모두 두 배로 뜁니다. 코드에 한 번 박아 넣고 잊어버릴 수 있는 고정 단가가 아니라, 시간대에 따라 실제로 변하는 비용 구조라는 뜻입니다.
+
+## 주목할 부분은 V4 Pro의 사실상 은퇴
+
+2026년 9월 14일 UTC 04:00부터 DeepSeek는 `deepseek-v4-pro`로 들어오는 모든 API Request를 V4.1 Pro가 나오기 전까지 자동으로 V4.1 Flash에, 그것도 Flash 가격으로 Routing합니다. `v4-pro`를 Model 문자열로 Hardcoding해 둔 기존 Integration은 그대로 동작하지만, 알아채지 못한 채 Latency와 출력 특성이 다른 별개의 Model을 호출하게 됩니다. 대부분의 Team에게는 순수한 업그레이드 — 동등 이상의 Benchmark에 더 낮은 비용 — 이지만, "Model 문자열"이 Provider와의 안정적인 계약이 아니라는 점을 다시 일깨워주는 사례이기도 합니다. 출력 Format이나 Latency Budget에 엄격한 Eval을 걸어둔 Team이라면, Version 번호만으로는 알 수 없는 이런 교체에 주의해야 합니다.
+
+## Provider와 무관하게 가져가야 할 Pattern
+
+DeepSeek를 쓰든 안 쓰든, 이 Peak/Off-peak Pricing과 중간 Tier의 은퇴는 같은 문제를 가리킵니다. Model 선택을 Build 시점의 상수가 아니라 실행 시점의 판단으로 다뤄야 한다는 것입니다. 최소한의 구현은 다음과 같은 형태가 됩니다.
+
+```ts
+type TaskProfile = "lint-fix" | "multi-file-refactor" | "spec-review";
+
+interface ModelChoice {
+  model: string;
+  maxOutputTokens: number;
+}
+
+function pickModel(task: TaskProfile, utcHour: number): ModelChoice {
+  const isPeak = (utcHour >= 1 && utcHour < 4) || (utcHour >= 6 && utcHour < 10);
+
+  if (task === "lint-fix") {
+    return { model: "deepseek-v4.1-flash", maxOutputTokens: 512 };
+  }
+
+  if (task === "multi-file-refactor" && !isPeak) {
+    return { model: "deepseek-v4.1-flash", maxOutputTokens: 4096 };
+  }
+
+  // Peak 시간대의 복잡한 작업이나 Flash의 지식 격차가 문제되는 작업은
+  // 추론력이 더 높은 Model로 Fallback한다
+  return { model: "claude-opus-5", maxOutputTokens: 4096 };
+}
+```
+
+이건 DeepSeek만의 특수한 Trick이 아닙니다. 뒤에서 다룰 Gloo Code 같은 Agentic Coding 제품들이 기본 기능으로 내장하기 시작한 것과 같은 형태의 Logic입니다. Pricing과 성능이 모두 시간대와 작업에 따라 달라지는 이상, Model 문자열 하나를 고정해 두면 비용이든 품질이든 어느 한쪽에서 손해를 보게 됩니다.
+
+## 평가하는 Team에게 전하고 싶은 것
+
+1. **Provider 평가를 한 번으로 끝내지 않습니다**: 2026년 8월에 Integration을 구성한 V4 Pro 사용자는 Code 한 줄 바꾸지 않은 채 다른 Model을 쓰고 있는 셈입니다. 테스트했던 Model Version뿐 아니라, 실제 운영 중인 Endpoint를 대상으로 주기적으로 Eval을 돌려야 합니다.
+2. **"저렴하다"와 "이 작업에는 충분히 저렴하다"를 구분합니다**: V4.1 Flash의 지식 Benchmark 격차는 실재합니다. Refactor나 Test 생성을 하는 Coding Agent라면 거의 문제되지 않지만, Open Domain 질문에 답하는 Support Bot이라면 영향이 있을 수 있습니다.
+3. **Routing Layer는 기능마다가 아니라 한 번만 만듭니다**: 위와 같은 Router는 공유 Module 하나에 담을 수 있는 규모입니다. 이 작업을 생략하는 Team은 모든 걸 Frontier Model에 맞춰 과다 지불하거나, 반대로 추론이 필요한 작업에까지 저렴한 Model을 써서 품질을 떨어뜨리는 결과를 겪곤 합니다.
+
+## Webhani의 시각
+
+DeepSeek V4.1 Flash는 LLM Market 전반에서 나타나고 있는 더 큰 흐름을 보여주는 하나의 사례입니다. "Model 하나에 가격 하나"라는 전제는 더 이상 Team들의 실제 사용 방식과 맞지 않습니다. Client의 Default Model 선정을 돕는 Consulting 현장에서는 최근 늘 같은 결론에 도달합니다 — Model 하나를 고르는 게 아니라 Routing 정책을 고르고, 이를 매달 다시 점검해야 한다는 것입니다. Model이 바뀌는 속도는 대부분 Team의 도입 주기보다 훨씬 빠릅니다.
+
+---
+
+*참고: [DeepSeek V4.1 Flash Matches GPT 5.6 Sol, Claude Opus 5 On Some Benchmarks At Substantially Lower Pricing - officechai](https://officechai.com/ai/deepseek-v4-1-flash-benchmarks-pricing/)*
