@@ -1,0 +1,59 @@
+---
+title: "Agentic Coding Tool이 Model 간 Routing을 시작한 이유"
+description: "Gloo Code 출시는 더 큰 흐름을 보여주는 한 사례입니다 — Coding Agent가 하나의 Frontier Model에 모든 것을 맡기는 대신, Task 복잡도에 맞는 가장 저렴한 Model을 조합하기 시작했습니다. 이 Trend의 배경과, 전체 Platform 없이 적용하는 방법을 살펴봅니다."
+date: "2026-09-15"
+status: "published"
+tags: ["Agentic Coding", "AI", "DevOps", "비용 관리"]
+thumbnail: ""
+author: "webhani"
+slug: "gloo-code-agentic-model-routing-2026"
+---
+
+## 발표 뒤에 숨어 있는 진짜 문제
+
+Gloo는 2026년 9월 8일, Gloo AI Studio 내의 Agentic Coding 기능인 Gloo Code를 출시했습니다. 단일 고정 Model이 아니라 Task마다 선택된 Model과 전용 Agent를 짝지어 사용하는 방식입니다. Gloo의 발표에 따르면 내부 예비 Benchmark에서 Frontier Model 품질의 약 70%를 절반가량의 비용으로 달성했다고 합니다. 이는 검증된 제3자 Benchmark가 아니라 Gloo 측 주장으로 소개하는 수치이지만, 그 배후의 Mechanism — 가장 비싼 Model에 전부 맡기는 대신 Task 복잡도에 따라 Routing하는 것 — 은 이 특정 제품이 어떤 Team에 맞는지와는 별개로 그 자체로 살펴볼 가치가 있습니다.
+
+이 발표가 의미를 갖는 배경에는 함께 보도된 수치가 있습니다. 올해 AI Coding Tool을 사용하거나 사용할 계획인 Developer 비율이 84%에 달하지만, 그 결과로 발생하는 Token 비용을 관리하거나 변동하는 Usage를 재무 부서와 경영진에게 설명할 명확한 방법을 가진 조직은 아직 드물다고 합니다. Gloo Code 같은 제품이 대응하는 것은 바로 이 격차입니다. "AI Coding이 더 똑똑해져야 한다"가 아니라 "모든 Keystroke에 Frontier 요금을 매기지 않는 비용 Model이 필요하다"는 이야기입니다.
+
+## 일률적인 Model 운용이 빠르게 비싸지는 이유
+
+한 번의 작업 Session에서 Coding Agent가 다루는 Task의 복잡도는 폭이 넓습니다. Lint Error 수정, 한 줄짜리 Null Check 추가, 여러 File에 걸친 Refactor, Architecture 판단에 대한 Review 등 다양합니다. 이 모두를 같은 Frontier Model에 통과시키는 것은 구현이 단순하고 동작을 추론하기 쉽지만, 훨씬 저렴한 Model로도 충분히 처리할 수 있는 Task에까지 Frontier 요금을 계속 지불하게 됩니다. 반대로 모든 것을 저렴한 Model에 맡기면 당장은 비용이 줄어드는 것처럼 보이지만, 자신 있게 잘못된 Refactor를 내놓아 그 Review 비용이 Model 절감분을 넘어서는 결과를 낳습니다.
+
+## Platform 없이도 적용할 수 있는 Routing 정책
+
+특정 Vendor의 Platform을 도입하지 않아도 핵심 이점은 얻을 수 있습니다. Task 복잡도를 판단하는 Classifier와 작은 Model Registry를 조합하는 것만으로 상당 부분을 커버할 수 있습니다.
+
+```ts
+interface RoutingPolicy {
+  model: string;
+  requiresHumanReview: boolean;
+}
+
+function classifyTask(diffLineCount: number, filesTouched: number): RoutingPolicy {
+  if (diffLineCount < 10 && filesTouched === 1) {
+    return { model: "cheap-fast-model", requiresHumanReview: false };
+  }
+
+  if (filesTouched > 3) {
+    return { model: "frontier-model", requiresHumanReview: true };
+  }
+
+  return { model: "mid-tier-model", requiresHumanReview: false };
+}
+```
+
+이 예시는 의도적으로 단순화한 것입니다. 실제 Routing 정책이라면 변경 사항이 Auth, 결제, Public API를 건드리는지 같은 요소도 함께 고려합니다. 다만 세부 사항보다 중요한 것은 구조 자체입니다 — 생성하기 전에 먼저 분류하고, 그 분류에 Model뿐 아니라 Review 기준까지 함께 연동시키는 것입니다.
+
+## 이 Trend를 평가하는 Team에게 전하고 싶은 것
+
+1. **Token 단가가 아니라 Task 유형별 비용을 추적합니다**: 집계된 Token 사용량만 봐서는 돈이 어디로 가는지 거의 알 수 없습니다. Routing하기 전에 Task를 유형(Lint 수정, Refactor, Spec Review)별로 Tag를 달아두면, 어디에서 저렴한 Model을 써도 안전한지 판단할 Data를 얻을 수 있습니다.
+2. **Review 기준을 Routing 결정에 포함시킵니다. 나중에 덧붙이지 않습니다**: 위험도가 낮은 변경을 저렴한 Model에 가벼운 Review로 맡기는 것은 합리적인 선택입니다. 하지만 위험도가 높은 변경을 다른 것과 동일한 Review 기준으로 저렴한 Model에 맡기면, 절감액이 Incident 비용으로 바뀌게 됩니다.
+3. **비용 Data의 뒷받침 없이 정교한 Routing Logic에 과도하게 투자하지 않습니다**: 위의 Classifier 정도면 시작하기에 충분합니다. 실제 지출이 어디에 집중되는지 측정하기도 전에 정교한 Routing Logic을 만드는 Team은 엉뚱한 80%를 최적화하는 경우가 많습니다.
+
+## Webhani의 시각
+
+Gloo Code 출시를 "평가해야 할 새 Tool"이라기보다 "Model Routing이 Agentic Coding의 표준 Layer가 되어가고 있다"는 증거로 읽고 있습니다. 예전에 누구도 단일 Server로 모든 것을 감당하는 것을 정당화할 수 없게 되자 Load Balancing이 Web Infrastructure의 표준 Layer가 된 것과 같은 흐름입니다. AI Coding 지출 관리를 도와달라는 Client에게 저희가 가장 먼저 제안하는 것은, Vendor의 Platform 버전으로 갈아탈 가치가 있는지 검토하기 전에, 위와 같이 분류한 뒤 Routing하는 Pattern을 작고 내부적으로 직접 만들어 보는 것입니다.
+
+---
+
+*참고: [Gloo Launches Gloo Code - Agentic Coding and Optimized Agents that Make Your Tokens Go Farther - Gloo](https://gloo.com/press/releases/gloo-launches-gloo-code)*
