@@ -1,0 +1,86 @@
+---
+title: "The EU Cyber Resilience Act's Reporting Clock Already Started — Is Your SBOM Ready?"
+description: "Article 14 incident reporting under the EU Cyber Resilience Act took effect September 11, 2026, well before the 2027 SBOM deadline most teams are tracking. Here's why that timing matters and what to build now."
+date: "2026-09-16"
+status: "published"
+tags: ["Security", "Compliance", "SBOM", "DevOps", "CyberResilienceAct"]
+thumbnail: ""
+author: "webhani"
+slug: "eu-cyber-resilience-act-sbom-readiness-2026"
+---
+
+## Two deadlines, and the earlier one just passed
+
+Most engineering teams tracking the EU Cyber Resilience Act (CRA) have the December 11, 2027 deadline circled — that's when the full set of requirements applies: secure-by-design obligations, mandatory Software Bill of Materials (SBOM), CE marking, and technical documentation, for any product with digital elements placed on the EU market.
+
+What's easy to miss is that a separate, earlier obligation already took effect on September 11, 2026: Article 14 vulnerability and incident reporting. Manufacturers now have 24 hours to file an early warning and 72 hours to submit a full notification after becoming aware of an actively exploited vulnerability or a severe incident affecting a covered product. That clock is running now, not in 2027.
+
+## Why the reporting deadline forces the SBOM question early
+
+Here's the part that catches teams off guard: you cannot meet a 24-hour vulnerability reporting obligation for a component you don't know you're shipping. If a critical CVE drops against a transitive dependency buried three layers deep in your build, the first task isn't writing the incident report — it's figuring out whether you're even affected. Without an existing, queryable inventory of what's in your software, that discovery step alone can burn most of your 24-hour window.
+
+In practice, this means SBOM readiness isn't a 2027 problem — it's a prerequisite for complying with an obligation that started in September 2026. Industry guidance has converged on the same number from different directions: get SBOM generation and vulnerability matching operational at least 15 months ahead of the full CRA deadline, which lands right around now.
+
+## What "SBOM readiness" actually requires
+
+An SBOM isn't a one-time export you file away. To be useful for a 24-hour reporting obligation, it needs to be:
+
+1. **Generated automatically, on every build** — not produced manually before an audit.
+2. **Machine-readable** in a standard format (CycloneDX or SPDX) so it can be diffed and queried programmatically.
+3. **Matched against a live vulnerability feed** so a new CVE against a known component triggers an alert without a human first asking "do we use this?"
+
+A minimal CI step gets you most of the way there:
+
+```yaml
+# .github/workflows/sbom.yml
+name: Generate SBOM
+on: [push]
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      - name: Scan SBOM against known vulnerabilities
+        uses: anchore/scan-action@v3
+        with:
+          sbom: sbom.cdx.json
+          fail-build: false
+          severity-cutoff: critical
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+```
+
+The `fail-build: false` there is deliberate for a first rollout — you want visibility before you want a gate. Once you trust the signal (no false-positive noise blocking every merge), tighten it.
+
+## Building the reporting process around the artifact
+
+The SBOM alone doesn't satisfy Article 14 — it's the input to a process that has to exist independently:
+
+- **A defined owner** for triaging a new vulnerability alert against the SBOM within hours, not days.
+- **A pre-written incident report template** so the 24-hour early warning isn't drafted from scratch under time pressure.
+- **A dependency update path** that's already tested and fast, since "we found it" and "we can ship a fix" are different capabilities.
+
+None of this is exotic. It's the same operational muscle security-mature teams already have for CVE response — the CRA just puts a hard, external clock on it with real financial consequences: fines up to €15 million or 2.5% of global annual turnover, whichever is higher.
+
+## Who this actually applies to
+
+The CRA's scope is broad — "products with digital elements" placed on the EU market covers most commercial software, plus open-source components distributed as part of a commercial offering. If your product has any EU customer base, or your open-source project has a company behind it selling support or hosting, this is worth a compliance review now rather than after the first incident forces the question.
+
+## webhani's take
+
+The practical mistake we'd want clients to avoid is treating this as a 2027 project that can wait. The reporting obligation is live today, and the gap between "we have a rough idea what's in our dependency tree" and "we can name every affected system within an hour of a CVE dropping" is usually bigger than teams assume until they try to close it under pressure. Start with automated SBOM generation in CI — it's a low-effort, low-risk change — and treat the vulnerability-matching and incident-reporting process as the harder, higher-priority follow-up.
+
+---
+
+*Sources: [Keysight](https://www.keysight.com/blogs/en/tech/nwvs/2025/09/11/one-year-countdown-to-eu-cra-compliance-september-11-2026-changes-everything), [Anchore](https://anchore.com/sbom/eu-cra/), [HeroDevs](https://www.herodevs.com/blog-posts/cra-reporting-obligations-start-september-2026-what-eol-dependencies-mean-for-your-compliance)*

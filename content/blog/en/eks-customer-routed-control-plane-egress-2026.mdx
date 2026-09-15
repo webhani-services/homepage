@@ -1,0 +1,91 @@
+---
+title: "EKS Customer-Routed Control Plane Egress: Closing the Private-Cluster Gap"
+description: "Amazon EKS now lets the Kubernetes control plane send outbound traffic through your own VPC instead of an AWS-managed path. Here's the real problem this solves, and where it matters."
+date: "2026-09-16"
+status: "published"
+tags: ["AWS", "EKS", "Kubernetes", "Networking", "CloudInfrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "eks-customer-routed-control-plane-egress-2026"
+---
+
+## The traffic nobody could see or route
+
+Amazon EKS's control plane has always initiated a category of outbound calls that most cluster operators never think about: admission webhook callbacks, OIDC provider lookups for authentication, and aggregated API server requests to extension API servers. Historically, that traffic left through an AWS-managed path — which is fine, until the destination for one of those calls sits behind a private network boundary you control.
+
+That's a real, common gap. If your admission webhook server, your custom OIDC provider, or your aggregated API extension only resolves inside your VPC — because it talks to internal services, sits behind a private endpoint, or exists specifically to keep that traffic off the public internet — the EKS control plane simply couldn't reach it. Teams worked around this with public-facing endpoints protected by IP allowlists or mutual TLS, which technically worked but ran against the spirit of "private cluster" architectures that regulated or security-conscious organizations actually want.
+
+## What customer-routed egress changes
+
+Amazon EKS now supports routing that control plane egress traffic through your own VPC. When enabled, the Kubernetes API server's outbound calls flow through an Elastic Network Interface (ENI) placed in your VPC, and from there you control the path: your route tables, your security groups, your VPC endpoints, your PrivateLink connections.
+
+Enabling it is a single configuration flag:
+
+```bash
+# New cluster with customer-routed control plane egress
+aws eks create-cluster \
+  --name production-private-cluster \
+  --kubernetes-version 1.36 \
+  --resources-vpc-config subnetIds=subnet-0abc123,subnet-0def456 \
+  --access-config controlPlaneEgressMode=CUSTOMER_ROUTED
+```
+
+```bash
+# Or enable it on an existing cluster
+aws eks update-cluster-config \
+  --name existing-cluster \
+  --access-config controlPlaneEgressMode=CUSTOMER_ROUTED
+```
+
+Once set, a private OIDC provider or webhook server that only resolves inside your VPC becomes reachable — no public endpoint, no IP allowlist workaround, no compromise on the "private cluster" design you actually wanted.
+
+## A concrete use case: private admission control
+
+Say you run a mutating admission webhook that injects sidecar configuration based on internal service metadata that must never leave your network:
+
+```yaml
+# webhook-config.yaml — reachable only via the VPC after CUSTOMER_ROUTED is enabled
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: sidecar-injector
+webhooks:
+  - name: inject.internal.example.com
+    clientConfig:
+      url: "https://webhook.internal.example.com:8443/mutate"
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+```
+
+Before this feature, `webhook.internal.example.com` had to be reachable from AWS's managed egress path — which usually meant exposing it publicly with strict access controls, or not using a private hostname at all. With customer-routed egress, the control plane's call to that URL travels through your ENI, so it can resolve against a private hosted zone and route entirely inside your VPC.
+
+## Who should actually turn this on
+
+This isn't a default-on feature, and it shouldn't be. It matters specifically for:
+
+- **Regulated environments** with data perimeter requirements that prohibit control-plane traffic from touching AWS-managed paths for certain workloads.
+- **Private identity providers** — an internal OIDC issuer that isn't meant to be internet-facing.
+- **Extension API servers or webhooks** that were previously public purely to satisfy control-plane reachability, not because they needed to be.
+
+If none of your webhooks, OIDC providers, or aggregated APIs are private, this feature adds operational surface (an ENI to monitor, routing to own) without a corresponding benefit.
+
+## What to check before enabling it
+
+**Route table completeness.** The ENI's traffic follows your VPC's route tables. Missing routes to a private hosted zone or a PrivateLink endpoint will silently break control-plane calls that used to work.
+
+**Security group scope.** The ENI needs security group rules that permit the specific outbound calls the control plane makes — don't default to overly broad egress rules just to make it work; scope it to the ports and CIDRs your webhooks and OIDC provider actually use.
+
+**Latency on the hot path.** Admission webhooks sit in the pod creation path. Routing that call through additional VPC infrastructure adds a network hop; measure webhook response times after enabling this before rolling it out cluster-wide.
+
+## webhani's take
+
+This closes a specific, previously awkward gap for anyone building genuinely private EKS clusters with internal admission control or identity infrastructure. It's not a feature most teams need on day one, but for clients in finance, healthcare, or any regulated sector who've been forced into a public-endpoint-plus-allowlist compromise just to satisfy control-plane reachability, this removes that compromise entirely. Test it against a staging webhook first — the failure mode when a route is missing is a cluster that suddenly can't admit new pods, which is not where you want to discover a routing gap.
+
+---
+
+*Sources: [AWS containers blog](https://aws.amazon.com/blogs/containers/amazon-eks-now-supports-control-plane-egress-through-your-vpc/), [AWS What's New](https://aws.amazon.com/about-aws/whats-new/2026/06/amazon-eks-customer-routed-control-plane-egress/)*

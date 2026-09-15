@@ -1,0 +1,91 @@
+---
+title: "EKS Customer-Routed Control Plane Egress が埋める「Private Cluster」の穴"
+description: "Amazon EKS の Control Plane が発信する通信を、AWS 管理経路ではなく自分の VPC 経由でルーティングできるようになりました。これまで見過ごされてきた実務上の課題と、有効化すべきケースを整理します。"
+date: "2026-09-16"
+status: "published"
+tags: ["AWS", "EKS", "Kubernetes", "Networking", "CloudInfrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "eks-customer-routed-control-plane-egress-2026"
+---
+
+## 誰も意識してこなかった発信トラフィック
+
+Amazon EKS の Control Plane は、多くの運用者が普段意識しない発信通信を常に行っています。Admission Webhook へのコールバック、認証のための OIDC Provider への問い合わせ、そして Aggregated API Server へのリクエストです。これまでこの通信は AWS が管理する経路を通っており、それ自体は問題ありません — 呼び出し先が自分たちの管理するプライベートなネットワーク境界の内側にある場合を除いては。
+
+これは決して珍しいケースではありません。Admission Webhook Server や独自の OIDC Provider、Aggregated API の拡張が VPC 内部でしか名前解決できない — 内部サービスとしか通信しない、Private Endpoint の裏にある、あるいはそのトラフィックを Public Internet に出さないために意図的にそう設計されている — 場合、EKS の Control Plane はそこに到達できませんでした。多くのチームは IP Allowlist や mTLS で保護した Public Endpoint を用意することでこれを回避してきましたが、それは技術的には動いても、規制業界やセキュリティ意識の高い組織が本来求めている「Private Cluster」の思想には反する妥協でした。
+
+## Customer-Routed Egress が変えること
+
+Amazon EKS は、Control Plane の発信トラフィックを自分の VPC 経由でルーティングできる機能に対応しました。有効化すると、Kubernetes API Server の発信通信は VPC 内に配置された ENI (Elastic Network Interface) を通過し、そこから先は自分たちの Route Table・Security Group・VPC Endpoint・PrivateLink 接続で経路を制御できます。
+
+有効化は設定を1つ変えるだけです。
+
+```bash
+# Customer-Routed Control Plane Egress を有効にした新規クラスター
+aws eks create-cluster \
+  --name production-private-cluster \
+  --kubernetes-version 1.36 \
+  --resources-vpc-config subnetIds=subnet-0abc123,subnet-0def456 \
+  --access-config controlPlaneEgressMode=CUSTOMER_ROUTED
+```
+
+```bash
+# 既存クラスターへの有効化
+aws eks update-cluster-config \
+  --name existing-cluster \
+  --access-config controlPlaneEgressMode=CUSTOMER_ROUTED
+```
+
+これにより、VPC 内でしか名前解決できない Private な OIDC Provider や Webhook Server に到達できるようになります。Public Endpoint も IP Allowlist の回避策も不要で、本来望んでいた「Private Cluster」設計をそのまま実現できます。
+
+## 具体例: Private な Admission Control
+
+内部サービスのメタデータをもとに Sidecar 設定を注入する Mutating Admission Webhook を考えます。そのメタデータは絶対に社外ネットワークに出したくないとします。
+
+```yaml
+# webhook-config.yaml — CUSTOMER_ROUTED 有効化後は VPC 経由でのみ到達可能
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: sidecar-injector
+webhooks:
+  - name: inject.internal.example.com
+    clientConfig:
+      url: "https://webhook.internal.example.com:8443/mutate"
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+```
+
+この機能が登場する前は、`webhook.internal.example.com` は AWS 管理の Egress 経路から到達できる必要があり、多くの場合それは Public に公開して厳格なアクセス制御をかけるか、そもそも Private な Hostname を使わないことを意味しました。Customer-Routed Egress を使えば、Control Plane からこの URL への呼び出しは自分の ENI を経由するため、Private Hosted Zone に対して名前解決でき、経路もすべて VPC 内で完結します。
+
+## どのような組織が有効化すべきか
+
+これはデフォルトで有効にすべき機能ではなく、そうあるべきでもありません。特に価値を発揮するのは以下のケースです。
+
+- **規制業界**で、特定のワークロードについて Control Plane のトラフィックが AWS 管理経路に触れることを禁じる Data Perimeter 要件がある
+- **Private な Identity Provider** — Internet に公開する想定のない内部 OIDC Issuer を運用している
+- **拡張 API Server や Webhook** が、本来は Private でよいにもかかわらず、Control Plane からの到達性を満たすためだけに Public 化されていた
+
+逆に、Webhook・OIDC Provider・Aggregated API のいずれも Private でないなら、この機能は対応するメリットのないまま運用対象（監視すべき ENI、管理すべき経路）だけを増やすことになります。
+
+## 有効化前に確認すべきこと
+
+**Route Table の網羅性**: ENI のトラフィックは VPC の Route Table に従います。Private Hosted Zone や PrivateLink Endpoint への経路が抜けていると、これまで動いていた Control Plane の呼び出しが静かに失敗します。
+
+**Security Group の範囲**: ENI には Control Plane が実際に行う発信通信を許可する Security Group ルールが必要です。動かすためだけに過度に広い Egress ルールをデフォルトにせず、Webhook や OIDC Provider が実際に使うポートと CIDR に絞ってください。
+
+**Hot Path のレイテンシー**: Admission Webhook は Pod 作成の Critical Path 上にあります。この呼び出しを追加の VPC インフラ経由にすることでネットワークホップが増えるため、Cluster 全体に展開する前に Webhook の応答時間を計測してください。
+
+## webhani の見解
+
+これは、内部の Admission Control や Identity 基盤を持つ、本当の意味で Private な EKS Cluster を構築したいチームにとって、これまで地味に厄介だった穴を塞ぐ機能です。すべてのチームが初日から必要とするものではありませんが、Control Plane の到達性を満たすためだけに Public Endpoint + Allowlist という妥協を強いられてきた金融・医療などの規制業界の Client にとっては、その妥協を完全に解消できます。まずは Staging 環境の Webhook で検証することを勧めます — Route の設定漏れが起きたときの障害は「新しい Pod を Admit できなくなる」という形で現れるため、本番で初めて気づくのは避けたい種類の失敗です。
+
+---
+
+*参考: AWS containers blog, AWS What's New*

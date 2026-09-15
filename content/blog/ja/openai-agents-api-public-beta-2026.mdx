@@ -1,0 +1,80 @@
+---
+title: "OpenAI Agents API — Harness を自作せず「借りる」という選択"
+description: "OpenAI が2026年9月10日、Codex を支える内部 Harness を Agents API として Public Beta 公開しました。何を肩代わりしてくれるのか、そしてどこで自由度と引き換えになるのかを整理します。"
+date: "2026-09-16"
+status: "published"
+tags: ["OpenAI", "AI Agents", "API", "LLM", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "openai-agents-api-public-beta-2026"
+---
+
+## Agent 実装で一番時間を食う部分
+
+LLM Agent を本番運用まで持っていったチームに「一番時間がかかったのはどこか」と聞くと、Prompt ではなく「配管部分」だという答えが多く返ってきます。会話が伸びるにつれて Context を Window 内に収める処理、何を要約し何を残すかの判断、親 Agent の Context を汚さずに Sub-task を別 Agent に委譲する仕組み、Tool 呼び出しの途中で長時間実行 Job が落ちたときの回復、そして今のターンで使わない Tool の Schema にまで Token を浪費しない遅延読み込み — どれも技術的に新しいものではなく、単に地味で、しかも自作すると微妙にバグりやすい部分です。
+
+これまでは Chat Completion API の上に Agent を組むチームが、この配管を全部自前で書く必要がありました。2026年9月10日、OpenAI はこの問題への自社の答えを Public API として公開しました。Codex 系の Coding Agent を動かしているのと同じ Harness を外部から呼べる、Agents API です。
+
+## 実際に肩代わりしてくれること
+
+Agents API は agent・environment・session・events という4つの概念を軸に構成されており、価値の中心はこの4つに関わる面倒な部分を OpenAI 側が引き受けてくれる点にあります。
+
+- **Session Orchestration** — 複数ターン・複数 Tool 呼び出しにまたがる Session を、毎回全履歴を送り直すことなく維持する
+- **Context Compaction** — Session が Context 上限に近づくと自動的に過去のやり取りを圧縮する。独自の要約処理を書く必要はなく、Root Agent と各 Sub-agent でそれぞれ独立して行われる
+- **Sub-agent Coordination** — Root Agent がタスクを分割して Sub-agent に委譲でき、各 Sub-agent は独立した Context を保ちながら並列に動作し、結果を Root に返す
+- **Tool の遅延読み込み** — Tool の Schema はタスクが実際に必要とするタイミングで初めて Context に載る
+- **Crash Recovery** — 長時間実行の Session が途中のステップで失敗しても、それ以前の状態を失わずに済む
+
+実行は OpenAI がホストする Sandbox か、自分で指定した Compute のどちらかで行われ、料金体系は Model の Token、Tool 利用、Sandbox 実行時間のみで、それとは別の Platform 利用料は加算されません。
+
+## イメージをつかむためのコード例（仕様のコピーではなく概念図）
+
+正確な Request/Response Schema は Beta 期間中に変わり続けるはずなので、以下はあくまでパターンを示す例として見てください。
+
+```python
+from openai import OpenAI
+
+client = OpenAI()
+
+session = client.agents.sessions.create(
+    agent="repo-maintainer",
+    environment={"sandbox": "hosted"},
+    tools=["read_file", "run_tests", "open_pull_request"],
+)
+
+client.agents.sessions.send(
+    session_id=session.id,
+    input="payment_service の失敗しているテストを見つけて修正し、PR を作成して。",
+)
+
+for event in client.agents.sessions.stream(session_id=session.id):
+    if event.type == "subagent.spawned":
+        print(f"委譲先: {event.subagent_id}")
+    if event.type == "session.compacted":
+        print("Context を圧縮しました。回収した Token 数:", event.tokens_reclaimed)
+```
+
+注目すべきは `session.compacted` というイベントです。ここは現状、多くのチームが自前実装だとうまく処理できていない箇所そのものです。
+
+## これで置き換わるもの、置き換わらないもの
+
+現状の構成が Chat Completion の上に手作りの Loop を組んだもの — 手動の履歴トリミング、独自のリトライ処理、その場しのぎの Sub-task 生成 — であれば、Agents API はかなりの量の Infrastructure Code を不要にしてくれます。最初に動く Agent までの時間を短縮できるのは間違いありません。
+
+一方で、どこまで制御を手放すかという判断はなくなりません。Managed Harness は OpenAI の判断基準で「何を捨てても安全か」を決めて Context を圧縮し、OpenAI の実行モデルの上で動き、Orchestration ロジックを同社の Platform に固定します。Claude Agent SDK や LangGraph、あるいは複数の Model Provider に対応させる必要がある自作 Harness にすでに投資しているチームにとっては、この利便性がロックインに見合わないケースも多いはずです。
+
+## 実際にどこで使うか
+
+Client の案件で判断するとき、鍵になるのは「複数 Provider への対応が必要か」と「Agent の仕事内容が自作 Orchestration に見合うか」の2点です。
+
+- **向いているケース**: OpenAI を Model として受け入れている Greenfield の社内 Tool や MVP、大規模な Codebase の Migration や複数ファイルにまたがる Refactor、リサーチして要約するような Sub-agent の並列性が本当に効くタスク、そして Harness 実装に何週間もかけたくない場合
+- **向いていないケース**: Client がすでに Anthropic に標準化している、コストや性能に応じて Provider を切り替える必要がある、Session Data や Sandbox 実行の場所に Compliance 上の制約がある場合
+
+## webhani の見解
+
+Agents API は「Agent を作るチームの多くは Orchestration 層を自分で持ちたいわけではなく、Agent の振る舞いだけを制御して Context 管理は誰かに任せたい」という賭けです。社内 Tool や Prototype の多くにとっては妥当な賭けだと思います。一方、数年単位で使い続ける Client 向けサービスについては、Context Compaction の挙動や Sub-agent の連携方法は一度依存すると外しにくい部分なので、Managed Harness への移行コストと Open な構成の柔軟性を比較検討してから採用を決めることを勧めます。
+
+導入を検討しているなら、まずは PR の一次トリアージや Documentation 同期のような、Customer 向けでない社内ワークフローから試すのが安全です。
+
+---
+
+*参考: MarkTechPost, CellCog*
