@@ -1,0 +1,80 @@
+---
+title: "OpenAI's Agents API: Renting a Harness Instead of Building One"
+description: "OpenAI opened its internal agent harness — the same infrastructure behind Codex — as a public API on September 10, 2026. Here's what it actually automates, and when it's worth trading control for speed."
+date: "2026-09-16"
+status: "published"
+tags: ["OpenAI", "AI Agents", "API", "LLM", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "openai-agents-api-public-beta-2026"
+---
+
+## The part everyone skips when they build an agent
+
+Ask any team that has shipped an LLM agent to production what took the longest, and it's rarely the prompt. It's the plumbing: keeping a session's context under the model's window as the conversation grows, deciding when and how to summarize without losing something load-bearing, coordinating a sub-task to a second agent without polluting the parent's context, recovering cleanly when a long-running job dies mid-tool-call, and loading tool definitions lazily so you're not burning tokens on schemas the model never uses this turn.
+
+None of that is novel engineering. It's just tedious, easy to get subtly wrong, and — until now — something every team building on top of a raw chat completion API had to write themselves. On September 10, 2026, OpenAI put its own internal answer to that problem behind a public API: the Agents API, in public beta, exposing the same harness that runs its Codex-style coding agents.
+
+## What the API actually hands you
+
+The Agents API is organized around four concepts — agent, environment, session, and events — and the value proposition is that OpenAI manages the hard parts across all four:
+
+- **Session orchestration.** A session persists across many turns and tool calls without the caller re-sending the full history each time.
+- **Context compaction.** As a session approaches its context limit, the harness compacts earlier turns automatically. You don't write your own summarization pass, and it happens independently for the root agent and for each sub-agent.
+- **Sub-agent coordination.** A root agent can delegate a piece of work to a sub-agent that keeps its own isolated context, runs in parallel with other sub-agents, and reports results back for the root to merge.
+- **Lazy tool loading.** Tool schemas are only pulled into context when a task actually needs them, instead of sitting in every request regardless of relevance.
+- **Crash recovery.** Long-running sessions can survive a failed step without losing everything before it.
+
+Execution happens either in an OpenAI-hosted sandbox or in compute you point it at yourself, and pricing is model tokens, tool usage, and any hosted sandbox time — no separate platform fee on top.
+
+## A representative shape (illustrative, not a spec copy)
+
+The exact request/response schema is beta and will keep shifting, so treat this as an illustration of the pattern rather than a copy-pasteable reference:
+
+```python
+from openai import OpenAI
+
+client = OpenAI()
+
+session = client.agents.sessions.create(
+    agent="repo-maintainer",
+    environment={"sandbox": "hosted"},
+    tools=["read_file", "run_tests", "open_pull_request"],
+)
+
+client.agents.sessions.send(
+    session_id=session.id,
+    input="Find and fix the failing test in payment_service, then open a PR.",
+)
+
+for event in client.agents.sessions.stream(session_id=session.id):
+    if event.type == "subagent.spawned":
+        print(f"delegated to: {event.subagent_id}")
+    if event.type == "session.compacted":
+        print("context compacted, tokens reclaimed:", event.tokens_reclaimed)
+```
+
+The interesting line there is `session.compacted` — that's the event most teams currently implement badly themselves, if they implement it at all.
+
+## What this replaces, and what it doesn't
+
+If your current stack is a hand-rolled loop around chat completions — manual history trimming, your own retry logic, ad-hoc sub-task spawning — the Agents API removes a meaningful amount of infrastructure code. That's a real win for time-to-first-working-agent.
+
+What it doesn't remove is the decision about how much control you're willing to give up. A managed harness compacts context using OpenAI's judgment about what's safe to drop, runs in OpenAI's execution model, and locks your orchestration logic to their platform. Teams already invested in a provider-agnostic stack — the Claude Agent SDK, LangGraph, or a custom harness that needs to run against multiple model providers — will find the convenience doesn't offset the lock-in.
+
+## Where we'd actually reach for it
+
+In client work, the calculus comes down to two questions: does the team need multi-provider flexibility, and does the agent's job justify writing custom orchestration.
+
+- **Good fit:** a greenfield internal tool or MVP where OpenAI is the accepted model choice, the task genuinely benefits from sub-agent parallelism (large codebase migrations, multi-file refactors, research-and-summarize pipelines), and the team wants to skip weeks of harness engineering.
+- **Poor fit:** anything where the client has already standardized on Anthropic, needs to swap providers based on cost or capability, or has compliance requirements around where session data and sandboxed execution run.
+
+## webhani's take
+
+The Agents API is a bet that most teams building agents don't want to own an orchestration layer — they want to own the agent's behavior and let someone else handle context management. That's a reasonable bet for a large slice of internal tooling and prototype work. For anything client-facing with a multi-year lifespan, we'd still weigh the migration cost of a managed harness against the flexibility of an open one before committing, since context-compaction logic and sub-agent coordination are exactly the pieces that are painful to rip out once a product depends on their specific behavior.
+
+If you're evaluating this for a project, start with a non-critical internal workflow — something like automated PR triage or a documentation-sync agent — before routing anything customer-facing through it.
+
+---
+
+*Sources: [MarkTechPost](https://www.marktechpost.com/2026/09/10/openai-launches-the-agents-api-in-public-beta-putting-the-codex-harness-behind-one-api-call/), [CellCog](https://cellcog.ai/blog/openai-agents-api/)*
