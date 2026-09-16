@@ -1,0 +1,76 @@
+---
+title: "Gemini 3.8 Live: 会話しながらバックグラウンドで作業する Voice AI"
+description: "Google DeepMind が9月15日にリリースした Gemini 3.8 Live と Live Extended Thinking は、台本通りに応答するだけの Voice Assistant を超えて、会話の途中で推論しツールを呼び出す Agent へと進化しました。Voice Interface を作る立場から見た変化点を整理します。"
+date: "2026-09-17"
+status: "published"
+tags: ["Gemini", "Google DeepMind", "Voice AI", "LLM", "AI Agents"]
+thumbnail: ""
+author: "webhani"
+slug: "gemini-3-8-live-extended-thinking-voice-ai-2026"
+---
+
+## 「Voice Assistant」と「Voice Agent」の間にあるGap
+
+多くの Voice Interface は、今も15年前の IVR とそれほど変わらない構造で動いています。ユーザーが話す、システムが聞くのを止めて処理する、そして応答する。残高照会やドキュメント検索、API 呼び出しといった実際の作業は、その「無音の間」に押し込まれていて、処理が長引くほど会話としての自然さが崩れていきます。
+
+2026年9月15日、Google DeepMind は Gemini 3.8 Live と Gemini 3.8 Live Extended Thinking という2つの対話モデルをリリースしました。この Update の本質は「より自然な声になった」ことではなく、モデルが黙って考え込むのではなく、話し続けながらバックグラウンドで Tool Call や複数Stepの推論を実行できるようになった点にあります。
+
+## 実際にリリースされたもの
+
+2つのモデルは、想定するWorkloadで役割が分かれています。
+
+- **Gemini 3.8 Live**: Scale と Cost 効率を重視したモデル。滑らかな対話、リアルタイムの視覚的グラウンディング、97言語対応の会話途中の言語切り替えに対応しています。
+- **Gemini 3.8 Live Extended Thinking**: 会話を続けながら、応答の前後でより深く推論する必要がある複雑な複数Stepタスク向けです。
+
+両モデルとも Gemini API、Google AI Studio、Gemini Enterprise、Search Live、Gemini Live、Google Workspace に順次展開されています。Artificial Analysis の Speech-to-Speech Quality Index では Extended Thinking が82.6のスコアで上位に位置し、Google はエージェント的なタスクを測る τ-Voice Benchmark で68.6%、Sierra の τ-Voice-banking Benchmark で35.1%、Big Bench Audio で97.7%という数値を公表しています。開発元自身が出すBenchmarkは割り引いて見る必要がありますが、「音声のみで完結する複数Stepのエージェント的タスクに強い」という主張の方向性自体は注目に値します。
+
+## 本当の変化点は「バックグラウンド処理」にある
+
+Voice Bot を作った経験があれば分かる通り、面倒なのは意図認識そのものではなく、時間のかかる処理中の状態管理です。保留音を流すのか、進捗を実況するのか、Tool Call が終わる前にユーザーが話し始めたらどうするのか——こうした問題が常について回ります。
+
+会話を継続しながら本当に Tool Call を実行できるモデルは、この設計課題そのものを変えます。厳密な Turn-taking の State Machine(聞く → 考える → 実行する → 応答する)ではなく、会話の Thread とタスクの Thread が並行して進み、Tool の結果が届いた時点で合流する「並行状態」を設計することになります。これは電話の分岐メニューを作るというより、Streaming と Optimistic Update を持つ Chat UI を設計する感覚に近いものです。
+
+特定の SDK に依存しない、この Flow の形を示す簡略化した例です。
+
+```javascript
+async function handleVoiceTurn(session, userAudio) {
+  const { transcript, intent } = await session.transcribe(userAudio);
+
+  if (intent.requiresBackgroundTool) {
+    // 発話への応答をブロックせずに Tool Call を発火する
+    const toolPromise = session.callTool(intent.tool, intent.args);
+
+    // Promise が解決する間もモデルは会話を継続できる
+    const holdingReply = await session.respond({
+      style: "acknowledge_and_continue",
+      context: transcript,
+    });
+
+    const toolResult = await toolPromise;
+    await session.respond({
+      style: "deliver_result",
+      result: toolResult,
+    });
+  } else {
+    await session.respond({ context: transcript });
+  }
+}
+```
+
+このコード自体が実際の API 仕様というわけではなく、伝えたいのは新しい課題の形です。1回のユーザー発話に対して2つの応答Eventが紐づくこと、そして「つなぎの応答」が間延びして聞こえないようにする UX 上の判断が必要になることです。
+
+## 本当に有用な場面と、まだ慎重になるべき場面
+
+音声ベースの Customer Support、社内向け Ops Assistant(「注文状況を確認しながら配送日を変更して」)、多言語対応の受付自動化などは分かりやすい適用先です。これまで無音が発生していた実際の Backend 呼び出しを伴うタスクだからです。Extended Thinking が Banking 向け Benchmark を打ち出している点からも、Google が口座操作のような規制業界のユースケースを意識しているのが伺え、Fintech や 保険 業界であれば注目しておく価値があります。
+
+一方で慎重になるべき点もあります。リアルタイムの音声処理は、既存の Voice AI 導入で問われる Privacy や Data Residency の問題を同様に伴います——音声がどこで処理され、何が保持され、それが Client の Compliance 要件を満たすのかという点です。また、開発元が公表する Agentic Benchmark は評価の出発点にはなっても、自社の実際の Call Flow、特にモデルが得意としない専門用語や訛りを含む会話での検証の代わりにはなりません。
+
+## webhani の見解
+
+ここで注目すべきは「Voice AI が賢くなった」という Slogan ではなく、Interaction Model そのものが厳密な Turn-taking から「会話とタスク実行の並行処理」へと変わったことです。これは、どのモデルを呼ぶかという選択以上に、Voice Product 裏側の State Machine の設計に実質的な影響を与えます。
+
+導入を検討する場合、いきなり Customer 向けの実運用から始めるべきではありません。注文状況の確認やサポートチケットの一次仕分けといった、社内向けでリスクの低い Workflow で Pilot 導入し、「話しながら作業する」パターンが実際の Latency や Backend 障害の中でどう振る舞うかを観察してから、Customer との通話に適用することをお勧めします。
+
+---
+
+*Sources: [Unite.AI](https://www.unite.ai/google-launches-gemini-3-8-live-and-extended-thinking-voice-models/), [Google DeepMind Model Card](https://deepmind.google/models/model-cards/gemini-3-8-audio/), [TestingCatalog](https://www.testingcatalog.com/google-rolled-out-gemini-3-8-live-and-extended-thinking/)*

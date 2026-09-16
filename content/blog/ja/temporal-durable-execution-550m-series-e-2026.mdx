@@ -1,0 +1,52 @@
+---
+title: "Temporal の評価額1.25兆円が示す「Durable Execution」再注目の理由"
+description: "Temporal は2026年9月、Series E で550億円を調達し評価額125.5億ドルに達しました。処理量も1年で3倍以上に伸びています。AI Agent がクラッシュ後も処理を継続できる Infrastructure を求めていることが背景にあります。その中核にある Durable Execution Pattern を、導入すべき場面とあわせて整理します。"
+date: "2026-09-17"
+status: "published"
+tags: ["Temporal", "Durable Execution", "Backend Architecture", "Workflow Orchestration", "AI Agents"]
+thumbnail: ""
+author: "webhani"
+slug: "temporal-durable-execution-550m-series-e-2026"
+---
+
+## 長時間 Workflow が必ずぶつかる障害パターン
+
+決済 Flow を想像してください。カードに課金し、在庫を確保し、確認メールを送り、配送処理を開始する——この一連の処理が、課金は成功したもののメール送信前に Process が落ちたとします。Workflow 全体をやり直して二重課金のリスクを冒すのか、クラッシュしうる箇所ごとに個別の復旧ロジックを書くのか。多くのチームは、Idempotency Key や Dead-letter Queue、そして「そこで落ちませんように」という願いのパッチワークで乗り切っているのが実情です。
+
+今月のあるFunding Newsは、まさにこの課題領域に関するものでした。OSSのDurable Execution Engineを開発する Temporal が、2026年9月中旬に Series E で5億5千万ドル(約8,250億円)を調達し、評価額125.5億ドルに達したというNewsです。Lightspeed が主導し、Wellington Management、Goldman Sachs Alternatives の Growth Equity 部門、Tiger Global が参加しました。評価額は2026年2月の Series D 時点の50億ドルから、わずか7ヶ月で2倍以上に膨らんでいます。金額以上に興味深いのは、Temporal が2026年8月に1.9兆件の課金対象Actionを処理したと報告している点です。前年同期比で350%以上の増加、有料顧客数も139%増の4,300社超に達しており、AI Lab によるAgent Workloadの急拡大が、1年足らずでの利用急増として語られています。
+
+## 「Durable Execution」が実際に意味すること
+
+Marketing的な文言を取り除くと、Durable Execution は上記のクラッシュ復旧問題に対する具体的な解答です。Workflow を通常の逐次処理コードとして書きますが、各Stepの結果が完了と同時にDurableに記録されます。Process がクラッシュしても、ゼロからやり直すのではなく、最後に完了したStepまで Replay して、そこから再開します。すでに発生した副作用を再実行することはありません。
+
+ここで重要なのは「再実行を伴わない Replay」という性質です。素朴な「Job全体をリトライする」アプローチは、すでに成功した部分も含めてすべてを再実行してしまい、それこそが二重課金やメール重複送信の原因になります。Durable Execution Engine は Step 単位で進捗を追跡するため、復旧は「続きから」であり「最初から」ではありません。
+
+特定の Vendor の SDK に依存しない、この Pattern の形を示す簡略化した例です。
+
+```python
+def checkout_workflow(order):
+    payment = step("charge_card", charge_card, order.card, order.total)
+    step("reserve_inventory", reserve_inventory, order.items)
+    step("send_confirmation", send_email, order.customer_email, payment.receipt_id)
+    step("start_fulfillment", enqueue_fulfillment, order.id)
+```
+
+各 `step()` 呼び出しが、Engine が完了を記録するPointです。`charge_card` が完了した後、`reserve_inventory` が始まる前に Process が落ちた場合、Workflow を再開すると処理は直接 `reserve_inventory` から始まり、`charge_card` が再度呼ばれることはありません。この一点こそが、Job全体を再配信するだけの Queue + Retry 構成との決定的な違いです。
+
+## なぜ AI Agent がこの波を牽引しているのか
+
+Agent Workload は、この課題を特に顕在化させやすい性質を持っています。Temporal のFunding報道で AI Infrastructure需要が成長要因として挙げられているのも、おそらくそのためです。複数のTool Callにまたがってトピックを調査し、文書を作成し、承認を求め、送信する——こうした複数Stepの Agent Task は数分から数時間動き続け、実際に副作用を伴う複数の外部Systemに触れ、通常のWeb Requestよりも処理途中で失敗しやすくなります。単純に「やることが多く、待ち時間も長い」からです。クラッシュ後にAgentのTool Callを最初からやり直すのは無駄というだけでなく、そのTool Callがメッセージ送信や送金を伴っていた場合、実害につながります。
+
+## 導入すべき場面と、過剰な場面
+
+Durable Execution Framework は、実運用上のSurfaceを確実に増やします。動かすべき Workflow Engine、独自の制約(決定論的な Workflow コード、実行中Workflowに対するVersioning規律)を持つ新しいProgramming Model、そしてチームの学習コストです。このコストを払う価値があるのは、Workflow が長時間(数分〜数日)動き続け、副作用を伴う複数のServiceや外部APIをまたぎ、再実行のコストやリスクが高く、Process再起動やDeploymentをまたいで手動介入なしに継続する必要がある場合です。
+
+逆に、単一Serviceで完結する短時間の処理であれば過剰投資です。単純な Idempotency Key と Backoff付きRetryだけで正しさが担保できる場面に Workflow Engine を持ち込んでも、複雑さに見合う見返りは得られません。AWS Step Functions のようなManaged Serviceはその中間に位置し、Programming Modelの柔軟性は劣るものの、そのCloudにすでにCommitしているなら運用負担は軽くなります。
+
+## webhani の見解
+
+今回のFunding額そのものは見出しにすぎません。その裏にある本質的なSignalは、「長時間動き、副作用が多く、クラッシュしても必ず継続しなければならない」Workloadが——主にAgentic AIの普及によって——専用の実行Modelを採用する価値があると判断されるほど一般的になってきたという点です。Client案件では「そのWorkflowを途中で部分的に再実行したら、危険あるいは高コストになるか」を判断基準にしています。答えがYesで、かつ複数Serviceにまたがるなら、Durable Execution Engineはその複雑さに見合う価値があります。答えがNoなら、Idempotentな Job と素朴な Queue で十分です。Retry Loopで正しく処理できることのために、新しい実行Modelを持ち込む必要はありません。
+
+---
+
+*Sources: [GeekWire](https://www.geekwire.com/2026/temporal-raises-550m-hits-12-55b-valuation-as-agentic-ai-wave-fuels-massive-growth/), [Temporal](https://temporal.io/blog/temporal-raises-usd550m-series-e-at-usd12-55b-valuation-ai), [Forkast](https://forkast.news/temporal-raises-550m-at-12-55b-valuation-signaling-durable-execution-as-core-agent-infrastructure/)*
