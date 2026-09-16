@@ -1,0 +1,76 @@
+---
+title: "Gemini 3.8 Live: 대화하면서 Background에서 일하는 Voice AI"
+description: "Google DeepMind가 9월 15일 공개한 Gemini 3.8 Live와 Live Extended Thinking은 정해진 대본대로 응답하던 Voice Assistant를 넘어, 대화 도중 추론하고 Tool을 호출하는 Agent로 진화했습니다. Voice Interface를 만드는 입장에서 무엇이 달라지는지 정리합니다."
+date: "2026-09-17"
+status: "published"
+tags: ["Gemini", "Google DeepMind", "Voice AI", "LLM", "AI Agents"]
+thumbnail: ""
+author: "webhani"
+slug: "gemini-3-8-live-extended-thinking-voice-ai-2026"
+---
+
+## "Voice Assistant"와 "Voice Agent" 사이의 간극
+
+대부분의 Voice Interface는 여전히 15년 전 IVR과 크게 다르지 않은 방식으로 동작합니다. 사용자가 말하면 System이 듣기를 멈추고 처리한 뒤 응답합니다. 잔액 조회, 문서 검색, API 호출처럼 실제 작업이 필요한 부분은 이 "무음 구간"에 몰려 있고, 처리 시간이 길어질수록 대화라는 착각은 쉽게 깨집니다.
+
+2026년 9월 15일, Google DeepMind는 Gemini 3.8 Live와 Gemini 3.8 Live Extended Thinking이라는 두 개의 대화 Model을 공개했습니다. 이번 Update의 핵심은 "목소리가 더 자연스러워졌다"가 아니라, Model이 침묵한 채 생각하는 대신 계속 대화를 이어가면서 Background에서 Tool Call과 여러 단계의 추론을 수행할 수 있게 됐다는 점입니다.
+
+## 실제로 공개된 내용
+
+두 Model은 처리하려는 Workload에 따라 역할이 나뉩니다.
+
+- **Gemini 3.8 Live**: Scale과 비용 효율성에 초점을 맞춘 Model로, 자연스러운 대화 흐름, 실시간 시각 정보 처리, 97개 언어를 대화 중간에 전환하는 기능을 지원합니다.
+- **Gemini 3.8 Live Extended Thinking**: 대화를 이어가면서도 응답 전후로 더 깊게 추론해야 하는 복잡한 다단계 작업을 대상으로 합니다.
+
+두 Model 모두 Gemini API, Google AI Studio, Gemini Enterprise, Search Live, Gemini Live, Google Workspace에 순차적으로 적용되고 있습니다. Artificial Analysis의 Speech-to-Speech Quality Index에서 Extended Thinking은 82.6점으로 상위권에 올랐고, Google은 Agent형 작업을 측정하는 τ-Voice Benchmark에서 68.6%, Sierra의 τ-Voice-banking Benchmark에서 35.1%, Big Bench Audio에서 97.7%라는 수치를 공개했습니다. Vendor가 직접 발표한 Benchmark는 어느 정도 감안해서 봐야 하지만, "음성만으로 이루어지는 다단계 Agent 작업에 강하다"는 주장의 방향성 자체는 주목할 만합니다.
+
+## 진짜 변화는 "Background 작업"에 있다
+
+Voice Bot을 만들어본 경험이 있다면 알겠지만, 까다로운 부분은 의도 인식 자체가 아니라 처리 시간이 긴 작업 중의 상태 관리입니다. 대기음을 틀 것인가, 진행 상황을 말해줄 것인가, Tool Call이 끝나기 전에 사용자가 말을 걸면 어떻게 할 것인가 — 이런 문제가 항상 따라붙습니다.
+
+대화를 계속하면서 실제로 Tool Call을 실행할 수 있는 Model은 이 설계 문제 자체를 바꿉니다. 엄격한 Turn-taking 방식의 State Machine(듣기 → 생각 → 실행 → 응답) 대신, 대화 Thread와 작업 Thread가 독립적으로 진행되다가 Tool 결과가 도착하는 시점에 합쳐지는 "병렬 상태"를 설계해야 합니다. 이는 전화 분기 메뉴를 만드는 것보다 Streaming과 Optimistic Update를 갖춘 Chat UI를 설계하는 감각에 더 가깝습니다.
+
+특정 SDK에 종속되지 않은, 이 Flow의 형태를 보여주는 단순화한 예시입니다.
+
+```javascript
+async function handleVoiceTurn(session, userAudio) {
+  const { transcript, intent } = await session.transcribe(userAudio);
+
+  if (intent.requiresBackgroundTool) {
+    // 응답을 Block하지 않고 Tool Call을 실행
+    const toolPromise = session.callTool(intent.tool, intent.args);
+
+    // Promise가 처리되는 동안에도 Model은 대화를 계속할 수 있음
+    const holdingReply = await session.respond({
+      style: "acknowledge_and_continue",
+      context: transcript,
+    });
+
+    const toolResult = await toolPromise;
+    await session.respond({
+      style: "deliver_result",
+      result: toolResult,
+    });
+  } else {
+    await session.respond({ context: transcript });
+  }
+}
+```
+
+이 코드는 실제 API 규격이 아니라, 새로운 문제의 형태를 보여주기 위한 것입니다. 하나의 사용자 발화에 두 개의 응답 Event가 연결되고, "이어주는 응답"이 늘어지게 들리지 않도록 하는 UX 판단이 필요해진다는 점입니다.
+
+## 실제로 유용한 곳, 아직은 신중해야 할 곳
+
+음성 기반 Customer Support, 사내 Ops Assistant("주문 상태 확인하면서 배송일 변경해줘"), 다국어 대응 안내 자동화 같은 곳이 분명한 적용 대상입니다. 실제 Backend 호출이 필요해서 기존에는 어색한 무음이 발생하던 작업들이기 때문입니다. Extended Thinking이 Banking Benchmark를 전면에 내세운 점을 보면 Google이 계좌 관련 업무 같은 규제 산업 Use Case를 염두에 두고 있다는 것을 알 수 있고, Fintech나 보험 업계라면 눈여겨볼 만합니다.
+
+반면 신중해야 할 부분도 있습니다. 실시간 음성 처리는 기존 Voice AI 도입에서도 늘 제기되던 Privacy와 Data Residency 문제를 그대로 안고 있습니다 — 음성이 어디서 처리되고, 무엇이 보관되며, 그것이 Client의 Compliance 요건을 충족하는지입니다. 또한 Vendor가 공개한 Agentic Benchmark는 평가의 출발점일 뿐, 자사의 실제 Call Flow, 특히 Model이 강하지 않은 전문 용어나 억양이 섞인 대화에서의 검증을 대체할 수는 없습니다.
+
+## webhani의 견해
+
+여기서 주목해야 할 것은 "Voice AI가 똑똑해졌다"는 Slogan이 아니라, Interaction Model 자체가 엄격한 Turn-taking에서 "대화와 작업 실행의 병렬 처리"로 바뀌었다는 점입니다. 이는 어떤 Model을 호출할지 고르는 것 이상으로, Voice Product 뒤에 있는 State Machine 설계에 실질적인 영향을 미칩니다.
+
+도입을 검토 중이라면 처음부터 Customer 대상 실서비스로 시작하지 않는 것을 권합니다. 주문 상태 확인이나 Support Ticket 1차 분류처럼 사내에서 Risk가 낮은 Workflow로 먼저 Pilot을 진행해, "대화하면서 작업하는" 패턴이 실제 Latency와 Backend 장애 상황에서 어떻게 동작하는지 관찰한 뒤 Customer 통화에 적용하는 것이 안전합니다.
+
+---
+
+*Sources: [Unite.AI](https://www.unite.ai/google-launches-gemini-3-8-live-and-extended-thinking-voice-models/), [Google DeepMind Model Card](https://deepmind.google/models/model-cards/gemini-3-8-audio/), [TestingCatalog](https://www.testingcatalog.com/google-rolled-out-gemini-3-8-live-and-extended-thinking/)*
