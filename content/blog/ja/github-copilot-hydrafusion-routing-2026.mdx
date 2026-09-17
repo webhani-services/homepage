@@ -1,0 +1,57 @@
+---
+title: "GitHub Copilot の Project HydraFusion：答えを見る前に複数の Model に議論させる"
+description: "Copilot CLI の Project HydraFusion は、Task ごとに Single・Cascade・Critique という 3 つの実行パターンを自動選択します。単純な Model 選択と何が違うのかを整理します。"
+date: "2026-09-18"
+status: "published"
+tags: ["GitHub Copilot", "AI Coding Assistant", "DevOps", "LLM", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "github-copilot-hydrafusion-routing-2026"
+---
+
+AI Coding Tool で「どの Model を使うか」という判断は、多くの場合 Dropdown 一つで済まされています。定型作業には安くて速い Model、行き詰まったら高価で強力な Model に切り替える、というシンプルな運用です。GitHub の Project HydraFusion は、Copilot CLI で Research Preview 中の機能ですが、これをそもそも違う問いとして扱います。セッション単位で Model を選ぶのではなく、Task ごとに *実行パターン* を選び、1 回のターンの中で複数の Model を使うという発想です。
+
+## 核となるアイデア：Model 一つではなく 3 つのパターン
+
+HydraFusion は Copilot CLI の `/experimental` 設定から、他の Model と同じように選択できます。ただし内部では、Task ごとに次の 3 パターンのどれを実行するかを判断しています。
+
+- **Single** — 選択された Model 一つが直接 Task を解く。Orchestration のオーバーヘッドなし。推論の深さや Tool 利用の複雑さといった Capability Signal から、単一の有能な Model で十分と判断された場合に使われる
+- **Cascade** — まず安価で効率的な Model が Draft を作成する。その後 Quality Gate がその Draft を採用するか、より強力な Model にエスカレーションするかを判断する。単純な Refactor や定型作業の多くはこの安価な段階で解決する
+- **Critique** — ある Model が Draft を作成し、*別の Model Family* に属する第二の Model が Read-only の Critic としてレビューし、そのレビューを踏まえて元の Model が一度だけ修正する
+
+アーキテクチャとして興味深いのは Critique パターンです。同じ Family のより大きな Model ではなく、あえて別 Family の Model を Critic にしているのは、単一 Model の Blind Spot に対する意図的なヘッジです。同じ学習系統の Model 同士は失敗のパターンも似通いがちですが、本当に異なる Model であれば、最初の Model が自信を持って間違えているケースを拾える可能性が高くなります。
+
+## 実際の使い方
+
+```bash
+# 固定 Model ではなく HydraFusion を選択する
+copilot config set model hydrafusion --experimental
+
+# 定型的な Task は Single か安価な Cascade Draft で解決する可能性が高い
+copilot "このモジュール全体で変数をリネームし、JSDoc も更新して"
+
+# 要件が曖昧な Task は Critique を Trigger しやすい
+copilot "この認証 Middleware を、既存のルートを壊さずに JWT と Session Cookie の両方に対応させてリファクタリングして"
+```
+
+どのパターンを使うかは自分では選べません。HydraFusion の Routing Model が Prompt から Capability Signal（推論の深さの見積もり、コード生成の複雑さ、デバッグか実装か、Tool 利用の必要性など）を読み取り、パフォーマンス・コスト・レイテンシのバランスを最適化するワークフローを選びます。
+
+## 注目すべき数字
+
+GitHub 社内の CheckpointBench では、HydraFusion はトップクラスの Frontier Model 単体の性能に対して 0.1 ポイント差まで肉薄しつつ、コストは約 65% 低く抑えられています。この差は、日常的なコーディング作業の大半において、単純な Task を安価な Model にルーティングし必要な場合のみエスカレーションすることによるコスト削減効果が、Model を 2 つ使うことによるレイテンシコストを上回るのに十分小さい水準です。
+
+ただしこの数字が示さないトレードオフもあります。Cascade と Critique はどちらも、同じトップ Model への Single 呼び出しと比べてレイテンシが増えます。エスカレーションされる Task では Draft と Review の往復コストを支払うことになるためです。Inline Completion のようなレイテンシに敏感な対話的用途ではこのオーバーヘッドは実質的なコストになりますが、レイテンシよりコストあたりの出力品質が重要な自律的なバックグラウンド Task であれば、ほぼ無視できるコストです。
+
+## 手動での Model 切り替えとの違い
+
+多くのエンジニアはすでにこれに近いことを手動でやっています。速い Model から始めて、明らかに詰まったら強い Model にエスカレーションするというやり方です。HydraFusion の価値は、このエスカレーション判断が悪い回答を実際に見た *後* ではなく、Task の Signal に基づいて *事前に* 行われる点にあります。悪い回答を見てから一往復無駄にすることがなくなります。Critique パターンはさらに一歩踏み込んでいて、多くのエンジニアは「解けた Task をわざわざ別の Model Family でもう一度検証する」ことを習慣的にはやっていません。しかし実はそれこそが、Review に届く前に微妙なバグを拾える種類のチェックです。
+
+## webhani の見解
+
+これはまだ Research Preview であり、注意すべき失敗モードは、Critique を Trigger するほど曖昧だが実際には Critique が必要なほど複雑ではない Task に対して Routing のオーバーヘッドが発生するケースです。単一の有能な Model がすでに正解していたはずのことに対して、第二 Model の意見のコストを払うことになります。レイテンシに敏感な Workflow でデフォルトとして推奨する前に、Routing 判断の Telemetry を見てみたいところです。
+
+一方で、自動 Refactor・依存関係の更新・スクリプト化された Migration など、1 秒未満の対話的応答が求められず、Model 選択に付きっきりにならずに正しい答えを得ることが重要な Batch・CI 駆動のコーディング Task であれば、今すぐ試す価値があります。常にトップ Model を使い続ける場合に近い品質を、その一部のコストで実現できるというコストプロファイルは、対話的な即時応答を必要としないあらゆる用途に対して妥当なデフォルトと言えます。
+
+Sources:
+- [Project HydraFusion: Frontier quality via multi-model orchestration — The GitHub Blog](https://github.blog/ai-and-ml/github-copilot/project-hydrafusion-frontier-quality-via-multi-model-orchestration/)
+- [GitHub Copilot's Project HydraFusion Promises Frontier Level Performance through Multi-Model Routing — InfoQ](https://www.infoq.com/news/2026/09/github-hydrafusion/)

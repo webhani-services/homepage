@@ -1,0 +1,84 @@
+---
+title: "Claude Code의 plugin eval 명령어: '이 Plugin, 진짜 도움이 되나?'에 드디어 답할 수 있게 됐습니다"
+description: "Claude Code 2.1.269에 추가된 plugin eval 명령어는 Plugin 없이 실행한 Baseline과 비교해 점수를 매겨줍니다. 작동 방식과 사내 Skill을 선별하는 데 어떻게 쓰는지 소개합니다."
+date: "2026-09-18"
+status: "published"
+tags: ["Claude Code", "AI Coding Assistant", "Testing", "DevOps", "Anthropic"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-plugin-eval-2026"
+---
+
+저희는 Blog 생성 Pipeline용, Infra Scaffolding용, Commit Message 형식을 강제하는 용도까지 작은 Claude Code Plugin 모음을 사내에서 운영하고 있습니다. 그런데 지금까지는 이 Plugin들이 실제로 Claude의 출력을 개선하는지, 아니면 그냥 실행을 느리고 비싸게만 만드는지 엄밀하게 판단할 방법이 없었습니다. Transcript를 눈으로 훑어보고 "그럭저럭 괜찮네" 정도로 넘어가는 게 현실이었습니다.
+
+Claude Code 2.1.269에 이 공백을 메우는 `claude plugin eval` 명령어가 추가되었습니다. 여러 Prompt에 대해 Plugin을 실행하고 출력을 채점한 뒤, 그 Plugin을 로드하지 않은 Baseline 실행과 비교합니다. "이 Skill이 효과가 있는 것 같다"는 감으로 남아있던 판단을 PR 설명에 적어 넣을 수 있는 숫자로 바꿔주는 셈입니다.
+
+## 이 명령어가 실제로 하는 일
+
+`plugin eval` 실행은 Case 단위로 구성됩니다. 각 Case는 실제로 그 Plugin에 보냈던 현실적인 Prompt와, 좋은 출력·나쁜 출력이 어떤 모습인지에 대한 설명으로 구성됩니다. Claude는 Plugin을 로드한 상태와 로드하지 않은 상태 각각에서 여러 번 실행한 뒤 두 결과를 채점합니다.
+
+```bash
+# 실제 사용 이력으로부터 Eval Case를 자동 생성하고 전체 Suite를 실행합니다
+claude plugin eval init
+claude plugin eval run
+```
+
+`plugin eval init`은 대상 Plugin을 분석해 Case와 채점 기준 후보를 자동으로 초안 작성해 줍니다. Full Run은 Baseline과 Plugin 양쪽에서 실제 Model 호출이 발생하는 만큼 비용이 들기 때문에, 본격 실행 전에 한 번 시험 실행부터 거치는 구조입니다.
+
+## Grader: 여기서 말하는 "좋은 출력"이란
+
+Eval Framework는 여러 Grader Type을 지원하며, 하나의 Suite 안에서 섞어 쓸 수 있습니다.
+
+- **Regex Match** — 응답에 특정 Pattern이 포함되어 있는지(또는 포함되어 있지 않은지)
+- **Tool Call Check** — 해당 Skill이 원래 Trigger해야 할 Tool을 실제로 호출했는지
+- **Rubric Grading** — 다른 Model이 작성된 Rubric을 기준으로 응답을 평가
+- **Transcript / File Inspection** — 최종 응답뿐 아니라 실행 중 생성된 File이나 전체 Transcript도 Grader가 검사 가능
+
+이 중 Tool Call Check가 생각보다 훨씬 중요했습니다. 저희 입장에서 진짜 궁금했던 건 "Commit Format용 Skill이 실제로 Trigger됐는가"였지, 개별 Commit Message가 겉보기에 깔끔한가가 아니었기 때문입니다. Rubric Grading만 썼다면, Skill이 전혀 Trigger되지 않았는데도 우연히 그럴듯한 Message가 나온 경우를 놓쳤을 겁니다.
+
+## 최소 구성 Eval Case
+
+```yaml
+# evals/commit-format.yaml
+name: "conventional commit prefix를 강제하는지 확인"
+prompt: "이 Diff에 대한 Commit Message를 작성해줘: SES 메일 발송 로직에 재시도 처리 추가"
+graders:
+  - type: tool_call
+    tool: "Bash"
+    pattern: "git commit -m"
+  - type: regex
+    target: reply
+    pattern: "^(feat|fix|refactor)\\(.+\\): "
+  - type: rubric
+    criteria: "요약 줄이 72자 이내이고, 변경한 File이 아니라 변경 내용을 설명한다"
+```
+
+`--runs 6`으로 실행하면 Plugin 적용 3회, Baseline 3회의 시도를 얻게 되므로 한 번의 운 좋은(혹은 운 나쁜) 생성 결과만으로 결론이 나지 않습니다.
+
+## 비용은 공짜가 아니며, 그게 핵심입니다
+
+모든 실행이 실제 Model 호출이고 이를 다시 다른 Model 호출로 채점하기 때문에, 비용은 "Case 수 × Case당 실행 횟수 × 사용 Model"로 결정됩니다. Anthropic이 공개한 예시로는 7개 Case, 각 6회 실행에 $9.59, Case당 1.37달러가 채 안 되는 수준이었습니다. 몇 달간 매 Session마다 로드할 Plugin을 검증하는 데는 저렴한 비용이지만, Commit마다 돌아가는 촘촘한 CI Loop에 넣기에는 부담이 됩니다.
+
+저희는 Prompt나 채점 로직을 변경했을 때, 그리고 Claude의 새 Model이 출시됐을 때 Full Suite를 실행하는 방식으로 운영하고 있습니다. `main` Merge Gate로는 가벼운 CI Job을 걸어두었지만, 모든 Push마다 Full Suite를 돌리지는 않습니다. 새로운 Signal 없이 비용만 늘어나기 때문입니다.
+
+## CI Gate로서의 활용
+
+이 명령어의 본래 목적은 Regression 감지입니다. Prompt를 수정한 뒤에도 해당 Skill이 예전과 같은 방식으로 계속 Trigger되는지, 그리고 Model이 Upgrade된 뒤에도 살아남는지 확인하는 것입니다. 둘 다 저희가 실제로 겪었던 문제입니다. 특정 Model의 Tool Calling 동작에 맞춰 Tuning된 Skill이 정기 Upgrade 이후 조용히 Trigger되지 않게 되었고, 출력 품질이 떨어진 걸 일주일이나 지나서야 알아챈 적이 있습니다.
+
+```bash
+# .github/workflows/plugin-eval.yml (일부)
+- name: Run plugin eval suite
+  run: claude plugin eval run --plugin ./plugins/commit-format --min-score 0.85
+```
+
+이걸 단순한 수동 확인이 아니라 CI Gate로 다루는 것 자체가 이 기능이 가져오는 실질적인 변화입니다. Plugin도 결국 코드인 이상, 조용히 저하되는 코드에는 "느낌상 괜찮음"이 아니라 Test Suite가 필요합니다.
+
+## webhani의 의견
+
+팀에서 두 개 이상의 Claude Code Plugin을 운영하고 있다면 `plugin eval`은 지금 바로 도입할 가치가 있습니다. 특히 Tool Call Check와 Transcript Inspection은 최종 응답만 읽어서는 절대 알아챌 수 없는 실패 유형을 잡아냅니다. 반대로 가끔 쓰는 개인용 Skill 하나뿐이라면 비용 대비 얻는 Signal이 아쉬운 수준이라, 빠르게 눈으로 확인하는 편이 여전히 더 빠를 수 있습니다.
+
+저희는 Commit Format과 Infra Scaffold Plugin부터 이 방식을 도입하려 합니다. Merge된 PR에 조용한 Regression이 섞여 들어갈 가능성이 가장 높은 영역이기 때문입니다.
+
+Sources:
+- [Anthropic Adds Plugin Evals to Claude Code: 6 Grader Types, a No-Plugin Baseline, and a CI Gate for Skills](https://www.marktechpost.com/2026/09/11/anthropic-adds-plugin-evals-to-claude-code-6-grader-types-a-no-plugin-baseline-and-a-ci-gate-for-skills/)
+- [Test plugins with evals — Claude Code Docs](https://code.claude.com/docs/en/plugin-evals)

@@ -1,0 +1,76 @@
+---
+title: "Docker Desktop 4.50: Docker Debug 무료화, 진짜 핵심은 IDE 통합입니다"
+description: "Docker Desktop 4.50에서 Docker Debug가 전체 사용자에게 무료로 제공되고, VS Code 확장에 Dockerfile Step-by-step Debugger가 추가되었습니다. echo 문으로 Build를 Troubleshooting하던 팀들을 위해 정리합니다."
+date: "2026-09-18"
+status: "published"
+tags: ["Docker", "DevOps", "Cloud Infrastructure", "Kubernetes", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-desktop-4-50-free-debug-2026"
+---
+
+컨설팅을 진행하다 보면 놀랄 만큼 많은 팀이 아직도 5년 전과 똑같은 방식으로 망가진 Docker Build를 Debugging하고 있습니다. Dockerfile에 `RUN echo`를 곳곳에 넣고 Rebuild하고, Log를 읽고, echo를 지우고, 다시 반복하는 식입니다. Docker Desktop 4.50은 이런 방식을 고수할 이유를 대부분 없애줍니다. 이전에는 유료 Tier 뒤에 있던 Docker Debug가 전체 사용자에게 무료로 제공되며, 단순한 CLI가 아니라 실질적인 IDE 통합과 함께 나왔습니다.
+
+## 실제로 무엇이 바뀌었나
+
+Docker Desktop 4.50의 주요 변경 사항입니다.
+
+- **Docker Debug 전체 사용자 무료화** — 실행 중이거나 Crash된 Container에 임시 Shell을 붙이는 데 Subscription이 필요 없어졌습니다
+- **VS Code 확장에 Dockerfile Debugger 추가** — Image Build를 Step-by-step으로 살펴보며 각 Layer의 File System 상태를 확인할 수 있습니다
+- **Windows의 WSL2 안정성·성능 개선** — 대규모 Enterprise 환경에서 보고되던 불일치 문제를 겨냥했습니다
+- **Compose-to-Kubernetes 도구 개선** — 로컬 Multi-service Compose 구성을 Kubernetes Manifest로 변환하는 정확도가 향상되었습니다
+- **MCP Toolkit 확장** — MCP Catalog가 270개 이상의 Server로 늘었고, 그중 60개 이상은 OAuth가 내장된 Remote Server입니다(Notion, Linear 등)
+
+소규모 팀에 가장 크게 와닿는 변화는 Docker Debug 무료화입니다. 유료 Step Debugger는 결국 Senior Engineer 한 명만 쓰다 마는 경우가 많지만, 무료라면 마침 오후 4시에 Build가 터진 사람 누구나 바로 쓸 수 있습니다.
+
+## Step 단위로 Build Debugging하기
+
+실무적인 차이는 Dockerfile에 임시 코드를 섞지 않고도 Container 상태를 들여다볼 수 있다는 점입니다.
+
+```bash
+# 실행 중인 Container에 임시 Debug Shell을 붙입니다
+# Base Image에 도구가 전혀 없어도 busybox 계열 도구를 쓸 수 있습니다
+docker debug my-broken-container
+
+# Container를 띄우지 않고 특정 Build Stage를 바로 Debugging합니다
+docker debug --target builder .
+```
+
+이 Shell 안에서는 대상 Image가 `distroless`나 `scratch`처럼 최소 구성 Base여도 `ls`, `cat`, `ps`, `curl` 같은 실용적인 도구를 그대로 쓸 수 있습니다. 예전에는 이런 도구를 쓰겠다고 일회성 `FROM debian` Build를 따로 만들어야 했던 상황입니다.
+
+## VS Code 통합이야말로 진짜 이야기
+
+CLI 형태의 Debugger 자체는 4.50 이전에도 제한적으로 존재했습니다. 새로운 점은 실행 중인 Container뿐 아니라 *Build 자체*를 Editor 안에서 Step-by-step으로 살펴보면서, `RUN`, `COPY`, `ADD` 각 명령어에서 File System이 어떻게 달라지는지 관찰할 수 있게 된 것입니다.
+
+다음과 같은 Multi-stage Build를 예로 들어보겠습니다.
+
+```dockerfile
+FROM node:22-slim AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:22-slim
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+CMD ["node", "dist/server.js"]
+```
+
+`npm run build`에서 실패하면 예전에는 `--progress=plain`을 붙여 다시 실행하고 Log를 읽는 수밖에 없었습니다. VS Code Debugger에서는 실패한 `RUN` 바로 직전 Layer까지 이동해서 `COPY . .`가 실제로 무엇을 복사했는지 그 자리에서 확인할 수 있습니다. File이 누락된 건지, `.dockerignore` 설정이 잘못된 건지, 아니면 Build Script 자체의 버그인지를 Image를 다시 Build하지 않고도 추측만으로 판별할 수 있습니다.
+
+## Compose-to-Kubernetes는 계속 진화 중
+
+Docker의 Compose-to-Kubernetes 변환 도구(Docker 생태계 전체에서는 Kanvas로 Branding됨)는 4.50에서 전면 재작성이 아니라 점진적인 개선을 받았습니다. 로컬에서는 `docker-compose.yml`로 개발하고 Kubernetes에 배포하는 팀이라면, 기존 Compose File에 대해 변환을 다시 실행해볼 가치가 있습니다. Resource Limit이나 Multi-network 구성 주변의 거친 부분들이 이번 Release에서 특히 개선 대상이 되었습니다.
+
+## webhani의 의견
+
+Multi-stage Build 때문에 오후 시간을 통째로 날려본 경험이 한 번이라도 있는 팀이라면, Docker Debug 무료화만으로도 Upgrade할 가치가 있습니다. 그것만으로도 Version 변경의 수고를 충분히 상쇄합니다. VS Code 통합은 특이한 버그를 쫓는 사람뿐 아니라, 어느 정도 복잡한 Dockerfile을 유지보수하는 모든 사람에게 실질적으로 유용합니다.
+
+MCP Catalog 확장은 지금 당장은 대부분의 팀에게 작은 이야기지만, 이미 Docker Desktop의 MCP Toolkit으로 AI Agent Workflow용 Local MCP Server를 운영하고 있다면 알아둘 가치가 있습니다. OAuth가 내장된 Remote Server 덕분에 Credential 연결에 드는 상당한 반복 작업을 줄일 수 있습니다.
+
+Sources:
+- [Docker Desktop 4.50 Launches with Free Debugger and Deep IDE Integration](https://linuxiac.com/docker-desktop-4-50-launches-with-free-debugger-and-deep-ide-integration/)
+- [Docker Desktop 4.50 Release — Docker Blog](https://www.docker.com/blog/docker-desktop-4-50/)

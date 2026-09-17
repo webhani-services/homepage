@@ -1,0 +1,76 @@
+---
+title: "Docker Desktop 4.50：Docker Debug が無料化、本当の目玉は IDE 統合"
+description: "Docker Desktop 4.50 では Docker Debug が全ユーザー無料になり、VS Code 拡張に Dockerfile のステップ実行デバッガーが追加されました。echo 文でビルドをトラブルシュートしているチームに向けて解説します。"
+date: "2026-09-18"
+status: "published"
+tags: ["Docker", "DevOps", "Cloud Infrastructure", "Kubernetes", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "docker-desktop-4-50-free-debug-2026"
+---
+
+コンサルティング先のチームを見ていて驚くのは、いまだに壊れた Docker Build を 5 年前と同じやり方でデバッグしているケースが少なくないことです。Dockerfile に `RUN echo` を散りばめて Rebuild し、ログを読み、echo を消して、また Rebuild。Docker Desktop 4.50 はその言い訳の大部分を無くしてくれます。これまで有料 Tier の裏に隠れていた Docker Debug が全ユーザー無料になり、しかも素の CLI ではなく本格的な IDE 統合付きで提供されるようになりました。
+
+## 何が変わったか
+
+Docker Desktop 4.50 の主な変更点です。
+
+- **Docker Debug が全ユーザー無料化** — 実行中・クラッシュ中の Container に一時的な Shell を差し込むのに Subscription が不要に
+- **VS Code 拡張に Dockerfile Debugger を追加** — Image Build をステップ実行し、各レイヤーでの File System の状態を確認できる
+- **Windows の WSL2 の安定性・パフォーマンス改善** — 大規模なエンタープライズ環境で報告されていた不整合への対応
+- **Compose-to-Kubernetes ツールの改善** — ローカルのマルチサービス Compose 構成を Kubernetes Manifest に変換する精度が向上
+- **MCP Toolkit の拡充** — MCP Catalog が 270 以上の Server に増加、うち 60 以上は OAuth 組み込みの Remote Server（Notion、Linear など）
+
+小規模チームにとって特に効くのは Docker Debug の無料化です。有料のステップ実行デバッガーは結局シニアエンジニア一人しか使わなくなりがちですが、無料であれば「たまたま 16 時に壊れた Build を踏んだ人」が誰でも使えるようになります。
+
+## ステップ実行でビルドをデバッグする
+
+実務的な違いは、Dockerfile に一時的な仕込みを入れずに Container の状態を確認できる点です。
+
+```bash
+# 実行中の Container に一時的な Debug Shell をアタッチ
+# ベースイメージにツールが何もなくても busybox 系ツールが使える
+docker debug my-broken-container
+
+# Container を起動せず、特定の Build Stage を直接デバッグ
+docker debug --target builder .
+```
+
+この Shell の中では、対象 Image が `distroless` や `scratch` のような最小構成のベースであっても `ls`・`cat`・`ps`・`curl` といった実用的なツール群が使えます。以前であれば、これらのツールを使うためだけに `FROM debian` の使い捨て Build を作る羽目になっていたケースです。
+
+## VS Code 統合こそが本題
+
+CLI 版の Debugger 自体は 4.50 以前から限定的な形で存在していました。新しいのは、実行中の Container だけでなく *Build そのもの* を Editor 内でステップ実行し、`RUN`・`COPY`・`ADD` 各命令での File System の差分を観察できるようになった点です。
+
+以下のような Multi-stage Build を例にします。
+
+```dockerfile
+FROM node:22-slim AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:22-slim
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+CMD ["node", "dist/server.js"]
+```
+
+`npm run build` で失敗した場合、これまでは `--progress=plain` を付けて再実行し、ログを読むしかありませんでした。VS Code の Debugger では、失敗した `RUN` の直前のレイヤーまでステップし、`COPY . .` が実際に何をコピーしたのかをその場で確認できます。File 欠落なのか、`.dockerignore` の設定漏れなのか、それとも Build Script 自体のバグなのかを、Image を再度 Build することなく切り分けられます。
+
+## Compose-to-Kubernetes は引き続き進化中
+
+Docker の Compose-to-Kubernetes 変換ツール（Docker エコシステム全体では Kanvas としてブランディングされているもの）は、4.50 では作り直しではなく段階的な改善にとどまっています。ローカルは `docker-compose.yml` で開発し、Kubernetes にデプロイしているチームであれば、既存の Compose ファイルに対して変換を再実行してみる価値があります。Resource Limit やマルチネットワーク構成周りの粗さが、今回のリリースで特に改善対象になっています。
+
+## webhani の見解
+
+Multi-stage Build で午後を丸ごと溶かした経験が一度でもあるチームなら、Docker Debug 無料化だけでもアップグレードする価値があります。それだけでバージョンアップの手間を回収できるはずです。VS Code 統合は、特殊なバグを追っている人だけでなく、それなりに複雑な Dockerfile を保守している全員にとって有用です。
+
+MCP Catalog の拡充は、今のところ多くのチームにとっては小さな話ですが、すでに Docker Desktop の MCP Toolkit を使って AI Agent Workflow 用のローカル MCP Server を動かしているなら知っておく価値があります。OAuth 組み込みの Remote Server により、Credential の配線にまつわる定型作業がかなり減ります。
+
+Sources:
+- [Docker Desktop 4.50 Launches with Free Debugger and Deep IDE Integration](https://linuxiac.com/docker-desktop-4-50-launches-with-free-debugger-and-deep-ide-integration/)
+- [Docker Desktop 4.50 Release — Docker Blog](https://www.docker.com/blog/docker-desktop-4-50/)

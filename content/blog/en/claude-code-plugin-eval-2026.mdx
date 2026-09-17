@@ -1,0 +1,84 @@
+---
+title: "Claude Code's plugin eval Command: Finally a Real Answer to 'Does This Plugin Actually Help?'"
+description: "Claude Code 2.1.269 shipped a plugin eval command that scores a plugin against a no-plugin baseline. Here's how it works and how we use it to decide which internal skills are worth keeping."
+date: "2026-09-18"
+status: "published"
+tags: ["Claude Code", "AI Coding Assistant", "Testing", "DevOps", "Anthropic"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-plugin-eval-2026"
+---
+
+We maintain a small library of internal Claude Code plugins — one for our blog pipeline, a few for infra scaffolding, one that enforces our commit message format. Until now, we had no rigorous way to tell whether any of them actually made Claude better, or just made runs slower and more expensive. We eyeballed transcripts and moved on.
+
+Claude Code 2.1.269 adds `claude plugin eval`, a command built specifically for this gap. It runs a plugin against a suite of prompts, scores the output, and compares it against a baseline run where the plugin is not loaded. This turns "I think this skill helps" into a number you can put in a PR description.
+
+## What the command actually does
+
+A `plugin eval` run is structured around cases. Each case is a realistic prompt you've actually sent the plugin, paired with a description of what good and bad output looks like. Claude runs every case multiple times with the plugin loaded and multiple times without it, then grades both sets.
+
+```bash
+# Draft eval cases from real usage, then run the full suite
+claude plugin eval init
+claude plugin eval run
+```
+
+`plugin eval init` inspects your plugin and drafts candidate cases and grading checks for you. It pilots them once before committing to a full run, since a full run means real model calls on both sides of the comparison.
+
+## Graders: what "good" means here
+
+The eval framework supports multiple grader types, and you can mix them within one suite:
+
+- **Regex match** — did the reply contain (or avoid) a specific pattern
+- **Tool-call check** — did Claude actually invoke the tool the skill is supposed to trigger
+- **Rubric grading** — a second model judges the reply against a written rubric
+- **Transcript/file inspection** — graders can look at the full transcript or a file Claude produced during the run, not just the final reply
+
+That tool-call check matters more than it sounds. For us, "did the commit-format skill actually get triggered" was the real question — not whether the commit message looked nice in isolation. A rubric grader would have missed cases where Claude ignored the skill entirely but still produced an acceptable-looking message by luck.
+
+## A minimal eval case
+
+```yaml
+# evals/commit-format.yaml
+name: "enforces conventional commit prefix"
+prompt: "Write a commit message for this diff: adds retry logic to the SES email sender"
+graders:
+  - type: tool_call
+    tool: "Bash"
+    pattern: "git commit -m"
+  - type: regex
+    target: reply
+    pattern: "^(feat|fix|refactor)\\(.+\\): "
+  - type: rubric
+    criteria: "Message is under 72 characters on the summary line and describes the change, not the file touched"
+```
+
+Running this with `--runs 6` gives you three plugin-loaded and three baseline attempts, so a single lucky or unlucky generation doesn't decide the verdict.
+
+## Cost is not free, and that's the point
+
+Every run is a real model call, scored by another real model call, so cost scales with `case count × runs per case × model choice`. Anthropic's own published example — 7 cases at 6 runs each — came to $9.59, a little under $1.37 per case. That's cheap for validating a plugin you'll load in every session for months, but it's not something you want in a tight CI loop on every commit.
+
+Our practice: run the full eval suite when a plugin's prompt or grading logic changes, and when a new Claude model ships. We gate merges to `main` on eval plugins with a lightweight CI job, but we don't re-run the full suite on every push — that would burn budget for no new signal.
+
+## Where this fits in a CI gate
+
+The headline use case is regression detection: does this skill still trigger the same way after you edited its prompt, and does it still survive a model upgrade? Both are things we've been burned by before — a skill tuned against one model's tool-calling behavior quietly stopped firing after a routine upgrade, and we only noticed a week later because output quality had quietly dropped.
+
+```bash
+# .github/workflows/plugin-eval.yml (excerpt)
+- name: Run plugin eval suite
+  run: claude plugin eval run --plugin ./plugins/commit-format --min-score 0.85
+```
+
+Treating that as a CI gate — not just a manual curiosity check — is the actual shift here. Plugins are code, and code that silently degrades needs a test suite, not a vibe check.
+
+## Our take
+
+If you're maintaining more than one or two Claude Code plugins across a team, `plugin eval` is worth adopting immediately, specifically for the tool-call and transcript graders — those catch failure modes that reading the final reply never will. For a single personal skill you use occasionally, the cost-to-signal ratio is worse; a quick manual spot check is probably still faster than writing eval cases.
+
+We're rolling this out on our commit-format and infra-scaffold plugins first, since those are the ones where silent regressions are most likely to slip into a merged PR unnoticed.
+
+Sources:
+- [Anthropic Adds Plugin Evals to Claude Code: 6 Grader Types, a No-Plugin Baseline, and a CI Gate for Skills](https://www.marktechpost.com/2026/09/11/anthropic-adds-plugin-evals-to-claude-code-6-grader-types-a-no-plugin-baseline-and-a-ci-gate-for-skills/)
+- [Test plugins with evals — Claude Code Docs](https://code.claude.com/docs/en/plugin-evals)
