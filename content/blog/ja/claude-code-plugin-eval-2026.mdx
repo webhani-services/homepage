@@ -1,0 +1,84 @@
+---
+title: "Claude Code の plugin eval コマンド：「このプラグイン、本当に役立ってる？」にようやく答えが出せる"
+description: "Claude Code 2.1.269 で追加された plugin eval コマンドは、プラグインなしのベースラインと比較してスコアを出してくれます。仕組みと、社内 Skill の取捨選択にどう使っているかを紹介します。"
+date: "2026-09-18"
+status: "published"
+tags: ["Claude Code", "AI Coding Assistant", "Testing", "DevOps", "Anthropic"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-plugin-eval-2026"
+---
+
+弊社では Blog 生成パイプライン用、Infra Scaffolding 用、Commit Message のフォーマット強制用など、小規模な Claude Code Plugin ライブラリを社内で運用しています。これまでは、それぞれの Plugin が本当に Claude の出力を改善しているのか、それとも単に実行を遅く・高コストにしているだけなのかを厳密に判断する手段がありませんでした。Transcript を目視で確認して「まあ良さそう」で済ませていたのが実情です。
+
+Claude Code 2.1.269 でこのギャップを埋める `claude plugin eval` コマンドが追加されました。一連の Prompt に対して Plugin を実行し、出力を採点した上で、その Plugin を読み込まない Baseline 実行と比較します。「このスキルは効いている気がする」という感覚を、PR の説明に書ける数字に変換できるわけです。
+
+## コマンドが実際にやっていること
+
+`plugin eval` の実行は Case 単位で構成されています。各 Case は、実際にその Plugin に送ったことのある現実的な Prompt と、良い出力・悪い出力がどういうものかの説明のペアです。Claude は Plugin を読み込んだ状態と読み込まない状態のそれぞれで複数回実行し、両方を採点します。
+
+```bash
+# 実際の利用履歴から Eval Case を自動生成し、Suite 全体を実行する
+claude plugin eval init
+claude plugin eval run
+```
+
+`plugin eval init` は対象の Plugin を解析し、Case と採点基準の候補を自動で下書きしてくれます。Full Run はコスト（Baseline 側・Plugin 側の両方で実際の Model 呼び出し）が発生するため、まず一度だけ試験実行してから本番実行に進む流れになっています。
+
+## Grader：ここでの「良い出力」の定義
+
+Eval Framework は複数の Grader Type をサポートしており、一つの Suite の中で組み合わせて使えます。
+
+- **Regex Match** — 返答に特定のパターンが含まれているか（あるいは含まれていないか）
+- **Tool Call Check** — そのスキルが本来 Trigger するはずの Tool を、実際に呼び出したかどうか
+- **Rubric Grading** — 別の Model が、記述された Rubric に基づいて返答を評価する
+- **Transcript / File Inspection** — 最終的な返答だけでなく、実行中に作成された File や Transcript 全体を Grader が検査できる
+
+この Tool Call Check が想像以上に重要でした。弊社の場合、本当に確認したかったのは「Commit Format 用の Skill が実際に Trigger されたか」であって、単体の Commit Message が見た目上きれいかどうかではなかったからです。Rubric Grading だけだと、Skill が全く Trigger されていないのに偶然それっぽい Message が生成されたケースを見逃してしまいます。
+
+## 最小構成の Eval Case
+
+```yaml
+# evals/commit-format.yaml
+name: "conventional commit prefix を強制できているか"
+prompt: "この Diff に対する Commit Message を書いて: SES メール送信処理にリトライロジックを追加"
+graders:
+  - type: tool_call
+    tool: "Bash"
+    pattern: "git commit -m"
+  - type: regex
+    target: reply
+    pattern: "^(feat|fix|refactor)\\(.+\\): "
+  - type: rubric
+    criteria: "サマリー行が 72 文字以内で、変更したファイルではなく変更内容を説明している"
+```
+
+`--runs 6` で実行すると、Plugin あり 3 回・Baseline 3 回の試行が得られるため、一回の生成の運・不運だけで結果が決まらなくなります。
+
+## コストはタダではない — それが本質
+
+すべての実行が実際の Model 呼び出しであり、それをさらに別の Model 呼び出しで採点するため、コストは「Case 数 × Case あたりの実行回数 × 使用 Model」で決まります。Anthropic が公開した例では、7 Case・各 6 回実行で $9.59、1 Case あたり $1.37 弱でした。数ヶ月にわたって毎回のセッションで読み込む Plugin を検証するには十分安いコストですが、Commit のたびに走らせる Tight な CI Loop に組み込むには重すぎます。
+
+弊社の運用では、Prompt や採点ロジックを変更したタイミングと、Claude の新しい Model がリリースされたタイミングで Full Suite を実行しています。`main` へのマージ Gate としては軽量な CI Job を用意していますが、すべての Push で Full Suite を回すことはしていません。新しい Signal が得られない割にコストだけがかさむためです。
+
+## CI Gate としての使い道
+
+このコマンドの本命の用途は Regression 検知です。Prompt を編集した後もそのスキルは以前と同じように Trigger され続けるか、そして Model がアップグレードされた後も生き残るか。どちらも弊社が実際に痛い目を見たポイントです。あるスキルが特定 Model の Tool Calling の挙動に依存してチューニングされていたため、通常のアップグレード後に静かに Trigger されなくなり、出力品質が下がっていることに 1 週間気づかなかったことがありました。
+
+```bash
+# .github/workflows/plugin-eval.yml（抜粋）
+- name: Run plugin eval suite
+  run: claude plugin eval run --plugin ./plugins/commit-format --min-score 0.85
+```
+
+これを単なる手動の気まぐれチェックではなく CI Gate として扱うこと自体が、この機能がもたらす実質的な変化です。Plugin もコードである以上、静かに劣化するコードには「なんとなく良さそう」ではなく Test Suite が必要です。
+
+## webhani の見解
+
+チームで複数の Claude Code Plugin を運用しているなら、`plugin eval` はすぐに導入する価値があります。特に Tool Call Check と Transcript Inspection は、最終的な返答だけを読んでいては絶対に気づけない失敗モードを拾ってくれます。一方で、たまにしか使わない個人用の Skill 一つだけであれば、コストと得られる Signal のバランスは悪く、手早く目視確認するほうがまだ速いでしょう。
+
+弊社ではまず、Commit Format と Infra Scaffold の Plugin から導入します。マージ済みの PR に静かな Regression が紛れ込む可能性が最も高い箇所だからです。
+
+Sources:
+- [Anthropic Adds Plugin Evals to Claude Code: 6 Grader Types, a No-Plugin Baseline, and a CI Gate for Skills](https://www.marktechpost.com/2026/09/11/anthropic-adds-plugin-evals-to-claude-code-6-grader-types-a-no-plugin-baseline-and-a-ci-gate-for-skills/)
+- [Test plugins with evals — Claude Code Docs](https://code.claude.com/docs/en/plugin-evals)
