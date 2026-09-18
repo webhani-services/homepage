@@ -1,0 +1,119 @@
+---
+title: "ChatからBrowserへ — Claude Compliance API拡張が示すEnterprise AIガバナンスの行方"
+description: "AnthropicはCompliance APIをClaude Code・Coworkに続き、Claude in Chromeセッションにも拡張しました。Agentic AIを本番導入する際にチェックすべきポイントをwebhaniの視点でまとめます。"
+date: "2026-09-19"
+status: "published"
+tags: ["Claude", "AI", "Enterprise", "Compliance", "Security"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-compliance-api-chrome-2026"
+---
+
+## 地味だが見逃せないAPI拡張
+
+2026年8月26日、AnthropicはClaude CoworkとClaude Code向けのCompliance API（セッション・トランスクリプト取得Endpoint）をベータからGA（一般提供）に移行しました。そこから約3週間後の9月18日には、同じlocal-session Endpointを「Claude in Chrome」——Claudeがブラウザ上でページ遷移やフォーム入力をエージェントとして自律実行するセッション——にも拡張しています。Enterprise Organization向けにベータ公開されており、既存のCompliance Access Key（`read:compliance_user_data` スコープ）でアクセス可能です。この時系列はAnthropicの公式Blogおよび Claude Platform Docsで確認できます。
+
+個別に見ると小さなAPI Updateですが、並べてみるとひとつのパターンが見えてきます。Anthropicは新しいAgentic Surface（Claudeが自律的にActionを起こす領域）をリリースするたびに、1〜2リリースサイクル以内にそのSurface向けのCompliance/Audit Endpointを追加しています。Chatが最初、次にCoding Agent、次にCowork、そして今回のBrowserです。この順序自体がSignalであり、「Audit可能性を後付けするのではなく、設計段階から組み込む」ことがAgentic製品の標準要件になりつつあることを示しています。
+
+私たちwebhaniのようにClaude Code・Cowork・Browser Agentを実際にClient向けに導入するConsulting会社にとって、これは単なる機能追加ではなく、導入チェックリストのUpdateとして捉えるべき変化です。
+
+## なぜ「新Surfaceごとに新Audit Endpoint」が重要なのか
+
+Claudeが動作するSurfaceごとに、Riskの性質が異なります。
+
+- **Chat** — 基本はText in/out。Riskの中心はUserが貼り付けるPIIやSecretと、返ってくるResponseの内容。
+- **Claude Code** — SourceCodeの読み書き、Shell Commandの実行、CI/CDへの接触まで含む。Repository内のCredential漏洩や、未Reviewのコード実行がRisk。
+- **Cowork** — Workspace横断でDocumentやFile、複数Toolを扱う、比較的長時間のSession。
+- **Claude in Chrome** — 実際のBrowserをNavigateし、画面に表示されている内容をすべて閲覧でき、UserとしてAuthenticateされた状態でForm送信などのActionを取れる。
+
+Governanceの観点で最もImpactが大きいのはBrowser Surfaceです。なぜなら「AIに依頼した内容」と「Loginした人間が実行できる内容」の境界が事実上消えるからです。Browser AgentはSession Cookie、SSO状態、そのBrowser Profileから到達可能な社内Toolをすべて引き継ぎます。Agentが実際に何を見て何をしたかを再構成する手段がなければ、Incident発生時に「AgentがAccessすべきでない顧客情報を見たか」「誤ったDataでFormを送信したか」「想定外のSystemまでClickして到達したか」といった基本的な問いにすら答えられません。
+
+Compliance APIが埋めるのはまさにこのGapです。Anthropicによると、API経由で取得できるTranscriptにはPromptとResponse、Tool Call内容（Web・MCP双方）、Skills/Artifacts内容、そしてMetadata（検証済みUser ID、Email、Org ID、Session/Message ID、Timestamp）が含まれます。Chrome Agent Sessionにおいては、Chat用と同じInterfaceで、Page単位・Action単位の記録をCompliance Teamが取得できるということです。
+
+## Clientの大規模導入前にチェックすべき項目
+
+Claude Code・Cowork・Chrome AgentをPilot Teamの範囲を超えて展開する際、Compliance観点で「本番Ready」と呼べるかどうか、私たちが実際にClientとConfirmしている項目を紹介します。
+
+### 1. Data保持Policyを明文化する
+
+Tool Call内容やPII寄りのMetadataを含むTranscriptがAPI経由で取得可能になった以上、保持期間・取得できる人・取得のTrigger（定期Audit vs Incident調査）を組織として文書化する必要があります。「何か起きたらその都度考える」はPolicyとは呼べません。
+
+### 2. `read:compliance_user_data` スコープに紐づくAccess範囲の管理
+
+Compliance APIは専用のCompliance Access Keyを使い、`read:compliance_user_data` スコープでAccessします。このKeyはProduction DatabaseのCredentialと同等に厳格に扱うべきで、定期的なRotation、呼び出し可能Systemの制限、取得ログの記録が必要です。誰でもQueryできるCompliance APIはAudit Trailの意味を失わせます——「Audit Logへのアクセスログ」自体が次のAudit対象になります。
+
+### 3. TranscriptにおけるPII露出はPromptだけでない
+
+特にBrowser Agentでは、Claudeが「見る」内容はUserが入力したTextだけではなく、画面に表示されているものすべてです。社内CRMやHR SystemにAgentを向けた場合、UserのInstructionにはPIIが一切含まれていなくても、TranscriptにCustomer情報やEmployee情報が付随的に記録される可能性があります。Data Classification Policyは、TranscriptをMain Databaseと並ぶ新たなPII保持先として扱う必要があります。
+
+### 4. SOC2とGDPRへのMapping
+
+SOC2においてTranscript取得可能性はMonitoring Control（CC7.2相当の変更/異常検知）にとってPlusですが、それは誰かが実際にOperationalize——つまり定期的にDashboardを確認し対応する体制を作って——初めて意味を持ちます。GDPRについては、TranscriptにEU域内の個人Dataが含まれる場合、他の個人Data保持先と同じくData Subject Access RequestやErasure Requestの対象になります。保持期間をDefaultより短く設定する必要がないか、削除RequestがApplication LayerだけでなくCompliance APIの裏側のStorageまで伝播するかをLegal Teamと確認してください。
+
+### 5. Audit Trail以前に、Agent自体のLeast Privilege設計
+
+Compliance APIはDetective Control（事後検知）であり、Preventive Control（事前防止）ではありません。何が起きたかを後から追跡できても、Chrome AgentやCowork SessionがそもそもどのSite・Tool・MCP Serverに到達できるかを制限するものではありません。Audit Trailが価値を持つのは、それが記録するBlast Radius（影響範囲）がそもそも小さく設計されている場合です。
+
+## 最小限のCode例
+
+以下はCompliance Data取得のIllustrativeなImageです。Node.jsで書いていますが、公式Documentから丸写ししたものではなく、Client向けCompliance Toolingを組む際に想定するShapeの一例として示しています。
+
+```javascript
+// compliance-export.js
+// read:compliance_user_data スコープのCompliance Access Keyを使い、
+// 指定Org・期間のSession Transcriptを取得する例。
+// あくまでIllustrative。実装前に最新のClaude Platform Docsで
+// Endpoint Pathとレスポンス形式を確認すること。
+
+const COMPLIANCE_API_BASE = "https://api.anthropic.com/v1/compliance";
+
+async function fetchSessionTranscripts({ orgId, productSurface, since, until }) {
+  const res = await fetch(`${COMPLIANCE_API_BASE}/sessions`, {
+    method: "GET",
+    headers: {
+      "x-api-key": process.env.COMPLIANCE_ACCESS_KEY, // scope: read:compliance_user_data
+      "anthropic-version": "2026-08-01",
+    },
+    // product_surface の例: claude_code, claude_cowork, claude_in_chrome
+  });
+
+  if (!res.ok) {
+    throw new Error(`Compliance export failed: ${res.status} ${res.statusText}`);
+  }
+
+  const { sessions } = await res.json();
+
+  return sessions
+    .filter((s) => s.org_id === orgId && s.product_surface === productSurface)
+    .filter((s) => s.started_at >= since && s.started_at <= until)
+    .map((s) => ({
+      sessionId: s.session_id,
+      userEmail: s.user_email,
+      startedAt: s.started_at,
+      toolCalls: s.tool_calls?.length ?? 0,
+    }));
+}
+
+// 例: Chrome AgentのSessionをSOC2 Evidence用に毎晩Archiveするジョブ
+fetchSessionTranscripts({
+  orgId: "org_webhani_client_001",
+  productSurface: "claude_in_chrome",
+  since: "2026-09-18T00:00:00Z",
+  until: "2026-09-19T00:00:00Z",
+}).then((records) => {
+  console.log(`Archived ${records.length} sessions for compliance review.`);
+});
+```
+
+このCode例で重要なのは正確なAPI Shapeではなく（それは変わりうるので実装前に必ずDocsを確認してください）、パターンそのものです。Compliance取得は誰かがAudit前に手動で行うものではなく、既存のEvidence保管先（SIEM、GRC Tool等）にFeedするScheduled Jobとして組み込むべきです。
+
+## webhaniとしての推奨事項
+
+Claude Code・Cowork・Chrome AgentをPilotを超えてScaleするClientには、Compliance APIをRollout後ではなくRollout前に整備すべきBase Infrastructureとして扱うことを推奨します。
+
+1. Environment（Staging/Production）ごとに専用のCompliance Access Keyを発行し、範囲を絞った上で取得ログ自体も記録する。
+2. Transcript ExportをExisting Log Pipelineに`product_surface`ごとにTagづけしてScheduled組み込み、Chrome Agent・Cowork・CodeのSessionをChatと同じEvidence Trailに統合する。
+3. Data Classification/保持Policyを更新し、Agent TranscriptをExplicitにCoverし、GDPR Erasure対応についてLegalのSign-offを得る。
+4. Audit Trailと合わせて、Browser AgentやCowork SessionがAccessできる社内Systemの範囲をUpstreamで制限し、保持しているTranscriptが「有限のActionの集合」を記録するものになるようにする。
+
+より大きなTrendとしても、Claudeが新Surfaceを獲得するたびにCompliance Toolingがすぐ後を追う流れは今後も続くと見ています。個別のEndpointではなく、このパターンを前提にGovernance Programを設計しておくことで、Surfaceが増えるたびに作り直す事態を避けられます。

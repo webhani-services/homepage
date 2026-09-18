@@ -1,0 +1,96 @@
+---
+title: "Client-Side Caching in go-redis: When Skipping the Round-Trip Actually Helps"
+description: "go-redis 9.22.0 adds experimental RESP3 CLIENT TRACKING support and automatic pipelining. A practical look at when in-process caching for Go services pays off, and when it just adds complexity."
+date: "2026-09-19"
+status: "published"
+tags: ["Redis", "Caching", "Go", "Database", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "redis-client-side-caching-go-2026"
+---
+
+Most teams that reach for Redis in front of a Go service assume the latency win is in Redis itself — fast in-memory lookups, sub-millisecond command execution. That part is true, but it's rarely the bottleneck once you look at a real request path under load. The cost that actually shows up in your p99 graphs is the round-trip: TCP (or even loopback) hops between your application process and the Redis server, multiplied by however many keys a single request touches.
+
+go-redis 9.22.0, released in September 2026, ships two experimental features aimed squarely at that round-trip cost: client-side caching built on RESP3 `CLIENT TRACKING`, and automatic pipelining. Both are worth understanding even if you don't adopt them immediately, because they change what "caching" means at the client layer.
+
+## The round-trip is the tax, not Redis's processing time
+
+Take a typical Go web service handling a request that needs a user's session, three feature flags, and a piece of shared config. That's five separate `GET` calls to Redis in the naive case. Even at a generous 0.3ms per round-trip on a well-tuned network inside the same availability zone, that's 1.5ms of pure network tax before Redis has done anything expensive. Under load, with connection pool contention and GC pauses in the mix, that number gets worse, not better — and it compounds across every request, every replica, every minute.
+
+Redis's own command processing is single-threaded and extremely fast for simple key lookups — often tens of microseconds. The mismatch between "Redis does the work in 50 microseconds" and "the round-trip costs 300 microseconds or more" is the whole reason client-side caching exists. If you can avoid the round-trip entirely for a read, you avoid the dominant cost.
+
+## What RESP3 CLIENT TRACKING actually changes
+
+The traditional way to reduce Redis load from a client is to cache reads locally with a TTL — a `sync.Map` or an LRU cache in-process, expired after N seconds. This works, but it has an uncomfortable trade-off: pick a TTL too long and you serve stale data after a write; pick it too short and you barely reduce round-trips.
+
+`CLIENT TRACKING`, part of the RESP3 protocol, removes the guesswork. When a client opts into tracking, Redis remembers which keys that client has read. If another client (or the same one) modifies one of those keys, Redis pushes an invalidation message down the same connection, telling the client "the value you cached for this key is no longer valid." The client can then evict it from its local cache immediately, rather than waiting for a TTL to expire.
+
+This is a meaningful shift: instead of the client *guessing* how long data stays fresh, the server *tells* the client when it stops being fresh. The cache in your Go process becomes a correctness-preserving mirror of a subset of Redis's keyspace, not a best-effort approximation.
+
+## An illustrative example
+
+The following is illustrative Go code to show the shape of the idea, not a literal transcription of the go-redis API — check the actual go-redis 9.22.0 documentation for exact method names and options before writing production code against it, since this is an experimental feature and the surface may still shift.
+
+Before — every read is a round-trip:
+
+```go
+func GetFeatureFlag(ctx context.Context, rdb *redis.Client, key string) (string, error) {
+    // Every call hits the network, even if the flag hasn't
+    // changed in the last hour.
+    return rdb.Get(ctx, key).Result()
+}
+```
+
+After — conceptually, with client-side caching enabled on the connection:
+
+```go
+// Illustrative: go-redis 9.22.0 exposes an opt-in client-side cache
+// backed by RESP3 CLIENT TRACKING. Exact API surface may differ —
+// treat this as a sketch of the interaction pattern, not a reference.
+type TrackedCache struct {
+    rdb   *redis.Client
+    local *sync.Map // key -> cached value, invalidated by server push
+}
+
+func (c *TrackedCache) GetFeatureFlag(ctx context.Context, key string) (string, error) {
+    if v, ok := c.local.Load(key); ok {
+        return v.(string), nil // no round-trip
+    }
+
+    val, err := c.rdb.Get(ctx, key).Result()
+    if err != nil {
+        return "", err
+    }
+
+    // The read itself registers this key for tracking with Redis.
+    // A background goroutine consumes invalidation pushes on this
+    // connection and calls c.local.Delete(key) when Redis reports
+    // the key changed.
+    c.local.Store(key, val)
+    return val, nil
+}
+```
+
+The important part isn't the exact method signatures — it's the pattern: a local read path that's fully in-process, and a separate invalidation channel that keeps that local state honest without polling or arbitrary TTLs.
+
+Automatic pipelining addresses a related but distinct problem. Even without caching, if your service issues several independent Redis commands in a tight time window (e.g., concurrent goroutines each doing their own `GET`), go-redis can transparently batch them into a single network round-trip instead of one round-trip per command, without you hand-building a `Pipeline`. It's a lower-risk feature than client-side caching because it doesn't change data freshness semantics at all — it's purely a network-layer optimization.
+
+## Correctness caveats that matter more than the speedup
+
+Client-side caching isn't free, and the caveats are where most of the risk lives:
+
+- **Server-side tracking table limits.** Redis has to remember which client is tracking which keys to know who to notify on invalidation. That tracking table consumes server memory, and it does not scale infinitely — if you track a very large, high-cardinality set of keys across many client connections, you're pushing real memory pressure onto Redis itself, not just saving client-side round-trips.
+- **Disconnect and reconnect must flush the local cache.** If the connection carrying the tracking invalidations drops, the client can no longer guarantee it hasn't missed an invalidation push during the gap. The only safe behavior is to flush the entire local cache on reconnect and rebuild it from scratch. Any client-side caching implementation you rely on needs to handle this correctly — silently keeping stale entries after a reconnect is a real correctness bug, not a minor inefficiency.
+- **This helps hot, read-heavy, rarely-written keys.** Feature flags, config values, session lookups that are read many times per write — this is the sweet spot. The round-trips you eliminate vastly outnumber the invalidation pushes you receive.
+- **This does not help write-heavy keys.** If a key is written as often as it's read, every write triggers an invalidation push to every client tracking it. You end up paying network cost on the invalidation channel that roughly matches or exceeds what you saved on reads. For counters, rate-limit buckets, or frequently updated queues, client-side caching is close to pure overhead.
+
+## webhani's take on rollout
+
+We'd treat this as an addition to your caching strategy, not a replacement for anything you already have. A sensible rollout looks like:
+
+1. Start with a small number of clearly read-heavy, infrequently-written keys — feature flags and static config are the easiest first targets, session lookups are a reasonable second step.
+2. Instrument invalidation frequency before and after. If a key you enabled tracking on turns out to be invalidated almost as often as it's read, pull it back out — the feature isn't helping there.
+3. Keep your existing caching layers (CDN, in-memory application caches with explicit TTLs, read replicas) in place. Client-side caching via `CLIENT TRACKING` is a narrower, more precise tool for a specific class of key access pattern — it doesn't replace the broader caching architecture you already run.
+4. Because both features are marked experimental in go-redis 9.22.0, we'd gate their use behind a feature flag in production and watch memory behavior on the Redis side closely during rollout, particularly the tracking table size, before expanding coverage to more keys.
+
+The underlying idea — let the server tell you when your cached copy is wrong, instead of guessing with a TTL — is a solid one. The value depends entirely on choosing the right keys for it.
