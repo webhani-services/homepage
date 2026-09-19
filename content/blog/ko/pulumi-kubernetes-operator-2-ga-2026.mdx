@@ -1,0 +1,99 @@
+---
+title: "Pulumi Kubernetes Operator 2.0 GA, 클라우드 인프라를 Kubernetes Resource로 선언하기"
+description: "Pulumi Kubernetes Operator 2.0이 정식 GA에 도달했습니다. Stack마다 Pod를 분리하는 새 아키텍처가 실제로 어떤 문제를 해결하는지, Workspace/Update CRD 구조와 YAML 예시, RBAC·마이그레이션 관련 실무 체크포인트를 정리합니다."
+date: "2026-09-20"
+status: "published"
+tags: ["Kubernetes", "Pulumi", "IaC", "GitOps", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "pulumi-kubernetes-operator-2-ga-2026"
+---
+
+Pulumi Kubernetes Operator(PKO)는 `Stack`이라는 Custom Resource를 통해 Kubernetes Cluster 내부에서 클라우드 인프라를 reconcile하는 도구로 몇 년째 사용되어 왔습니다. 최근 메이저 버전 2.0으로 GA(정식 배포)에 도달했는데, 이번 릴리스의 핵심은 새로운 기능 추가가 아니라 Stack 작업을 실제로 실행하는 방식 자체를 다시 짠 아키텍처 변경입니다. webhani는 그동안 PKO 1.x를 클라이언트에게 권장할 때 Blast Radius에 대한 우려 때문에 다소 신중한 입장을 취해왔는데, 2.0은 그 우려를 정면으로 해결하는 릴리스입니다.
+
+## PKO가 실제로 하는 일
+
+아키텍처 이야기에 들어가기 전에 기본 개념부터 정리합니다. PKO는 TypeScript, Python, Go, .NET, Java 또는 순수 YAML로 작성된 Pulumi 프로그램, 즉 평소 로컬이나 CI에서 `pulumi up`으로 실행하던 것과 동일한 프로그램을 Cluster 안에 존재하는 `Stack`이라는 Custom Resource로 감쌉니다. 이후로는 Kubernetes의 일반적인 reconciliation loop가 작업을 이어받습니다. Manifest를 apply하면 Operator가 AWS, Azure, GCP, Kubernetes 자체, 그리고 Pulumi가 지원하는 60개 이상의 Provider를 대상으로 preview/update/refresh/destroy를 수행하며, 실제 인프라를 Pulumi 프로그램이 선언한 상태로 수렴시킵니다. ArgoCD나 Flux가 애플리케이션 Manifest에 대해 하는 "목표 상태와의 diff를 보고 Controller로 수렴시킨다"는 모델을, 애플리케이션이 돌아가는 기반인 인프라 레이어에 그대로 적용한 것이라고 보면 이해하기 쉽습니다.
+
+## 1.0의 Pod 공유 구조가 실제로 문제였던 이유
+
+PKO 1.x에서는 Operator 자체가 사실상 하나의(혹은 소규모로 수평 확장된) Deployment였습니다. apply한 모든 `Stack`은 그 공유 Operator Pod의 실행 컨텍스트 안에서 동작하는 Pulumi CLI 프로세스에 의해 reconcile되었습니다. 다루는 Stack이 몇 개를 넘어가는 순간부터 이는 두 가지 문제를 낳습니다.
+
+첫 번째는 리소스 경합입니다. 많은 Resource를 건드리는 Stack update나, 응답이 느린 Provider를 기다리는 update는 CPU와 메모리를 오랫동안 점유할 수 있습니다. 그 update가 다른 열 개 팀의 Stack reconciliation과 같은 프로세스 공간에서 돈다면, 하나의 무겁거나 暴走(runaway)한 update가 다른 모든 팀의 처리량을 끌어내립니다. "각 팀이 자기 인프라를 소유한다"고 생각하지만 실제로는 테넌트 사이에 cgroup 경계가 없는 공유 테넌트 모델인 셈입니다.
+
+두 번째는 webhani가 더 심각하다고 보는 부분인 Secret 노출입니다. Pulumi 프로그램은 클라우드 Provider Key, Stack Output으로 쓰이는 데이터베이스 비밀번호, 프로그램 안에서 참조하는 서드파티 API Token 등 Credential을 일상적으로 필요로 합니다. 모든 Stack의 update가 같은 Operator 프로세스 안에서 실행된다는 것은, 결국 모든 Stack의 Secret이 어느 시점엔가 같은 Pod의 메모리 위에 올라간다는 뜻입니다. Operator 자체의 취약점 하나, 잘못 설정된 Sidecar 하나, 혹은 그 Pod에 연결된 ServiceAccount의 권한이 조금만 넓어도, 한 팀이 아니라 모든 팀의 클라우드 Credential에 걸친 Blast Radius가 됩니다. 클라이언트마다 다른 환경의 인프라를 다루는 컨설팅 회사 입장에서 이건 추상적인 리스크가 아니라, 첫 리뷰에서 클라이언트 보안팀이 당연히 물어볼 만한 종류의 문제입니다.
+
+## 2.0에서 바뀐 것: Stack 하나에 Pod 하나
+
+PKO 2.0은 기존에 사용하던 `Stack` CR의 API는 그대로 유지하면서, `Workspace`와 `Update`라는 두 개의 새 Custom Resource를 중심으로 실행 구조를 재구성했습니다. `Stack`을 apply해도 Operator가 더 이상 이를 직접 실행하지 않습니다. 대신 그 Stack 전용의 `Workspace`, 즉 전용 Pod, 전용 파일시스템, 전용 환경, 전용으로 마운트된 Secret을 가진 실행 환경을 프로비저닝합니다. Stack 작업(preview/update/refresh/destroy)은 이 Workspace에 대한 개별 실행을 나타내는 `Update` Resource로 추적됩니다. `CronJob`의 한 번의 스케줄 실행을 `Job`이 나타내는 관계와 개념적으로 비슷하다고 보면 됩니다.
+
+실무적으로 달라지는 점은 명확합니다. A팀의 Staging VPC용 Stack update와 B팀의 Production RDS Cluster용 Stack update가 더 이상 프로세스도, 파일시스템도, 메모리 공간도 공유하지 않습니다. A팀의 update가 멈추거나 메모리를 과도하게 잡아먹어도, 그건 A팀의 Workspace Pod 안에 갇힙니다. Kubernetes의 일반적인 Resource Limit과 스케줄링이, 애플리케이션 Workload에 대해 이미 그렇듯이 Pod 단위로 그대로 적용됩니다. B팀의 Secret은 애초에 A팀의 Pod에 로드된 적이 없습니다. 공유되는 Pod 자체가 존재하지 않기 때문입니다.
+
+이는 이전에는 어려웠던 Stack 단위 커스터마이징도 가능하게 합니다. 특정 Toolchain, Private Plugin, 추가 CLI 의존성이 들어간 커스텀 Container Image를 Workspace에 지정하거나, 해당 Stack의 실제 부하에 맞춘 Resource Request/Limit을 설정하거나, Stack마다 다른 Secret과 Volume을 마운트하는 일을, 공유 Operator 설정을 건드리지 않고도 할 수 있습니다.
+
+중요한 점은 이것이 API 레벨에서 Breaking Change가 아니라 추가(additive)라는 것입니다. 1.x에서 쓰던 기존 `Stack` Manifest는 수정 없이 그대로 동작합니다. Workspace와 Update는 일반적인 사용에서 직접 작성하는 것이 아니라, Operator가 내부에서 생성하고 관리하는 Resource입니다. 특정 Stack의 실행 환경을 세밀하게 제어하고 싶다면 `Workspace`를 직접 작성할 수도 있지만, 어디까지나 선택 사항입니다.
+
+## 구조 예시
+
+아래는 개념을 보여주기 위한 예시적인 YAML입니다. 실제로 적용하기 전에는 PKO 2.0 공식 CRD Reference에서 정확한 필드명을 확인해야 합니다.
+
+```yaml
+apiVersion: pulumi.com/v1
+kind: Stack
+metadata:
+  name: platform-networking
+  namespace: infra-prod
+spec:
+  stack: acme-org/platform-networking/prod
+  projectRepo: https://github.com/acme-org/infra-pulumi
+  branch: refs/heads/main
+  # 선택 사항: Operator 기본값 대신 커스텀 이미지/리소스 프로필을
+  # 가진 Workspace 템플릿을 지정
+  workspaceTemplate:
+    spec:
+      image: registry.acme.internal/pulumi-runner:go1.23-aws
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+        limits:
+          cpu: "2"
+          memory: "2Gi"
+  envRefs:
+    AWS_ROLE_ARN:
+      type: Secret
+      secret:
+        name: platform-networking-aws-role
+        key: roleArn
+  destroyOnFinalize: false
+```
+
+```yaml
+apiVersion: pulumi.com/v1
+kind: Workspace
+metadata:
+  name: platform-networking-ws
+  namespace: infra-prod
+spec:
+  stack: acme-org/platform-networking/prod
+  image: registry.acme.internal/pulumi-runner:go1.23-aws
+  serviceAccountName: platform-networking-runner
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+```
+
+두 번째 블록을 직접 작성할 일은 평소에는 많지 않습니다. Operator가 `Stack`의 `workspaceTemplate`로부터 동등한 것을 자동 생성해주기 때문입니다. 다만 이것이 독립적으로 조회 가능한 실제 Object라는 걸 알아두면 Debug할 때 도움이 됩니다. 공유 Operator의 뒤섞인 로그를 뒤지는 대신 `kubectl get workspace`, `kubectl logs`로 특정 Stack의 실행 Pod만 바로 들여다볼 수 있습니다.
+
+## 실무에서 체크할 점
+
+도입을 검토하는 팀이라면, webhani가 실제로 클라이언트에게 Rollout할 때 짚어주는 항목들은 다음과 같습니다.
+
+- **`Stack`(그리고 이번에 추가된 `Workspace`/`Update`)에 대한 RBAC은 곧 인프라 Provisioning 권한 그 자체입니다.** Production AWS 계정에 스코프된 Credential을 가진 Namespace에서 `Stack` CR을 생성·수정할 수 있는 사람은 Production 인프라를 만들거나 파괴할 수 있습니다. `Stack`은 IAM 콘솔에 대한 직접 접근과 동일한 수준으로 취급해야 합니다. 환경별로 Namespace를 분리하고, Terraform이나 Pulumi CI 파이프라인의 보호 브랜치에 적용하는 것과 같은 승인 절차를 걸어두고, 애플리케이션 Manifest용으로 부여된 광범위한 `edit` ClusterRole을 상속받지 않도록 해야 합니다.
+- **1.x에서의 마이그레이션은 한 번에 갈아엎는 작업은 아니지만, 검증 시간은 반드시 확보해야 합니다.** `Stack` API가 그대로 유지되므로 Operator 자체의 업그레이드는 작업량 자체는 크지 않습니다. 실제로 Production에 반영하기 전에 검증해야 할 부분은, Stack마다 뜨는 Workspace Pod가 기존 공유 Operator Pod가 가지고 있던 ServiceAccount/IRSA 혹은 Workload Identity 바인딩을 동일하게 받고 있는지입니다. 예전 Operator Pod에 미리 심어져 있던 커스텀 이미지나 Plugin도 암묵적으로 남아있다고 가정하지 말고 `workspaceTemplate`으로 명시적으로 다시 표현해야 합니다.
+- **모든 경우에 CI 기반 Pulumi 실행을 대체하는 것은 아닙니다.** 이미 성숙한 CI 파이프라인을 갖추고 있고, Review Gate와 plan-then-apply 승인, 기존 배포 프로세스에 연결된 Audit Log를 운영 중인 팀이라면, 인프라 변경을 Cluster 내부의 `Stack` CR로 옮기는 것이 의미를 가지는 시점은 인프라 Reconciliation도 애플리케이션 Manifest와 같은 GitOps 루프(ArgoCD, Flux)를 따르길 원할 때입니다. 즉 머지 시점에 한 번 Apply하는 것을 넘어, Drift를 지속적으로 교정하고 싶은 경우입니다. 인프라 변경이 드물거나, 사람이 Plan을 검토한 뒤 명시적으로 "apply"를 눌러야 한다면 수동 승인 Gate가 있는 CI 파이프라인이 여전히 더 단순하고 감사하기 쉬운 선택입니다. Cluster 안의 다른 모든 것을 이미 GitOps Controller로 운영 중이고 인프라 상태도 지속적으로 수렴시키고 싶을 때 PKO의 가치가 제대로 나옵니다.
+
+## webhani의 결론
+
+이미 GitOps 중심의 Kubernetes 플랫폼을 운영 중인 클라이언트에게 PKO 2.0은 webhani가 1.x에 대해 가졌던 가장 큰 우려를 해소해주는 릴리스입니다. "인프라도 그냥 Kubernetes Resource로 다룬다"는 모델이, 클라우드 Credential을 다루는 대상에게 기대할 만한 격리 수준을 드디어 따라잡았다고 볼 수 있습니다. 그럼에도 `Stack` 생성 권한은 클라우드 콘솔 직접 접근과 동일한 수준의 RBAC 심사 대상으로 취급할 것이고, 1.x에서의 마이그레이션은 단순히 Operator 버전을 올리고 기본값을 믿는 작업이 아니라 Stack별 Workload Identity 바인딩을 하나하나 검증하는 프로젝트로 범위를 잡아야 한다고 봅니다.

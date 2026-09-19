@@ -1,0 +1,93 @@
+---
+title: "WebMCP: Website가 AI Agent에게 직접 기능을 등록하는 방식"
+description: "W3C에서 논의 중인 새로운 Draft 표준 WebMCP는 navigator.modelContext를 통해 Website가 Browser 내 AI Agent에게 호출 가능한 Tool을 직접 공개할 수 있게 합니다. Frontend 팀에게 어떤 의미가 있는지, Anthropic의 MCP와는 어떻게 다른지 정리합니다."
+date: "2026-09-20"
+status: "published"
+tags: ["WebMCP", "AI Agents", "Browser API", "Web Development", "Next.js"]
+thumbnail: ""
+author: "webhani"
+slug: "webmcp-browser-ai-agents-2026"
+---
+
+지금 Browser에서 동작하는 대부분의 AI Agent는 인내심 많은 QA 담당자와 비슷하게 일합니다. Screenshot을 찍고, "장바구니 담기" 버튼처럼 보이는 요소를 추측해서 Click하고, 기다렸다가 다시 Screenshot을 찍습니다. 동작은 하지만 느리고, Redesign에 취약하며, Model이 매 단계마다 Pixel과 DOM Tree를 다시 해석해야 하기 때문에 Token 소모도 큽니다.
+
+2026년 2월 10일 Google과 Microsoft 소속 Engineer들이 W3C Web Machine Learning Community Group 아래에서 처음 발표한 WebMCP는 이 문제를 다른 방식으로 접근합니다. Agent가 Page의 기능을 추측하는 대신, Page가 직접 알려주는 구조입니다. `navigator.modelContext`(그리고 짝을 이루는 `document.modelContext`)라는 JavaScript API를 통해 사이트는 호출 가능한 Tool 목록—이름, 설명, Parameter Schema—을 등록합니다. Browser 안에서 동작하는 Agent는 `addToCart`나 `applyFilter` 같은 Tool을 일반 함수 호출처럼 직접 부르고, 구조화된 결과를 돌려받습니다.
+
+현재는 Chrome 146 Canary에서 실험적으로 제공되고 있고, Chrome 149부터는 Public Origin Trial 단계로 넘어갔습니다. 이 글을 쓰는 시점 기준으로는 아직 Draft Community Group Report(2026년 4월 23일 발행) 단계이며 확정된 표준이 아닙니다. 각 Browser의 Stable Rollout은 대략 2026년 4분기를 목표로 하고 있습니다. 아래 내용 전체를 이 전제—아직 변경될 수 있는 초기 단계의 Spec—를 깔고 읽어주시기 바랍니다.
+
+## 왜 중요한가: 단순히 "Agent가 더 빨리 Click한다"는 이야기가 아니다
+
+실무적으로 중요한 이유는 비용과 신뢰성입니다. Screenshot이나 DOM Scraping 기반의 Agent 조작은 매 단계마다 Page 구조와 의도를 다시 추론해야 하므로 Token 비용이 높고, Layout이 바뀔 때마다 쉽게 깨집니다. 초기 보고에서는 동일한 작업을 기준으로 Screenshot 기반 조작 대비 약 89%의 Token 절감이 있었다는 수치도 나왔습니다—이는 초기 Benchmark에 기반한 참고 수치로 받아들여야 하며, Spec으로 보장된 값은 아닙니다. 다만 방향성 자체는 "Type이 있는 인자로 함수를 호출하는 것이 렌더링된 Page를 해석해서 같은 의도를 추론하는 것보다 저렴하다"는 직관과 맞아떨어집니다.
+
+정확성 측면에서도 의미가 있습니다. `checkout({ paymentMethodId, shippingAddressId })`를 Schema가 있는 Tool로 공개한 Page는, Agent가 그 주에 배포된 DOM 구조에 의존해서 올바른 시각적 상태에서 올바른 순서로 버튼을 Click해야 하는 Page보다 오작동 위험이 확실히 낮습니다.
+
+## Anthropic의 MCP와의 관계
+
+이름이 비슷해서 혼동하기 쉽지만, 두 Protocol은 서로 다른 위치에서 다른 문제를 풉니다. Anthropic의 Model Context Protocol(MCP)은 Backend 간 Protocol입니다. LLM Host Application을 외부 Tool Server와 연결하는데, 보통 Local Process나 Network 연결을 통해 Database Query Tool이나 File Search Tool처럼 Browser 바깥에 존재하는 Tool을 Model이 호출할 수 있게 합니다.
+
+반면 WebMCP는 완전히 Client Side에서, 사용자가 이미 인증된 Browser Session 안에서 동작합니다. 별도 Server를 세울 필요도, 별도 인증 정보를 관리할 필요도 없습니다. Web Page 자체가 Tool Server가 되고, 사용자가 이미 로그인해 있는 바로 그 Session 안에서 실행됩니다. 이는 인증이 관련된 기능에서 중요한 차이입니다. WebMCP의 Tool은 Page 위의 버튼 Click과 마찬가지로 사용자의 Session과 권한을 그대로 물려받습니다. 개념적으로 두 Protocol은 경쟁 관계라기보다 상호 보완적입니다. MCP는 Model을 Infrastructure와 Data Source에 연결하기 위한 것이고, WebMCP는 Model을 특정 Web Application 자신의 UI 수준 동작에 연결하기 위한 것입니다.
+
+## Next.js App에서의 패턴 스케치
+
+아래 Code는 어디까지나 예시입니다. API Surface는 아직 Draft 단계이고, Method 이름, Option, 등록 Lifecycle 등 세부 사항은 정식 Release 전까지 바뀔 가능성이 높습니다. 그대로 복사해서 Production에 넣을 Code가 아니라 개념의 윤곽으로 읽어주십시오.
+
+React/Next.js App에서는 다른 Browser API를 Side Effect로 연결할 때처럼, Mount 시점에 Tool을 등록하고 Unmount 시점에 정리하는 작은 Hook을 만드는 것이 합리적인 패턴입니다.
+
+```tsx
+// 예시일 뿐입니다. API Surface는 W3C Draft이며 앞으로 바뀔 수 있습니다.
+function useModelContextTool(tool: {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>; // JSON Schema와 유사한 형태
+  execute: (input: unknown) => Promise<unknown>;
+}) {
+  useEffect(() => {
+    if (!("modelContext" in navigator)) return; // Feature Detection
+
+    const unregister = navigator.modelContext.registerTool(tool);
+    return () => unregister();
+  }, [tool]);
+}
+```
+
+Checkout Component에서는 내부의 원시 상태를 그대로 노출하기보다, 범위가 좁고 명확한 동작을 등록하는 식입니다.
+
+```tsx
+// 예시일 뿐입니다.
+function CheckoutSummary({ cartId }: { cartId: string }) {
+  useModelContextTool({
+    name: "applyDiscountCode",
+    description: "현재 장바구니에 할인 코드를 적용하고 갱신된 합계를 반환합니다.",
+    inputSchema: {
+      type: "object",
+      properties: { code: { type: "string" } },
+      required: ["code"],
+    },
+    execute: async (input) => {
+      const { code } = input as { code: string };
+      // 일반 Form 제출이 사용하는 것과 동일한 Server 측 검증 경로를 재사용한다
+      return applyDiscountCodeAction(cartId, code);
+    },
+  });
+
+  return /* 기존 UI를 그대로 반환 */ null;
+}
+```
+
+여기서 중요한 부분은 `execute`의 마지막 줄입니다. Tool Handler는 기존 UI가 이미 사용하고 있는 것과 동일한 Server Action이나 API Route를 호출합니다. WebMCP는 이미 검증된 기존 Business Logic으로 들어가는 새로운 입구여야 하며, 독자적인 규칙을 가진 별도의 Code Path가 되어서는 안 됩니다.
+
+## 실무에서 주의할 점
+
+- **아직 Draft이며 확정된 표준이 아닙니다.** Method 이름, 등록 Lifecycle, Schema 형태까지도 정식 배포 전에 바뀔 수 있습니다. 지금 단계에서 도입하는 것은 반드시 Feature Detection을 전제로 하고, 언제든 걷어낼 수 있는 형태로 만들어야 합니다.
+- **등록한 Tool 하나하나가 새로운 인가(Authorization) 경계가 됩니다.** 상태를 변경하는 Tool이라면 대응하는 UI 동작과 정확히 같은 Server 측 검사—인증, 소유권 확인, Rate Limiting—가 필요합니다. 인증된 Session에서 Agent가 Tool을 호출한다고 해서 버튼을 Click하는 사용자보다 본질적으로 더 신뢰할 수 있는 것은 아니며, 검증을 우회시켜서는 안 됩니다.
+- **Tool 설명은 사람이 아니라 Model을 대상으로 하는 API 계약처럼 작동합니다.** 모호한 설명은 문서화가 부실한 REST Endpoint가 오용되는 것과 마찬가지로, Agent가 잘못된 Tool을 호출하거나 형식에 맞지 않는 입력을 전달하게 만듭니다. 공개 API 문서를 쓸 때와 같은 수준의 주의를 기울여 설명을 작성해야 합니다.
+- **Browser 지원은 현재 Chrome뿐이고, 그마저도 실험적 기능입니다.** 아직 Cross Browser 보장이 없고, 다른 Engine들이 다른 형태, 다른 시기에 API를 구현할 가능성도 있습니다.
+- **관측 가능성(Observability)이 아직 따라오지 못했습니다.** Agent가 호출한 Tool 사용은 Click Event와 같은 Analytics Funnel에 잡히지 않습니다. 일찍 도입하는 팀이라면 나중에 발견하기보다 처음부터 Tool 호출을 별도 축으로 Logging하고 Monitoring할 계획을 세워야 합니다.
+
+WordPress Playground 팀의 초기 실험—중첩된 iframe에서 WebMCP Tool을 공개하고, Proxy를 통해 Embed된 사이트로 호출을 전달하는 방식—은 이 기술이 어디로 향하는지 보여주는 흥미로운 신호입니다. 최상위 Page뿐 아니라 Embed된 Widget이나 Third-Party Component도 같은 방식으로 Tool을 공개하게 되면, iframe을 넘나들며 Tool 호출을 전달할 때의 신뢰 경계라는 새로운 문제도 함께 따라옵니다.
+
+## webhani의 제언
+
+지금 시점에 Production Application을 WebMCP 중심으로 재구성하는 것은 권장하지 않습니다. 아직 하나의 Browser에서 Origin Trial로 동작하는 Draft Community Group Report 단계입니다. 다만 자사 Site에 Agent와 관련성이 높은 Use Case가 있다면 지금부터 Prototype으로 시험해볼 가치는 있습니다. E-Commerce Checkout Flow, CRUD 동작이 명확한 SaaS Dashboard, 검색 중심 UI 등이 첫 후보로 다루기 좋습니다.
+
+시도한다면 상태를 변경하지 않는 검색·필터링·조회성 Tool부터 시작하고, 상태를 변경하는 동작을 공개하는 것은 뒤로 미루기를 권합니다. `navigator.modelContext`는 반드시 Feature Detection하고, 존재하지 않으면 조용히 아무 일도 하지 않도록 해야 합니다. 현재는 대부분의 사용자가 아직 이 API를 갖고 있지 않습니다. 그리고 각 Tool의 `execute` Handler는 기존 API가 이미 강제하고 있는 인가·검증 Logic을 반드시 거치도록 해서, WebMCP Tool이 UI 단에서는 당연하게 여겨지는 검사를 우회하는 뒷문이 되지 않도록 해야 합니다. 저희도 2026년 4분기 안정화를 향한 Spec의 진행 상황을 계속 지켜보고, API Surface가 굳어지는 시점에 맞춰 구체적인 구현 Guide를 다시 정리할 예정입니다.
