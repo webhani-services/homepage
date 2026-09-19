@@ -1,0 +1,99 @@
+---
+title: "Pulumi Kubernetes Operator 2.0: Cloud Infrastructure as a First-Class Kubernetes Resource"
+description: "PKO 2.0 just reached general availability with a pod-per-stack architecture built on two new CRDs, Workspace and Update. A practical look at the isolation problem this actually fixes, a Stack/Workspace YAML sketch, and where it does and doesn't fit."
+date: "2026-09-20"
+status: "published"
+tags: ["Kubernetes", "Pulumi", "IaC", "GitOps", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "pulumi-kubernetes-operator-2-ga-2026"
+---
+
+Pulumi Kubernetes Operator (PKO) has been around for a while as a way to reconcile cloud infrastructure from inside a Kubernetes cluster, using a `Stack` custom resource. It just reached general availability at major version 2.0, and the headline change is less a new feature than a rewrite of how the operator actually executes stack operations. We've been recommending PKO 1.x to clients cautiously, with real reservations about blast radius — and 2.0 is the release that addresses the reservation that mattered most to us.
+
+## What PKO does, for anyone who hasn't touched it
+
+Quick framing before getting into the architecture change. PKO takes a Pulumi program — TypeScript, Python, Go, .NET, Java, or plain YAML, the same kind of program you'd normally run with `pulumi up` from a laptop or a CI job — and wraps it in a `Stack` custom resource that lives in your cluster. From there, Kubernetes' usual reconciliation loop takes over: apply the manifest, and the operator drives preview, update, refresh, and destroy operations against AWS, Azure, GCP, Kubernetes itself, or any of Pulumi's 60+ other providers, converging real infrastructure toward whatever the Pulumi program declares. It's the same "diff state against desired state, converge via controller" model ArgoCD or Flux apply to your application manifests — just applied one layer down, to the infrastructure those applications run on.
+
+## Why the 1.0 shared-pod model was a real liability
+
+In PKO 1.x, the operator was effectively a single Deployment (or a small, horizontally scaled one). Every `Stack` you applied got reconciled by a Pulumi CLI process running inside that shared operator pod's execution context. That has two consequences once you're running more than a handful of stacks through it.
+
+First, resource contention. A stack update that touches a large number of resources, or waits on a slow-to-respond provider, can consume CPU and memory for a long stretch. If that update shares a process space with ten other teams' reconciliations, one expensive or runaway update degrades throughput for everyone else. You don't get the isolation you'd expect from "each team owns its own infra" — you get a shared-tenant model with no cgroup boundary between tenants.
+
+Second, and more serious from where we sit: secrets exposure. Pulumi programs routinely need credentials — cloud provider keys, database passwords used as stack outputs, tokens for third-party APIs referenced in the program. When every stack's update runs inside the same operator process, every stack's secrets end up resident, at some point, in the memory of that same pod. A vulnerability in the operator, a misconfigured sidecar, or simply an overly broad ServiceAccount bound to that pod turns into a blast radius spanning every team's cloud credentials, not just one team's. For a consulting practice managing infrastructure across client environments, that's not an abstract risk — it's exactly the kind of thing a client's security team will, rightly, ask about in the first review.
+
+## What changes in 2.0: one pod per stack
+
+PKO 2.0 restructures execution around two new custom resources, `Workspace` and `Update`, while leaving the `Stack` CR you already write untouched. When you apply a `Stack`, the operator no longer runs it directly. Instead it provisions a dedicated `Workspace` — its own pod, its own filesystem, its own environment, its own mounted secrets — scoped to that single stack. Stack operations (preview, update, refresh, destroy) are then tracked as `Update` resources, individual runs against that Workspace, conceptually similar to how a `Job` represents one execution triggered by a `CronJob`.
+
+The practical effect: a stack update for team A's staging VPC and a stack update for team B's production RDS cluster no longer share a process, a filesystem, or a memory space. If team A's update hangs or balloons in memory, it stays contained to team A's Workspace pod — normal Kubernetes resource limits and scheduling apply per pod, exactly as they already do for application workloads. Team B's secrets were never loaded into team A's pod, because there's no shared pod to load them into.
+
+This also opens up per-stack customization that wasn't really available before: a custom container image for a Workspace (if a stack's Pulumi program needs a specific toolchain, a private plugin, or baked-in CLI dependencies), resource requests/limits tuned to that stack's actual footprint, or a different set of mounted secrets and volumes per stack — none of which requires touching the shared operator configuration.
+
+Importantly, this is additive at the API level. Existing `Stack` manifests from 1.x continue to work unmodified — the Workspace and Update resources are created and managed underneath by the operator, not something you're expected to hand-author for typical use. You can author a `Workspace` yourself if you need fine control over a specific stack's execution environment, but it's opt-in.
+
+## A sketch
+
+Treat this as illustrative — check the actual PKO 2.0 CRD reference for exact field names before applying anything to a real cluster.
+
+```yaml
+apiVersion: pulumi.com/v1
+kind: Stack
+metadata:
+  name: platform-networking
+  namespace: infra-prod
+spec:
+  stack: acme-org/platform-networking/prod
+  projectRepo: https://github.com/acme-org/infra-pulumi
+  branch: refs/heads/main
+  # Optional: point this Stack at a Workspace template with a custom
+  # image / resource profile instead of the operator's defaults.
+  workspaceTemplate:
+    spec:
+      image: registry.acme.internal/pulumi-runner:go1.23-aws
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+        limits:
+          cpu: "2"
+          memory: "2Gi"
+  envRefs:
+    AWS_ROLE_ARN:
+      type: Secret
+      secret:
+        name: platform-networking-aws-role
+        key: roleArn
+  destroyOnFinalize: false
+```
+
+```yaml
+apiVersion: pulumi.com/v1
+kind: Workspace
+metadata:
+  name: platform-networking-ws
+  namespace: infra-prod
+spec:
+  stack: acme-org/platform-networking/prod
+  image: registry.acme.internal/pulumi-runner:go1.23-aws
+  serviceAccountName: platform-networking-runner
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+```
+
+The point of the second block isn't that you'll typically write it by hand — the operator generates the equivalent from the `Stack`'s `workspaceTemplate` — but knowing it exists as a real, independently addressable object matters when debugging. You can `kubectl get workspace` and `kubectl logs` a specific stack's execution pod, instead of digging through a shared operator's combined log stream.
+
+## Practical caveats
+
+A few things we'd flag to any team evaluating this, based on how we'd actually roll it out for a client.
+
+- **RBAC on `Stack` (and now `Workspace`/`Update`) is provisioning permission, full stop.** Anyone who can create or edit a `Stack` CR in a namespace with credentials scoped to your production AWS account can provision or destroy production infrastructure. Treat `Stack` the same way you'd treat direct IAM console access — scope it per environment namespace, gate it behind the same approval process you'd use for a protected branch in a Terraform or Pulumi CI pipeline, and don't let it inherit broad `edit` ClusterRole bindings meant for application manifests.
+- **Migration from 1.x isn't a big-bang rewrite, but budget real verification time.** Because the `Stack` API is preserved, upgrading the operator itself is usually the smaller part of the work. What we'd actually test before rolling to production: that per-stack Workspace pods get the same ServiceAccount/IRSA or Workload Identity bindings the shared operator pod used to have, and that any custom images or plugins baked into the old operator pod are now expressed through a `workspaceTemplate` rather than silently assumed to still exist.
+- **This doesn't replace CI-driven Pulumi in every case.** If your team already runs a mature CI pipeline with review gates, plan-then-apply approvals, and audit logging tied to your existing deployment process, moving infra changes into in-cluster `Stack` CRs mainly pays off when you also want infra reconciliation to follow the same GitOps loop (ArgoCD, Flux) as your application manifests — continuous drift correction, not just a triggered-on-merge apply. If infra changes are infrequent, or you want a human explicitly approving a plan before it's applied, a CI pipeline with a manual gate is still the simpler and more auditable choice. PKO earns its keep when infra state needs to converge continuously and you're already running a GitOps controller for everything else in the cluster.
+
+## Where we'd land this for clients
+
+For clients already running a GitOps-first Kubernetes platform, PKO 2.0 closes the gap that made us cautious about 1.x — it makes the "infrastructure as just another Kubernetes resource" model actually match the isolation guarantees you'd want for anything holding cloud credentials. We'd still gate `Stack` creation behind the same RBAC scrutiny as direct cloud console access, and we'd scope a migration from 1.x as a real project that includes verifying every stack's Workspace identity bindings — not just bumping the operator version and hoping the defaults carry over.

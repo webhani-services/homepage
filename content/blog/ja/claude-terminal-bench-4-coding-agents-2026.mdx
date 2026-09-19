@@ -1,0 +1,103 @@
+---
+title: "コーディングAgentのBenchmarkは何を測っているのか: 2026年9月の実例で読み解く"
+description: "SWE-bench VerifiedとSWE-bench Pro、Terminal-Bench 4.0では同じモデルの順位が入れ替わります。エンジニアリングリード向けに、公開Benchmarkの正しい読み方と自社リポジトリベースの簡易内製Evalの作り方を整理しました。"
+date: "2026-09-20"
+status: "published"
+tags: ["Claude", "AI Coding Agents", "Benchmarking", "LLM"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-terminal-bench-4-coding-agents-2026"
+---
+
+クライアントから「どのコーディングAgentやModelをチームの標準にすべきか」と聞かれたとき、その裏にあるのはたいてい「最新Benchmarkで一番スコアが高いのはどれか」という質問です。これは問いの立て方自体がずれています。2026年9月のModelリリースラッシュは、そのことを具体的な数字で示してくれる良い題材です。
+
+AnthropicはClaude Opus 5を2026年7月24日にリリースし、続けて9月1日にClaude Fable 5.1とClaude Mythos 5.1を発表しました。当時、コーディングとKnowledge Work向けの最も高性能なModelと位置づけられていました。その2日後にはOpenAIがGPT-6 Astraをリリースし、Codex上で動作します。この1週間ほどの間に、3種類のBenchmarkファミリーがそれぞれ違う「どちらが優勢か」というストーリーを語っていました。どれも間違ってはいません。単に測っているものが違うだけです。
+
+## なぜ単一の数字では決着しないのか
+
+Agent向けコーディングBenchmarkは、名前に「-bench」がつくからといって同じものを測っているわけではありません。
+
+- **SWE-bench Verified**は、実際のGitHub Issueから人手で選定されたサブセットで、Issueを渡してテストが通るDiffを1回で生成できるかを見るSingle-shot形式です。実績のあるBenchmarkですが、既にTop Modelがスコアの上限付近に密集しており、モデル間の差が縮まりつつあります。
+- **SWE-bench Pro**はより難しく露出の少ないタスクで構成されており、順位を再びばらけさせる傾向があります。Verifiedとは別のランキングになることも珍しくありません。
+- **Terminal-Bench 4.0**は構造的に違うものを測ります。1回のPatch生成ではなく、Terminal環境で計画を立て、Commandを実行し、出力を確認し、複数ターンにわたって軌道修正しながら進める長時間タスクです。実際にコーディングAgentが日々こなしている作業に、単発PRのBenchmarkよりもずっと近い形です。
+- 科学領域向けなどのDomain特化Variantは、さらに狭い範囲を見ています。汎用的なコーディング能力が、特定Domainのツールや慣習にどこまで転移するかです。
+
+あるModelが一方の軸でリードし、別の軸で後れを取ることは普通に起こります。Benchmarkが間違っているのではなく、測定している能力そのものが違うのです。
+
+## 具体例: 3つのBenchmark、3つの順位
+
+以下は2026年9月上旬時点で報告されていた数字であり、webhaniが独自に検証したものではなく、あくまで当時報告された値として扱ってください。
+
+SWE-bench Verifiedでは、Opus 5が約96.0%、Fable 5が約95.0%と報告されており、Opus 5がわずかにリードしています。ただしVerifiedがここまでスコアが飽和している状況では、この差はBenchmarkのノイズに近い水準とも言えます。
+
+SWE-bench Proでは順位が入れ替わります。Fable 5が約80.3%、Opus 5が約79.2%と報告されました。同じ2モデル、同じBenchmarkファミリーの中でも、より難易度の高いVariantに切り替えるだけで順位が逆転しています。
+
+Terminal-Bench 4.0では、9月にアップデートされたFable 5.1が約55.8%と報告され、Opus 5の約52.3%を上回りました。さらに、Fable 5.1を素のAPI呼び出しではなくClaude Code上で動かして評価すると、スコアは約57.9%へと変化しています。これはModel本体の重みだけでなく、周囲のAgent HarnessやTool-calling機構自体が測定対象の一部になっていることを示しています。
+
+このClaude Code + Fable 5.1のスコアのすぐ隣に並んでいたのが、Codex上で動くGPT-6 AstraのTerminal-Bench 4.0スコア約58.2%です。この程度のBenchmarkで0.3ポイント差は、通常の実行ごとのブレの範囲内です。実務的にはどちらかが勝っているというより、フロンティアで実質的に並んでいると見るべきです。
+
+さらにDomain特化のケースとして、Terminal-Bench-Science 0.1では、Fable 5.1が約52.6%と報告され、同じBenchmark上のFable 5の約24.7%の2倍以上になっています。汎用コーディングBenchmarkでは見られない大きなジャンプであり、マイナーバージョンアップが特定Domainのスコアを大きく動かす一方で、汎用スコアはほぼ横ばいのままということもある、という注意喚起になります。
+
+あえて動かなかった数字にも触れておきます。Fable 5.1のAPI価格はFable 5から変わらず、Input $10/Output $50(100万Tokenあたり)です。この2バージョン間でCapabilityは意味のある差が出た一方、価格は据え置きでした。この乖離は珍しいことではなく、別軸として追いかける価値があります。
+
+## Leaderboardを信じる代わりに作るもの
+
+上記の公開Benchmarkは、どれもチーム固有のタスク構成、つまり自社のFramework、Monorepoの慣習、社内APIの形、テストスイートの癖までは反映していません。特定チーム向けにAgentを選ぶなら、最も信頼できるシグナルは自社リポジトリの履歴から作った小規模な内製Evalです。
+
+構造は複雑である必要はありません。最小限の形は次のようなイメージです。
+
+```typescript
+type EvalTask = {
+  id: string;
+  prompt: string;          // Issue/Ticketの本文そのまま
+  repoRef: string;         // 実行前にCheckoutするCommit
+  successCheck: () => Promise<boolean>; // テストスイート実行結果などで判定
+  maxTurns: number;
+  maxWallClockMs: number;
+};
+
+type RunResult = {
+  taskId: string;
+  agent: string;           // 例: "claude-code+fable-5.1", "codex+gpt-6-astra"
+  passed: boolean;
+  turnsUsed: number;
+  wallClockMs: number;
+  tokenCost: number;
+  humanReviewNotes?: string; // Pass/Failだけでなく、Diffの質を記録
+};
+
+async function runEval(tasks: EvalTask[], agents: Agent[]): Promise<RunResult[]> {
+  const results: RunResult[] = [];
+  for (const task of tasks) {
+    for (const agent of agents) {
+      const run = await agent.execute(task.prompt, {
+        repoRef: task.repoRef,
+        maxTurns: task.maxTurns,
+        maxWallClockMs: task.maxWallClockMs,
+      });
+      results.push({
+        taskId: task.id,
+        agent: agent.name,
+        passed: await task.successCheck(),
+        turnsUsed: run.turnsUsed,
+        wallClockMs: run.elapsedMs,
+        tokenCost: run.tokenCost,
+      });
+    }
+  }
+  return results;
+}
+```
+
+自社リポジトリのClose済みTicketやMergeされたPRから20〜50件を選びます。単純なBug Fixだけでなく、中規模のRefactor、そしてSWE-bench VerifiedよりもTerminal-Benchに近い、複数FileにまたがるMulti-stepタスクを何件か混ぜるのが理想です。評価軸もPass/Failだけにしません。Turn数と実行時間はAgentの自律性を、Token Costはタスク実際のPrice感を(単なるToken単価ではなく)教えてくれますし、Diffの質を人間がレビューすることで「テストは通るがこのままMergeはしたくない」という自動判定では拾えない結果も検知できます。
+
+## 実務上の注意点
+
+- **公開Benchmarkのスコアは数週間単位で動きます。** 今回の5から5.1というマイナーバージョンアップだけで、Domain特化スコアが2倍以上動く一方、汎用コーディングスコアはほぼ横ばいでした。Benchmarkの数字はModel Familyの固定的な性質ではなく、あくまでスナップショットとして扱うべきです。
+- **多くの場合、比較しているのはModel単体ではなくModel + Harnessです。** 同じFable 5.1でも、素のAPI呼び出しとClaude Codeでラップした場合でTerminal-Bench 4.0のスコアが変わっています。「ClaudeとCodexを比較する」とき、実質的にはClaude CodeとCodexというAgent環境同士を比較している面があります。
+- **公開Benchmarkにはコンタミネーションのリスクが常にあります。** 公開されている解法が学習データに混入していく可能性があり、これがSWE-bench Proのような、より難しく露出の少ないVariantが存在する理由の一部です。そして、自社の非公開タスクセットの方が公開Leaderboardより信頼できる理由でもあります。
+- **BenchmarkはCostとLatencyのトレードオフを直接示しません。** 数ポイントリードしていても、成功あたりの実行時間やコストが明らかに悪いModelは、チームの実際のワークフローにとって最適な選択とは限りません。
+
+## webhaniとしての推奨
+
+私たちはクライアントに対して「どのModelが勝っている」とは言いません。フロンティアの動きが速すぎて、それはすぐに古い情報になりますし、今回紹介した2026年9月の数字自体、同じ週の中でどのBenchmarkを見るかによってTop Modelの順位が入れ替わっていました。代わりに推奨しているのは次の3点です。チームの実際の作業に近いBenchmark Variantを選ぶこと(単発PatchのVerified型だけでなく、日々の作業がMulti-stepタスク中心ならTerminal-Bench型も重視する)、特定のAgentをチームに導入する前に自社リポジトリベースの小規模な内製Evalを作ること、そしてそのEvalを四半期ごとに再実行し、ある時点のLeaderboardのスナップショットを確定事項として扱わないことです。ある数字が何を示していて何を示していないかを見極める力は、今週のLeaderboardの順位を知っていることよりも、エンジニアリング組織にとって価値があります。

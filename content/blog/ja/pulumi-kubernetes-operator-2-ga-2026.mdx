@@ -1,0 +1,99 @@
+---
+title: "Pulumi Kubernetes Operator 2.0 GA: クラウドインフラをKubernetesリソースとして宣言的に扱う"
+description: "Pulumi Kubernetes Operator 2.0がGAに到達し、Stack単位でPodを分離するアーキテクチャに刷新されました。WorkspaceとUpdateという2つの新CRDが何を解決するのか、YAML例とRBAC・移行時の注意点を交えて整理します。"
+date: "2026-09-20"
+status: "published"
+tags: ["Kubernetes", "Pulumi", "IaC", "GitOps", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "pulumi-kubernetes-operator-2-ga-2026"
+---
+
+Pulumi Kubernetes Operator（PKO）は、Kubernetesクラスタの内側から`Stack`というCustom Resourceでクラウドインフラを調整（reconcile）する仕組みとして、数年前から存在していました。このたびメジャーバージョン2.0としてGA（一般提供）に到達しましたが、目玉は新機能の追加というより、Stack操作を実際にどう実行するかというアーキテクチャそのものの刷新です。webhaniではPKO 1.xをこれまで慎重に、いくつかの懸念点付きでクライアントに勧めてきましたが、2.0はその中でも一番気になっていた点に手を入れたリリースです。
+
+## PKOが何をするツールか、簡単に整理する
+
+アーキテクチャの話に入る前に、まず前提を揃えます。PKOはTypeScript、Python、Go、.NET、Java、あるいはプレーンなYAMLで書かれたPulumiプログラム、つまりローカルやCIから`pulumi up`で実行するのと同じ種類のプログラムを、クラスタ内に置く`Stack`というCustom Resourceでラップします。あとはKubernetesのいつもの調整ループに任せます。Manifestをapplyすれば、OperatorがAWS、Azure、GCP、Kubernetes自身、あるいはPulumiが対応する60以上のプロバイダーに対してpreview/update/refresh/destroyを実行し、実際のインフラをPulumiプログラムが宣言した状態へ収束させます。ArgoCDやFluxがアプリケーションManifestに対してやっている「望ましい状態との差分を見てControllerで収束させる」というモデルを、アプリケーションが動く土台であるインフラのレイヤーにそのまま適用したものだと考えると分かりやすいです。
+
+## 1.0の「Podを共有する」アーキテクチャが抱えていた実害
+
+PKO 1.xでは、Operator自体が実質的に単一（あるいは小規模にスケールした）Deploymentでした。適用した`Stack`は、その共有Operator Podの実行コンテキストの中で動くPulumi CLIプロセスによって調整されます。扱うStackの数が数個を超えたあたりから、これは2つの問題を生みます。
+
+1つ目はリソース競合です。大量のリソースを扱うStack更新や、レスポンスの遅いProviderを待つ更新は、長時間CPUとメモリを消費し続けることがあります。それが他の10チーム分のStack調整と同じプロセス空間で動いていれば、1つの重い、あるいは暴走した更新が他チーム全体のスループットを引きずり下ろします。「各チームが自分のインフラを持つ」つもりでいても、実態はテナント間にcgroupの境界がない共有テナントモデルです。
+
+2つ目は、より深刻だとwebhaniが考える点で、Secretの露出です。Pulumiプログラムはクラウドプロバイダーのキー、Stack出力として扱うデータベースのパスワード、プログラム内で参照するサードパーティAPIのトークンなど、日常的にCredentialを必要とします。すべてのStackの更新が同じOperatorプロセスの中で走るということは、あるタイミングですべてのStackのSecretが同じPodのメモリ上に載ることを意味します。Operator自体の脆弱性、設定ミスのあるSidecar、あるいはそのPodに紐づいたServiceAccountの権限が広すぎるだけで、1チーム分ではなく全チーム分のクラウドCredentialにまたがるBlast Radiusになります。クライアントごとに異なる環境のインフラを扱うコンサルティングという立場からすると、これは抽象的なリスクではなく、最初のレビューでクライアントのセキュリティチームから当然聞かれる類の話です。
+
+## 2.0での変更点: Stack1つにつきPod1つ
+
+PKO 2.0は、既存の`Stack` CRのAPIをそのまま残しつつ、`Workspace`と`Update`という2つの新しいCustom Resourceを中心に実行系を再構成しました。`Stack`をapplyしても、Operatorはもう直接それを実行しません。代わりに、そのStack専用の`Workspace`、つまり専用のPod・専用のファイルシステム・専用の環境・専用にマウントされたSecretを持つ実行環境をプロビジョニングします。Stack操作（preview/update/refresh/destroy）は、そのWorkspaceに対する個別の実行を表す`Update`リソースとして追跡されます。`CronJob`のスケジュールに対して`Job`が1回分の実行を表すのと似た関係だとイメージすると理解しやすいです。
+
+実務上の効果は明確です。チームAのStaging VPC用のStack更新と、チームBのProduction RDSクラスタ用のStack更新が、もうプロセスもファイルシステムもメモリ空間も共有しません。チームAの更新がハングしたりメモリを膨張させたりしても、それはチームAのWorkspace Podの中に閉じ込められます。Kubernetes標準のリソース制限やスケジューリングが、アプリケーションWorkloadに対してすでにそうしているのと同じ粒度で、Pod単位で効きます。チームBのSecretは、そもそもチームAのPodにロードされることがありません。共有するPod自体が存在しないからです。
+
+これは以前は難しかったStack単位のカスタマイズも可能にします。特定のツールチェーンやPrivate Plugin、追加のCLI依存関係を組み込んだ独自のコンテナイメージをWorkspaceに指定したり、そのStackの実際の負荷に合わせたリソースのRequest/Limitを設定したり、Stackごとに異なるSecretやVolumeをマウントしたりといったことが、共有Operatorの設定を触ることなく行えます。
+
+重要なのは、これがAPIレベルでは追加であって破壊的変更ではないという点です。1.xから持っている既存の`Stack` Manifestは、そのまま無修正で動き続けます。WorkspaceとUpdateは、通常の利用では手で書くものではなく、Operatorが裏側で生成・管理するリソースです。特定Stackの実行環境を細かく制御したい場合には自分で`Workspace`を書くこともできますが、あくまでオプトインです。
+
+## 構成イメージ
+
+以下は考え方を示すための例示的なYAMLです。実際に適用する前には、PKO 2.0の公式CRDリファレンスで正確なフィールド名を確認してください。
+
+```yaml
+apiVersion: pulumi.com/v1
+kind: Stack
+metadata:
+  name: platform-networking
+  namespace: infra-prod
+spec:
+  stack: acme-org/platform-networking/prod
+  projectRepo: https://github.com/acme-org/infra-pulumi
+  branch: refs/heads/main
+  # オプション: Operatorのデフォルトではなく、カスタムイメージや
+  # リソースプロファイルを持つWorkspaceテンプレートを指定する
+  workspaceTemplate:
+    spec:
+      image: registry.acme.internal/pulumi-runner:go1.23-aws
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+        limits:
+          cpu: "2"
+          memory: "2Gi"
+  envRefs:
+    AWS_ROLE_ARN:
+      type: Secret
+      secret:
+        name: platform-networking-aws-role
+        key: roleArn
+  destroyOnFinalize: false
+```
+
+```yaml
+apiVersion: pulumi.com/v1
+kind: Workspace
+metadata:
+  name: platform-networking-ws
+  namespace: infra-prod
+spec:
+  stack: acme-org/platform-networking/prod
+  image: registry.acme.internal/pulumi-runner:go1.23-aws
+  serviceAccountName: platform-networking-runner
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+```
+
+2つ目のブロックを自分で書く機会は普段はあまりありません。Operatorが`Stack`の`workspaceTemplate`から同等のものを生成してくれるからです。ただ、これが独立してアドレス可能な実在のオブジェクトだと知っておくことは、Debug時に効いてきます。共有Operatorの混ざったログを掘るのではなく、`kubectl get workspace`や`kubectl logs`で特定Stackの実行Podだけを直接見に行けます。
+
+## 実務上の注意点
+
+導入を検討するチームに対して、webhaniが実際にクライアントへロールアウトする際に伝えるであろう点をいくつか挙げます。
+
+- **`Stack`（そして今回追加された`Workspace`/`Update`）へのRBACは、そのままクラウドインフラのプロビジョニング権限です。** Production AWSアカウントにスコープされたCredentialを持つNamespaceで`Stack` CRを作成・編集できる人は、Production環境のインフラを作成・破棄できます。`Stack`はIAMコンソールへの直接アクセスと同等に扱うべきです。環境ごとにNamespaceを分け、TerraformやPulumiのCIパイプラインで保護対象ブランチに使っているのと同じ承認プロセスをかけ、アプリケーションManifest向けに設定された広範な`edit` ClusterRoleを継承させないようにします。
+- **1.xからの移行は一気書き換えではありませんが、検証には時間を見ておくべきです。** `Stack`のAPIは維持されているので、Operator自体のアップグレードは作業量としては小さい部分です。むしろProductionに展開する前に実際に検証すべきなのは、Stackごとに立つWorkspace Podが、これまで共有Operator Podが持っていたServiceAccount/IRSAやWorkload Identityのバインディングを同じように受け取っているかどうかです。旧Operator Podに組み込まれていたカスタムイメージやPluginについても、暗黙のうちに残っていると仮定せず、`workspaceTemplate`として明示的に表現し直す必要があります。
+- **すべてのケースでCI駆動のPulumi実行を置き換えるものではありません。** すでに成熟したCIパイプラインがあり、レビューゲート、plan→apply承認、既存のデプロイプロセスに紐づいた監査ログを持っているチームであれば、インフラ変更をクラスタ内の`Stack` CRに移す価値が出るのは、インフラのReconciliationもアプリケーションManifestと同じGitOpsループ（ArgoCD、Flux）に乗せたい場合です。つまり、マージ時に単発でApplyするだけでなく、継続的にドリフトを是正したいというニーズがある場合です。インフラ変更の頻度が低い、あるいはplanをレビューした人間が明示的に「apply」を押したいという運用であれば、手動承認ゲート付きのCIパイプラインの方がまだシンプルで監査もしやすい選択です。クラスタ内の他のリソースをすでにGitOpsコントローラーで運用していて、インフラの状態を継続的に収束させたい場合にこそPKOは効いてきます。
+
+## webhaniとしての結論
+
+すでにGitOpsを前提としたKubernetes基盤を運用しているクライアントにとって、PKO 2.0はwebhaniが1.xに対して慎重だった一番の理由を解消するリリースです。「インフラもただのKubernetesリソースとして扱う」というモデルが、クラウドCredentialを扱うものとして期待すべき分離レベルにようやく追いついたと言えます。それでも`Stack`の作成権限は、クラウドコンソールへの直接アクセスと同じ水準のRBAC審査の対象として扱いますし、1.xからの移行はOperatorのバージョンを上げてデフォルト設定を信じるだけの作業ではなく、Stackごとのワークロード認証（Identity Binding）をひとつひとつ検証するプロジェクトとしてスコープすべきだと考えています。

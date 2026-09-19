@@ -1,0 +1,103 @@
+---
+title: "Reading Coding-Agent Benchmarks Correctly: A September 2026 Worked Example"
+description: "SWE-bench Verified, SWE-bench Pro, and Terminal-Bench 4.0 rank the same models differently. A practical guide for engineering leads on interpreting agentic coding benchmarks and building a lightweight internal eval instead of trusting a single leaderboard number."
+date: "2026-09-20"
+status: "published"
+tags: ["Claude", "AI Coding Agents", "Benchmarking", "LLM"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-terminal-bench-4-coding-agents-2026"
+---
+
+When a client asks us which coding agent or model their team should standardize on, the question behind the question is usually "which one scored highest on the latest benchmark." That's the wrong question, and September 2026's model releases make a clean case study for why.
+
+Anthropic shipped Claude Opus 5 on July 24, 2026, then followed it on September 1 with Claude Fable 5.1 and Claude Mythos 5.1 — described at the time as its most capable models for coding and knowledge work. Two days later, OpenAI released GPT-6 Astra, running inside Codex. Within that one-week window, three different benchmark families told three different stories about which model was "ahead." None of them were wrong. They were measuring different things.
+
+## Why one number doesn't settle it
+
+Agentic coding benchmarks aren't interchangeable just because they all end in "-bench." They differ in what kind of work they exercise:
+
+- **SWE-bench Verified** is a curated, human-checked subset of real GitHub issues, evaluated as a single-shot patch: given an issue, produce a diff that makes the held-out tests pass. It's a well-understood benchmark, but it's also older and increasingly saturated — top models are clustered near the ceiling, which compresses the gaps between them.
+- **SWE-bench Pro** raises the bar with harder, less-exposed tasks, which tends to spread models out again and can reorder the leaderboard relative to Verified.
+- **Terminal-Bench 4.0** measures something structurally different: long-horizon, multi-step work in a terminal environment, where the agent has to plan, run commands, inspect output, and course-correct across many turns rather than produce one patch in one shot. This is much closer to what a coding agent actually does during a real day of work than a single-PR benchmark is.
+- Domain-specific variants, like a science-focused benchmark, test something narrower still: whether the model's general coding ability transfers into a specialized domain's tooling and conventions.
+
+A model can lead on one axis and trail on another without any benchmark being "wrong" — they're just not measuring the same skill.
+
+## The worked example: three benchmarks, three rankings
+
+Here's what the reported numbers from early September 2026 looked like, treating them as figures reported at the time rather than numbers we independently verified:
+
+On SWE-bench Verified, Opus 5 was reported at roughly 96.0% against Fable 5 at roughly 95.0% — Opus ahead, though the gap is small enough to be near the benchmark's noise floor given how saturated Verified has become.
+
+On SWE-bench Pro, the ranking flipped: Fable 5 was reported at roughly 80.3% against Opus 5's roughly 79.2%. Same two models, same benchmark family, opposite order, just because the harder variant exercises different failure modes.
+
+On Terminal-Bench 4.0, Fable 5.1 (the September update) was reported at roughly 55.8%, ahead of Opus 5's roughly 52.3%. And when Fable 5.1 was evaluated running inside Claude Code rather than as a bare API call, the reported score shifted again, to roughly 57.9% — a reminder that the agent harness and tool-calling scaffold around a model is part of what's being measured, not just the underlying weights.
+
+That Claude Code + Fable 5.1 figure sat right next to GPT-6 Astra's reported Terminal-Bench 4.0 score of roughly 58.2%, running in Codex. A 0.3-point gap on a benchmark like this is inside typical run-to-run variance — practically speaking, that's a tie at the frontier, not a win for either side.
+
+Then there's the domain-specific case: on Terminal-Bench-Science 0.1, Fable 5.1 was reported at roughly 52.6%, more than double Fable 5's roughly 24.7% on the same benchmark. That's a far bigger jump than anything visible on the general coding benchmarks, and it's a useful warning that a minor version bump can move a domain-specific number dramatically while leaving general-purpose numbers roughly where they were.
+
+One more data point worth noting precisely because it *doesn't* move: Fable 5.1's API pricing was unchanged from Fable 5, at $10 per million input tokens and $50 per million output tokens. Capability shifted meaningfully between these two versions; price didn't. That decoupling is normal and worth tracking separately.
+
+## What to build instead of trusting a leaderboard
+
+None of the public benchmarks above encode your team's actual task mix — your framework, your monorepo conventions, your internal API surface, your test suite's quirks. If you're choosing an agent for a specific engineering team, the most reliable signal is a small internal eval built from your own repository's history.
+
+The structure doesn't need to be elaborate. A minimal version looks like this:
+
+```typescript
+type EvalTask = {
+  id: string;
+  prompt: string;          // the issue/ticket text, verbatim
+  repoRef: string;         // commit to check out before running
+  successCheck: () => Promise<boolean>; // e.g. run test suite, check exit code
+  maxTurns: number;
+  maxWallClockMs: number;
+};
+
+type RunResult = {
+  taskId: string;
+  agent: string;           // e.g. "claude-code+fable-5.1", "codex+gpt-6-astra"
+  passed: boolean;
+  turnsUsed: number;
+  wallClockMs: number;
+  tokenCost: number;
+  humanReviewNotes?: string; // diff quality, not just pass/fail
+};
+
+async function runEval(tasks: EvalTask[], agents: Agent[]): Promise<RunResult[]> {
+  const results: RunResult[] = [];
+  for (const task of tasks) {
+    for (const agent of agents) {
+      const run = await agent.execute(task.prompt, {
+        repoRef: task.repoRef,
+        maxTurns: task.maxTurns,
+        maxWallClockMs: task.maxWallClockMs,
+      });
+      results.push({
+        taskId: task.id,
+        agent: agent.name,
+        passed: await task.successCheck(),
+        turnsUsed: run.turnsUsed,
+        wallClockMs: run.elapsedMs,
+        tokenCost: run.tokenCost,
+      });
+    }
+  }
+  return results;
+}
+```
+
+Pull 20 to 50 tasks from resolved tickets or merged PRs in your own repo — ideally a mix of quick bug fixes, medium refactors, and at least a few multi-file, multi-step tasks that resemble Terminal-Bench more than SWE-bench Verified. Score on more than pass/fail: turns used and wall-clock time tell you about autonomy, token cost tells you about the actual price of a task (not just the per-token rate), and a human review pass on diff quality catches "technically passes tests but I wouldn't merge this" outcomes that an automated check misses.
+
+## Caveats worth keeping in mind
+
+- **Public benchmark numbers can shift within weeks.** A minor version bump — 5 to 5.1 in this case — moved a domain-specific score by more than 2x while leaving general coding scores nearly flat. Treat any benchmark number as a snapshot, not a fixed property of a model family.
+- **You're often comparing model+harness, not model alone.** The gap between a bare-API Terminal-Bench score and a Claude-Code-wrapped score for the same model shows the scaffold matters. If you're evaluating "Claude" vs "Codex," you're partly evaluating Claude Code vs Codex as agent environments.
+- **Contamination is a real risk on any public benchmark.** Tasks with public solutions may leak into training data over time, which is part of why harder, less-exposed variants like SWE-bench Pro exist — and part of why your own private task set is more trustworthy than any public leaderboard.
+- **Benchmarks don't show cost and latency tradeoffs directly.** A model that's a percentage point ahead but noticeably slower or pricier per successful task may not be the better choice for your team's actual workflow.
+
+## webhani's recommendation
+
+We don't tell clients which model "wins" — the frontier moves too fast for that to stay true for long, and the September 2026 numbers above show top models trading places within the same week depending on which benchmark you read. What we do recommend: match the benchmark variant to the shape of your team's actual work (Terminal-Bench-style multi-step tasks if that's what your engineers do daily, not just Verified-style single patches), build a small internal eval from your own repository before committing a team to a specific agent, and re-run that eval quarterly rather than treating any one leaderboard snapshot as settled. Benchmark literacy — knowing what a number does and doesn't tell you — is worth more to an engineering org than knowing this week's leaderboard order.
