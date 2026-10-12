@@ -1,0 +1,118 @@
+---
+title: "Claude Haiku 5.5와 Model Routing: Agent Workflow에서 소형 모델을 둘 자리"
+description: "Claude Haiku 5.5는 대량 처리와 저비용 용도, 그리고 Sub-agent 역할을 겨냥한 모델입니다. 소형 모델과 대형 모델의 역할 분담 방법과 그 효과를 측정하는 방법을 실무 관점에서 정리합니다."
+date: "2026-10-13"
+status: "published"
+tags: ["AI", "LLM", "Claude", "Agents", "Cost Optimization"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-haiku-5-5-subagent-model-routing-2026"
+---
+
+Anthropic이 2026년 10월 초 Claude Haiku 5.5를 출시했습니다. 5.5 패밀리에서 가장 빠르고 저렴한 모델로 소개되며, 요약·분류·Database Query 생성 같은 대량 처리와 Opus 5.5·Sonnet 5.5 아래에서 동작하는 Sub-agent 용도를 염두에 둔 것으로 보도되었습니다. 큰 Context Window와 조절 가능한 Effort Level에 관한 정보도 있지만, 이는 2차 출처이며 매체마다 서술이 다릅니다. 사양과 가격은 반드시 Anthropic 공식 문서에서 확인하시기 바랍니다.
+
+모델의 세부 사양보다 중요한 것은 이 모델이 던지는 설계상의 질문입니다. Agent Workflow에서 정말로 가장 강력한 모델이 필요한 단계는 어디일까요?
+
+## 흔한 실수: 모든 것을 하나의 모델로 처리
+
+Agent를 단일 모델에 연결한 채 운영하는 팀이 많습니다. 동작은 하지만 가장 비용이 많이 드는 구성이기도 합니다. 일반적인 Coding Agent나 Support Agent는 토큰 대부분을 어렵지 않은 단계에 사용합니다.
+
+- 파일을 읽고 관련 여부를 판단하기
+- 들어온 요청을 분류하기
+- Tool 출력을 메인 Context로 돌려보내기 전에 요약하기
+- 텍스트에서 구조화된 필드를 추출하기
+
+반면 모듈을 어떻게 재구성할지 결정하는 Planner는 성격이 다르며, 보유한 모델 중 가장 강력한 것이 도움이 됩니다. Routing의 목적은 분류 작업에 Planner 수준의 비용을 계속 지불하지 않는 것입니다.
+
+## 단순한 Routing Layer
+
+처음부터 Framework가 필요하지는 않습니다. 작업 종류에서 모델을 찾는 함수 하나면 충분하며, 가격이나 모델 품질이 바뀔 때 수정할 곳도 한 군데로 모입니다.
+
+```typescript
+type TaskKind = "classify" | "summarize" | "extract" | "plan" | "review";
+
+const MODEL_BY_TASK: Record<TaskKind, string> = {
+  classify: "claude-haiku-5-5",
+  summarize: "claude-haiku-5-5",
+  extract: "claude-haiku-5-5",
+  plan: "claude-opus-5-5",
+  review: "claude-sonnet-5-5",
+};
+
+export function pickModel(kind: TaskKind): string {
+  return MODEL_BY_TASK[kind];
+}
+```
+
+Mapping은 호출 지점에 흩어 두지 말고 Configuration으로 관리합니다. 나중에 긴 문서에서 `summarize` 품질이 부족하다고 판명되면 한 줄만 바꾸면 됩니다.
+
+## 추측 대신 Escalation
+
+정적인 Routing에는 약점이 있습니다. "쉬울 것"이라 여긴 작업이 실제로는 어려운 경우가 있기 때문입니다. 작은 모델로 시작해 신호가 나오면 상위 모델로 올리는 방식이 더 안정적입니다.
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+async function classifyTicket(text: string) {
+  const small = await client.messages.create({
+    model: "claude-haiku-5-5",
+    max_tokens: 200,
+    messages: [
+      {
+        role: "user",
+        content: `Classify this ticket as "bug", "feature", or "question". If unsure, answer "unsure".\n\n${text}`,
+      },
+    ],
+  });
+
+  const first = small.content[0];
+  const label = first.type === "text" ? first.text.trim().toLowerCase() : "unsure";
+
+  if (label !== "unsure") return label;
+
+  // 판단이 모호한 경우에만 더 큰 모델로 넘깁니다
+  const large = await client.messages.create({
+    model: "claude-sonnet-5-5",
+    max_tokens: 200,
+    messages: [
+      {
+        role: "user",
+        content: `Classify this ticket as "bug", "feature", or "question".\n\n${text}`,
+      },
+    ],
+  });
+  const second = large.content[0];
+  return second.type === "text" ? second.text.trim().toLowerCase() : "unsure";
+}
+```
+
+소형 모델에 "unsure"라고 답할 수 있는 탈출구를 주는 것은 저렴하면서 효과적인 방법입니다. 지시문이 한 줄 늘어날 뿐인데, 경계 사례에서 확신에 찬 오답을 줄일 수 있습니다.
+
+## Sub-agent: 절감 효과가 가장 큰 곳
+
+Claude Code 같은 Tool에서는 메인 Agent가 독립된 Context를 가진 Sub-agent에게 작업을 위임할 수 있습니다. Repository를 검색해 결과를 보고하는 탐색용 Sub-agent는 많은 텍스트를 읽고 짧은 답을 돌려줍니다. 입력 토큰은 많고 출력은 적으며 추론 깊이는 얕다는 이 특성은 소형 모델과 잘 맞습니다.
+
+저희가 사용하는 운영 규칙은 다음과 같습니다. 읽기 중심이고 판단이 가벼운 작업은 소형 모델에 위임하고, 판단이 무거운 단계는 메인 Agent에 남깁니다. Sub-agent의 출력이 Migration 계획이나 보안상 민감한 변경처럼 되돌리기 어려운 판단에 쓰인다면, 상위 모델로 검증합니다.
+
+## 전환하기 전에 측정하기
+
+Routing은 품질이 유지될 때만 의미가 있습니다. 어떤 단계를 소형 모델로 옮기기 전에 다음 절차를 밟습니다.
+
+1. 운영 또는 Staging 로그에서 해당 단계의 실제 입력을 50~100건 수집합니다.
+2. 두 모델을 모두 실행해 정답 Label과 비교하거나, 명문화한 평가 기준으로 상위 모델에게 채점하게 합니다.
+3. 평균 점수만이 아니라 불일치 비율도 추적합니다. 95%가 맞더라도 가장 가치가 높은 사례에서 틀리는 모델은 받아들이기 어려울 수 있습니다.
+4. 품질과 함께 작업당 비용과 Latency도 기록합니다.
+
+새 모델이 나오면 다시 실행하십시오. 소형 모델은 빠르게 개선되므로, 반년 전에 평가에서 탈락한 단계가 지금은 통과할 수 있습니다.
+
+## webhani의 권장 사항
+
+- Agent의 각 단계를 "읽기 중심", "판단 중심", "형식 정리 중심"으로 분류합니다.
+- 분류·추출·요약부터 소형 모델로 옮깁니다. 가장 안전하게 효과를 볼 수 있습니다.
+- 고정된 분담에 의존하지 말고 "unsure" 기반 Escalation 경로를 마련합니다.
+- 모델 이름은 Configuration에 두고, 요청마다 사용한 모델을 로그로 남겨 비용을 귀속할 수 있게 합니다.
+- Vendor의 Benchmark는 가설로 취급하고 자체 데이터로 검증합니다.
+
+이미 Agent Workflow를 운영 중인 팀이라면, 처리량이 클수록 단일 모델 구성과 Routing 구성의 비용 차이가 커집니다. 차이가 크지 않더라도 작은 단계의 Latency가 줄어들면서 전체 체감 속도가 좋아지는 경우가 많습니다.

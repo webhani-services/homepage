@@ -1,0 +1,118 @@
+---
+title: "Claude Haiku 5.5 and Model Routing: Putting a Small Model Where It Belongs in Agent Workflows"
+description: "Claude Haiku 5.5 targets high-volume, cost-sensitive work and sub-agent roles. A practical look at how to split work between small and large models, and how to measure whether the split is paying off."
+date: "2026-10-13"
+status: "published"
+tags: ["AI", "LLM", "Claude", "Agents", "Cost Optimization"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-haiku-5-5-subagent-model-routing-2026"
+---
+
+Anthropic released Claude Haiku 5.5 in early October 2026, positioning it as the fastest and cheapest model in the 5.5 family. Reports describe it as aimed at summarization, classification, database queries, and sub-agent work under Opus 5.5 and Sonnet 5.5. Third-party coverage also mentions a large context window and adjustable effort levels, but those figures come from secondary sources and reporting differs between outlets. Check Anthropic's documentation for the authoritative specs and pricing before you plan around them.
+
+The model details matter less than the design question they raise: in an agent workflow, which steps actually need your strongest model?
+
+## The default mistake: one model for everything
+
+Many teams wire an agent to a single model and leave it there. It works, and it is also the most expensive way to run the workflow. A typical coding or support agent spends most of its tokens on steps that are not hard:
+
+- Reading a file and deciding whether it is relevant
+- Classifying an incoming request
+- Summarizing tool output before it goes back into the main context
+- Extracting structured fields from text
+
+A planner that decides how to restructure a module is a different kind of step. It benefits from the strongest model you have. The point of routing is to stop paying planner prices for triage work.
+
+## A simple routing layer
+
+You do not need a framework to start. A function that maps a task type to a model is enough, and it gives you one place to change when pricing or model quality moves.
+
+```typescript
+type TaskKind = "classify" | "summarize" | "extract" | "plan" | "review";
+
+const MODEL_BY_TASK: Record<TaskKind, string> = {
+  classify: "claude-haiku-5-5",
+  summarize: "claude-haiku-5-5",
+  extract: "claude-haiku-5-5",
+  plan: "claude-opus-5-5",
+  review: "claude-sonnet-5-5",
+};
+
+export function pickModel(kind: TaskKind): string {
+  return MODEL_BY_TASK[kind];
+}
+```
+
+Keep the mapping in configuration rather than scattered through call sites. When you later find that `summarize` quality is not good enough on long documents, you change one line.
+
+## Escalation instead of guessing
+
+Static routing has a weakness: some "easy" tasks turn out hard. A better pattern is to start small and escalate on a signal.
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+async function classifyTicket(text: string) {
+  const small = await client.messages.create({
+    model: "claude-haiku-5-5",
+    max_tokens: 200,
+    messages: [
+      {
+        role: "user",
+        content: `Classify this ticket as "bug", "feature", or "question". If unsure, answer "unsure".\n\n${text}`,
+      },
+    ],
+  });
+
+  const first = small.content[0];
+  const label = first.type === "text" ? first.text.trim().toLowerCase() : "unsure";
+
+  if (label !== "unsure") return label;
+
+  // Escalate only the ambiguous cases to a larger model
+  const large = await client.messages.create({
+    model: "claude-sonnet-5-5",
+    max_tokens: 200,
+    messages: [
+      {
+        role: "user",
+        content: `Classify this ticket as "bug", "feature", or "question".\n\n${text}`,
+      },
+    ],
+  });
+  const second = large.content[0];
+  return second.type === "text" ? second.text.trim().toLowerCase() : "unsure";
+}
+```
+
+Asking the small model to say "unsure" is a cheap, useful escape hatch. It costs one extra token of instruction and avoids confident wrong answers on edge cases.
+
+## Sub-agents: where the savings are largest
+
+In Claude Code and similar tools, a main agent can delegate to sub-agents that run with their own context. Exploration sub-agents, which search a repository and report back, read a lot of text and return a short answer. That profile (many input tokens, few output tokens, low reasoning depth) suits a small model well.
+
+The practical rule we use: delegate read-heavy, decision-light work to the small model, and keep the decision-heavy step in the main agent. If a sub-agent's output feeds a decision that is expensive to reverse, such as a migration plan or a security-sensitive change, have the stronger model verify it.
+
+## Measure before you commit
+
+Routing is only worth it if quality holds. Before moving a step to a smaller model:
+
+1. Collect 50-100 real inputs for that step from production or staging logs.
+2. Run both models and compare outputs against a labeled answer, or have a stronger model grade them with a written rubric.
+3. Track the disagreement rate, not just the average score. A model that is right 95% of the time but fails on your highest-value cases may not be acceptable.
+4. Record cost per task and latency alongside quality.
+
+Re-run this when a new model ships. Small models improve quickly, and a step that failed evaluation six months ago may pass now.
+
+## What we recommend
+
+- Audit your agent's steps and label each as read-heavy, decision-heavy, or format-heavy.
+- Move classification, extraction, and summarization to the small model first; these are the safest wins.
+- Add an "unsure" escalation path rather than relying on a fixed split.
+- Keep model names in configuration, and log the model used per request so cost reports are attributable.
+- Treat vendor benchmark claims as a starting hypothesis and verify on your own data.
+
+For teams already running agent workflows, the cost difference between a single-model and a routed design can be significant at volume. Even when it is modest, the latency improvement on small steps often makes the overall experience feel faster.

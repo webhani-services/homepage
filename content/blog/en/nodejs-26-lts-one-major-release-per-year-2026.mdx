@@ -1,0 +1,94 @@
+---
+title: "Node.js 26 Goes LTS on October 28: Planning Upgrades Under the New One-Release-a-Year Schedule"
+description: "Node.js is moving to one major release per year starting with Node 27, and Node 26 enters Active LTS on October 28, 2026. What changes for upgrade planning, CI matrices, and container base images."
+date: "2026-10-13"
+status: "published"
+tags: ["Node.js", "DevOps", "CI/CD", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "nodejs-26-lts-one-major-release-per-year-2026"
+---
+
+Two things about Node.js matter this month. Node.js 26 is scheduled to become Active LTS on October 28, 2026, with security patches planned through April 30, 2029, according to the project's release schedule. And, as [InfoQ reported](https://www.infoq.com/news/2026/06/nodejs-release-changes/), the project is moving from two major releases per year to one, starting with Node 27. Node 26 is the last major release under the old cadence.
+
+The LTS date is a calendar item. The schedule change is the part that should alter how you plan.
+
+## What the new schedule looks like
+
+Under the new model, a single major version ships each April, and it is promoted to LTS the following October. Compared with the old pattern, there are no more odd-numbered "Current-only" releases that never reach LTS.
+
+Practically, this means:
+
+- One upgrade decision per year instead of two.
+- A predictable window: new major in April, production-ready LTS in October.
+- No need to skip alternating versions, because every major is intended to reach LTS.
+
+Verify the exact dates and support windows on nodejs.org before committing them to a roadmap; schedules are announced by the project and can be adjusted.
+
+## Why this is good for application teams
+
+The old two-a-year cadence pushed many teams into a rule of thumb: "only run even-numbered versions in production." That rule existed because odd versions had a short life and never became LTS. It also meant that teams reading release notes were mentally filtering half of them.
+
+With one major per year, the rule disappears. The mapping is straightforward: the version that reaches LTS in October is the one you adopt, and you have roughly a year of overlap with its predecessor.
+
+The tradeoff is that each major carries more change. A year of V8 updates, dependency bumps, and deprecations lands in one release. Native addons and build toolchains are the usual friction point.
+
+## An upgrade checklist for Node 26
+
+Start testing before October 28 rather than after. Node 26 is already available, so you can run your suite against it today.
+
+1. **Pin the runtime explicitly.** Use `.nvmrc` or the `engines` field so local, CI, and production agree.
+2. **Add Node 26 to the CI matrix** alongside your current LTS, without making it blocking at first.
+3. **Check native dependencies.** Anything that compiles on install (image processing, database drivers, crypto bindings) should be rebuilt and tested.
+4. **Read the deprecation list** for APIs your code or your dependencies use. Run your tests with `--throw-deprecation` to turn warnings into failures:
+
+```bash
+node --throw-deprecation --test
+```
+
+5. **Update container base images** in a branch, and confirm that image size and startup time have not regressed.
+
+A minimal GitHub Actions matrix that tests the current LTS and the incoming one:
+
+```yaml
+name: test
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [24, 26]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+```
+
+`fail-fast: false` matters here. You want to see the Node 26 result even when another job fails, so that incompatibilities surface early instead of piling up.
+
+## Frameworks and hosting platforms
+
+Application frameworks and hosting providers usually add LTS versions shortly after they are promoted, but not always on the same day. Before you bump, check:
+
+- Whether your framework's supported-versions table lists Node 26.
+- Whether your hosting platform or serverless runtime offers it. Some platforms set a default version and require you to opt in.
+- Whether your lockfile resolves to packages that declare an `engines` range excluding Node 26.
+
+In our experience, the surprises tend to come from a transitive dependency with a strict `engines` field, not from your own code.
+
+## What we recommend
+
+- Run Node 26 in CI now as a non-blocking job.
+- Plan the production move for the weeks after Node 26 enters LTS, not the day it does. Let ecosystem packages catch up.
+- If you are still on a version that is approaching end of life, treat the Node 26 move as the replacement rather than an intermediate step.
+- Put the new cadence in your team calendar: April for evaluation, October for adoption.
+- Keep one LTS of overlap during migration so you can roll back.
+
+The single-release model makes Node upgrades easier to schedule, but it concentrates change. A small, regular upgrade habit, with CI already testing the next version, is what keeps a yearly upgrade from becoming a large project.

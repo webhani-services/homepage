@@ -1,0 +1,94 @@
+---
+title: "Node.js 26, 10월 28일 LTS 진입: 연 1회 릴리스 체제에서의 업그레이드 계획"
+description: "Node.js는 Node 27부터 연 1회 Major 릴리스로 전환하며, Node 26은 2026년 10월 28일 Active LTS에 진입할 예정입니다. 업그레이드 계획, CI Matrix, Container Base Image에 미치는 영향을 정리합니다."
+date: "2026-10-13"
+status: "published"
+tags: ["Node.js", "DevOps", "CI/CD", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "nodejs-26-lts-one-major-release-per-year-2026"
+---
+
+이번 달 Node.js에서 주목할 점은 두 가지입니다. 첫째, 프로젝트의 릴리스 일정에 따르면 Node.js 26은 2026년 10월 28일 Active LTS로 전환되며 보안 패치는 2029년 4월 30일까지 제공될 예정입니다. 둘째, [InfoQ 보도](https://www.infoq.com/news/2026/06/nodejs-release-changes/)에 따르면 Node 27부터 연 2회였던 Major 릴리스가 연 1회로 바뀝니다. Node 26은 기존 주기를 따르는 마지막 Major 릴리스입니다.
+
+LTS 날짜는 달력에 적어 두면 되는 일정입니다. 계획 방식을 바꿔야 하는 쪽은 일정 변경입니다.
+
+## 새 일정의 모습
+
+새 모델에서는 Major 버전이 매년 4월에 하나 출시되고, 이듬해 10월에 LTS로 승격됩니다. 예전처럼 LTS가 되지 못하는 홀수 버전의 Current 릴리스는 사라집니다.
+
+실무적으로는 다음과 같습니다.
+
+- 업그레이드 판단이 연 2회에서 연 1회로 줄어듭니다.
+- 4월에 새 Major, 10월에 운영 환경에 쓸 수 있는 LTS라는 예측 가능한 흐름이 생깁니다.
+- 모든 Major가 LTS에 도달하는 것이 전제이므로 번갈아 건너뛸 필요가 없습니다.
+
+정확한 날짜와 지원 기간은 Roadmap에 확정해 넣기 전에 nodejs.org에서 확인하십시오. 일정은 프로젝트가 발표하는 것이며 조정될 수 있습니다.
+
+## 애플리케이션 팀에 좋은 점
+
+연 2회 주기에서는 "운영 환경에서는 짝수 버전만 사용한다"는 경험칙이 널리 퍼져 있었습니다. 홀수 버전은 수명이 짧고 LTS가 되지 않았기 때문입니다. Release Note의 절반은 머릿속에서 걸러 읽어야 하는 부담도 있었습니다.
+
+연 1회가 되면 이 경험칙은 필요 없어집니다. 10월에 LTS가 된 버전을 채택하고, 이전 버전과는 약 1년간 지원 기간이 겹친다는 단순한 대응 관계가 됩니다.
+
+대신 Major 하나에 담기는 변경이 커집니다. 1년 치 V8 업데이트, 의존성 갱신, Deprecation이 한 릴리스에 모입니다. 마찰이 생기기 쉬운 곳은 Native Addon과 Build Toolchain입니다.
+
+## Node 26 업그레이드 체크리스트
+
+10월 28일 이후가 아니라 지금 테스트를 시작하십시오. Node 26은 이미 사용할 수 있으므로 현재 Test Suite를 오늘부터 돌려 볼 수 있습니다.
+
+1. **Runtime을 명시적으로 고정합니다.** `.nvmrc`나 `engines` 필드로 로컬, CI, 운영 환경의 버전을 맞춥니다.
+2. **CI Matrix에 Node 26을 추가합니다.** 현재 LTS와 나란히 두고, 처음에는 실패해도 Build를 막지 않도록 설정합니다.
+3. **Native Dependency를 확인합니다.** 설치 시 컴파일되는 패키지(이미지 처리, Database Driver, 암호화 Binding 등)는 다시 Build하고 테스트합니다.
+4. **Deprecation 목록을 읽습니다.** 코드나 의존 패키지가 사용하는 API를 확인하고, `--throw-deprecation` 옵션으로 테스트를 실행해 경고를 실패로 바꿉니다.
+
+```bash
+node --throw-deprecation --test
+```
+
+5. **Container Base Image를 갱신합니다.** Branch에서 갱신한 뒤 Image 크기와 시작 시간이 나빠지지 않았는지 확인합니다.
+
+현재 LTS와 곧 나올 LTS를 함께 테스트하는 GitHub Actions의 최소 Matrix는 다음과 같습니다.
+
+```yaml
+name: test
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [24, 26]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+```
+
+여기서는 `fail-fast: false`가 중요합니다. 다른 Job이 실패해도 Node 26의 결과를 볼 수 있어, 비호환 문제가 뒤늦게 쌓이지 않고 일찍 드러납니다.
+
+## Framework와 Hosting 환경
+
+Application Framework와 Hosting 업체는 보통 LTS 승격 직후 새 버전을 지원하지만, 같은 날이라는 보장은 없습니다. 버전을 올리기 전에 다음을 확인하십시오.
+
+- 사용 중인 Framework의 지원 버전 표에 Node 26이 있는지.
+- Hosting 플랫폼이나 Serverless Runtime이 Node 26을 제공하는지. 기본 버전이 정해져 있어 직접 선택해야 하는 환경도 있습니다.
+- Lockfile이 가리키는 패키지 중 `engines` 범위에서 Node 26을 제외하는 것이 없는지.
+
+저희 경험으로는 문제의 원인이 자체 코드보다 `engines`를 엄격하게 지정한 간접 의존 패키지인 경우가 많습니다.
+
+## webhani의 권장 사항
+
+- 지금 바로 CI에서 Node 26을 실패를 허용하는 Job으로 실행합니다.
+- 운영 환경 이전은 Node 26이 LTS에 들어간 당일이 아니라 몇 주 뒤로 계획합니다. Ecosystem의 패키지가 따라올 시간을 줍니다.
+- 수명 종료가 가까운 버전을 쓰고 있다면 Node 26 이전을 중간 단계가 아니라 교체 대상으로 취급합니다.
+- 새 주기를 팀 달력에 넣습니다. 4월은 평가, 10월은 채택입니다.
+- 이전 중에는 직전 LTS와 병행하는 기간을 남겨 Rollback이 가능하도록 합니다.
+
+연 1회 모델은 업그레이드 일정을 잡기 쉽게 해 주지만 변경은 한곳에 집중됩니다. 다음 버전을 CI에서 항상 테스트해 두는 작은 습관이 연 1회 업그레이드가 대형 프로젝트로 커지는 것을 막아 줍니다.
