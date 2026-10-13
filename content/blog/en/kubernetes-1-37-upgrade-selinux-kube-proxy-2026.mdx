@@ -1,0 +1,123 @@
+---
+title: "Kubernetes 1.37 Upgrade Notes: SELinux Volume Labels, kube-proxy IPVS Deprecation, and HPA Scale-to-Zero"
+description: "Kubernetes 1.37 changes SELinux volume labeling, deprecates kube-proxy's ipvs mode and kube-dns, and enables HPA scale-to-zero by default. What to audit before upgrading a production cluster."
+date: "2026-10-14"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "DevOps", "Upgrade", "Networking"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-37-upgrade-selinux-kube-proxy-2026"
+---
+
+Kubernetes 1.37 ("Garhwal") shipped on August 26, 2026, with 67 enhancements: 16 graduating to stable, 23 to beta, and 27 entering alpha, plus one deprecation or removal item, per the official release blog. Managed services are now rolling it out, so many teams will plan the upgrade over the coming weeks.
+
+Feature lists are easy to find. This post is narrower: the changes in 1.37 that can break a working cluster or change behavior silently, and the checks to run before you upgrade. Confirm the details in the official release notes and your distribution's documentation, since managed providers sometimes lag or patch defaults.
+
+## 1. SELinux volume labeling
+
+The release notes warn that pods with different SELinux labels sharing a volume on the same node may fail to start under the new labeling behavior. Pods that need the previous behavior can opt in with `seLinuxChangePolicy: Recursive`.
+
+This only matters on nodes running SELinux in enforcing mode, which includes RHEL-family distributions and OpenShift-style setups. If your nodes run Ubuntu or Amazon Linux with SELinux off, you can skip ahead.
+
+Where it applies, the risky workloads are those sharing one volume across pods with different security contexts, such as a writer and a sidecar reader, or two deployments mounting the same `ReadWriteMany` claim.
+
+Find candidates before upgrading:
+
+```bash
+# PVCs mounted by more than one pod
+kubectl get pods -A -o json | jq -r '
+  .items[] | . as $p
+  | $p.spec.volumes[]? | select(.persistentVolumeClaim)
+  | "\($p.metadata.namespace)/\(.persistentVolumeClaim.claimName) <- \($p.metadata.name)"
+' | sort | awk -F' <- ' '{c[$1]++; p[$1]=p[$1]" "$2} END {for (k in c) if (c[k]>1) print k, p[k]}'
+```
+
+For each shared claim, compare the pods' `securityContext.seLinuxOptions`. Where they differ and you want the old behavior while you sort it out, set the policy explicitly:
+
+```yaml
+spec:
+  securityContext:
+    seLinuxChangePolicy: Recursive
+```
+
+Treat that as a stopgap. The better fix is to give pods that share data a consistent SELinux label.
+
+Test this in a staging cluster with real storage drivers. Behavior depends on the CSI driver, so a green result on a hostPath-based dev cluster says little.
+
+## 2. kube-proxy ipvs mode and kube-dns are deprecated
+
+The release deprecates kube-proxy's `ipvs` mode in favor of `nftables` and `iptables`, and deprecates kube-dns in favor of CoreDNS. Deprecation is not removal. Your cluster keeps working on 1.37, but you now have a clock running.
+
+Check what you actually use:
+
+```bash
+# kube-proxy mode
+kubectl -n kube-system get cm kube-proxy -o jsonpath='{.data.config\.conf}' | grep -E '^mode:'
+
+# DNS implementation
+kubectl -n kube-system get deploy -o name | grep -E 'coredns|kube-dns'
+```
+
+If you are on `ipvs`, plan the move to `nftables`. A reasonable sequence:
+
+1. Confirm your kernel supports nftables for kube-proxy. Older enterprise kernels may not.
+2. Switch a single staging node pool first and run your service-level checks, including `NodePort`, `LoadBalancer` source IP preservation, and `externalTrafficPolicy: Local` services.
+3. Compare connection tracking behavior under load. Services with very high connection churn were a common reason teams picked ipvs, so measure before assuming parity.
+4. Roll the change through production pools gradually, keeping the old mode available for rollback.
+
+```yaml
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: nftables
+```
+
+On managed Kubernetes, the provider usually controls kube-proxy. Check their roadmap rather than editing the DaemonSet yourself.
+
+If you still run kube-dns, migrate to CoreDNS now. It is the default in kubeadm-based clusters and most managed offerings, so only clusters carried forward from very old setups are likely affected.
+
+## 3. HPA scale-to-zero is beta and on by default
+
+Scale-to-zero for the Horizontal Pod Autoscaler with object and external metrics has graduated to beta and is enabled by default. That allows `minReplicas: 0`, which is useful for queue consumers and event-driven jobs.
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: queue-worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: queue-worker
+  minReplicas: 0
+  maxReplicas: 20
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: queue_messages_ready
+        target:
+          type: AverageValue
+          averageValue: "30"
+```
+
+Two cautions. First, scaling from zero adds cold-start latency: image pull, container start, and readiness. Measure it against what the workload tolerates. Second, the metric source must keep reporting while there are no pods, which is why this works for external metrics such as queue depth and not for CPU.
+
+This is a good fit for background workers and a poor fit for anything user-facing with a latency target.
+
+## 4. Memory QoS with cgroup v2
+
+Memory QoS on cgroup v2 also moved to beta and is on by default. It uses cgroup v2 memory controls to apply requests and limits more precisely, which can change how a pod behaves near its limit.
+
+Nothing needs changing if you are not near your limits. If you have workloads that run close to their memory limit today, watch OOM kill counts and throttling after the upgrade. Setting realistic `requests` becomes more consequential.
+
+## Upgrade checklist
+
+1. Read the official 1.37 release notes and your provider's notes for deviations.
+2. Check API deprecations against your manifests and Helm charts using your preferred scanner.
+3. Audit shared volumes if nodes run SELinux enforcing.
+4. Record your current kube-proxy mode and DNS implementation.
+5. Upgrade a staging cluster first and run the same smoke tests you use for production.
+6. Upgrade the control plane, then node pools one at a time, watching error rates.
+
+We also published a [1.37 preview](/blog/kubernetes-1-37-preview-2026) covering the feature direction. Most of the real work in this release is auditing for the items above rather than adopting new features. Do that first, and adopt scale-to-zero later on the workloads where it pays off.

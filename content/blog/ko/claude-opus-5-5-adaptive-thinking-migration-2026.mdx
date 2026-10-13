@@ -1,0 +1,113 @@
+---
+title: "Claude Opus 5.5와 항상 켜져 있는 Adaptive Thinking: Model ID를 바꾸기 전에 확인할 것"
+description: "Opus 5.5는 thinking을 끌 수 없다고 보도되었습니다. 기존 연동 코드에 미치는 영향, 모델별 Parameter를 분리하는 방법, 안전한 단계적 전환 절차를 실무 관점에서 정리합니다."
+date: "2026-10-14"
+status: "published"
+tags: ["AI", "LLM", "Claude", "API", "Migration"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-opus-5-5-adaptive-thinking-migration-2026"
+---
+
+Anthropic은 2026년 9월 22일 5.5 패밀리의 첫 모델로 Claude Opus 5.5를 출시했습니다. 대부분의 기사는 Benchmark와 가격에 초점을 맞추지만, 이미 운영 환경에서 API를 호출하는 팀에게 더 중요한 내용은 Release Note의 다른 부분입니다. 보도된 내용에 따르면 이 모델의 adaptive thinking은 항상 켜져 있으며, thinking을 끄려는 Request는 Error를 반환합니다.
+
+변경 이력의 한 줄에 불과하지만, Request Parameter를 코드에 고정해 둔 코드베이스에서는 실제 장애로 이어질 수 있습니다. 이 글에서는 Model ID를 바꾸기 전에 확인할 사항과, 다음 모델 변경을 평범한 작업으로 만드는 호출부 구조를 다룹니다.
+
+아래 내용은 반드시 Anthropic 공식 문서로 확인하시기 바랍니다. 가격처럼 2차 자료마다 수치가 다른 항목이 있었습니다.
+
+## 무엇이 바뀌었다고 보도되었나
+
+출시 기사와 Release Note에서 연동 작업과 관련된 부분은 다음과 같습니다.
+
+- Adaptive thinking이 항상 켜져 있습니다. Request마다 모델이 추론량을 정하며, 끌 수 없습니다.
+- 기본 100만 Token의 Context Window와 최대 12.8만 Token 출력을 지원합니다.
+- Anthropic은 일반적인 Workload 기준으로 Opus 5보다 약 40% 저렴하고 출력도 더 빠르다고 설명합니다.
+
+첫 번째 항목이 기존 전제를 깨뜨립니다. 자동완성, 분류, 짧은 채팅 응답처럼 지연 시간에 민감한 경로에서는 thinking을 비활성화해 둔 애플리케이션이 많습니다. 이 설정을 거부하는 모델에서는 품질이 조금 떨어지는 것이 아니라 Request 자체가 실패합니다.
+
+## 모델의 문제가 아니라 연동 설계의 문제
+
+모델 업그레이드는 ID를 바꾸고 평가 Set을 돌린 뒤 배포하는 설정 변경으로 취급되곤 합니다. Parameter가 모델 간에 호환될 때는 그것으로 충분합니다. 모델마다 Parameter 처리가 다르면 그렇지 않습니다.
+
+이번 실패는 소리가 큰 유형이며, 오히려 다행입니다. 거부된 Request는 Log에 바로 나타납니다. 함께 점검해야 할 더 조용한 위험도 있습니다.
+
+- **지연 시간 특성 변화**: Adaptive thinking에서는 어려운 Prompt의 첫 Token까지 걸리는 시간이 이전 모델에서 측정한 값보다 길어질 수 있습니다. 이전 모델 기준으로 맞춘 Timeout은 너무 짧을 수 있습니다.
+- **Token 소비 변화**: Thinking Token은 출력으로 과금됩니다. Thinking 없이 저렴했던 Prompt가 Token 단가가 내려가도 더 비싸질 수 있습니다.
+- **출력 길이 가정**: 출력 길이로 Parsing이나 Truncation을 하고 있다면, 출력 상한 확대와 기본 상세도 차이로 동작이 달라질 수 있습니다.
+
+## 모델별 Parameter를 한 곳에 모으기
+
+가장 간단한 방어책은 Request Object를 여기저기서 직접 만들지 않고, 작은 Capability 표와 Builder 함수 하나를 두는 것입니다.
+
+```ts
+type ModelProfile = {
+  id: string;
+  supportsDisabledThinking: boolean;
+  defaultMaxTokens: number;
+  timeoutMs: number;
+};
+
+const PROFILES: Record<string, ModelProfile> = {
+  "claude-opus-5-5": {
+    id: "claude-opus-5-5",
+    supportsDisabledThinking: false,
+    defaultMaxTokens: 8192,
+    timeoutMs: 120_000,
+  },
+  "claude-sonnet-5": {
+    id: "claude-sonnet-5",
+    supportsDisabledThinking: true,
+    defaultMaxTokens: 4096,
+    timeoutMs: 60_000,
+  },
+};
+
+type Intent = { fast: boolean; maxTokens?: number };
+
+export function buildRequest(model: string, intent: Intent) {
+  const profile = PROFILES[model];
+  if (!profile) throw new Error(`Unknown model profile: ${model}`);
+
+  const request: Record<string, unknown> = {
+    model: profile.id,
+    max_tokens: intent.maxTokens ?? profile.defaultMaxTokens,
+  };
+
+  // 모델이 허용하는 경우에만 "thinking 없음"을 지정합니다.
+  if (intent.fast && profile.supportsDisabledThinking) {
+    request.thinking = { type: "disabled" };
+  }
+
+  return { request, timeoutMs: profile.timeoutMs };
+}
+```
+
+호출하는 쪽은 "이 경로는 빠른 응답이 필요하다"는 의도만 전달하고, 그 의도를 특정 모델에서 Parameter로 표현할 수 있는지는 Profile이 결정합니다. 빠른 경로에서 thinking을 끌 수 없다면, 필요한 것은 Parameter 수정이 아니라 Routing 결정입니다. 이 간접 계층의 목적은 그 결정을 눈에 보이게 만드는 것입니다.
+
+빠른 경로는 작은 모델에 두는 것이 일반적인 답입니다. 추론이 도움 되지 않는 경로에서 상위 모델 비용을 내기보다 5.5 패밀리의 경량 모델이나 Sonnet 급 모델이 더 적합합니다. 이 Pattern은 [에이전트 워크플로우의 모델 라우팅](/blog/claude-haiku-5-5-subagent-model-routing-2026) 글에서도 다루었습니다.
+
+## 영향 범위를 줄이는 전환 절차
+
+1. **Thinking 관련 설정부터 grep합니다.** SDK Wrapper, 사내 Gateway, Test Fixture를 포함해 설정 위치를 모두 찾습니다. Wrapper가 모르는 사이에 값을 지정하는 경우가 흔합니다.
+2. **두 모델로 평가 Set을 돌립니다.** 품질뿐 아니라 지연 시간 Percentile과 Request당 총 Token 수도 기록합니다. 비용에 대한 답은 가격표가 아니라 Token 수에 있습니다.
+3. **전환 전에 Shadow Traffic을 보냅니다.** 실제 Request의 일부를 새 모델에도 보내고 응답은 버립니다. 보는 것은 품질이 아니라 Error와 Tail Latency입니다.
+4. **Timeout은 의도적으로 조정합니다.** 추측이 아니라 새 모델에서 측정한 p99에 여유를 더해 정합니다.
+5. **전체가 아니라 Route 단위로 전환합니다.** 추론 부담이 큰 Route부터 옮기고, 지연에 민감한 Route는 데이터가 쌓일 때까지 이전 모델에 둡니다.
+6. **Rollback은 설정값 하나로 끝나게 합니다.** Model ID를 환경 변수나 Flag로 두면 Rollback에 배포가 필요 없습니다.
+
+## 무엇을 측정할 것인가
+
+출시 글의 품질 주장은 벤더가 고른 Task로 측정한 결과입니다. 우리 Workload는 다르므로 다음 네 가지를 직접 측정하시기 바랍니다.
+
+- 자체 평가 Set에서의 Task 성공률
+- Route별 p50, p99 지연 시간
+- Thinking을 포함한 Request당 출력 Token 수
+- Shadow Traffic 동안의 Error 유형별 Error 비율
+
+성공한 Task당 비용이 내려갔다면 업그레이드는 값을 하는 것입니다. Token 단가만 내려갔다면 그렇지 않을 수 있습니다.
+
+## webhani의 권장 사항
+
+Opus 5.5는 추론 품질이 병목인 Route, 즉 여러 파일에 걸친 코드 변경, 다단계 분석, 오래 실행되는 Agent Task에 좋은 후보입니다. 새 상위 모델이 나왔다는 이유만으로 지연에 민감하고 복잡도가 낮은 Route까지 옮길 필요는 없습니다.
+
+더 큰 교훈은 구조에 있습니다. 모델별 동작은 앞으로도 계속 바뀌고, 릴리스마다 이런 제약이 따라올 것입니다. Capability 표와 Request Builder는 반나절이면 만들 수 있고, 다음 마이그레이션을 파일 하나의 Diff로 바꿔 줍니다.
