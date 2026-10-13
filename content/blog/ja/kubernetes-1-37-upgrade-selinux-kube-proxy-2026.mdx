@@ -1,0 +1,123 @@
+---
+title: "Kubernetes 1.37アップグレードノート: SELinuxボリュームラベル、kube-proxy IPVSの非推奨化、HPAのスケールtoゼロ"
+description: "Kubernetes 1.37ではSELinuxのボリュームラベル付けが変わり、kube-proxyのipvsモードとkube-dnsが非推奨になり、HPAのスケールtoゼロがデフォルトで有効になります。本番クラスターをアップグレードする前に点検すべき項目を整理します。"
+date: "2026-10-14"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "DevOps", "Upgrade", "Networking"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-37-upgrade-selinux-kube-proxy-2026"
+---
+
+Kubernetes 1.37（コードネーム「Garhwal」）は2026年8月26日にリリースされました。公式のリリースブログによると、改善項目は67件で、内訳はStableへの昇格が16件、Betaへの昇格が23件、Alphaでの導入が27件、加えて非推奨または削除が1件です。マネージドサービスでの提供も始まっており、今後数週間でアップグレードを計画するチームが増えるでしょう。
+
+機能一覧はどこでも見つかります。この記事の対象はもっと絞っています。動いているクラスターを壊しうる変更や、静かに挙動が変わる変更と、アップグレード前に行うべき確認です。詳細は公式のリリースノートと利用中ディストリビューションのドキュメントで確認してください。マネージドプロバイダーは提供が遅れたり、デフォルトを調整したりすることがあります。
+
+## 1. SELinuxのボリュームラベル付け
+
+リリースノートでは、異なるSELinuxラベルを持つPodが同じノード上で1つのボリュームを共有している場合、新しいラベル付けの挙動ではPodが起動に失敗することがあると警告されています。従来の挙動が必要なPodは `seLinuxChangePolicy: Recursive` でオプトインできます。
+
+影響があるのは、SELinuxをenforcingで動かしているノードだけです。RHEL系ディストリビューションやOpenShift系の構成が該当します。UbuntuやAmazon LinuxでSELinuxが無効なら、このセクションは読み飛ばして構いません。
+
+該当する環境で危険なのは、セキュリティコンテキストの異なるPod間で1つのボリュームを共有するワークロードです。たとえば、書き込み側とサイドカーの読み取り側、あるいは同じ `ReadWriteMany` のClaimをマウントする2つのDeploymentです。
+
+アップグレード前に候補を洗い出します。
+
+```bash
+# 複数のPodからマウントされているPVC
+kubectl get pods -A -o json | jq -r '
+  .items[] | . as $p
+  | $p.spec.volumes[]? | select(.persistentVolumeClaim)
+  | "\($p.metadata.namespace)/\(.persistentVolumeClaim.claimName) <- \($p.metadata.name)"
+' | sort | awk -F' <- ' '{c[$1]++; p[$1]=p[$1]" "$2} END {for (k in c) if (c[k]>1) print k, p[k]}'
+```
+
+共有されているClaimごとに、各Podの `securityContext.seLinuxOptions` を比較します。値が異なり、整理が済むまで従来の挙動を保ちたい場合は、ポリシーを明示します。
+
+```yaml
+spec:
+  securityContext:
+    seLinuxChangePolicy: Recursive
+```
+
+これは応急処置として扱ってください。根本的には、データを共有するPodに一貫したSELinuxラベルを付けるのが正解です。
+
+検証は、実際のストレージドライバーを使うステージングクラスターで行ってください。挙動はCSIドライバーに依存するため、hostPathベースの開発クラスターで問題なくても、ほとんど参考になりません。
+
+## 2. kube-proxyのipvsモードとkube-dnsが非推奨に
+
+このリリースでは、kube-proxyの `ipvs` モードが `nftables` と `iptables` に置き換える形で非推奨となり、kube-dnsもCoreDNSに置き換える形で非推奨となりました。非推奨は削除ではありません。1.37でクラスターは問題なく動きますが、期限へのカウントダウンが始まったことになります。
+
+実際に何を使っているか確認します。
+
+```bash
+# kube-proxyのモード
+kubectl -n kube-system get cm kube-proxy -o jsonpath='{.data.config\.conf}' | grep -E '^mode:'
+
+# DNSの実装
+kubectl -n kube-system get deploy -o name | grep -E 'coredns|kube-dns'
+```
+
+`ipvs` を使っているなら、`nftables` への移行を計画してください。現実的な手順は次のとおりです。
+
+1. カーネルがkube-proxyのnftablesに対応しているか確認する。古いエンタープライズ向けカーネルでは未対応の場合がある
+2. まずステージングのノードプール1つで切り替え、`NodePort`、`LoadBalancer` の送信元IP保持、`externalTrafficPolicy: Local` のServiceを含むサービスレベルの確認を行う
+3. 負荷時のコネクショントラッキングの挙動を比較する。コネクションの入れ替わりが非常に多いServiceは、ipvsを選んでいた典型的な理由なので、同等だと決めつけず計測する
+4. 本番のノードプールに段階的に展開し、ロールバック用に旧モードを残しておく
+
+```yaml
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: nftables
+```
+
+マネージドKubernetesでは、通常kube-proxyはプロバイダーが管理しています。DaemonSetを自分で編集せず、プロバイダーのロードマップを確認してください。
+
+kube-dnsをまだ使っている場合は、今のうちにCoreDNSへ移行してください。kubeadmベースのクラスターやほとんどのマネージド提供ではCoreDNSがデフォルトなので、影響を受けるのはかなり古い構成から引き継いだクラスターに限られるはずです。
+
+## 3. HPAのスケールtoゼロがBetaでデフォルト有効に
+
+オブジェクトメトリクスと外部メトリクスを使うHorizontal Pod Autoscalerのスケールtoゼロが、Betaに昇格し、デフォルトで有効になりました。これにより `minReplicas: 0` が使えます。キューのコンシューマーやイベント駆動のジョブに有効です。
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: queue-worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: queue-worker
+  minReplicas: 0
+  maxReplicas: 20
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: queue_messages_ready
+        target:
+          type: AverageValue
+          averageValue: "30"
+```
+
+注意点が2つあります。1つ目は、ゼロからのスケールアップにはコールドスタートの遅延が加わることです。イメージのPull、コンテナの起動、Readinessが含まれます。ワークロードが許容できる範囲か計測してください。2つ目は、Podがいない間もメトリクスのソースが値を報告し続ける必要があることです。キューの深さのような外部メトリクスで成立し、CPUでは成立しないのはこのためです。
+
+バックグラウンドワーカーには向いていますが、レイテンシ目標のあるユーザー向けワークロードには向きません。
+
+## 4. cgroup v2によるMemory QoS
+
+cgroup v2上のMemory QoSもBetaに昇格し、デフォルトで有効です。cgroup v2のメモリ制御を使ってrequestとlimitをより正確に適用するため、limit付近でのPodの挙動が変わる可能性があります。
+
+limitに近づいていないなら対応は不要です。現在メモリlimitぎりぎりで動いているワークロードがあれば、アップグレード後はOOM Killの回数とスロットリングを観察してください。現実的な `requests` を設定することの重みが増します。
+
+## アップグレードのチェックリスト
+
+1. 公式の1.37リリースノートと、プロバイダー独自の差異を確認する
+2. 利用中のスキャナーで、マニフェストとHelm ChartのAPI非推奨を点検する
+3. ノードがSELinux enforcingなら、共有ボリュームを棚卸しする
+4. 現在のkube-proxyのモードとDNSの実装を記録する
+5. 先にステージングクラスターをアップグレードし、本番と同じスモークテストを実行する
+6. コントロールプレーン、続いてノードプールを1つずつアップグレードし、エラー率を見る
+
+機能の方向性は[1.37プレビュー](/blog/kubernetes-1-37-preview-2026)の記事でも扱っています。このリリースで実際に手間がかかるのは、新機能の採用よりも上記項目の棚卸しです。まずそれを済ませ、スケールtoゼロは効果が出るワークロードを選んで後から採用するのが良いでしょう。

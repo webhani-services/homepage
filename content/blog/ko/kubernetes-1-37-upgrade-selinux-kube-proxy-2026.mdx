@@ -1,0 +1,123 @@
+---
+title: "Kubernetes 1.37 업그레이드 노트: SELinux Volume Label, kube-proxy IPVS Deprecation, HPA Scale-to-Zero"
+description: "Kubernetes 1.37에서는 SELinux Volume Label 처리가 바뀌고, kube-proxy의 ipvs 모드와 kube-dns가 Deprecated되며, HPA Scale-to-Zero가 기본 활성화됩니다. 운영 Cluster를 업그레이드하기 전에 점검할 항목을 정리합니다."
+date: "2026-10-14"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "DevOps", "Upgrade", "Networking"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-37-upgrade-selinux-kube-proxy-2026"
+---
+
+Kubernetes 1.37("Garhwal")은 2026년 8월 26일에 릴리스되었습니다. 공식 Release Blog에 따르면 개선 항목은 67건이며, Stable 승격 16건, Beta 승격 23건, Alpha 도입 27건, 그리고 Deprecation 또는 제거 1건입니다. 관리형 서비스에서도 제공이 시작되고 있어 앞으로 몇 주 안에 업그레이드를 계획하는 팀이 많아질 것입니다.
+
+기능 목록은 어디서나 찾을 수 있습니다. 이 글은 범위를 좁혀, 정상 동작하는 Cluster를 깨뜨릴 수 있거나 조용히 동작이 바뀌는 변경 사항과 업그레이드 전에 해야 할 점검을 다룹니다. 세부 내용은 공식 Release Note와 사용 중인 Distribution 문서로 확인하십시오. 관리형 Provider는 제공 시점이 늦거나 기본값을 조정하기도 합니다.
+
+## 1. SELinux Volume Label 처리
+
+Release Note는 서로 다른 SELinux Label을 가진 Pod가 같은 Node에서 하나의 Volume을 공유할 경우, 새로운 Label 처리 방식에서 Pod 시작에 실패할 수 있다고 경고합니다. 이전 동작이 필요한 Pod는 `seLinuxChangePolicy: Recursive`로 Opt-in할 수 있습니다.
+
+SELinux를 Enforcing 모드로 운영하는 Node에서만 해당됩니다. RHEL 계열 Distribution과 OpenShift 계열 구성이 여기에 속합니다. Ubuntu나 Amazon Linux에서 SELinux를 사용하지 않는다면 이 절은 건너뛰어도 됩니다.
+
+해당되는 환경에서 위험한 Workload는 Security Context가 다른 Pod들이 하나의 Volume을 공유하는 경우입니다. 예를 들어 쓰기 Pod와 Sidecar 읽기 Pod, 또는 같은 `ReadWriteMany` Claim을 마운트하는 두 Deployment가 있습니다.
+
+업그레이드 전에 후보를 찾습니다.
+
+```bash
+# 둘 이상의 Pod가 마운트한 PVC
+kubectl get pods -A -o json | jq -r '
+  .items[] | . as $p
+  | $p.spec.volumes[]? | select(.persistentVolumeClaim)
+  | "\($p.metadata.namespace)/\(.persistentVolumeClaim.claimName) <- \($p.metadata.name)"
+' | sort | awk -F' <- ' '{c[$1]++; p[$1]=p[$1]" "$2} END {for (k in c) if (c[k]>1) print k, p[k]}'
+```
+
+공유되는 Claim마다 각 Pod의 `securityContext.seLinuxOptions`를 비교합니다. 값이 다르고 정리가 끝날 때까지 이전 동작을 유지하려면 Policy를 명시합니다.
+
+```yaml
+spec:
+  securityContext:
+    seLinuxChangePolicy: Recursive
+```
+
+이것은 임시 방편으로 취급하십시오. 근본적인 해결책은 데이터를 공유하는 Pod에 일관된 SELinux Label을 부여하는 것입니다.
+
+실제 Storage Driver를 쓰는 Staging Cluster에서 검증하십시오. 동작은 CSI Driver에 따라 달라지므로, hostPath 기반 개발 Cluster에서 문제가 없다고 해서 큰 의미는 없습니다.
+
+## 2. kube-proxy ipvs 모드와 kube-dns가 Deprecated
+
+이번 릴리스에서 kube-proxy의 `ipvs` 모드는 `nftables`와 `iptables`로 대체하는 방향으로 Deprecated되었고, kube-dns는 CoreDNS로 대체하는 방향으로 Deprecated되었습니다. Deprecation은 제거가 아닙니다. 1.37에서도 Cluster는 계속 동작하지만, 기한을 향한 카운트다운이 시작된 것입니다.
+
+실제로 무엇을 쓰는지 확인합니다.
+
+```bash
+# kube-proxy 모드
+kubectl -n kube-system get cm kube-proxy -o jsonpath='{.data.config\.conf}' | grep -E '^mode:'
+
+# DNS 구현
+kubectl -n kube-system get deploy -o name | grep -E 'coredns|kube-dns'
+```
+
+`ipvs`를 사용 중이라면 `nftables`로의 이전을 계획하십시오. 현실적인 순서는 다음과 같습니다.
+
+1. Kernel이 kube-proxy의 nftables를 지원하는지 확인합니다. 오래된 엔터프라이즈 Kernel은 지원하지 않을 수 있습니다.
+2. Staging의 Node Pool 하나에서 먼저 전환하고 `NodePort`, `LoadBalancer`의 Source IP 유지, `externalTrafficPolicy: Local` Service를 포함한 서비스 수준 점검을 수행합니다.
+3. 부하 상황에서 Connection Tracking 동작을 비교합니다. Connection 교체가 매우 잦은 Service는 팀들이 ipvs를 선택한 대표적인 이유였으므로, 동등하다고 가정하지 말고 측정하십시오.
+4. 운영 Node Pool에 점진적으로 적용하고, Rollback을 위해 이전 모드를 남겨 둡니다.
+
+```yaml
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: nftables
+```
+
+관리형 Kubernetes에서는 보통 Provider가 kube-proxy를 관리합니다. DaemonSet을 직접 수정하지 말고 Provider의 Roadmap을 확인하십시오.
+
+아직 kube-dns를 사용 중이라면 지금 CoreDNS로 이전하십시오. kubeadm 기반 Cluster와 대부분의 관리형 서비스에서는 CoreDNS가 기본값이므로, 영향을 받는 것은 아주 오래된 구성에서 이어 온 Cluster 정도일 것입니다.
+
+## 3. HPA Scale-to-Zero가 Beta로 승격되어 기본 활성화
+
+Object Metric과 External Metric을 사용하는 Horizontal Pod Autoscaler의 Scale-to-Zero가 Beta로 승격되어 기본적으로 활성화됩니다. `minReplicas: 0`을 사용할 수 있게 되며, Queue Consumer나 Event 기반 Job에 유용합니다.
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: queue-worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: queue-worker
+  minReplicas: 0
+  maxReplicas: 20
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: queue_messages_ready
+        target:
+          type: AverageValue
+          averageValue: "30"
+```
+
+주의할 점이 두 가지 있습니다. 첫째, 0에서 확장할 때는 Cold Start 지연이 추가됩니다. Image Pull, Container 시작, Readiness가 포함되므로 Workload가 감당할 수 있는 수준인지 측정하십시오. 둘째, Pod가 없는 동안에도 Metric 소스가 값을 계속 보고해야 합니다. Queue 길이 같은 External Metric에서는 성립하지만 CPU에서는 성립하지 않는 이유입니다.
+
+Background Worker에는 적합하지만, 지연 시간 목표가 있는 사용자 대면 Workload에는 맞지 않습니다.
+
+## 4. cgroup v2 기반 Memory QoS
+
+cgroup v2의 Memory QoS도 Beta로 승격되어 기본 활성화되었습니다. cgroup v2의 Memory 제어를 사용해 Request와 Limit을 더 정밀하게 적용하므로, Limit 근처에서 Pod의 동작이 달라질 수 있습니다.
+
+Limit에 근접하지 않는다면 바꿀 것은 없습니다. 현재 Memory Limit에 가깝게 동작하는 Workload가 있다면 업그레이드 후 OOM Kill 횟수와 Throttling을 관찰하십시오. 현실적인 `requests` 설정의 중요성이 커집니다.
+
+## 업그레이드 체크리스트
+
+1. 공식 1.37 Release Note와 Provider별 차이점을 확인합니다.
+2. 사용 중인 Scanner로 Manifest와 Helm Chart의 API Deprecation을 점검합니다.
+3. Node가 SELinux Enforcing이라면 공유 Volume을 전수 조사합니다.
+4. 현재 kube-proxy 모드와 DNS 구현을 기록해 둡니다.
+5. Staging Cluster를 먼저 업그레이드하고 운영과 같은 Smoke Test를 실행합니다.
+6. Control Plane을 업그레이드한 뒤 Node Pool을 하나씩 업그레이드하면서 Error 비율을 지켜봅니다.
+
+기능 방향성은 [1.37 프리뷰](/blog/kubernetes-1-37-preview-2026) 글에서도 다루었습니다. 이번 릴리스에서 실제로 손이 가는 일은 새 기능 도입보다 위 항목들의 전수 조사입니다. 이를 먼저 끝내고, Scale-to-Zero는 효과가 나는 Workload를 골라 나중에 도입하는 것이 좋습니다.

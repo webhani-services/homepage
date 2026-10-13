@@ -1,0 +1,113 @@
+---
+title: "Claude Opus 5.5 and Always-On Adaptive Thinking: What to Check Before You Switch Model IDs"
+description: "Opus 5.5 reportedly cannot run with thinking disabled. A practical look at what that means for existing integrations, how to isolate model-specific parameters, and how to roll the upgrade out safely."
+date: "2026-10-14"
+status: "published"
+tags: ["AI", "LLM", "Claude", "API", "Migration"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-opus-5-5-adaptive-thinking-migration-2026"
+---
+
+Anthropic released Claude Opus 5.5 on September 22, 2026, as the first model in the 5.5 family. Most coverage focuses on benchmarks and price. For teams that already have production code calling the API, the more interesting detail is in the release notes: according to reports citing them, the model uses adaptive thinking that is always on, and a request that tries to disable thinking returns an error.
+
+That is a small line in a changelog and a real problem for any codebase that hardcodes request parameters. This post covers what to check before changing a model ID, and how to structure the call site so the next model change is boring.
+
+Please verify the details below against Anthropic's official documentation. Some of the numbers we saw (pricing in particular) differed between secondary sources.
+
+## What reportedly changed
+
+From the launch coverage and release notes, the points relevant to integration work are:
+
+- Adaptive thinking is always on. The model decides how much to reason per request, and you cannot turn it off.
+- A 1M-token default context window and up to 128K output tokens.
+- Anthropic describes it as roughly 40% cheaper than Opus 5 on typical workloads, and faster in output generation.
+
+The first point breaks assumptions. Many applications set thinking to disabled for latency-sensitive paths such as autocomplete, classification, or short chat replies. Against a model that rejects that setting, those paths fail outright rather than degrade.
+
+## Why this is an integration problem, not a model problem
+
+Model upgrades are usually treated as a config change: swap the ID, run the eval set, ship. That works when parameters are portable across models. It stops working when the parameter surface differs per model.
+
+The failure mode here is loud, which is the good kind. A rejected request shows up in logs immediately. The quieter risks are worth checking at the same time:
+
+- **Latency profile changes.** With adaptive thinking, time-to-first-token on a hard prompt can be longer than you measured on the previous model. Timeouts tuned for the old model may be too tight.
+- **Token accounting changes.** Thinking tokens are billed as output. A prompt that was cheap with thinking off can cost more, even if the per-token price dropped.
+- **Output length assumptions.** If you parse or truncate responses by length, a larger output cap and different default verbosity can shift behavior.
+
+## Isolate model-specific parameters behind one function
+
+The simplest defense is to stop building request objects inline. Keep a small capability table and one builder.
+
+```ts
+type ModelProfile = {
+  id: string;
+  supportsDisabledThinking: boolean;
+  defaultMaxTokens: number;
+  timeoutMs: number;
+};
+
+const PROFILES: Record<string, ModelProfile> = {
+  "claude-opus-5-5": {
+    id: "claude-opus-5-5",
+    supportsDisabledThinking: false,
+    defaultMaxTokens: 8192,
+    timeoutMs: 120_000,
+  },
+  "claude-sonnet-5": {
+    id: "claude-sonnet-5",
+    supportsDisabledThinking: true,
+    defaultMaxTokens: 4096,
+    timeoutMs: 60_000,
+  },
+};
+
+type Intent = { fast: boolean; maxTokens?: number };
+
+export function buildRequest(model: string, intent: Intent) {
+  const profile = PROFILES[model];
+  if (!profile) throw new Error(`Unknown model profile: ${model}`);
+
+  const request: Record<string, unknown> = {
+    model: profile.id,
+    max_tokens: intent.maxTokens ?? profile.defaultMaxTokens,
+  };
+
+  // Only ask for "no thinking" when the model allows it.
+  if (intent.fast && profile.supportsDisabledThinking) {
+    request.thinking = { type: "disabled" };
+  }
+
+  return { request, timeoutMs: profile.timeoutMs };
+}
+```
+
+Callers express intent ("this is a fast path"), and the profile decides whether that intent can be expressed as a parameter on a given model. When a fast path cannot disable thinking, you have a routing decision to make, not a parameter to patch. That is the point of the indirection: it makes the decision visible.
+
+For fast paths, the usual answer is to keep them on a smaller model. A 5.5-family model with a lower thinking overhead, or a Sonnet-class model, is a better fit than paying for a flagship on a path where reasoning adds nothing. We covered this pattern in our post on [model routing for agent workflows](/blog/claude-haiku-5-5-subagent-model-routing-2026).
+
+## A rollout that limits the blast radius
+
+1. **Grep for thinking parameters first.** Search the repository for every place thinking is configured, including SDK wrappers, internal gateways, and test fixtures. Wrapper libraries often set it on your behalf.
+2. **Run your eval set on both models.** Compare quality, but also record latency percentiles and total tokens per request. The cost question is answered by tokens, not the price sheet.
+3. **Shadow traffic before cutover.** Send a copy of a small slice of real requests to the new model and discard the responses. You are looking for errors and tail latency, not quality.
+4. **Raise timeouts deliberately.** Set them from measured p99 on the new model plus margin, not from a guess.
+5. **Cut over by route, not globally.** Move the reasoning-heavy routes first. Leave latency-sensitive routes on the previous model until you have data.
+6. **Keep rollback to one config value.** If the model ID lives in an environment variable or flag, rollback is a deploy-free change.
+
+## What to measure
+
+Quality claims in launch posts are measured on the vendor's tasks. Your workload is different, so measure these four things on yours:
+
+- Task success rate on your own eval set
+- p50 and p99 latency per route
+- Output tokens per request, including thinking
+- Error rate by error type during shadow traffic
+
+If cost per successful task drops, the upgrade is paying for itself. If it only drops per token, it may not.
+
+## Our recommendation
+
+Treat Opus 5.5 as a good candidate for the routes where reasoning quality is the bottleneck: code changes across many files, multi-step analysis, and long-running agent tasks. Do not move latency-critical, low-complexity routes just because a newer flagship exists.
+
+The larger lesson is structural. Model-specific behavior will keep changing, and every release will carry some constraint like this one. A capability table and a single request builder cost an afternoon and turn the next migration into a diff of one file.
