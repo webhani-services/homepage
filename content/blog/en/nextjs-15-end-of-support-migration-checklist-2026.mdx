@@ -1,0 +1,107 @@
+---
+title: "Next.js 15 Reaches End of Support on October 21: A Migration Checklist"
+description: "Next.js 15 leaves Maintenance LTS this month. A practical checklist for moving production apps to Next.js 16 — inventory, codemods, caching changes, and rollout."
+date: "2026-10-15"
+status: "published"
+tags: ["Next.js", "React", "Migration", "Security", "TypeScript"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-15-end-of-support-migration-checklist-2026"
+---
+
+Next.js 15 was released on October 21, 2024. Under the Next.js support policy, a major version stays in Maintenance LTS for two years, which puts the end of support at October 21, 2026 — about a week from now. After that date, security fixes for the 15.x line are no longer guaranteed. Vercel has said it may patch unsupported versions in rare, severe cases, but that is not something to plan a production system around.
+
+This post is a checklist we use when moving client applications from 15.x to 16.x. It assumes an App Router project. Verify version details against the official Next.js docs; the dates here come from the support policy and third-party EOL trackers.
+
+## Why this deadline matters more than usual
+
+Next.js has shipped several security releases this year, and the fixes were released for supported lines only. Teams on 15.x had to land on a specific patched minor, not just "any 15". Once the line is unsupported, the next advisory may not have a 15.x backport at all. In practice that means a forced, rushed upgrade under incident pressure — the worst time to do a major version jump.
+
+Doing it now, on your schedule, is cheaper.
+
+## Step 1: Inventory what you actually run
+
+Before touching code, find out which versions are deployed:
+
+```bash
+# Per repository
+npm ls next react react-dom --depth=0
+
+# Across many repos in a directory
+for d in */; do
+  [ -f "$d/package.json" ] && \
+    echo "$d: $(node -p "require('./$d/package.json').dependencies?.next ?? 'n/a'")"
+done
+```
+
+Include preview environments and any long-lived staging branches. Forgotten internal tools are the usual stragglers.
+
+## Step 2: Move to the latest 15.x first
+
+Jump to the final 15.x patch release before going to 16. This separates "my app breaks because of 16" from "my app breaks because I was on an old 15 minor":
+
+```bash
+npm install next@15 react@19 react-dom@19
+npm run build && npm test
+```
+
+If the build is green here, you have a clean baseline to diff against.
+
+## Step 3: Run the official upgrade tooling
+
+Next.js ships a codemod CLI that applies mechanical changes for you:
+
+```bash
+npx @next/codemod@canary upgrade latest
+```
+
+Review the diff rather than committing blindly. Codemods handle renamed APIs well, but they cannot judge whether your data-fetching assumptions still hold.
+
+## Step 4: Check the three areas that usually bite
+
+**Bundler.** Turbopack is the default bundler in 16. If you have a custom `webpack` function in `next.config`, the build will tell you. You can keep Webpack explicitly while you migrate, but plan to move off it — features and performance work land on Turbopack first.
+
+```bash
+# Opt out temporarily if a plugin blocks you
+next build --webpack
+```
+
+**Caching.** Caching semantics changed across the 15 → 16 line, with Cache Components and `use cache` replacing much of the implicit behavior. If you relied on defaults that happened to cache `fetch` results or route handlers, add explicit tests for freshness-sensitive pages (pricing, inventory, user dashboards) before upgrading.
+
+**Removed features.** AMP support is gone in 16. If any legacy page still uses it, handle that separately.
+
+## Step 5: Add a regression net before you flip the switch
+
+A small set of end-to-end checks catches most migration issues. We typically cover:
+
+- Login and an authenticated page load
+- One page per rendering strategy (static, dynamic, streamed)
+- A form submission through a Server Action
+- Response headers on key routes (cache-control, CSP)
+
+```ts
+// e2e/smoke.spec.ts (Playwright)
+import { test, expect } from "@playwright/test";
+
+test("pricing page is not served stale", async ({ page, request }) => {
+  const res = await request.get("/pricing");
+  expect(res.status()).toBe(200);
+  expect(res.headers()["cache-control"]).not.toContain("immutable");
+  await page.goto("/pricing");
+  await expect(page.getByRole("heading", { name: /pricing/i })).toBeVisible();
+});
+```
+
+Run the suite against the 15.x baseline and the 16.x branch. Differences in headers are often the first sign of a caching change.
+
+## Step 6: Roll out gradually
+
+If your platform supports it, use a canary or percentage rollout. On Vercel this is Rolling Releases; on self-hosted setups a weighted load balancer does the same job. Watch error rate and p95 latency for a day before going to 100%. Keep the 15.x deployment available for quick rollback until you are confident.
+
+## What we recommend
+
+- **If you are on 15.x today:** schedule the upgrade this week. A week of margin is thin but workable for most apps.
+- **If you cannot finish by October 21:** at least pin to the latest 15.x patch, subscribe to the Next.js security advisories, and write down who decides on an emergency upgrade.
+- **If you maintain many apps:** upgrade the lowest-risk one first and reuse its codemod diff and test suite as a template.
+
+The upgrade itself is rarely the hard part. The hard part is discovering which apps you forgot about. Start with the inventory.

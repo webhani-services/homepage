@@ -1,0 +1,104 @@
+---
+title: "Pinning Models Across a Claude Code Subagent Pipeline"
+description: "Recent Claude Code releases add finer control over subagents, including workflow-level model selection. Why model pinning matters for cost, reproducibility, and review — and how to structure it."
+date: "2026-10-15"
+status: "published"
+tags: ["Claude Code", "AI", "LLM", "Subagents", "Developer Tooling"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-subagent-model-pinning-pipelines-2026"
+---
+
+Once a team moves from a single AI coding session to a pipeline of subagents — one for exploration, one for implementation, one for review — a new question appears: which model runs each step, and who decides?
+
+A weekly roundup covering Claude Code 2.1.290 through 2.1.296 (week of October 11, 2026) reports new subagent-related controls, including a workflow-level setting that pins every subagent in a pipeline to one chosen model, and effort control on the Agent tool. We could not confirm the exact setting names against an official changelog at the time of writing, so check the Claude Code release notes before relying on specific option names. This post is about the design question behind the feature, which holds regardless of syntax.
+
+## Why model choice per step matters
+
+In a multi-step agent workflow, the model is a variable that affects three things you care about.
+
+**Cost.** Exploration — grepping, reading files, summarizing — is high-volume and tolerant of a smaller model. Implementation and review of tricky logic benefit from a stronger one. Running everything on the largest model is simple but expensive; running everything on the smallest is cheap but produces more rework.
+
+**Reproducibility.** If a subagent silently inherits whatever model the parent session uses, the same workflow gives different results depending on who started it and what they had selected. That makes failures hard to reproduce and makes prompt changes hard to evaluate.
+
+**Reviewability.** When a pipeline's behavior is defined in version-controlled files, a pull request can show "the reviewer agent now runs on a different model." When it depends on a developer's local selection, that change is invisible.
+
+## Pinning at the definition level
+
+Claude Code subagents are defined as Markdown files with YAML frontmatter, and the documented frontmatter includes a `model` field. Pinning there is the most explicit option:
+
+```markdown
+---
+name: code-explorer
+description: Read-only codebase search. Use for locating files and call sites.
+tools: Read, Grep, Glob
+model: haiku
+---
+
+You search the repository and report file paths and short excerpts.
+Do not propose changes. Do not read files outside the repository root.
+```
+
+```markdown
+---
+name: change-reviewer
+description: Reviews a diff for correctness and security issues.
+tools: Read, Grep, Glob, Bash
+model: opus
+---
+
+Review the staged diff. Report only issues you can point to by file and line.
+Separate confirmed defects from suspicions.
+```
+
+Here the cheap, high-volume role is pinned to a small model and the judgment-heavy role to a larger one. The assignment lives in the repository, next to the prompt it applies to.
+
+## When a single pinned model is the better choice
+
+A workflow-level pin — one model for every subagent in the pipeline — is a different tradeoff. It trades per-step optimization for predictability. We would reach for it in three situations:
+
+1. **Evaluating a prompt or workflow change.** Fix the model so that differences in output come from your change, not from model variation.
+2. **Regulated or audited environments.** If you must state which model processed a given change, one pinned value is easier to document than a mixture.
+3. **Incident reproduction.** When an automated run produced a bad result, you want to rerun it under the same conditions.
+
+For day-to-day development, per-role pinning usually gives a better cost-quality balance.
+
+## A lightweight way to make pinning auditable
+
+Whichever mechanism you use, add a check so that unpinned agents do not slip in. A small script in CI can enforce that every agent definition declares a model:
+
+```ts
+// scripts/check-agent-models.ts
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+const dir = ".claude/agents";
+const missing: string[] = [];
+
+for (const file of readdirSync(dir).filter((f) => f.endsWith(".md"))) {
+  const text = readFileSync(join(dir, file), "utf8");
+  const frontmatter = text.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? "";
+  if (!/^model:\s*\S+/m.test(frontmatter)) missing.push(file);
+}
+
+if (missing.length > 0) {
+  console.error(`Agents without an explicit model: ${missing.join(", ")}`);
+  process.exit(1);
+}
+```
+
+Run it in the same job as your linting. The cost is a few lines; the benefit is that "which model runs this?" always has an answer in the repository.
+
+## Related permission fixes worth noting
+
+The same roundup mentions fixes for cases where Bash deny and ask rules were skipped, and a permission bypass involving UNC-path file reads. These are reminders that subagent permissions deserve their own review. When you give a subagent `Bash`, treat its allowed commands like any other privilege grant: allowlist narrowly, and keep read-only agents read-only. We covered the permission side in more depth in an earlier post on subagent permission controls.
+
+## webhani's recommendation
+
+- **Define roles first, then assign models.** Exploration, implementation, and review have different needs; write that down before choosing models.
+- **Pin explicitly in version control.** Avoid relying on inheritance from the parent session for anything you want to reproduce.
+- **Measure before downsizing.** Move a role to a smaller model, run it on a fixed set of past tasks, and compare outcomes — not just cost.
+- **Add a CI check** so new agents cannot be added without a declared model.
+- **Verify option names against the current release notes** before writing them into team documentation.
+
+Model selection is a configuration decision with real consequences for cost and quality. Treating it as code — declared, reviewed, and tested — is what makes an agent pipeline something a team can maintain.

@@ -1,0 +1,104 @@
+---
+title: "Claude Code Subagent Pipeline에서 Model 고정하기"
+description: "최근 Claude Code는 Workflow 단위 Model 지정 등 Subagent 제어를 세분화하고 있습니다. 비용, 재현성, 리뷰 관점에서 Model 고정이 왜 중요한지, 어떻게 구성할지 정리합니다."
+date: "2026-10-15"
+status: "published"
+tags: ["Claude Code", "AI", "LLM", "Subagents", "Developer Tooling"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-subagent-model-pinning-pipelines-2026"
+---
+
+AI 코딩을 단일 Session에서 쓰던 단계를 넘어 탐색, 구현, 리뷰를 각각 맡는 Subagent Pipeline으로 옮겨 가면 새로운 질문이 생깁니다. 각 단계에서 어떤 Model이 동작하며, 그것을 누가 결정하는가 하는 질문입니다.
+
+Claude Code 2.1.290부터 2.1.296까지를 다룬 주간 정리(2026년 10월 11일 주)에 따르면 Subagent 관련 제어가 새로 추가되었습니다. Pipeline 안의 모든 Subagent를 하나의 Model로 고정하는 Workflow 단위 설정, 그리고 Agent Tool의 Effort 제어 등입니다. 작성 시점에는 설정 이름을 공식 Changelog로 확인하지 못했으므로, 특정 Option 이름에 의존하기 전에 Claude Code Release Notes를 확인하십시오. 이 글은 기능 뒤에 있는 설계상의 질문을 다루며, 이는 Syntax와 무관하게 유효합니다.
+
+## 단계별 Model 선택이 중요한 이유
+
+다단계 Agent Workflow에서 Model은 세 가지에 영향을 주는 변수입니다.
+
+**비용.** 탐색(grep, 파일 읽기, 요약)은 양이 많고 작은 Model로도 충분한 경우가 많습니다. 까다로운 로직의 구현과 리뷰에는 더 강한 Model이 도움이 됩니다. 모든 단계를 가장 큰 Model로 돌리면 단순하지만 비쌉니다. 모두 가장 작은 Model로 돌리면 싸지만 재작업이 늘어납니다.
+
+**재현성.** Subagent가 부모 Session의 Model을 암묵적으로 상속하면, 같은 Workflow라도 누가 시작했고 무엇을 선택해 두었는지에 따라 결과가 달라집니다. 그러면 실패를 재현하기 어렵고 Prompt 변경을 평가하기도 어렵습니다.
+
+**리뷰 가능성.** Pipeline의 동작이 버전 관리되는 파일에 정의되어 있으면 Pull Request에서 "리뷰 Agent가 다른 Model로 동작하게 되었다"는 변경이 보입니다. 개발자의 로컬 선택에 의존하면 그 변경은 보이지 않습니다.
+
+## 정의 파일 수준에서 고정하기
+
+Claude Code Subagent는 YAML Frontmatter가 있는 Markdown 파일로 정의되며, 문서화된 Frontmatter에는 `model` Field가 있습니다. 여기서 고정하는 것이 가장 명시적인 방법입니다.
+
+```markdown
+---
+name: code-explorer
+description: Read-only codebase search. Use for locating files and call sites.
+tools: Read, Grep, Glob
+model: haiku
+---
+
+You search the repository and report file paths and short excerpts.
+Do not propose changes. Do not read files outside the repository root.
+```
+
+```markdown
+---
+name: change-reviewer
+description: Reviews a diff for correctness and security issues.
+tools: Read, Grep, Glob, Bash
+model: opus
+---
+
+Review the staged diff. Report only issues you can point to by file and line.
+Separate confirmed defects from suspicions.
+```
+
+양이 많고 저렴해야 하는 역할은 작은 Model로, 판단 비중이 큰 역할은 큰 Model로 고정했습니다. 이 할당은 적용 대상 Prompt 바로 옆, 즉 Repository 안에 있습니다.
+
+## 단일 Model 고정이 더 나은 경우
+
+Workflow 단위 고정(Pipeline의 모든 Subagent에 하나의 Model)은 다른 Trade-off입니다. 단계별 최적화를 포기하는 대신 예측 가능성을 얻습니다. 다음 세 가지 상황에서 선택할 만합니다.
+
+1. **Prompt나 Workflow 변경을 평가할 때.** Model을 고정하면 출력 차이가 Model 편차가 아니라 우리의 변경에서 비롯되었다고 말할 수 있습니다.
+2. **규제 또는 감사 환경.** 어떤 변경을 어느 Model이 처리했는지 설명해야 한다면, 여러 Model이 섞인 것보다 고정된 하나의 값이 문서화하기 쉽습니다.
+3. **장애 재현.** 자동 실행이 나쁜 결과를 냈을 때 같은 조건으로 다시 실행하고 싶어집니다.
+
+일상 개발에서는 역할별 고정이 대체로 비용과 품질의 균형이 더 좋습니다.
+
+## 고정 상태를 감사 가능하게 만드는 간단한 방법
+
+어떤 방식을 쓰든, 고정되지 않은 Agent가 끼어들지 못하도록 검사를 추가해 두십시오. CI의 작은 Script로 모든 Agent 정의가 Model을 선언하도록 강제할 수 있습니다.
+
+```ts
+// scripts/check-agent-models.ts
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+const dir = ".claude/agents";
+const missing: string[] = [];
+
+for (const file of readdirSync(dir).filter((f) => f.endsWith(".md"))) {
+  const text = readFileSync(join(dir, file), "utf8");
+  const frontmatter = text.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? "";
+  if (!/^model:\s*\S+/m.test(frontmatter)) missing.push(file);
+}
+
+if (missing.length > 0) {
+  console.error(`Agents without an explicit model: ${missing.join(", ")}`);
+  process.exit(1);
+}
+```
+
+Lint와 같은 Job에서 실행하십시오. 비용은 몇 줄이고, 얻는 것은 "이 Agent는 어떤 Model로 동작하는가"라는 질문에 항상 Repository 안에서 답할 수 있는 상태입니다.
+
+## 함께 짚어 둘 권한 관련 수정
+
+같은 정리에는 Bash의 deny/ask Rule이 건너뛰어지던 경우의 수정과, UNC 경로 파일 읽기와 관련된 권한 우회 수정도 언급되어 있습니다. Subagent 권한은 그 자체로 별도 검토가 필요하다는 점을 상기시킵니다. Subagent에 `Bash`를 줄 때는 허용 Command를 다른 권한 부여와 똑같이 취급해 Allowlist를 좁게 유지하고, 읽기 전용 Agent는 읽기 전용으로 유지하십시오. 권한 측면은 이전의 Subagent 권한 제어 글에서 더 자세히 다루었습니다.
+
+## webhani의 권고
+
+- **역할을 먼저 정의하고 Model을 나중에 배정하십시오.** 탐색, 구현, 리뷰는 요구 사항이 다릅니다. Model을 고르기 전에 문서로 적어 두십시오.
+- **버전 관리 안에서 명시적으로 고정하십시오.** 재현하고 싶은 것은 부모 Session의 상속에 맡기지 마십시오.
+- **줄이기 전에 측정하십시오.** 어떤 역할을 작은 Model로 옮기고 과거 작업의 고정 Set으로 실행해, 비용뿐 아니라 결과도 비교하십시오.
+- **CI Check를 추가하십시오.** Model 선언 없이 새 Agent를 추가하지 못하게 합니다.
+- **Option 이름은 최신 Release Notes로 확인하십시오.** 팀 문서에 적기 전에 꼭 확인해야 합니다.
+
+Model 선택은 비용과 품질에 실질적인 영향을 주는 Configuration 결정입니다. 이를 코드처럼 선언하고, 리뷰하고, 테스트하는 것이 Agent Pipeline을 팀이 유지보수할 수 있는 대상으로 만듭니다.
