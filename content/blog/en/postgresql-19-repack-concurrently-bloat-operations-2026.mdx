@@ -1,0 +1,97 @@
+---
+title: "PostgreSQL 19 REPACK CONCURRENTLY: Rethinking Table Bloat Operations"
+description: "PostgreSQL 19 adds REPACK, with a CONCURRENTLY mode, and parallel index vacuuming in autovacuum. What changes for teams who rely on pg_repack or scheduled maintenance windows."
+date: "2026-10-15"
+status: "published"
+tags: ["PostgreSQL", "Database", "Operations", "Performance", "Maintenance"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-19-repack-concurrently-bloat-operations-2026"
+---
+
+Table bloat is one of the least glamorous problems in running PostgreSQL, and one of the most persistent. Heavy UPDATE or DELETE workloads leave dead tuples behind; plain `VACUUM` makes the space reusable but rarely returns it to the operating system. The traditional fixes either take an exclusive lock (`VACUUM FULL`, `CLUSTER`) or require a third-party extension (`pg_repack`).
+
+PostgreSQL 19 addresses this in core. According to the PostgreSQL 19 release notes, the new `REPACK` command replaces the confusingly named pair of `VACUUM FULL` and `CLUSTER`, and a `CONCURRENTLY` option rebuilds a table without blocking reads and writes.
+
+A status note first: at the time of writing, the PostgreSQL 19 documentation we reviewed is for the beta series, and the release date was not yet set on that page. Features can change before GA. Treat everything below as something to evaluate on a test cluster, not something to schedule into production yet.
+
+## What the release notes describe
+
+Three changes matter for day-to-day operations:
+
+- **`REPACK`**: one command for rewriting a table, with an optional index to order by. The older commands remain for compatibility. `CONCURRENTLY` avoids long blocking of readers and writers, and a new `max_repack_replication_slots` setting supports it.
+- **Parallel autovacuum**: autovacuum can use parallel workers to vacuum a table's indexes, controlled by `autovacuum_max_parallel_workers` and a per-table `autovacuum_parallel_workers` storage parameter. A scoring system also prioritizes tables that most need vacuuming or analyzing.
+- **`WAIT`**: lets a session wait on a standby until a given LSN has been replayed, which is useful for read-your-writes behavior on replicas.
+
+## Why a core REPACK is useful
+
+`pg_repack` works, and many teams run it successfully. But it carries operational costs that a core feature can remove:
+
+- It is an extension, so it has to be available and version-matched on every managed environment. Some managed services lag on extension versions.
+- It uses triggers and a log table to capture changes during the rebuild, which adds write overhead and its own failure modes.
+- It needs a brief exclusive lock at the end, and extra disk for the new copy.
+
+A core implementation tied to replication slots (as the new setting suggests) should integrate better with the server's own change capture. We have not benchmarked it, so we won't claim it is faster. The more certain benefit is fewer moving parts.
+
+## A bloat check you can run today
+
+Whatever version you are on, measure before you act. The `pgstattuple` extension gives an accurate picture:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+SELECT
+  relname,
+  pg_size_pretty(pg_relation_size(c.oid))          AS size,
+  round(s.dead_tuple_percent::numeric, 1)           AS dead_pct,
+  round(s.free_percent::numeric, 1)                 AS free_pct
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace,
+LATERAL pgstattuple(c.oid) s
+WHERE n.nspname = 'public'
+  AND c.relkind = 'r'
+  AND pg_relation_size(c.oid) > 100 * 1024 * 1024
+ORDER BY pg_relation_size(c.oid) DESC
+LIMIT 20;
+```
+
+Note that `pgstattuple` scans the whole table, so run it off-peak or on a replica. For a cheaper estimate, use `pg_stat_user_tables.n_dead_tup`.
+
+## What a PostgreSQL 19 workflow might look like
+
+Based on the documented behavior, a maintenance step could shrink to a single statement. The exact syntax should be confirmed in the final documentation, but the shape is along these lines:
+
+```sql
+-- Rebuild a bloated table without blocking reads and writes
+REPACK (CONCURRENTLY) orders;
+
+-- Rebuild and physically order by an index
+REPACK (CONCURRENTLY) orders USING INDEX orders_created_at_idx;
+```
+
+Before using this on anything large, plan for:
+
+1. **Disk headroom.** A rewrite needs space for a second copy of the table and its indexes.
+2. **WAL volume.** A full rewrite generates WAL. Check replica lag and archive capacity.
+3. **Replication slot limits.** Confirm `max_repack_replication_slots` and `max_replication_slots` leave room.
+4. **Long-running transactions.** Concurrent rebuilds typically have to wait for older transactions. Monitor `pg_stat_activity` for them.
+
+## Parallel autovacuum: the quieter change
+
+Index vacuuming is often the slowest phase on large tables with many indexes. Letting autovacuum parallelize it should shorten the window during which a table accumulates bloat. If you have a few very large, write-heavy tables, you can tune per table once you are on 19:
+
+```sql
+-- Syntax per the 19 release notes; verify against final docs
+ALTER TABLE events SET (autovacuum_parallel_workers = 4);
+```
+
+Raise this carefully. More workers means more I/O concurrent with your application traffic.
+
+## webhani's recommendation
+
+1. **Don't upgrade for this alone.** Bloat is manageable today with good autovacuum tuning and, where necessary, `pg_repack`.
+2. **Do stand up a PostgreSQL 19 test cluster** from a recent copy of production and try `REPACK (CONCURRENTLY)` on your worst-bloated table. Measure duration, WAL generated, and lock waits.
+3. **Fix the cause, not only the symptom.** If a table bloats repeatedly, look at update patterns, `fillfactor`, HOT update eligibility, and long-running transactions that hold back vacuum.
+4. **Wait for GA and your provider's support** before planning a production upgrade. Major version upgrades also require `pg_upgrade`, dump/restore, or logical replication.
+
+A built-in, non-blocking rebuild is a real operational improvement. It is worth testing now so that you know what it does for your workload when the stable release arrives.

@@ -1,0 +1,97 @@
+---
+title: "PostgreSQL 19 の REPACK CONCURRENTLY: テーブル肥大化対策の運用を見直す"
+description: "PostgreSQL 19 では CONCURRENTLY オプション付きの REPACK と、autovacuum によるインデックスの並列 VACUUM が追加されます。pg_repack やメンテナンスウィンドウに頼ってきたチームにとっての変化を整理します。"
+date: "2026-10-15"
+status: "published"
+tags: ["PostgreSQL", "Database", "Operations", "Performance", "Maintenance"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-19-repack-concurrently-bloat-operations-2026"
+---
+
+テーブルの肥大化(bloat)は、PostgreSQL の運用で最も地味でありながら、最も根深い問題のひとつです。UPDATE や DELETE が多いワークロードではデッドタプルが残り、通常の `VACUUM` は領域を再利用可能にしても、OS に返すことはほとんどありません。従来の対処法は、排他ロックを取る `VACUUM FULL` や `CLUSTER` を使うか、サードパーティの拡張機能 `pg_repack` を使うかのどちらかでした。
+
+PostgreSQL 19 では、これがコア機能として扱われます。PostgreSQL 19 のリリースノートによると、新しい `REPACK` コマンドは、名前が紛らわしかった `VACUUM FULL` と `CLUSTER` を置き換えるもので、`CONCURRENTLY` オプションを付けるとテーブルの読み書きをブロックせずに再構築できます。
+
+先に状況を整理します。執筆時点で確認した PostgreSQL 19 のドキュメントはベータ版のもので、リリース日も未定のままでした。GA までに仕様が変わる可能性があります。以下は、本番に組み込む予定として扱うのではなく、テストクラスターで評価する材料として読んでください。
+
+## リリースノートの内容
+
+日々の運用に関係する変更は3点です。
+
+- **`REPACK`**: テーブルを書き直すための単一のコマンドで、並び順に使うインデックスも指定できます。従来のコマンドも互換性のために残ります。`CONCURRENTLY` を付けると読み書きの長時間ブロックを避けられ、これを支える設定として `max_repack_replication_slots` が追加されます。
+- **autovacuum の並列化**: autovacuum がテーブルのインデックスを並列ワーカーで VACUUM できるようになります。`autovacuum_max_parallel_workers` とテーブル単位の `autovacuum_parallel_workers` ストレージパラメータで制御します。また、VACUUM や ANALYZE が最も必要なテーブルを優先するスコアリングも導入されます。
+- **`WAIT`**: スタンバイ側で、指定した LSN まで適用されるのを待てます。レプリカでの read-your-writes に役立ちます。
+
+## コアの REPACK が役に立つ理由
+
+`pg_repack` は十分に機能しており、多くのチームが問題なく使っています。ただし、コア機能なら取り除ける運用上のコストがあります。
+
+- 拡張機能なので、すべての環境で利用可能かつバージョンが合っている必要があります。マネージドサービスによっては拡張のバージョン追随が遅れます。
+- 再構築中の変更を捕捉するためにトリガーとログテーブルを使うため、書き込みのオーバーヘッドと固有の障害パターンが生じます。
+- 最後に短時間の排他ロックが必要で、新しいコピーのための追加ディスクも必要です。
+
+新しい設定からも読み取れるように、レプリケーションスロットと結びついたコア実装であれば、サーバー自身の変更捕捉との統合が良くなると期待できます。ただし私たちはベンチマークを取っていないため、速いとは言いません。確実なメリットは、構成要素が減ることです。
+
+## 今日から使える肥大化チェック
+
+どのバージョンを使っていても、対処の前にまず計測します。`pgstattuple` 拡張を使うと正確な状況が分かります。
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+SELECT
+  relname,
+  pg_size_pretty(pg_relation_size(c.oid))          AS size,
+  round(s.dead_tuple_percent::numeric, 1)           AS dead_pct,
+  round(s.free_percent::numeric, 1)                 AS free_pct
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace,
+LATERAL pgstattuple(c.oid) s
+WHERE n.nspname = 'public'
+  AND c.relkind = 'r'
+  AND pg_relation_size(c.oid) > 100 * 1024 * 1024
+ORDER BY pg_relation_size(c.oid) DESC
+LIMIT 20;
+```
+
+`pgstattuple` はテーブル全体をスキャンするため、ピーク時間帯を避けるか、レプリカで実行してください。より軽い見積もりには `pg_stat_user_tables.n_dead_tup` が使えます。
+
+## PostgreSQL 19 でのワークフロー
+
+ドキュメントに書かれた挙動を前提にすると、メンテナンス作業は1文に収まる可能性があります。正確な構文は最終版のドキュメントで確認が必要ですが、イメージは次のとおりです。
+
+```sql
+-- 肥大化したテーブルを、読み書きをブロックせずに再構築
+REPACK (CONCURRENTLY) orders;
+
+-- 再構築しつつ、インデックス順に物理的に並べ替え
+REPACK (CONCURRENTLY) orders USING INDEX orders_created_at_idx;
+```
+
+大きなテーブルに使う前に、次の点を計画しておいてください。
+
+1. **ディスクの余裕。** 書き直しには、テーブルとインデックスの2つ目のコピー分の領域が必要です。
+2. **WAL の量。** 全体の書き直しは WAL を生成します。レプリカの遅延とアーカイブの容量を確認してください。
+3. **レプリケーションスロットの上限。** `max_repack_replication_slots` と `max_replication_slots` に余裕があるか確認します。
+4. **長時間トランザクション。** 並行再構築では、通常、古いトランザクションの終了を待つ必要があります。`pg_stat_activity` で監視してください。
+
+## autovacuum の並列化: 目立たないが重要な変更
+
+インデックスが多い大きなテーブルでは、インデックスの VACUUM が最も時間のかかるフェーズになりがちです。これを autovacuum が並列化できれば、テーブルに肥大化が溜まる時間は短くなるはずです。更新が多い巨大なテーブルが少数ある場合は、19 に上げた後にテーブル単位で調整できます。
+
+```sql
+-- 構文は 19 のリリースノートに基づく。最終版のドキュメントで要確認
+ALTER TABLE events SET (autovacuum_parallel_workers = 4);
+```
+
+増やす際は慎重に。ワーカーが増えると、アプリケーションのトラフィックと並行して I/O が増えます。
+
+## webhani の推奨
+
+1. **これだけを理由にアップグレードしない。** 肥大化は、適切な autovacuum のチューニングと、必要に応じた `pg_repack` で今でも管理できます。
+2. **PostgreSQL 19 のテストクラスターを立てる。** 本番の最近のコピーから作り、最も肥大化したテーブルで `REPACK (CONCURRENTLY)` を試します。所要時間、生成された WAL、ロック待ちを計測してください。
+3. **症状だけでなく原因を直す。** 繰り返し肥大化するテーブルでは、更新パターン、`fillfactor`、HOT 更新の適用条件、VACUUM を妨げる長時間トランザクションを確認します。
+4. **GA とマネージドサービスの対応を待ってから** 本番アップグレードを計画します。メジャーバージョンの移行には、`pg_upgrade`、ダンプ/リストア、論理レプリケーションのいずれかが必要です。
+
+ブロックしない再構築が標準で使えるようになるのは、運用上の実質的な改善です。安定版が出た時点で自社のワークロードにどう効くかを把握できるよう、今のうちに試しておく価値があります。

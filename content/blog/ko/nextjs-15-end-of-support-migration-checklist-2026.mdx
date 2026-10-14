@@ -1,0 +1,107 @@
+---
+title: "Next.js 15, 10월 21일 지원 종료: Next.js 16 마이그레이션 체크리스트"
+description: "Next.js 15가 이번 달 Maintenance LTS를 종료합니다. 운영 중인 앱을 Next.js 16으로 옮기기 위한 실무 체크리스트를 인벤토리, Codemod, Cache 변경, 단계적 Rollout 순서로 정리했습니다."
+date: "2026-10-15"
+status: "published"
+tags: ["Next.js", "React", "Migration", "Security", "TypeScript"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-15-end-of-support-migration-checklist-2026"
+---
+
+Next.js 15는 2024년 10월 21일에 릴리스되었습니다. Next.js 지원 정책상 Major 버전은 릴리스 후 2년간 Maintenance LTS 상태로 유지되므로, 15.x의 지원 종료일은 2026년 10월 21일, 즉 약 일주일 뒤입니다. 이후에는 15.x 라인에 대한 Security 패치가 보장되지 않습니다. Vercel이 심각한 경우 예외적으로 패치를 낼 수 있다고 밝혔지만, 운영 계획의 전제로 삼을 수는 없습니다.
+
+이 글은 webhani가 고객 Application을 15.x에서 16.x로 옮길 때 사용하는 체크리스트입니다. App Router 프로젝트를 기준으로 합니다. 날짜 정보는 지원 정책과 서드파티 EOL Tracker를 근거로 했으므로, 최종 확인은 공식 문서에서 해 주시기 바랍니다.
+
+## 이번 기한이 특히 중요한 이유
+
+올해 Next.js는 Security Release가 이어졌고, 수정은 지원 중인 라인에만 제공되었습니다. 15.x 사용 팀은 "아무 15"가 아니라 패치가 적용된 특정 Minor 버전으로 올려야 했습니다. 지원이 끝나면 다음 Advisory가 나와도 15.x Backport가 없을 수 있습니다. 그러면 장애 대응 도중에 Major 버전을 급히 올려야 하는데, 이는 가장 피하고 싶은 상황입니다.
+
+여유 있을 때 우리 일정에 맞춰 올리는 편이 확실히 저렴합니다.
+
+## Step 1: 실제 운영 중인 버전 파악
+
+코드를 건드리기 전에 어떤 버전이 배포되어 있는지부터 확인합니다.
+
+```bash
+# Repository 단위
+npm ls next react react-dom --depth=0
+
+# 디렉터리 아래 여러 Repository를 한 번에 확인
+for d in */; do
+  [ -f "$d/package.json" ] && \
+    echo "$d: $(node -p "require('./$d/package.json').dependencies?.next ?? 'n/a'")"
+done
+```
+
+Preview 환경과 오래 방치된 Staging Branch도 포함하십시오. 놓치기 쉬운 것은 대개 사내 도구입니다.
+
+## Step 2: 먼저 최신 15.x로 올리기
+
+16으로 가기 전에 15.x의 마지막 패치까지 올립니다. "16 때문에 깨졌는지"와 "오래된 15 Minor라서 깨졌는지"를 분리하기 위해서입니다.
+
+```bash
+npm install next@15 react@19 react-dom@19
+npm run build && npm test
+```
+
+여기서 Build가 통과하면 비교 기준이 되는 깨끗한 Baseline이 생깁니다.
+
+## Step 3: 공식 Codemod 실행
+
+Next.js는 기계적인 변경을 적용해 주는 Codemod CLI를 제공합니다.
+
+```bash
+npx @next/codemod@canary upgrade latest
+```
+
+Diff는 반드시 검토하십시오. Codemod는 API 이름 변경에는 강하지만, Data Fetching에 대한 기존 가정이 여전히 유효한지는 판단하지 못합니다.
+
+## Step 4: 자주 문제가 되는 세 영역
+
+**Bundler.** 16에서는 Turbopack이 기본 Bundler입니다. `next.config`에 커스텀 `webpack` 설정이 있으면 Build 시점에 드러납니다. 마이그레이션 중에는 Webpack을 명시적으로 유지할 수 있지만, 기능과 성능 개선이 Turbopack에 먼저 들어오므로 결국 전환을 계획해야 합니다.
+
+```bash
+# Plugin이 막고 있을 때의 임시 방편
+next build --webpack
+```
+
+**Cache.** 15에서 16으로 오면서 Cache Components와 `use cache`가 암묵적 Cache 동작을 대체하는 방향으로 Cache 의미가 바뀌었습니다. `fetch` 결과나 Route Handler가 우연히 Cache되던 기본 동작에 의존했다면, 업그레이드 전에 최신성이 중요한 페이지(가격, 재고, 사용자 Dashboard 등)에 테스트를 추가해 두십시오.
+
+**제거된 기능.** 16에서는 AMP 지원이 종료되었습니다. 레거시 페이지에서 사용 중이라면 별도로 대응해야 합니다.
+
+## Step 5: 전환 전에 회귀 테스트 마련
+
+소수의 E2E 검증만으로도 마이그레이션 문제의 대부분을 잡을 수 있습니다. 보통 다음을 다룹니다.
+
+- 로그인과 인증이 필요한 페이지 로드
+- Rendering 방식별(Static, Dynamic, Streaming) 페이지 하나씩
+- Server Action을 통한 Form 제출
+- 주요 Route의 Response Header(cache-control, CSP)
+
+```ts
+// e2e/smoke.spec.ts (Playwright)
+import { test, expect } from "@playwright/test";
+
+test("pricing page is not served stale", async ({ page, request }) => {
+  const res = await request.get("/pricing");
+  expect(res.status()).toBe(200);
+  expect(res.headers()["cache-control"]).not.toContain("immutable");
+  await page.goto("/pricing");
+  await expect(page.getByRole("heading", { name: /pricing/i })).toBeVisible();
+});
+```
+
+15.x Baseline과 16.x Branch 양쪽에서 실행합니다. Header 차이는 Cache 동작 변화를 알려 주는 첫 신호인 경우가 많습니다.
+
+## Step 6: 단계적 Rollout
+
+Platform이 지원한다면 Canary나 비율 기반 Rollout을 사용합니다. Vercel에서는 Rolling Releases, Self-hosted 환경에서는 가중치를 둔 Load Balancer로 같은 효과를 낼 수 있습니다. 100%로 올리기 전에 Error Rate와 p95 Latency를 하루 정도 관찰하십시오. 확신이 생길 때까지는 빠른 Rollback을 위해 15.x 배포를 남겨 둡니다.
+
+## webhani의 권고
+
+- **현재 15.x를 사용 중이라면:** 이번 주 안에 업그레이드를 일정에 넣으십시오. 일주일은 빠듯하지만 대부분의 앱에서 가능합니다.
+- **10월 21일까지 끝내기 어렵다면:** 최소한 최신 15.x 패치로 고정하고, Next.js Security Advisory를 구독하며, 긴급 업그레이드를 누가 결정할지 정해 두십시오.
+- **관리하는 앱이 많다면:** 위험이 가장 낮은 앱부터 올리고, 그 Codemod Diff와 테스트 Suite를 Template으로 재사용하십시오.
+
+업그레이드 작업 자체가 어려운 경우는 드뭅니다. 어려운 것은 존재를 잊고 있던 앱을 찾아내는 일입니다. 먼저 인벤토리부터 시작하십시오.
