@@ -1,0 +1,113 @@
+---
+title: "Node.js 20 のサポート打ち切りへ:Node 24 への実践的な移行チェックリスト"
+description: "Node.js 20 は 4 月に EOL を迎え、各プラットフォームが独自の期限を設け始めています。Docker イメージ、CI、サーバーレス関数を Node 24 LTS へ移すための手順をまとめます。"
+date: "2026-10-16"
+status: "published"
+tags: ["Node.js", "Docker", "CI/CD", "マイグレーション", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "nodejs-20-deprecation-node-24-migration-checklist-2026"
+---
+
+Node.js 20 は 2026 年 4 月 30 日に EOL を迎えました。セキュリティパッチの面でも重要な日付ですが、実際にインシデントの原因になりやすいのは、利用しているプラットフォームが決めた期限です。Vercel は 2026 年 10 月 1 日から Builds と Functions で Node.js 20 を非推奨にしました(影響を受けるのは新規デプロイで、既存のデプロイには影響しません)。ある情報源によれば、Google Cloud Run は 2026 年 10 月 30 日に Node.js 20 を廃止します。また別の情報源は、6 月に JavaScript Action の既定が Node 24 になったあと、GitHub-hosted runner からも秋以降に Node 20 が外されると伝えています。この最後の点は GitHub の一次情報で確認できていないため、自社の環境で確認してください。
+
+移行先として妥当なのは、2028 年 4 月までサポートされる Active LTS の Node 24 です。Node 26 は 10 月末に LTS へ入る予定ですが、今そこへ飛ぶと、移行作業に加えて削除された API の検証も必要になります。一度に飛ぶより、2 段階の方が楽です。
+
+## Step 1:Node 20 を固定している箇所をすべて洗い出す
+
+バージョンの固定は、`package.json` 以外にも潜んでいます。リポジトリ全体を検索します。
+
+```bash
+grep -rnE "node:?(-|@| )?20|node-version: ?['\"]?20|nodejs20|\"node\": ?\"[^\"]*20" \
+  --include="Dockerfile*" --include="*.yml" --include="*.yaml" \
+  --include="package.json" --include=".nvmrc" --include=".node-version" \
+  --include=".tool-versions" --include="*.toml" .
+```
+
+よく見つかる箇所です。
+
+- Dockerfile の `FROM node:20-alpine`(Multi-stage build で builder ステージだけ更新して、他のステージを忘れているケースを含む)
+- Workflow 内の `actions/setup-node` の `node-version: 20`
+- `package.json` の `engines.node`
+- `.nvmrc`、`.node-version`、`.tool-versions`
+- IaC の Lambda ランタイム設定(`nodejs20.x`)、Cloud Run のベースイメージ、Vercel のプロジェクト設定
+
+共有のベースイメージや社内の CI テンプレートも確認してください。10 個のリポジトリを直しても、全員が継承しているテンプレートを見逃せば、問題はそのまま残ります。
+
+## Step 2:サービスごとに 1 つの Pull Request でバージョンを変える
+
+バージョン変更は機能開発と分けておくと、ロールバックが簡単になります。
+
+```dockerfile
+# 変更前
+FROM node:20-alpine AS base
+
+# 変更後:メジャーを固定し、可能なら本番ではダイジェストも固定する
+FROM node:24-alpine AS base
+```
+
+```yaml
+- uses: actions/setup-node@v4
+  with:
+    node-version: 24
+    cache: npm
+```
+
+```json
+{
+  "engines": { "node": ">=24 <25" }
+}
+```
+
+`engines` に上限を付けて、`.npmrc` で `engine-strict=true` にしておくと、不一致が実行時ではなく `npm install` の時点で早く失敗します。
+
+## Step 3:ネイティブ依存を再ビルドする
+
+ネイティブアドオンを持つパッケージ(`sharp`、`bcrypt`、`better-sqlite3`、`sqlite3` など)は、Node の ABI ごとにビルド済みバイナリを配布しています。バージョン変更後は次を実行します。
+
+```bash
+rm -rf node_modules
+npm ci
+npm rebuild
+```
+
+Docker では、インストールのステップが新しいベースイメージ上で実行されること、そして古いイメージ由来の `node_modules` のレイヤーキャッシュが再利用されていないことを確認してください。Node のアップグレード後に「手元では動くがコンテナでは失敗する」原因として、これが最も多いものです。
+
+`sharp` を使うプロジェクト(Next.js の画像最適化もそうです)では、インストールされているバージョンが Node 24 向けのビルド済みバイナリを持っているか確認します。持っていなければ、先にアップグレードしてください。
+
+## Step 4:退行を実際に検出できるチェックを回す
+
+ユニットテストが通ることは必要条件ですが、十分ではありません。次を加えます。
+
+1. `dev` だけでなく、Node 24 での本番ビルド(`next build` など)。
+2. 実際の Database とキャッシュのコンテナを使った Integration テスト。
+3. ビルドしたイメージの Smoke テスト。起動し、ヘルスチェックのエンドポイントを叩き、主要な依存をそれぞれ使うページを 1 つずつ取得する。
+4. 依存関係の audit 結果。一部の間接依存が、同じ時期に古い Node のサポートを外すためです。
+
+ビルドログの deprecation 警告にも注意してください。Node 24 での警告は、Node 26 でエラーになることがよくあります。ログは、次の移行のための TODO リストにもなります。
+
+## Step 5:段階的にロールアウトする
+
+サーバーレス関数とコンテナの場合は次のとおりです。
+
+- まず Preview または Staging にデプロイし、エラー率とレイテンシを Node 20 のベースラインと比較する。
+- プラットフォームが対応していれば、重み付きトラフィックや Rolling Release を使う。
+- 1 週間分の指標が問題なくなるまで、前のイメージタグを残して、すぐロールバックできるようにしておく。
+
+## よくある問題
+
+| 症状 | 想定される原因 |
+|---|---|
+| `Error: Cannot find module '.../build/Release/xxx.node'` | 古い ABI 向けにビルドされたネイティブモジュール。再ビルドする |
+| `ERR_UNKNOWN_BUILTIN_MODULE`、組み込みモジュールの挙動変化 | Node 20 以降に削除・変更された API への依存。リリースノートを確認する |
+| ローカルは動くが CI で失敗する | テンプレートやキャッシュされたツールディレクトリ経由で CI が Node 20 のまま |
+| コンテナは起動するが画像最適化に失敗する | `sharp` のバイナリ不一致 |
+
+## webhani の推奨
+
+移行は、プラットフォームの期限が来てインシデント対応に追われる前に、通常の依存更新として今のうちに済ませてください。固定箇所を棚卸しし、サービスを 1 つずつ更新し、ネイティブモジュールを再ビルドし、本番ビルドと Smoke テストで検証します。Node 24 に乗ったあとは、Node 26 が LTS になり、依存パッケージが対応を明記してから、自分たちのペースで計画できます。
+
+## 参考
+
+- Vercel Changelog「Node.js 20 is being deprecated on October 1, 2026」
+- Node.js のリリーススケジュールと、2026 年の LTS 日程に関する第三者のまとめ(Node 26 の LTS 日付やプラットフォームの期限は情報源により異なるため、各プロバイダーで確認してください)

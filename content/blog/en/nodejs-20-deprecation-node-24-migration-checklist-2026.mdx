@@ -1,0 +1,113 @@
+---
+title: "Node.js 20 Is Being Cut Off: A Practical Migration Checklist to Node 24"
+description: "Node.js 20 reached end of life in April, and platforms are now setting their own cutoffs. A step-by-step checklist for moving Docker images, CI, and serverless functions to Node 24 LTS."
+date: "2026-10-16"
+status: "published"
+tags: ["Node.js", "Docker", "CI/CD", "Migration", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "nodejs-20-deprecation-node-24-migration-checklist-2026"
+---
+
+Node.js 20 reached end of life on April 30, 2026. That date matters for security patches, but the dates that tend to cause incidents are the ones set by your platforms. Vercel deprecated Node.js 20 for Builds and Functions on October 1, 2026, affecting new deployments (existing deployments are not affected). One source lists Google Cloud Run decommissioning Node.js 20 on October 30, 2026. Another reports that GitHub-hosted runners will drop Node 20 later this autumn, after Node 24 became the default for JavaScript actions in June; we could not confirm that last point against a GitHub primary source, so verify it for your own setup.
+
+Node 24 is the Active LTS line, supported until April 2028, and it is the sensible target. Node 26 is due to enter LTS at the end of October, but jumping to it now means validating removed APIs on top of the migration itself. Two steps are easier than one big one.
+
+## Step 1: Find every place Node 20 is pinned
+
+Version pins hide in more places than `package.json`. Search the whole repository:
+
+```bash
+grep -rnE "node:?(-|@| )?20|node-version: ?['\"]?20|nodejs20|\"node\": ?\"[^\"]*20" \
+  --include="Dockerfile*" --include="*.yml" --include="*.yaml" \
+  --include="package.json" --include=".nvmrc" --include=".node-version" \
+  --include=".tool-versions" --include="*.toml" .
+```
+
+Typical hits:
+
+- `FROM node:20-alpine` in Dockerfiles, including multi-stage builds where only the builder stage was updated
+- `actions/setup-node` with `node-version: 20` in workflows
+- `engines.node` in `package.json`
+- `.nvmrc`, `.node-version`, `.tool-versions`
+- Lambda runtime settings in IaC (`nodejs20.x`), Cloud Run base images, Vercel project settings
+
+Also check shared base images and internal CI templates. Fixing ten repositories and missing the template they all inherit from is a common way to leave the problem in place.
+
+## Step 2: Change the version in one pull request per service
+
+Keep the version change separate from feature work so a rollback is trivial.
+
+```dockerfile
+# Before
+FROM node:20-alpine AS base
+
+# After: pin the major, and use a digest in production if you can
+FROM node:24-alpine AS base
+```
+
+```yaml
+- uses: actions/setup-node@v4
+  with:
+    node-version: 24
+    cache: npm
+```
+
+```json
+{
+  "engines": { "node": ">=24 <25" }
+}
+```
+
+Setting `engines` with an upper bound makes a mismatch fail early on `npm install` (with `engine-strict=true` in `.npmrc`) instead of surfacing at runtime.
+
+## Step 3: Rebuild native dependencies
+
+Packages with native addons (`sharp`, `bcrypt`, `better-sqlite3`, `sqlite3`, and similar) ship prebuilt binaries per Node ABI. After the version change:
+
+```bash
+rm -rf node_modules
+npm ci
+npm rebuild
+```
+
+In Docker, make sure the install step runs on the new base image and that no cached `node_modules` layer from the old image is reused. This is the most frequent cause of "works on my machine, fails in the container" after a Node upgrade.
+
+For projects using `sharp` (as Next.js image optimisation does), confirm the installed version has Node 24 prebuilds. If it does not, upgrade it first.
+
+## Step 4: Run the checks that actually catch regressions
+
+A passing unit test suite is necessary but not sufficient. Add:
+
+1. A production build (`next build` or equivalent) on Node 24, not only `dev`.
+2. An integration run against a real database and cache container.
+3. A smoke test of the built image: start it, hit the health endpoint, and request one page that uses each major dependency.
+4. Dependency audit output, since some transitive packages drop old Node support in the same window.
+
+Watch for deprecation warnings in the build log. A warning on Node 24 often becomes an error on Node 26, so the log doubles as a to-do list for the next step.
+
+## Step 5: Roll out gradually
+
+For serverless functions and containers:
+
+- Deploy to a preview or staging environment first and compare error rates and latency with the Node 20 baseline.
+- Use weighted traffic or a rolling release where your platform supports it.
+- Keep the previous image tag available for a quick rollback until you have a full week of clean metrics.
+
+## Common problems
+
+| Symptom | Likely cause |
+|---|---|
+| `Error: Cannot find module '.../build/Release/xxx.node'` | Native module built for the old ABI; rebuild |
+| `ERR_UNKNOWN_BUILTIN_MODULE` or changed behaviour of a built-in | Reliance on an API removed or changed since Node 20; check release notes |
+| Dev works, CI fails | CI still pinned to Node 20 via a template or cached tool directory |
+| Container starts but image optimisation fails | `sharp` binary mismatch |
+
+## What we recommend
+
+Do the migration now, while it is a routine dependency bump, and not under an incident when a platform cutoff lands. Inventory pins, update one service at a time, rebuild native modules, and verify with a production build and a smoke test. Once you are on Node 24, you can plan the Node 26 move on your own schedule, once it is LTS and your dependencies list it as supported.
+
+## Sources
+
+- Vercel Changelog, "Node.js 20 is being deprecated on October 1, 2026"
+- Node.js release schedule and third-party summaries of the 2026 LTS timeline (dates for Node 26 LTS and platform cutoffs vary between sources; confirm with each provider)

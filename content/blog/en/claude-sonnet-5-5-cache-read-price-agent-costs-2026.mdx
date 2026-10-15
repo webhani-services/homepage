@@ -1,0 +1,87 @@
+---
+title: "Claude Sonnet 5.5 and the Cache-Read Price Cut: Where Agent Costs Actually Go"
+description: "Sonnet 5.5 shipped with unchanged list prices and a reported cache-read reduction. Why cache reads and effort settings, not input price, decide what an agent loop costs."
+date: "2026-10-16"
+status: "published"
+tags: ["Claude", "LLM", "Prompt Caching", "Cost Optimization", "AI Agents"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-sonnet-5-5-cache-read-price-agent-costs-2026"
+---
+
+Anthropic released Claude Sonnet 5.5 on September 28, 2026. According to coverage of the launch, responses are more than 30% faster than Sonnet 5, and typical tasks can cost up to 30% less while the per-token list price stays at $2 input / $10 output per million tokens. The saving comes from using fewer tokens for the same work, not from a lower rate.
+
+A week later, several trackers reported that cache reads on Sonnet 5.5 dropped from $0.20 to $0.10 per million tokens (October 7). We could not confirm this on Anthropic's own pricing page at the time of writing, so check it before you put the number into a budget. The reasoning below holds either way.
+
+## Why cache reads matter more than input price
+
+In a single-shot request, input price is the number you look at. In an agent loop it barely matters. Every turn re-sends the system prompt, tool definitions, and the accumulated conversation. With prompt caching, nearly all of that is billed as a cache read or a cache write, not as fresh input.
+
+Take a coding agent that runs 40 turns on a 60k-token context:
+
+- Fresh input per turn: a few thousand tokens (the new tool result)
+- Cache reads per turn: roughly 55–60k tokens
+- Output per turn: a few hundred to a few thousand tokens
+
+Over 40 turns that is about 2.3M cache-read tokens. At $0.20/M that is $0.46; at $0.10/M it is $0.23. Fresh input at $2/M for ~120k tokens is $0.24. So cache reads are the largest input-side line item, and halving their price moves the total more than any change to the headline input rate would.
+
+This also explains why the cost per task depends on how well you keep the cache warm.
+
+## What breaks the cache
+
+Caching is a prefix match. Anything that changes early in the prompt invalidates everything after it. The common causes we see in client code:
+
+```ts
+// Bad: a timestamp at the top of the system prompt changes every request
+const system = `Current time: ${new Date().toISOString()}\n${basePrompt}`;
+
+// Better: keep the stable prefix first, put volatile data last
+const system = [
+  { type: "text", text: basePrompt, cache_control: { type: "ephemeral" } },
+];
+const messages = [
+  { role: "user", content: `Current time: ${new Date().toISOString()}\n${task}` },
+];
+```
+
+Other frequent offenders:
+
+- Reordering or regenerating tool definitions between turns (for example, building the list from an unordered map)
+- Trimming old messages from the middle of the history instead of only appending
+- Switching models mid-session, which starts a new cache
+- Cache entries expiring because turns are spaced further apart than the cache lifetime
+
+If you log the usage fields from each response, the ratio of cache-read tokens to total input tokens tells you quickly whether caching is working. For a long-running agent we would expect it above 90% after the first couple of turns. If it is not, find the prefix that is changing.
+
+## Effort is the other lever
+
+Output and thinking tokens are billed at the output rate, which is five times the input rate. One source we reviewed notes that Claude apps and Claude Code default to medium effort, and that this setting affects the bill more than most other choices.
+
+A practical split for a team:
+
+| Task | Effort | Notes |
+|---|---|---|
+| Rename, small refactor, format fixes | Low | Output is short; extra reasoning adds cost only |
+| Feature work with tests | Medium | Default for most sessions |
+| Debugging a race condition, design review | High | Pay for reasoning where it changes the outcome |
+
+Set this explicitly in automation (CI review bots, scheduled agents) instead of relying on defaults, so a model or default change does not silently change your spend.
+
+## A note on tokenizers
+
+Coverage of the 5.5 family mentions that the newer tokenizer may use somewhat more tokens for the same text. If you compare Sonnet 5 and Sonnet 5.5 costs, compare per completed task on your own workload, not per token. Run the same 20–30 representative tasks on both models and record total billed tokens by category (fresh input, cache write, cache read, output).
+
+## What we recommend
+
+1. Log cache-read, cache-write, fresh-input, and output tokens per task, not just a monthly total.
+2. Audit prompt prefixes for volatile content. Move timestamps, request IDs, and user-specific data after the cached block.
+3. Set effort per workload class and keep it in version-controlled config.
+4. Treat price changes as a reason to re-measure, not to re-architect. A cache-read cut helps long-context agents most; short, stateless calls will see little difference.
+5. Verify any pricing figure against the official pricing page before it goes into a contract or estimate.
+
+Model releases will keep arriving every few weeks. The teams that keep costs predictable are the ones who can see where tokens go and change one variable at a time.
+
+## Sources
+
+- Launch coverage of Claude Sonnet 5.5 (September 28, 2026), including Inside and Let's Data Science
+- Pricing summaries from eesel.ai, Apidog, SessionWatcher, and LaoZhang (cache-read figures differ between sources)
