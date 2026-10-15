@@ -1,0 +1,113 @@
+---
+title: "Node.js 20 지원 종료 대응: Node 24 Migration 실전 Checklist"
+description: "Node.js 20은 4월에 EOL을 맞았고, 각 Platform이 자체 Cutoff를 정하고 있습니다. Docker Image, CI, Serverless Function을 Node 24 LTS로 옮기는 절차를 정리합니다."
+date: "2026-10-16"
+status: "published"
+tags: ["Node.js", "Docker", "CI/CD", "Migration", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "nodejs-20-deprecation-node-24-migration-checklist-2026"
+---
+
+Node.js 20은 2026년 4월 30일에 EOL을 맞았습니다. 보안 Patch 측면에서도 중요한 날짜이지만, 실제로 장애로 이어지기 쉬운 것은 사용 중인 Platform이 정한 기한입니다. Vercel은 2026년 10월 1일부터 Build와 Function에서 Node.js 20을 Deprecated 처리했습니다(영향을 받는 것은 신규 Deploy이며 기존 Deploy는 영향이 없습니다). 한 자료에 따르면 Google Cloud Run은 2026년 10월 30일에 Node.js 20을 폐지합니다. 또 다른 자료는 6월에 JavaScript Action의 기본값이 Node 24가 된 이후 GitHub-hosted Runner에서도 가을 이후 Node 20이 제거될 것이라고 전합니다. 이 마지막 내용은 GitHub 1차 자료로 확인하지 못했으므로 각자의 환경에서 확인하시기 바랍니다.
+
+Migration 대상으로는 2028년 4월까지 지원되는 Active LTS인 Node 24가 적절합니다. Node 26은 10월 말에 LTS로 들어갈 예정이지만, 지금 바로 건너뛰면 Migration 작업에 더해 제거된 API 검증까지 해야 합니다. 한 번에 건너뛰는 것보다 두 단계로 나누는 편이 쉽습니다.
+
+## Step 1: Node 20으로 고정된 모든 위치 찾기
+
+Version 고정은 `package.json` 외에도 여러 곳에 숨어 있습니다. Repository 전체를 검색합니다.
+
+```bash
+grep -rnE "node:?(-|@| )?20|node-version: ?['\"]?20|nodejs20|\"node\": ?\"[^\"]*20" \
+  --include="Dockerfile*" --include="*.yml" --include="*.yaml" \
+  --include="package.json" --include=".nvmrc" --include=".node-version" \
+  --include=".tool-versions" --include="*.toml" .
+```
+
+자주 발견되는 위치입니다.
+
+- Dockerfile의 `FROM node:20-alpine` (Multi-stage build에서 builder Stage만 바꾸고 나머지를 놓친 경우 포함)
+- Workflow의 `actions/setup-node`에 있는 `node-version: 20`
+- `package.json`의 `engines.node`
+- `.nvmrc`, `.node-version`, `.tool-versions`
+- IaC의 Lambda Runtime 설정(`nodejs20.x`), Cloud Run Base Image, Vercel Project 설정
+
+공유 Base Image와 사내 CI Template도 확인하십시오. Repository 10개를 고치고도 모두가 상속하는 Template을 놓치면 문제는 그대로 남습니다.
+
+## Step 2: Service별로 Pull Request 하나씩 Version 변경
+
+Version 변경은 기능 개발과 분리해 두면 Rollback이 간단해집니다.
+
+```dockerfile
+# 변경 전
+FROM node:20-alpine AS base
+
+# 변경 후: Major를 고정하고, 가능하면 Production에서는 Digest도 고정
+FROM node:24-alpine AS base
+```
+
+```yaml
+- uses: actions/setup-node@v4
+  with:
+    node-version: 24
+    cache: npm
+```
+
+```json
+{
+  "engines": { "node": ">=24 <25" }
+}
+```
+
+`engines`에 상한을 두고 `.npmrc`에서 `engine-strict=true`로 설정하면, 불일치가 Runtime이 아니라 `npm install` 시점에 일찍 실패합니다.
+
+## Step 3: Native 의존성 다시 Build
+
+Native Addon이 있는 Package(`sharp`, `bcrypt`, `better-sqlite3`, `sqlite3` 등)는 Node ABI별로 Build된 Binary를 배포합니다. Version 변경 후에는 다음을 실행합니다.
+
+```bash
+rm -rf node_modules
+npm ci
+npm rebuild
+```
+
+Docker에서는 설치 Step이 새 Base Image에서 실행되는지, 이전 Image의 `node_modules` Layer Cache가 재사용되지 않는지 확인하십시오. Node 업그레이드 후 "내 PC에서는 되는데 Container에서는 실패한다"는 문제의 가장 흔한 원인입니다.
+
+`sharp`를 쓰는 Project(Next.js의 Image 최적화도 해당)라면, 설치된 Version이 Node 24용 Prebuilt Binary를 제공하는지 확인합니다. 제공하지 않으면 먼저 업그레이드하십시오.
+
+## Step 4: 회귀를 실제로 잡아내는 Check 실행
+
+Unit Test 통과는 필요하지만 충분하지 않습니다. 다음을 추가합니다.
+
+1. `dev`만이 아니라 Node 24에서의 Production Build (`next build` 등).
+2. 실제 Database와 Cache Container를 사용한 Integration 실행.
+3. Build한 Image의 Smoke Test. 기동하고, Health Endpoint를 호출하고, 주요 의존성을 각각 사용하는 Page를 하나씩 요청합니다.
+4. 의존성 audit 결과. 일부 간접 의존 Package가 같은 시기에 오래된 Node 지원을 제거하기 때문입니다.
+
+Build Log의 deprecation 경고도 살펴보십시오. Node 24에서의 경고는 Node 26에서 Error가 되는 경우가 많습니다. Log가 다음 Migration의 TODO 목록 역할도 합니다.
+
+## Step 5: 단계적으로 Rollout
+
+Serverless Function과 Container의 경우입니다.
+
+- 먼저 Preview나 Staging에 Deploy하고 Error율과 Latency를 Node 20 Baseline과 비교합니다.
+- Platform이 지원한다면 가중치 Traffic이나 Rolling Release를 사용합니다.
+- 일주일치 Metric이 깨끗해질 때까지 이전 Image Tag를 남겨 두어 빠르게 Rollback할 수 있게 합니다.
+
+## 자주 발생하는 문제
+
+| 증상 | 예상 원인 |
+|---|---|
+| `Error: Cannot find module '.../build/Release/xxx.node'` | 이전 ABI용으로 Build된 Native Module. 다시 Build |
+| `ERR_UNKNOWN_BUILTIN_MODULE`, 내장 Module 동작 변화 | Node 20 이후 제거·변경된 API에 의존. Release Note 확인 |
+| 로컬은 되는데 CI에서 실패 | Template이나 Cache된 Tool Directory 때문에 CI가 여전히 Node 20 |
+| Container는 기동되지만 Image 최적화 실패 | `sharp` Binary 불일치 |
+
+## webhani의 권장 사항
+
+Platform 기한이 닥쳐 장애 대응에 쫓기기 전에, 일상적인 의존성 업데이트로 다룰 수 있는 지금 Migration을 마치십시오. 고정된 위치를 전수 조사하고, Service를 하나씩 업데이트하고, Native Module을 다시 Build하고, Production Build와 Smoke Test로 검증합니다. Node 24로 올라간 뒤에는 Node 26이 LTS가 되고 의존 Package들이 지원을 명시한 시점에, 우리 일정에 맞춰 이동을 계획할 수 있습니다.
+
+## 참고 자료
+
+- Vercel Changelog, "Node.js 20 is being deprecated on October 1, 2026"
+- Node.js Release Schedule 및 2026년 LTS 일정에 대한 서드파티 정리 (Node 26 LTS 날짜와 Platform별 기한은 출처마다 다르므로 각 Provider에서 확인하십시오)

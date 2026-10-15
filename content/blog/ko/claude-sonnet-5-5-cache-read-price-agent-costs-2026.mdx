@@ -1,0 +1,87 @@
+---
+title: "Claude Sonnet 5.5와 Cache Read 가격 인하: Agent 비용은 어디서 결정되는가"
+description: "Sonnet 5.5는 정가를 유지한 채 출시되었고, Cache Read 가격 인하도 보도되었습니다. Agent 비용을 좌우하는 것은 Input 단가가 아니라 Cache Read와 effort 설정입니다."
+date: "2026-10-16"
+status: "published"
+tags: ["Claude", "LLM", "Prompt Caching", "비용 최적화", "AI Agent"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-sonnet-5-5-cache-read-price-agent-costs-2026"
+---
+
+Anthropic은 2026년 9월 28일 Claude Sonnet 5.5를 출시했습니다. 출시 당시 보도에 따르면 Sonnet 5보다 응답이 30% 이상 빠르고, 일반적인 작업에서는 최대 30% 저렴해지지만 단가는 Input $2 / Output $10(100만 Token 기준)으로 유지됩니다. 비용이 줄어드는 이유는 단가 인하가 아니라, 같은 작업에 쓰는 Token 수가 줄기 때문입니다.
+
+약 1주일 뒤(10월 7일), 여러 Tracker가 Sonnet 5.5의 Cache Read 가격이 100만 Token당 $0.20에서 $0.10으로 내려갔다고 보도했습니다. 다만 작성 시점에 Anthropic 공식 가격 페이지에서는 확인하지 못했습니다. 예산에 반영하기 전에 공식 페이지에서 확인하시기 바랍니다. 아래 내용은 어느 쪽 수치이든 동일하게 적용됩니다.
+
+## Input 단가보다 Cache Read가 중요한 이유
+
+단발성 Request라면 Input 단가를 보면 됩니다. 그러나 Agent Loop에서는 Input 단가가 거의 영향을 주지 않습니다. 매 Turn마다 System Prompt, Tool 정의, 지금까지의 대화 전체가 다시 전송되기 때문입니다. Prompt Caching을 사용하면 그 대부분이 새 Input이 아니라 Cache Read 또는 Cache Write로 과금됩니다.
+
+60k Token Context에서 40 Turn 동안 동작하는 Coding Agent를 예로 들겠습니다.
+
+- Turn당 새 Input: 수천 Token (새로운 Tool 결과)
+- Turn당 Cache Read: 약 55~60k Token
+- Turn당 Output: 수백~수천 Token
+
+40 Turn 동안 Cache Read는 합계 약 230만 Token입니다. $0.20/M이면 $0.46, $0.10/M이면 $0.23입니다. 새 Input(약 12만 Token, $2/M)은 $0.24입니다. 즉 Input 측에서 가장 큰 항목은 Cache Read이며, 이를 절반으로 줄이는 효과가 Input 정가를 조정하는 것보다 큽니다.
+
+같은 이유로 Task당 비용은 Cache를 얼마나 유지하느냐에 좌우됩니다.
+
+## Cache를 깨뜨리는 대표적인 원인
+
+Cache는 Prefix 일치로 동작합니다. Prompt 앞부분이 한 곳이라도 바뀌면 그 뒤는 모두 무효가 됩니다. Client Code에서 자주 보는 원인은 다음과 같습니다.
+
+```ts
+// 나쁜 예: System Prompt 맨 앞에 매 요청마다 바뀌는 시각을 넣음
+const system = `Current time: ${new Date().toISOString()}\n${basePrompt}`;
+
+// 좋은 예: 변하지 않는 부분을 앞에 두고, 변동 정보는 뒤로 보냄
+const system = [
+  { type: "text", text: basePrompt, cache_control: { type: "ephemeral" } },
+];
+const messages = [
+  { role: "user", content: `Current time: ${new Date().toISOString()}\n${task}` },
+];
+```
+
+그 밖에도 다음과 같은 경우가 있습니다.
+
+- Tool 정의의 순서가 Turn마다 바뀜 (순서가 보장되지 않는 Map에서 목록을 만드는 경우 등)
+- History 중간을 잘라내어 줄임 (끝에 추가만 하는 방식이어야 합니다)
+- Session 도중 Model을 바꿔 Cache가 새로 시작됨
+- Turn 간격이 Cache 유효 시간보다 길어 만료됨
+
+각 Response의 usage 필드를 Log로 남기면, 전체 Input Token 대비 Cache Read 비율로 Cache가 제대로 동작하는지 바로 알 수 있습니다. 오래 도는 Agent라면 처음 몇 Turn 이후 90%를 넘는 것이 기준입니다. 그렇지 않다면 바뀌고 있는 Prefix를 찾아야 합니다.
+
+## 또 하나의 변수: effort
+
+Output Token(thinking 포함)은 Output 단가로 과금되며, 이는 Input 단가의 5배입니다. 참고한 자료 중 하나는 Claude 앱과 Claude Code의 기본값이 medium effort이며, 이 설정이 청구 금액에 미치는 영향이 다른 대부분의 선택보다 크다고 지적합니다.
+
+팀에서 적용할 수 있는 구분 예시입니다.
+
+| 작업 | effort | 비고 |
+|---|---|---|
+| 이름 변경, 작은 Refactoring, 포맷 수정 | Low | Output이 짧아 추론을 늘려도 비용만 증가 |
+| Test가 포함된 기능 개발 | Medium | 대부분 Session의 기본값 |
+| Race Condition Debugging, 설계 Review | High | 결과가 달라지는 곳에만 추론 비용 투입 |
+
+CI의 Review Bot이나 정기 실행 Agent에서는 기본값에 의존하지 말고 effort를 명시하십시오. Model이나 기본값이 바뀌어도 지출이 모르는 사이에 달라지는 일을 막을 수 있습니다.
+
+## Tokenizer에 대하여
+
+5.5 계열에 대한 보도에서는 새 Tokenizer가 같은 텍스트에 Token을 다소 더 쓸 수 있다고 언급합니다. Sonnet 5와 5.5를 비교할 때는 Token 단위가 아니라 자사 Workload에서 완료한 Task 단위로 비교하십시오. 대표 Task 20~30건을 두 Model에서 실행하고, 청구된 Token을 유형(새 Input, Cache Write, Cache Read, Output)별로 기록하는 방식이 확실합니다.
+
+## webhani의 권장 사항
+
+1. 월 합계만이 아니라 Task별로 Cache Read, Cache Write, 새 Input, Output Token을 기록합니다.
+2. Prompt Prefix에 변동 내용이 없는지 점검합니다. 시각, Request ID, 사용자별 정보는 Cache 대상 Block 뒤에 둡니다.
+3. effort는 Workload 유형별로 정하고, Version 관리되는 Configuration에 남깁니다.
+4. 가격 변경은 Architecture를 다시 짜는 이유가 아니라 다시 측정하는 이유로 다룹니다. Cache Read 인하는 긴 Context의 Agent에 효과가 크고, 짧은 Stateless 호출에서는 차이가 거의 없습니다.
+5. 계약이나 견적에 넣기 전에, 가격은 반드시 공식 가격 페이지에서 확인합니다.
+
+Model 출시는 앞으로도 몇 주 간격으로 이어질 것입니다. 비용을 예측 가능하게 유지하는 팀은 Token이 어디로 가는지 파악하고, 한 번에 하나의 변수만 바꿀 수 있는 팀입니다.
+
+## 참고 자료
+
+- Claude Sonnet 5.5 출시(2026년 9월 28일) 관련 보도 (Inside, Let's Data Science 등)
+- eesel.ai, Apidog, SessionWatcher, LaoZhang의 가격 정리 (Cache Read 수치는 출처마다 다릅니다)
