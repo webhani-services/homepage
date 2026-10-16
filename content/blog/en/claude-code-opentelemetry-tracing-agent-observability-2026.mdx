@@ -1,0 +1,95 @@
+---
+title: "Making Claude Code Observable with OpenTelemetry Tracing"
+description: "Claude Code 2.1.301 expands its OpenTelemetry tracing. Here is how to send agent telemetry into your own observability stack, with a minimal collector config and the design choices that matter."
+date: "2026-10-17"
+status: "published"
+tags: ["Claude Code", "OpenTelemetry", "Observability", "Monitoring", "AI Governance"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-opentelemetry-tracing-agent-observability-2026"
+---
+
+Claude Code 2.1.301, first seen around October 16, 2026, expanded its OpenTelemetry tracing alongside smaller changes such as Vim bracket navigation and math rendering in VS Code. Once a team adopts an AI coding agent, it quickly loses sight of who uses it, how much, and where time and money go. Telemetry is how you get that back.
+
+This post covers how to route Claude Code telemetry into your own observability stack, with a minimal setup. Attribute names and span structure change between versions, so verify details in the official docs.
+
+## Why agents need observability
+
+Unlike a typical web service, an agent behaves differently on each run. The same request can read different files, call different tools, and consume different amounts of tokens. Without data, questions like these get answered by feel:
+
+- How many tokens does a typical task use?
+- How often do tool calls fail, and how long does work sit waiting for approval?
+- Is cost concentrated in a particular project or team?
+
+Metrics show the overall trend; traces show the breakdown of a single run. With both, "token usage rose last week" and "why was this one run slow?" can be answered in the same place.
+
+## Minimal setup
+
+Telemetry is enabled through environment variables. The example below follows the form in the public docs, but tracing-specific settings may differ by version, so check the docs for the version you run.
+
+```bash
+export CLAUDE_CODE_ENABLE_TELEMETRY=1
+export OTEL_METRICS_EXPORTER=otlp
+export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+```
+
+On the receiving side, start with an OpenTelemetry Collector that just receives, tags, and forwards:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+  attributes/team:
+    actions:
+      - key: team
+        value: web-platform
+        action: upsert
+
+exporters:
+  otlphttp:
+    endpoint: https://observability.example.com
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [attributes/team, batch]
+      exporters: [otlphttp]
+    traces:
+      receivers: [otlp]
+      processors: [attributes/team, batch]
+      exporters: [otlphttp]
+```
+
+The `attributes/team` processor adds a team label to use as an aggregation key later. Whether you need per-person detail is a separate question, covered next.
+
+## Design considerations
+
+**Be clear about purpose and privacy.** If telemetry carries prompt content or personally identifiable data, people may reasonably read it as employee monitoring. Decide in advance what you collect, why, and who can see it, and tell the team. Starting with aggregates such as token counts and tool call counts is a sensible, low-friction path.
+
+**Watch cardinality.** Attaching session IDs or file paths as metric attributes inflates cardinality and your backend bill. Keep metrics to dimensions like team, model, and tool name, and leave fine-grained detail to traces.
+
+**Sample traces.** You do not need to store every trace. Sample a portion and configure the collector to keep failures and expensive runs. That balances cost against debuggability.
+
+**Pick a few indicators first.** Useful starting points:
+
+- Input tokens and cache usage per session (cost trend)
+- Tool call failure rate
+- Time spent blocked on human actions such as approvals
+
+Cache behavior ties into our post on idle compaction and prompt cache TTL.
+
+## Takeaways
+
+- Agent behavior varies per run, so metrics plus traces are worth the effort.
+- Claude Code telemetry is enabled with environment variables and can flow into your existing stack via an OpenTelemetry Collector.
+- Decide cardinality, sampling, and privacy up front; they are hard to fix later.
+- Attribute names evolve, so confirm them against your version's docs before relying on dashboards.
+
+Being able to explain both the value and the cost of an AI agent after rollout often decides whether the team keeps using it. We help teams design observability stacks and governance for AI usage.

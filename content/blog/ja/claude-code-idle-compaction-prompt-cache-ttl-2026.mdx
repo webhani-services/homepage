@@ -1,0 +1,92 @@
+---
+title: "Claude Code の idle compaction と Prompt Cache の TTL: 放置セッションのコストを理解する"
+description: "Claude Code は 200K Token を超えて約 54 分放置された会話を、Cache 失効前に自動で compact するようになりました。Prompt Cache の仕組みから、長時間セッションのコストが跳ね上がる理由と対策を解説します。"
+date: "2026-10-17"
+status: "published"
+tags: ["Claude Code", "Prompt Caching", "Context Management", "Cost Optimization", "LLM"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-idle-compaction-prompt-cache-ttl-2026"
+---
+
+2026 年 10 月 14 日付の Claude Code の changelog に、idle compaction という変更が記載されています。ターミナルで、200K Token を超える会話が約 54 分間放置された場合に、1 時間の Prompt Cache が失効する前に会話を自動で compact する、という内容です。
+
+小さな変更に見えますが、背景にある Prompt Cache の仕組みを理解すると、長時間の Agent セッションでなぜコストが急に増えるのかが見えてきます。
+
+## 何が問題だったのか
+
+LLM の Agent は、リクエストのたびに会話履歴全体を送信します。Prompt Caching は、送信内容の先頭から続く同一部分を再利用し、その部分の処理コストと遅延を下げる仕組みです。Anthropic の API では、Cache の読み取りは通常の入力 Token より大幅に安い料金で処理されます(正確な単価は公式の料金ページで確認してください)。
+
+ただし Cache には有効期限があります。Claude Code が使う 1 時間の Cache は、1 時間アクセスがないと失効します。
+
+ここで次のようなことが起こります。
+
+1. 会話が 200K Token まで育つ。毎ターンほぼ Cache が効いているので安い。
+2. 席を離れて 1 時間以上経つ。Cache が失効する。
+3. 戻って 1 通メッセージを送る。200K Token 全体が Cache なしの入力として処理される。
+
+つまり「放置のあとの最初の 1 通」だけが、不釣り合いに高くつきます。idle compaction は、失効する前に会話を要約して小さくしておくことで、この 1 通のコストを抑えるための仕組みだと理解しています。
+
+## 概算してみる
+
+仮に、通常の入力が 1M Token あたり X、Cache 読み取りがその 10 分の 1 だとします(あくまで考え方を示す仮定です)。
+
+- 200K Token の Cache ヒット: 0.2 × 0.1X = 0.02X
+- 200K Token の Cache なし: 0.2 × X = 0.2X
+
+最初の 1 通だけで約 10 倍の差になります。1 日に何度も昼休みや会議で中断する運用だと、積み上がる額は無視できません。Cache の書き込みには別途の料金設定がある点も、試算では考慮が必要です。
+
+## API で同じ問題に備える
+
+自社で Agent を実装している場合も、同じ構造の問題が起きます。Anthropic の Messages API では、`cache_control` で Cache の境界を指定します。
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+response = client.messages.create(
+    model="claude-sonnet-5-5",
+    max_tokens=1024,
+    system=[
+        {
+            "type": "text",
+            "text": LONG_SYSTEM_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ],
+    messages=history,
+)
+
+usage = response.usage
+print(usage.cache_read_input_tokens, usage.cache_creation_input_tokens)
+```
+
+`usage` に含まれる Cache 読み取りと作成の Token 数を記録しておくと、「どのターンで Cache が効かなかったか」を後から確認できます。TTL の指定方法や料金は仕様が更新されることがあるため、実装時は最新のドキュメントを参照してください。
+
+## 運用上の対策
+
+**セッションを意図的に区切る**
+
+作業の切れ目で新しいセッションを始めるのが最も単純な方法です。タスクの経緯が必要なら、要点を数行のメモにまとめて渡せば足ります。肥大した履歴を引き継ぐ必要はほとんどありません。
+
+**中断前に compact しておく**
+
+長く離れる前に手動で compact を実行すれば、戻ったときの最初の 1 通が軽くなります。idle compaction が自動で行ってくれる部分を、自分で先回りする形です。
+
+**compact による情報の損失を意識する**
+
+要約は情報を落とします。エラーメッセージの正確な文言や、Diff の細部が必要な作業の途中では、compact の後に該当ファイルを読み直させたほうが安全です。
+
+**Token 使用量を可視化する**
+
+チーム全体で使う場合は、セッションごとの入力 Token と Cache ヒット率を集計しておくと、コストの偏りを見つけやすくなります。Telemetry の取得方法については、別記事の OpenTelemetry の話題も参考にしてください。
+
+## まとめ
+
+- Prompt Cache には TTL があり、1 時間の Cache は 1 時間の放置で失効します。
+- 失効後の最初のリクエストは、会話全体を Cache なしで処理するため割高になります。
+- idle compaction はこの割高な 1 通を避けるための自動対策です。
+- 自前の Agent では `usage` の Cache 関連フィールドを記録し、セッション分割や事前 compact を運用に組み込むと安定します。
+
+LLM のコストは、モデルの単価だけでなく「どう使うか」で大きく変わります。Agent を業務に組み込む際の設計や運用ルールについては、webhani でもご相談を承っています。

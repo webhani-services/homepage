@@ -1,0 +1,96 @@
+---
+title: "Claude Code Mods: Changing Agent Behavior with Small TypeScript Functions"
+description: "Claude Code now supports Mods: TypeScript functions that rewrite prompts, add UI, or replace built-in behavior, shipped through plugins. Here is how we think about using them on a team."
+date: "2026-10-17"
+status: "published"
+tags: ["Claude Code", "Mods", "Plugins", "AI Coding", "Developer Tooling"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-mods-typescript-customization-2026"
+---
+
+Anthropic has added "Mods" to Claude Code. A Mod is a small TypeScript function that changes how Claude Code itself behaves: it can rewrite a prompt, add UI, or replace a built-in feature. Mods ship inside plugins, can be shared through a directory, and work in both the CLI and the desktop app.
+
+This post skips the API reference and focuses on the design decisions that matter once more than one person uses them. The API surface may change, so check the official docs before you build anything.
+
+## What is different about Mods
+
+Until now, Claude Code customization came in three forms:
+
+- `CLAUDE.md` instructions (natural language)
+- Hooks that run shell commands around tool calls
+- Plugins that distribute skills, subagents, and slash commands
+
+All three shape what the agent does. Mods reach one level lower, into how the application behaves. Pre-processing a prompt or changing what is displayed becomes ordinary code.
+
+That matters because natural-language instructions are not guaranteed to be followed. If something must happen every time, such as masking secrets or enforcing a ticket ID, code is the more reliable place for it. That is the gap Mods fill.
+
+## Where each mechanism fits
+
+This is the split we use internally:
+
+| Need | CLAUDE.md | Hooks | Mods |
+| --- | --- | --- | --- |
+| Share coding conventions | Good fit | - | - |
+| Safety check before a tool call | Weak | Good fit | - |
+| Deterministic prompt pre-processing | Weak | - | Good fit |
+| Show extra information in the UI | - | - | Good fit |
+
+The boundaries overlap. The question that usually settles it: must this happen every time, or can the agent use judgment?
+
+## Design sketch
+
+The following is not the real Mods API. It illustrates the principle of writing the logic as pure functions that take a string and return a string.
+
+```typescript
+// Illustration only; the actual Mods API differs.
+type PromptTransform = (input: string) => string;
+
+const SECRET_PATTERN = /\b(AKIA[0-9A-Z]{16})\b/g;
+
+export const maskAwsKeys: PromptTransform = (input) =>
+  input.replace(SECRET_PATTERN, "[REDACTED_AWS_ACCESS_KEY]");
+
+export const requireTicketId =
+  (pattern: RegExp): PromptTransform =>
+  (input) => {
+    if (!pattern.test(input)) {
+      throw new Error("Include a ticket ID (e.g. PROJ-123) in the prompt.");
+    }
+    return input;
+  };
+```
+
+Keeping the logic free of side effects means ordinary unit tests cover it:
+
+```typescript
+import { describe, expect, it } from "vitest";
+import { maskAwsKeys } from "./transforms";
+
+describe("maskAwsKeys", () => {
+  it("masks AWS access key IDs", () => {
+    expect(maskAwsKeys("key is AKIAABCDEFGHIJKLMNOP")).toBe(
+      "key is [REDACTED_AWS_ACCESS_KEY]",
+    );
+  });
+});
+```
+
+## Rolling Mods out to a team
+
+**A Mod is code that runs on your machine.** Treat a Mod pulled from a shared directory like any other dependency: verify where it comes from, review it, and pin the version. For internal plugins, require pull request review on the plugin repository.
+
+**Keep each Mod single-purpose.** When several Mods run together, order can change the result. One responsibility per Mod, with obvious inputs and outputs, makes problems far easier to isolate.
+
+**Make changes visible.** A Mod that silently rewrites prompts makes it impossible to answer "why did it do that?" later. If a Mod alters input, surface that on screen or in a log.
+
+**Check whether you need one at all.** If `CLAUDE.md` and Hooks cover the requirement, a Mod just adds code to maintain. We would reach for one only when natural language is not reliable enough and Hooks do not reach the behavior.
+
+## Takeaways
+
+- Mods are a new customization layer that changes Claude Code's own behavior through code.
+- They suit deterministic pre-processing and display tweaks; conventions still belong in `CLAUDE.md`.
+- Because they execute, they need the same review and version control as any dependency.
+- Write transformation logic as pure functions so it can be tested normally.
+
+Standardizing AI coding tools across a team is a topic we get asked about often. Extension points like Mods are useful, and they also add things to govern. Decide up front what you leave to natural language and what you pin down in code.
