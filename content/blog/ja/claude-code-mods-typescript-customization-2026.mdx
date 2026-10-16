@@ -1,0 +1,104 @@
+---
+title: "Claude Code Mods: TypeScript の小さな関数で Agent の挙動を変える"
+description: "Claude Code に Mods が登場しました。プロンプトの書き換えや UI の追加を TypeScript の関数で行い、Plugin として共有できます。チーム運用で何が変わるか、導入時の設計方針を整理します。"
+date: "2026-10-17"
+status: "published"
+tags: ["Claude Code", "Mods", "Plugin", "AI Coding", "Developer Tooling"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-mods-typescript-customization-2026"
+---
+
+Anthropic は Claude Code に「Mods」を導入しました。Mods は小さな TypeScript の関数で、プロンプトの書き換え、UI の追加、組み込み機能の置き換えといった形で Claude Code の挙動を変更できます。Plugin に同梱して Directory 経由で共有でき、CLI とデスクトップアプリの両方で使えるとされています。
+
+この記事では、Mods そのものの API 解説ではなく、チームで使うときの設計判断に焦点を当てます。API の詳細は変更される可能性があるため、実装時は必ず公式ドキュメントを確認してください。
+
+## Mods で何が変わるのか
+
+これまでの Claude Code のカスタマイズ手段は、おおむね次の 3 つでした。
+
+- `CLAUDE.md` による指示(自然言語)
+- Hooks による Tool 実行前後の処理(Shell Command)
+- Plugin による Skill / Subagent / Slash Command の配布
+
+いずれも「Agent に何をさせるか」を決めるものです。Mods は「Claude Code というアプリケーション自体がどう振る舞うか」に手が届く点が違います。入力プロンプトの前処理や、表示内容の変更が、コードとして書けるようになります。
+
+自然言語の指示は強力ですが、確実に守られる保証がありません。決定的に動かしたい処理(秘密情報のマスキング、チケット番号の自動付与など)は、コードで書いたほうが信頼できます。Mods はこの領域を埋めるものと捉えています。
+
+## 使いどころの整理
+
+webhani では、Mods の用途を次のように分けて考えています。
+
+| 用途 | CLAUDE.md | Hooks | Mods |
+| --- | --- | --- | --- |
+| コーディング規約の共有 | 向いている | - | - |
+| Tool 実行前の安全チェック | 弱い | 向いている | - |
+| プロンプトの定型的な前処理 | 弱い | - | 向いている |
+| UI への情報表示 | - | - | 向いている |
+
+重複する部分もありますが、「確実に実行したいか」「Agent の判断に委ねてよいか」で切り分けると迷いにくくなります。
+
+## 設計の考え方(イメージ)
+
+以下は Mods の公式 API ではありません。「プロンプトを受け取って文字列を返す純粋関数」として前処理を書く場合の、考え方を示すための例です。
+
+```typescript
+// 概念を示すための例。Mods の実際の API とは異なります。
+type PromptTransform = (input: string) => string;
+
+const SECRET_PATTERN = /\b(AKIA[0-9A-Z]{16})\b/g;
+
+export const maskAwsKeys: PromptTransform = (input) =>
+  input.replace(SECRET_PATTERN, "[REDACTED_AWS_ACCESS_KEY]");
+
+export const requireTicketId =
+  (pattern: RegExp): PromptTransform =>
+  (input) => {
+    if (!pattern.test(input)) {
+      throw new Error("Include a ticket ID (e.g. PROJ-123) in the prompt.");
+    }
+    return input;
+  };
+```
+
+ポイントは、変換ロジックを副作用のない関数に保つことです。そうしておけば、通常の Unit Test でそのまま検証できます。
+
+```typescript
+import { describe, expect, it } from "vitest";
+import { maskAwsKeys } from "./transforms";
+
+describe("maskAwsKeys", () => {
+  it("masks AWS access key IDs", () => {
+    expect(maskAwsKeys("key is AKIAABCDEFGHIJKLMNOP")).toBe(
+      "key is [REDACTED_AWS_ACCESS_KEY]",
+    );
+  });
+});
+```
+
+## チームで導入するときの注意点
+
+**1. Mods はコードである**
+
+共有 Directory から取り込む Mods は、手元の開発環境で実行されるコードです。Dependency と同じ扱いが必要になります。出所の確認、レビュー、バージョン固定を行わずに導入するのは避けるべきです。社内で配布する場合も、Plugin のリポジトリに対して通常の Pull Request レビューを必須にします。
+
+**2. 小さく、単機能に保つ**
+
+Mods が複数組み合わさると、実行順序によって結果が変わりえます。1 つの Mod は 1 つの責務だけを持たせ、入出力が自明な状態にしておくと、トラブル時に原因を切り分けやすくなります。
+
+**3. 挙動の変更を利用者に見せる**
+
+プロンプトを黙って書き換える Mod は、後から「なぜこう動いたのか」を追えなくなります。書き換えを行った場合は、その事実が画面かログに残る設計にしてください。
+
+**4. 先に既存の仕組みで足りないか確認する**
+
+`CLAUDE.md` と Hooks で十分な要件に Mods を持ち込む必要はありません。保守対象のコードが増えるだけです。「自然言語では確実性が足りず、Hooks では対象外」という要件が出てから検討するのが現実的です。
+
+## まとめ
+
+- Mods は、Claude Code 自体の挙動をコードで変更できる新しいカスタマイズ層です。
+- 確実に実行したい前処理や表示の調整に向き、規約の共有は引き続き `CLAUDE.md` が適しています。
+- 実行されるコードである以上、Dependency と同じ水準のレビューとバージョン管理が必要です。
+- 変換ロジックは純粋関数として書き、通常の Test で検証できる形にしておくと運用が楽になります。
+
+AI Coding Tool の社内標準化やガバナンス設計は、webhani でも相談の多いテーマです。Mods のような拡張機構は便利な反面、管理対象を増やします。導入前に「何を自然言語に任せ、何をコードで固定するか」の線引きを決めておくことをお勧めします。

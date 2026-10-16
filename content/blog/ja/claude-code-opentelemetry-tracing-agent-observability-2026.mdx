@@ -1,0 +1,103 @@
+---
+title: "Claude Code の OpenTelemetry Tracing で Agent の挙動を可視化する"
+description: "Claude Code 2.1.301 で OpenTelemetry の Tracing が強化されました。AI Agent の利用状況を Metrics と Trace で観測し、コストと品質の把握に使うための設計と Collector 設定の例を紹介します。"
+date: "2026-10-17"
+status: "published"
+tags: ["Claude Code", "OpenTelemetry", "Observability", "Monitoring", "AI Governance"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-opentelemetry-tracing-agent-observability-2026"
+---
+
+Claude Code のバージョン 2.1.301(2026 年 10 月 16 日頃に確認)では、Vim の括弧移動や VS Code での数式表示などと並んで、OpenTelemetry の Tracing が拡充されました。AI Coding Agent をチームで使い始めると、「誰がどれだけ使い、どこで時間とコストがかかっているか」が見えなくなりがちです。Telemetry はその答えを出すための基盤になります。
+
+この記事では、Claude Code の Telemetry を自社の Observability 基盤に流すときの考え方と、最小構成の設定例を紹介します。Telemetry の項目名や Span の構造はバージョンで変わるため、詳細は公式ドキュメントで確認してください。
+
+## なぜ Agent に Observability が必要か
+
+通常の Web サービスと違い、Agent の挙動は実行のたびに変わります。同じ依頼でも、読むファイル、呼ぶ Tool、使う Token の量が異なります。そのため、次のような問いに「感覚」で答えることになりやすいです。
+
+- 1 つのタスクに平均でどれくらい Token を使っているか
+- Tool 呼び出しの失敗や、承認待ちで止まる時間はどの程度か
+- 特定のプロジェクトやチームにコストが偏っていないか
+
+Metrics は全体の傾向を、Trace は 1 回の実行の内訳を見るのに向いています。両方あると、「先週から Token 消費が増えた」という傾向の把握と、「この 1 回はなぜ遅かったか」の調査を、同じ基盤でできます。
+
+## 最小構成
+
+Claude Code の Telemetry は環境変数で有効にします。以下は公式ドキュメントに記載されている形式に沿った例ですが、Tracing 用の項目はバージョンによって異なる可能性があるため、利用中のバージョンのドキュメントを確認してください。
+
+```bash
+export CLAUDE_CODE_ENABLE_TELEMETRY=1
+export OTEL_METRICS_EXPORTER=otlp
+export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+```
+
+受け側の OpenTelemetry Collector は、受信して整形し、バックエンドへ転送するだけの構成から始めるのが無難です。
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+  attributes/team:
+    actions:
+      - key: team
+        value: web-platform
+        action: upsert
+
+exporters:
+  otlphttp:
+    endpoint: https://observability.example.com
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [attributes/team, batch]
+      exporters: [otlphttp]
+    traces:
+      receivers: [otlp]
+      processors: [attributes/team, batch]
+      exporters: [otlphttp]
+```
+
+`attributes/team` で Team 名を付与しているのは、後から集計軸として使うためです。個人単位の詳細な追跡が必要かどうかは、次の「プライバシー」の節を踏まえて決めてください。
+
+## 設計上の注意点
+
+**プライバシーと目的の明確化**
+
+Telemetry にプロンプトの内容や個人を特定できる情報が含まれる場合、従業員の監視と受け取られる可能性があります。何を目的に、どの項目を、誰が見られるのかを事前に決め、チームに周知してください。まずは Token 量や Tool 呼び出し回数などの集計値から始めるのが無理のない進め方です。
+
+**Cardinality の管理**
+
+Metrics に Session ID やファイルパスのような値を属性として付けると、Cardinality が爆発してバックエンドのコストが跳ね上がります。集計用の Metrics には Team、Model、Tool 名程度にとどめ、細かい情報は Trace 側に持たせるのが基本です。
+
+**Sampling**
+
+Trace を全件保存する必要はありません。通常は一部を Sampling し、失敗や高コストの実行は残すように Collector 側で設定すると、費用と調査性のバランスが取れます。
+
+**見るべき指標を絞る**
+
+最初に見ると有用なのは、次のあたりです。
+
+- Session あたりの入力 Token と Cache の利用状況(コスト傾向)
+- Tool 呼び出しの失敗率
+- 承認待ちなど、人の操作で止まっている時間
+
+Cache の話題は、別記事の idle compaction と Prompt Cache TTL の解説とも関係します。
+
+## まとめ
+
+- Agent は実行ごとに挙動が変わるため、Metrics と Trace による観測が有効です。
+- Claude Code の Telemetry は環境変数で有効化し、OpenTelemetry Collector 経由で既存の基盤に集約できます。
+- Cardinality、Sampling、プライバシーの 3 点は最初に設計しておくと後で困りません。
+- 項目名は更新されるため、運用前に利用バージョンのドキュメントで確認してください。
+
+AI Agent の導入後に「効果とコストを説明できる状態」を作ることは、継続利用の判断に直結します。Observability 基盤の設計や、AI 利用のガバナンス整備については、webhani でも支援しています。

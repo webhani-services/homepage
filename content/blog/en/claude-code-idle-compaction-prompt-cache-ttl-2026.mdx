@@ -1,0 +1,82 @@
+---
+title: "Claude Code Idle Compaction and Prompt Cache TTL: Why the First Message After a Break Costs So Much"
+description: "Claude Code now compacts conversations over 200K tokens that sit idle for about 54 minutes, before the one-hour prompt cache expires. This post explains the cache mechanics behind it and how to keep long agent sessions affordable."
+date: "2026-10-17"
+status: "published"
+tags: ["Claude Code", "Prompt Caching", "Context Management", "Cost Optimization", "LLM"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-idle-compaction-prompt-cache-ttl-2026"
+---
+
+The Claude Code changelog dated October 14, 2026 includes a change called idle compaction. In the terminal, a conversation over 200K tokens that has been idle for about 54 minutes is compacted automatically, before the one-hour prompt cache expires.
+
+It looks minor, but it points at something every team running long agent sessions should understand: the cost of a session is not smooth, and the spike usually lands on the first message after a break.
+
+## The problem
+
+An LLM agent resends the whole conversation on every request. Prompt caching lets the provider reuse an identical prefix of that request, which lowers both cost and latency for the cached portion. On Anthropic's API, cache reads are billed well below the normal input rate (check the pricing page for exact figures).
+
+Caches expire, though. A one-hour cache lapses after an hour without a hit. Here is how that plays out:
+
+1. The conversation grows to 200K tokens. Nearly every turn hits the cache, so turns are cheap.
+2. You step away for over an hour. The cache expires.
+3. You come back and send one message. All 200K tokens are processed as uncached input.
+
+So the first message after an idle period is disproportionately expensive. As we read it, idle compaction shrinks the conversation before expiry so that message costs far less.
+
+## A rough estimate
+
+Assume, purely for illustration, that normal input costs X per million tokens and cache reads cost one tenth of that:
+
+- 200K tokens, cache hit: 0.2 × 0.1X = 0.02X
+- 200K tokens, cache miss: 0.2 × X = 0.2X
+
+That is roughly a 10x difference on a single message. If you break for lunch, meetings, and reviews several times a day, it adds up. Cache writes are priced separately, so include that in any real estimate.
+
+## Handling the same problem in your own agents
+
+If you build agents yourself, the same structure applies. The Messages API marks cache boundaries with `cache_control`:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+response = client.messages.create(
+    model="claude-sonnet-5-5",
+    max_tokens=1024,
+    system=[
+        {
+            "type": "text",
+            "text": LONG_SYSTEM_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ],
+    messages=history,
+)
+
+usage = response.usage
+print(usage.cache_read_input_tokens, usage.cache_creation_input_tokens)
+```
+
+Logging the cache read and creation counts from `usage` lets you see afterward which turns missed the cache. TTL options and pricing can change, so confirm against current documentation.
+
+## Practical countermeasures
+
+**Split sessions on purpose.** Starting fresh at a natural break is the simplest fix. If the next task needs context, a few lines of notes carry it. You rarely need to drag a bloated history along.
+
+**Compact before you leave.** Running compaction manually before a long absence makes the first message on return cheap. You are doing by hand what idle compaction does automatically.
+
+**Remember that summaries lose detail.** Exact error text or diff specifics may not survive. Mid-task, it is safer to have the agent re-read the relevant files after compaction.
+
+**Measure it.** For a team, aggregate input tokens and cache hit rate per session. Cost skew becomes visible quickly. Our post on OpenTelemetry tracing for Claude Code covers one way to collect that data.
+
+## Takeaways
+
+- Prompt caches have a TTL; a one-hour cache expires after an hour of inactivity.
+- The first request after expiry reprocesses the whole conversation uncached and costs more.
+- Idle compaction is an automatic guard against that spike.
+- In your own agents, record the cache fields in `usage`, and build session splitting and pre-break compaction into your workflow.
+
+LLM cost depends less on the per-token price than on how you use the model. If you are designing agent workflows and usage rules for your team, we are glad to help.
