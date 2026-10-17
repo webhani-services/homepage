@@ -12,6 +12,10 @@
 
 ## Phase 2 — 섹션 통합 (별도 PR)
 
-- [ ] Philosophy + About → Statement 섹션 + `/about` 페이지
-- [ ] Services + Products 목록형 통합
-- [ ] Works / Blog 가로형 목록
+- [x] Philosophy + About → Statement 섹션 (`AreaStatement`) + `/about` 페이지 (기존 Component 재사용)
+- [x] Services 카드 → 번호 목록형, Products 를 Services 섹션 하단에 통합 (`AreaProducts` → `ProductList`)
+- [x] Blog 카드 → 가로형 목록 (Thumbnail 있을 때만 이미지 표시)
+- [x] Navigation: philosophy / products 항목 제거, about → `/about`. sitemap 에 `/about` 추가
+- [x] 미사용 `navigation.philosophy` / `navigation.products` Key 및 `public/images/services/*.svg` 삭제
+- [x] lint / typecheck / build 통과, Mobile (500px) 확인
+- Works 는 이미지 중심이라 카드형 유지 (메인 섹션 8 → 6)
