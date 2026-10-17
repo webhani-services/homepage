@@ -98,7 +98,7 @@ function buildSelectionPrompt(
   newsText: string,
   count: number
 ): string {
-  return `You are a technical content curator for webhani Inc., an IT consulting and development company specializing in web development, cloud infrastructure, and AI/LLM solutions.
+  return `You are a technical content curator for webhani, an IT consulting and development company specializing in web development, cloud infrastructure, and AI/LLM solutions.
 
 Below is a list of recent tech news articles. Select the top ${count} articles that would be most interesting and valuable for our company blog.
 
@@ -136,7 +136,7 @@ function buildArticlePrompt(
   const langName = LOCALE_NAMES[locale] ?? locale;
   const today = new Date().toISOString().split("T")[0];
 
-  return `You are a technical blog writer for webhani Inc., an IT consulting and development company.
+  return `You are a technical blog writer for webhani, an IT consulting and development company.
 
 Write an original blog post in ${langName} inspired by the following news article:
 

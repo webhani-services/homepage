@@ -98,7 +98,7 @@ function buildPolishPrompt(
   const langName = LOCALE_NAMES[locale] ?? locale;
   const today = new Date().toISOString().split("T")[0];
 
-  return `You are a technical blog editor for webhani Inc., an IT consulting and development company.
+  return `You are a technical blog editor for webhani, an IT consulting and development company.
 
 The user has written a draft blog post. Your job is to:
 1. Polish the content — fix grammar, improve structure, ensure clarity

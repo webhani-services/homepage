@@ -82,7 +82,7 @@ function buildPrompt(topic: string, locale: string): string {
   const langName = LOCALE_NAMES[locale] ?? locale;
   const today = new Date().toISOString().split("T")[0];
 
-  return `You are a technical blog writer for webhani Inc., an IT consulting and development company.
+  return `You are a technical blog writer for webhani, an IT consulting and development company.
 
 Write a technical blog post in ${langName} about the following topic:
 "${topic}"

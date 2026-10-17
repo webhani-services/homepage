@@ -1,5 +1,5 @@
 const footerData = {
-  companyName: "webhani inc.",
+  companyName: "webhani",
   getCurrentYear: () => new Date().getFullYear(),
 };
 

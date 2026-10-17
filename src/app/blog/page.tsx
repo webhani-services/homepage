@@ -8,10 +8,10 @@ import type { Metadata } from "next";
 export async function generateMetadata(): Promise<Metadata> {
   const t = await getTranslations("blog");
   return {
-    title: `${t("title")} | webhani Inc.`,
+    title: `${t("title")} | webhani`,
     description: t("description"),
     openGraph: {
-      title: `${t("title")} | webhani Inc.`,
+      title: `${t("title")} | webhani`,
       description: t("description"),
     },
   };
