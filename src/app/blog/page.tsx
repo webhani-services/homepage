@@ -1,9 +1,9 @@
-import { Suspense } from "react";
-import { getLocale, getTranslations } from "next-intl/server";
-import { getPosts } from "@/lib/blog";
-import BlogList from "@/components/blog/BlogList";
-import Link from "next/link";
 import type { Metadata } from "next";
+import Link from "next/link";
+import { getLocale, getTranslations } from "next-intl/server";
+import { Suspense } from "react";
+import BlogList from "@/components/blog/BlogList";
+import { getPosts } from "@/lib/blog";
 
 export async function generateMetadata(): Promise<Metadata> {
   const t = await getTranslations("blog");

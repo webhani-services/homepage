@@ -1,11 +1,11 @@
 "use client";
 
-import { useMemo, useState, useCallback } from "react";
-import { useSearchParams, useRouter } from "next/navigation";
 import Fuse from "fuse.js";
-import BlogCard from "./BlogCard";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useCallback, useMemo, useState } from "react";
 import type { BlogFrontmatter } from "@/lib/blog";
 import { buildTagFilterModel } from "@/lib/blogTagFilters";
+import BlogCard from "./BlogCard";
 
 const POSTS_PER_PAGE = 12;
 const DEFAULT_VISIBLE_TAGS = 10;
@@ -40,7 +40,7 @@ export default function BlogList({ posts, translations: t }: BlogListProps) {
         keys: ["title", "description", "tags"],
         threshold: 0.15,
       }),
-    [posts]
+    [posts],
   );
 
   const updateParams = useCallback(
@@ -56,7 +56,7 @@ export default function BlogList({ posts, translations: t }: BlogListProps) {
       params.delete("page");
       router.push(`/blog?${params.toString()}`, { scroll: false });
     },
-    [router, searchParams]
+    [router, searchParams],
   );
 
   const filteredPosts = useMemo(() => {
@@ -81,14 +81,17 @@ export default function BlogList({ posts, translations: t }: BlogListProps) {
         defaultVisibleCount: DEFAULT_VISIBLE_TAGS,
         expanded: showAllTags,
       }),
-    [posts, currentTag, showAllTags]
+    [posts, currentTag, showAllTags],
   );
 
-  const totalPages = Math.max(1, Math.ceil(filteredPosts.length / POSTS_PER_PAGE));
+  const totalPages = Math.max(
+    1,
+    Math.ceil(filteredPosts.length / POSTS_PER_PAGE),
+  );
   const safePage = Math.min(currentPage, totalPages);
   const paginatedPosts = filteredPosts.slice(
     (safePage - 1) * POSTS_PER_PAGE,
-    safePage * POSTS_PER_PAGE
+    safePage * POSTS_PER_PAGE,
   );
 
   const goToPage = (page: number) => {
@@ -167,6 +170,7 @@ export default function BlogList({ posts, translations: t }: BlogListProps) {
 
         <div className="flex flex-wrap gap-2">
           <button
+            type="button"
             onClick={() => updateParams({ tag: "" })}
             className={`px-3 py-1.5 text-sm rounded-lg transition-colors ${
               !currentTag
@@ -178,6 +182,7 @@ export default function BlogList({ posts, translations: t }: BlogListProps) {
           </button>
           {tagModel.visibleTags.map((tag) => (
             <button
+              type="button"
               key={tag.name}
               onClick={() =>
                 updateParams({ tag: currentTag === tag.name ? "" : tag.name })
@@ -206,6 +211,7 @@ export default function BlogList({ posts, translations: t }: BlogListProps) {
           <div className="mt-3 flex flex-wrap gap-2 border-t border-gray-100 pt-3 dark:border-gray-800">
             {tagModel.hiddenTags.map((tag) => (
               <button
+                type="button"
                 key={tag.name}
                 onClick={() =>
                   updateParams({ tag: currentTag === tag.name ? "" : tag.name })
@@ -254,6 +260,7 @@ export default function BlogList({ posts, translations: t }: BlogListProps) {
       {totalPages > 1 && (
         <nav className="flex items-center justify-center gap-2 mt-12">
           <button
+            type="button"
             onClick={() => goToPage(safePage - 1)}
             disabled={safePage <= 1}
             className="px-4 py-2 text-sm rounded-lg border border-gray-200 dark:border-gray-700 disabled:opacity-30 disabled:cursor-not-allowed hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
@@ -277,14 +284,12 @@ export default function BlogList({ posts, translations: t }: BlogListProps) {
             }, [])
             .map((item, idx) =>
               item === "ellipsis" ? (
-                <span
-                  key={`ellipsis-${idx}`}
-                  className="px-2 text-gray-400"
-                >
+                <span key={`ellipsis-${idx}`} className="px-2 text-gray-400">
                   ...
                 </span>
               ) : (
                 <button
+                  type="button"
                   key={item}
                   onClick={() => goToPage(item)}
                   className={`w-10 h-10 text-sm rounded-lg transition-colors ${
@@ -295,10 +300,11 @@ export default function BlogList({ posts, translations: t }: BlogListProps) {
                 >
                   {item}
                 </button>
-              )
+              ),
             )}
 
           <button
+            type="button"
             onClick={() => goToPage(safePage + 1)}
             disabled={safePage >= totalPages}
             className="px-4 py-2 text-sm rounded-lg border border-gray-200 dark:border-gray-700 disabled:opacity-30 disabled:cursor-not-allowed hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"

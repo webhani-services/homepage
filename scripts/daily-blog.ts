@@ -35,10 +35,10 @@
  *   4. Save as draft MDX files
  */
 
-import fs from "fs";
-import path from "path";
-import { createProvider } from "./lib/registry.js";
+import fs from "node:fs";
+import path from "node:path";
 import { fetchTechNews, formatNewsForLLM } from "./lib/news-fetcher.js";
+import { createProvider } from "./lib/registry.js";
 
 const CONTENT_DIR = path.join(process.cwd(), "content/blog");
 
@@ -94,10 +94,7 @@ function parseArgs(args: string[]) {
   return parsed;
 }
 
-function buildSelectionPrompt(
-  newsText: string,
-  count: number
-): string {
+function buildSelectionPrompt(newsText: string, count: number): string {
   return `You are a technical content curator for webhani, an IT consulting and development company specializing in web development, cloud infrastructure, and AI/LLM solutions.
 
 Below is a list of recent tech news articles. Select the top ${count} articles that would be most interesting and valuable for our company blog.
@@ -129,10 +126,7 @@ ${newsText}
 --- END LIST ---`;
 }
 
-function buildArticlePrompt(
-  topic: SelectedTopic,
-  locale: string
-): string {
+function buildArticlePrompt(topic: SelectedTopic, locale: string): string {
   const langName = LOCALE_NAMES[locale] ?? locale;
   const today = new Date().toISOString().split("T")[0];
 
@@ -210,7 +204,9 @@ async function main() {
   console.log(`\nSelecting top ${args.count} articles with LLM...`);
 
   const selectionResponse = await provider.generate({
-    messages: [{ role: "user", content: buildSelectionPrompt(newsText, args.count) }],
+    messages: [
+      { role: "user", content: buildSelectionPrompt(newsText, args.count) },
+    ],
     maxTokens: 2048,
     temperature: 0.3,
   });
@@ -231,14 +227,14 @@ async function main() {
   const llmCount = selectedTopics.filter((t) => t.isLLMRelated).length;
   if (llmCount === 0) {
     console.warn(
-      "Warning: No LLM/AI related topic was selected. The constraint was not met."
+      "Warning: No LLM/AI related topic was selected. The constraint was not met.",
     );
   }
 
   console.log("\nSelected topics:");
   selectedTopics.forEach((topic, i) => {
     console.log(
-      `  ${i + 1}. ${topic.title}${topic.isLLMRelated ? " [LLM/AI]" : ""}`
+      `  ${i + 1}. ${topic.title}${topic.isLLMRelated ? " [LLM/AI]" : ""}`,
     );
     console.log(`     Slug: ${topic.slug}`);
     console.log(`     Reason: ${topic.reason}`);
@@ -256,9 +252,7 @@ async function main() {
     console.log(`\n--- ${topic.title} ---`);
 
     for (const locale of args.locales) {
-      console.log(
-        `  Generating ${LOCALE_NAMES[locale] ?? locale} version...`
-      );
+      console.log(`  Generating ${LOCALE_NAMES[locale] ?? locale} version...`);
 
       const content = await provider.generate({
         messages: [
@@ -274,7 +268,7 @@ async function main() {
   }
 
   console.log(
-    `\nDone! Generated ${selectedTopics.length * args.locales.length} draft posts.`
+    `\nDone! Generated ${selectedTopics.length * args.locales.length} draft posts.`,
   );
   console.log('Review and change status to "published" when ready.');
 }

@@ -7,7 +7,7 @@
  * 3. LLM_PROVIDER=openai で実行
  */
 
-import type { LLMProvider, LLMGenerateOptions } from "../types.js";
+import type { LLMGenerateOptions, LLMProvider } from "../types.js";
 
 const DEFAULT_MODEL = "gpt-4o";
 
@@ -26,9 +26,7 @@ export class OpenAIProvider implements LLMProvider {
       // @ts-expect-error -- openai is an optional dependency
       openaiModule = await import("openai");
     } catch {
-      throw new Error(
-        "OpenAI package not installed. Run: npm install openai"
-      );
+      throw new Error("OpenAI package not installed. Run: npm install openai");
     }
 
     const OpenAI = openaiModule.default;
@@ -40,10 +38,12 @@ export class OpenAIProvider implements LLMProvider {
       model: this.model,
       max_tokens: options.maxTokens ?? 4096,
       temperature: options.temperature ?? 0.7,
-      messages: options.messages.map((m: LLMGenerateOptions["messages"][0]) => ({
-        role: m.role,
-        content: m.content,
-      })),
+      messages: options.messages.map(
+        (m: LLMGenerateOptions["messages"][0]) => ({
+          role: m.role,
+          content: m.content,
+        }),
+      ),
     });
 
     return response.choices[0]?.message?.content ?? "";

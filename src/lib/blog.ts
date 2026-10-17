@@ -1,5 +1,5 @@
-import fs from "fs";
-import path from "path";
+import fs from "node:fs";
+import path from "node:path";
 import matter from "gray-matter";
 import { LOCALES } from "@/lib/constants";
 
@@ -48,14 +48,11 @@ export function getPosts(locale: string): BlogPost[] {
     .sort(
       (a, b) =>
         new Date(b.frontmatter.date).getTime() -
-        new Date(a.frontmatter.date).getTime()
+        new Date(a.frontmatter.date).getTime(),
     );
 }
 
-export function getPostBySlug(
-  locale: string,
-  slug: string
-): BlogPost | null {
+export function getPostBySlug(locale: string, slug: string): BlogPost | null {
   const posts = getPosts(locale);
   return posts.find((p) => p.frontmatter.slug === slug) ?? null;
 }
@@ -65,6 +62,6 @@ export function getAllSlugs(): { locale: string; slug: string }[] {
     getPosts(locale).map((post) => ({
       locale,
       slug: post.frontmatter.slug,
-    }))
+    })),
   );
 }

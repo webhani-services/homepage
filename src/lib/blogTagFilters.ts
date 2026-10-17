@@ -56,7 +56,9 @@ export function buildTagFilterModel({
     }
   }
 
-  const hiddenTags = sortedTags.filter((tag) => !baseVisibleNames.has(tag.name));
+  const hiddenTags = sortedTags.filter(
+    (tag) => !baseVisibleNames.has(tag.name),
+  );
 
   return {
     visibleTags: baseVisible,

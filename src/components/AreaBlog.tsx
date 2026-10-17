@@ -2,10 +2,10 @@
 
 import Link from "next/link";
 import { useTranslations } from "next-intl";
-import { useScrollReveal } from "@/hooks/useScrollReveal";
 import BlogCard from "@/components/blog/BlogCard";
-import { getRevealDelayClass } from "@/lib/constants";
+import { useScrollReveal } from "@/hooks/useScrollReveal";
 import type { BlogFrontmatter } from "@/lib/blog";
+import { getRevealDelayClass } from "@/lib/constants";
 
 type AreaBlogProps = {
   posts: BlogFrontmatter[];

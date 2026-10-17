@@ -1,8 +1,8 @@
 "use client";
 
+import { useTranslations } from "next-intl";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
-import { useTranslations } from "next-intl";
 
 export type ContactFormInputs = {
   name: string;
@@ -48,8 +48,7 @@ export function useContactForm() {
       setSubmitStatus({ type: "success", message: t("success") });
       reset();
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : t("error");
+      const message = error instanceof Error ? error.message : t("error");
       setSubmitStatus({ type: "error", message });
     } finally {
       setIsSubmitting(false);

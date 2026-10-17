@@ -1,5 +1,5 @@
-import { getRequestConfig } from "next-intl/server";
 import { cookies } from "next/headers";
+import { getRequestConfig } from "next-intl/server";
 
 export default getRequestConfig(async () => {
   // cookieから言語設定を読み取る

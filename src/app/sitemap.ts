@@ -9,17 +9,17 @@ export default function sitemap(): MetadataRoute.Sitemap {
     getPosts(locale).map((post) => ({
       url: `${BASE_URL}/blog/${post.frontmatter.slug}`,
       lastModified: new Date(
-        post.frontmatter.updatedAt ?? post.frontmatter.date
+        post.frontmatter.updatedAt ?? post.frontmatter.date,
       ),
       changeFrequency: "monthly" as const,
       priority: 0.7,
-    }))
+    })),
   );
 
   // 重複スラグを除去（多言語で同じslugが存在するため）
   const uniqueBlogEntries = blogEntries.filter(
     (entry, index, self) =>
-      index === self.findIndex((e) => e.url === entry.url)
+      index === self.findIndex((e) => e.url === entry.url),
   );
 
   return [

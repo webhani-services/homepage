@@ -51,7 +51,11 @@ export default function AreaServices() {
   const revealRef = useScrollReveal();
 
   return (
-    <section id="services" className="section-padding bg-white dark:bg-[var(--dark-bg)] relative" ref={revealRef}>
+    <section
+      id="services"
+      className="section-padding bg-white dark:bg-[var(--dark-bg)] relative"
+      ref={revealRef}
+    >
       <div className="max-w-7xl mx-auto">
         <div className="text-center mb-16">
           <span className="reveal text-amber-600 dark:text-amber-400 text-sm font-semibold tracking-[0.15em] uppercase mb-4 block">

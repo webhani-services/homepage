@@ -1,14 +1,14 @@
+import type { Metadata } from "next";
+import Link from "next/link";
+import { notFound } from "next/navigation";
 import { getLocale } from "next-intl/server";
-import { getPostBySlug, getAllSlugs } from "@/lib/blog";
 import { MDXRemote } from "next-mdx-remote/rsc";
-import remarkGfm from "remark-gfm";
+import rehypeAutolinkHeadings from "rehype-autolink-headings";
 import rehypePrettyCode from "rehype-pretty-code";
 import rehypeSlug from "rehype-slug";
-import rehypeAutolinkHeadings from "rehype-autolink-headings";
-import { notFound } from "next/navigation";
+import remarkGfm from "remark-gfm";
 import BlogHeader from "@/components/blog/BlogHeader";
-import Link from "next/link";
-import type { Metadata } from "next";
+import { getAllSlugs, getPostBySlug } from "@/lib/blog";
 
 type Props = {
   params: Promise<{ slug: string }>;
@@ -35,9 +35,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       modifiedTime: post.frontmatter.updatedAt,
       authors: [post.frontmatter.author],
       tags: post.frontmatter.tags,
-      images: post.frontmatter.thumbnail
-        ? [post.frontmatter.thumbnail]
-        : [],
+      images: post.frontmatter.thumbnail ? [post.frontmatter.thumbnail] : [],
     },
   };
 }
@@ -69,6 +67,7 @@ export default async function BlogDetailPage({ params }: Props) {
     <section className="section-padding bg-[var(--surface-muted)] dark:bg-[var(--dark-bg)] min-h-screen">
       <script
         type="application/ld+json"
+        // biome-ignore lint/security/noDangerouslySetInnerHtml: JSON-LD built from trusted frontmatter via JSON.stringify
         dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
       />
       <div className="max-w-3xl mx-auto">
@@ -90,7 +89,10 @@ export default async function BlogDetailPage({ params }: Props) {
               mdxOptions: {
                 remarkPlugins: [remarkGfm],
                 rehypePlugins: [
-                  [rehypePrettyCode, { theme: "github-dark-default", keepBackground: true }],
+                  [
+                    rehypePrettyCode,
+                    { theme: "github-dark-default", keepBackground: true },
+                  ],
                   rehypeSlug,
                   [rehypeAutolinkHeadings, { behavior: "wrap" }],
                 ],

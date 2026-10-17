@@ -31,8 +31,8 @@
  *   3. Translate to all target locales
  */
 
-import fs from "fs";
-import path from "path";
+import fs from "node:fs";
+import path from "node:path";
 import { createProvider } from "./lib/registry.js";
 
 const CONTENT_DIR = path.join(process.cwd(), "content/blog");
@@ -93,7 +93,7 @@ function buildPolishPrompt(
   draft: string,
   locale: string,
   slug: string,
-  tags: string
+  tags: string,
 ): string {
   const langName = LOCALE_NAMES[locale] ?? locale;
   const today = new Date().toISOString().split("T")[0];
@@ -152,7 +152,7 @@ async function main() {
   if (!args.file) {
     console.error("Error: --file is required");
     console.error(
-      "Usage: npx tsx scripts/polish-blog.ts --file drafts/my-article.md"
+      "Usage: npx tsx scripts/polish-blog.ts --file drafts/my-article.md",
     );
     process.exit(1);
   }
@@ -175,7 +175,7 @@ async function main() {
 
   for (const locale of args.locales) {
     console.log(
-      `\nPolishing & translating to ${LOCALE_NAMES[locale] ?? locale}...`
+      `\nPolishing & translating to ${LOCALE_NAMES[locale] ?? locale}...`,
     );
 
     const prompt = buildPolishPrompt(draft, locale, slug, args.tags);
@@ -200,7 +200,7 @@ async function main() {
 
   if (!args.dryRun) {
     console.log(
-      `\nDone! Polished ${args.locales.length} versions with slug: "${slug}"`
+      `\nDone! Polished ${args.locales.length} versions with slug: "${slug}"`,
     );
     console.log('Status: draft (edit and change to "published" when ready)');
   }

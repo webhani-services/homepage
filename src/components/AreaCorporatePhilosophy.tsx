@@ -32,7 +32,10 @@ export default function AreaCorporatePhilosophy() {
             </p>
             <div className="space-y-6">
               {principles.map((principle, index) => (
-                <div key={principle.id} className={`reveal ${index === 0 ? "reveal-delay-3" : "reveal-delay-4"} flex items-start gap-5`}>
+                <div
+                  key={principle.id}
+                  className={`reveal ${index === 0 ? "reveal-delay-3" : "reveal-delay-4"} flex items-start gap-5`}
+                >
                   <div className="flex-shrink-0 w-12 h-12 bg-gradient-to-br from-amber-400 to-amber-600 rounded-2xl flex items-center justify-center shadow-lg shadow-amber-500/20">
                     <span className="text-white font-bold text-sm">
                       {principle.id}

@@ -1,10 +1,10 @@
-import type { Metadata } from "next";
 import { GoogleTagManager } from "@next/third-parties/google";
-import Navigation from "@/components/Navigation";
-import { Noto_Sans_JP, DM_Sans } from "next/font/google";
+import type { Metadata } from "next";
+import { DM_Sans, Noto_Sans_JP } from "next/font/google";
 import { NextIntlClientProvider } from "next-intl";
 import { getLocale, getMessages } from "next-intl/server";
 import Footer from "@/components/Footer";
+import Navigation from "@/components/Navigation";
 import "./globals.css";
 
 const dmSans = DM_Sans({

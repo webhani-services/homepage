@@ -1,6 +1,6 @@
 import Link from "next/link";
-import { NavigationItem } from "@/components/navigation/types";
 import { useTranslations } from "next-intl";
+import type { NavigationItem } from "@/components/navigation/types";
 
 type Props = {
   items: NavigationItem[];

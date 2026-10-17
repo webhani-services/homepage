@@ -1,7 +1,7 @@
-import test from "node:test";
 import assert from "node:assert/strict";
-import { buildTagFilterModel } from "@/lib/blogTagFilters";
+import test from "node:test";
 import type { BlogFrontmatter } from "@/lib/blog";
+import { buildTagFilterModel } from "@/lib/blogTagFilters";
 
 function createPost(slug: string, tags: string[]): BlogFrontmatter {
   return {
@@ -31,11 +31,11 @@ test("buildTagFilterModel prioritizes tags by usage count", () => {
 
   assert.deepEqual(
     model.visibleTags.map((tag) => tag.name),
-    ["AI", "DevOps"]
+    ["AI", "DevOps"],
   );
   assert.deepEqual(
     model.hiddenTags.map((tag) => tag.name),
-    ["React", "TypeScript"]
+    ["React", "TypeScript"],
   );
 });
 
@@ -55,7 +55,7 @@ test("buildTagFilterModel keeps the selected tag visible when collapsed", () => 
 
   assert.deepEqual(
     model.visibleTags.map((tag) => tag.name),
-    ["AI", "DevOps", "TypeScript"]
+    ["AI", "DevOps", "TypeScript"],
   );
   assert.equal(model.hiddenTags.length, 0);
 });
@@ -77,7 +77,7 @@ test("buildTagFilterModel exposes all remaining tags in expanded mode", () => {
 
   assert.deepEqual(
     model.visibleTags.map((tag) => tag.name),
-    ["AI", "DevOps", "TypeScript"]
+    ["AI", "DevOps", "TypeScript"],
   );
   assert.equal(model.hiddenTags.length, 0);
   assert.equal(model.hiddenCount, 1);

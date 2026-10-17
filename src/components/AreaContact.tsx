@@ -1,8 +1,8 @@
 "use client";
 
 import { useTranslations } from "next-intl";
-import { useScrollReveal } from "@/hooks/useScrollReveal";
 import { useContactForm } from "@/hooks/useContactForm";
+import { useScrollReveal } from "@/hooks/useScrollReveal";
 
 const inputClassName = `w-full px-5 py-3.5 border border-gray-200 dark:border-gray-700 rounded-xl
   focus:ring-2 focus:ring-amber-400/40 dark:focus:ring-amber-500/40 focus:border-amber-400 dark:focus:border-amber-500
@@ -12,12 +12,22 @@ const inputClassName = `w-full px-5 py-3.5 border border-gray-200 dark:border-gr
 
 export default function AreaContact() {
   const t = useTranslations("contact");
-  const { register, handleSubmit, onSubmit, isSubmitting, submitStatus, errors } =
-    useContactForm();
+  const {
+    register,
+    handleSubmit,
+    onSubmit,
+    isSubmitting,
+    submitStatus,
+    errors,
+  } = useContactForm();
   const revealRef = useScrollReveal();
 
   return (
-    <section id="contact" className="section-padding bg-white dark:bg-[var(--dark-bg)]" ref={revealRef}>
+    <section
+      id="contact"
+      className="section-padding bg-white dark:bg-[var(--dark-bg)]"
+      ref={revealRef}
+    >
       <div className="max-w-2xl mx-auto">
         <div className="text-center mb-12">
           <span className="reveal text-amber-600 dark:text-amber-400 text-sm font-semibold tracking-[0.15em] uppercase mb-4 block">
@@ -43,9 +53,15 @@ export default function AreaContact() {
           </div>
         )}
 
-        <form className="reveal reveal-delay-3 space-y-5" onSubmit={handleSubmit(onSubmit)}>
+        <form
+          className="reveal reveal-delay-3 space-y-5"
+          onSubmit={handleSubmit(onSubmit)}
+        >
           <div>
-            <label htmlFor="name" className="block text-gray-700 dark:text-gray-300 font-medium mb-2 text-sm">
+            <label
+              htmlFor="name"
+              className="block text-gray-700 dark:text-gray-300 font-medium mb-2 text-sm"
+            >
               {t("form.name")}
             </label>
             <input
@@ -55,12 +71,17 @@ export default function AreaContact() {
               className={inputClassName}
             />
             {errors.name && (
-              <p className="mt-1.5 text-sm text-red-600 dark:text-red-400">{t("form.nameRequired")}</p>
+              <p className="mt-1.5 text-sm text-red-600 dark:text-red-400">
+                {t("form.nameRequired")}
+              </p>
             )}
           </div>
 
           <div>
-            <label htmlFor="email" className="block text-gray-700 dark:text-gray-300 font-medium mb-2 text-sm">
+            <label
+              htmlFor="email"
+              className="block text-gray-700 dark:text-gray-300 font-medium mb-2 text-sm"
+            >
               {t("form.email")}
             </label>
             <input
@@ -73,22 +94,29 @@ export default function AreaContact() {
               className={inputClassName}
             />
             {errors.email && (
-              <p className="mt-1.5 text-sm text-red-600 dark:text-red-400">{t("form.emailRequired")}</p>
+              <p className="mt-1.5 text-sm text-red-600 dark:text-red-400">
+                {t("form.emailRequired")}
+              </p>
             )}
           </div>
 
           <div>
-            <label htmlFor="message" className="block text-gray-700 dark:text-gray-300 font-medium mb-2 text-sm">
+            <label
+              htmlFor="message"
+              className="block text-gray-700 dark:text-gray-300 font-medium mb-2 text-sm"
+            >
               {t("form.message")}
             </label>
             <textarea
               {...register("message", { required: true })}
               id="message"
               rows={6}
-              className={inputClassName + " resize-none"}
+              className={`${inputClassName} resize-none`}
             ></textarea>
             {errors.message && (
-              <p className="mt-1.5 text-sm text-red-600 dark:text-red-400">{t("form.messageRequired")}</p>
+              <p className="mt-1.5 text-sm text-red-600 dark:text-red-400">
+                {t("form.messageRequired")}
+              </p>
             )}
           </div>
 

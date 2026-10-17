@@ -1,8 +1,8 @@
 "use client";
 
-import { useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { useLocale } from "next-intl";
+import { useTransition } from "react";
 
 const languages = [
   { code: "en", label: "EN" },
@@ -30,6 +30,7 @@ export default function LanguageToggle() {
     <div className="flex items-center divide-x divide-gray-300 dark:divide-gray-700">
       {languages.map((lang) => (
         <button
+          type="button"
           key={lang.code}
           onClick={() => handleLocaleChange(lang.code)}
           disabled={isPending}

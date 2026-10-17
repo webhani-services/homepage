@@ -1,12 +1,12 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
-import Link from "next/link";
 import Image from "next/image";
-import DesktopMenu from "./navigation/DesktopMenu";
-import MobileMenu from "./navigation/MobileMenu";
+import Link from "next/link";
+import { useEffect, useMemo, useState } from "react";
 import DarkModeToggle from "./navigation/DarkModeToggle";
+import DesktopMenu from "./navigation/DesktopMenu";
 import LanguageToggle from "./navigation/LanguageToggle";
+import MobileMenu from "./navigation/MobileMenu";
 
 // ナビゲーションで使用するデータを定義
 const navigationData = {
@@ -104,7 +104,7 @@ export default function Navigation() {
 
   const { background, additionalClasses } = useMemo(
     () => navigationUtils.getScrolledStyle(isScrolled),
-    [isScrolled]
+    [isScrolled],
   );
 
   const handleToggleDarkMode = () => {
@@ -121,10 +121,26 @@ export default function Navigation() {
           <div className="flex-shrink-0 flex items-center">
             <Link href="/" className="flex items-center">
               <Image
-                src={isDark ? navigationData.logo.dark.src : navigationData.logo.light.src}
-                alt={isDark ? navigationData.logo.dark.alt : navigationData.logo.light.alt}
-                width={isDark ? navigationData.logo.dark.width : navigationData.logo.light.width}
-                height={isDark ? navigationData.logo.dark.height : navigationData.logo.light.height}
+                src={
+                  isDark
+                    ? navigationData.logo.dark.src
+                    : navigationData.logo.light.src
+                }
+                alt={
+                  isDark
+                    ? navigationData.logo.dark.alt
+                    : navigationData.logo.light.alt
+                }
+                width={
+                  isDark
+                    ? navigationData.logo.dark.width
+                    : navigationData.logo.light.width
+                }
+                height={
+                  isDark
+                    ? navigationData.logo.dark.height
+                    : navigationData.logo.light.height
+                }
                 priority
                 className="bg-transparent"
                 style={{

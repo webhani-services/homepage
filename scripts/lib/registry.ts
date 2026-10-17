@@ -6,10 +6,10 @@
  * 2. ここに登録
  */
 
-import type { LLMProvider } from "./types.js";
 import { AnthropicProvider } from "./providers/anthropic.js";
-import { OpenAIProvider } from "./providers/openai.js";
 import { GeminiProvider } from "./providers/gemini.js";
+import { OpenAIProvider } from "./providers/openai.js";
+import type { LLMProvider } from "./types.js";
 
 type ProviderFactory = (apiKey?: string, model?: string) => LLMProvider;
 
@@ -24,7 +24,7 @@ const DEFAULT_PROVIDER = "anthropic";
 export function createProvider(
   name?: string,
   apiKey?: string,
-  model?: string
+  model?: string,
 ): LLMProvider {
   const providerName = name ?? process.env.LLM_PROVIDER ?? DEFAULT_PROVIDER;
   const factory = providers[providerName];
@@ -32,7 +32,7 @@ export function createProvider(
   if (!factory) {
     const available = Object.keys(providers).join(", ");
     throw new Error(
-      `Unknown LLM provider: "${providerName}". Available: ${available}`
+      `Unknown LLM provider: "${providerName}". Available: ${available}`,
     );
   }
 

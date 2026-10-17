@@ -25,8 +25,8 @@
  *   npx tsx scripts/generate-blog.ts -t "AWS Lambda" -p anthropic -m claude-haiku-4-5-20251001
  */
 
-import fs from "fs";
-import path from "path";
+import fs from "node:fs";
+import path from "node:path";
 import { createProvider } from "./lib/registry.js";
 
 const CONTENT_DIR = path.join(process.cwd(), "content/blog");
@@ -152,7 +152,9 @@ async function main() {
 
   if (!args.topic) {
     console.error("Error: --topic is required");
-    console.error("Usage: npx tsx scripts/generate-blog.ts --topic 'Your topic'");
+    console.error(
+      "Usage: npx tsx scripts/generate-blog.ts --topic 'Your topic'",
+    );
     process.exit(1);
   }
 
@@ -188,7 +190,9 @@ async function main() {
   }
 
   if (!args.dryRun) {
-    console.log(`\nDone! Generated ${args.locales.length} posts with slug: "${slug}"`);
+    console.log(
+      `\nDone! Generated ${args.locales.length} posts with slug: "${slug}"`,
+    );
     console.log(`Status: draft (edit and change to "published" when ready)`);
   }
 }
