@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import type { LLMProvider, LLMGenerateOptions } from "../types.js";
+import type { LLMGenerateOptions, LLMProvider } from "../types.js";
 
 const DEFAULT_MODEL = "claude-sonnet-4-6";
 

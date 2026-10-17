@@ -1,5 +1,5 @@
-import { NextResponse } from "next/server";
 import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
+import { NextResponse } from "next/server";
 import { z } from "zod";
 
 // --- Environment validation ---
@@ -73,6 +73,7 @@ function escapeHtml(str: string): string {
 
 /** Strip control characters and limit length for safe use in email subject */
 function sanitizeForSubject(str: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: intentionally strips control chars
   return str.replace(/[\r\n\t\x00-\x1f]/g, "").slice(0, 100);
 }
 
@@ -84,7 +85,7 @@ export async function POST(request: Request) {
     if (isRateLimited(ip)) {
       return NextResponse.json(
         { error: "リクエストが多すぎます。しばらく経ってからお試しください。" },
-        { status: 429 }
+        { status: 429 },
       );
     }
 
@@ -93,7 +94,7 @@ export async function POST(request: Request) {
     if (contentLength && parseInt(contentLength, 10) > MAX_REQUEST_BODY_SIZE) {
       return NextResponse.json(
         { error: "リクエストが大きすぎます。" },
-        { status: 413 }
+        { status: 413 },
       );
     }
 
@@ -102,7 +103,7 @@ export async function POST(request: Request) {
     if (!result.success) {
       return NextResponse.json(
         { error: "入力内容に不備があります。" },
-        { status: 400 }
+        { status: 400 },
       );
     }
     const { name, email, message } = result.data;
@@ -192,7 +193,7 @@ ${message}
       console.error("AWS_SES_TO_EMAIL is not configured");
       return NextResponse.json(
         { error: "エラーが発生しました。もう一度お試しください。" },
-        { status: 500 }
+        { status: 500 },
       );
     }
 
@@ -227,16 +228,16 @@ ${message}
 
     return NextResponse.json(
       { message: "お問い合わせを送信しました。" },
-      { status: 200 }
+      { status: 200 },
     );
   } catch (error) {
     console.error(
       "Error sending email:",
-      error instanceof Error ? error.message : "Unknown error"
+      error instanceof Error ? error.message : "Unknown error",
     );
     return NextResponse.json(
       { error: "エラーが発生しました。もう一度お試しください。" },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }

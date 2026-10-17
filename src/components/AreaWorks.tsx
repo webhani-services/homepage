@@ -17,7 +17,7 @@ type WorkCardProps = {
   t: (
     key:
       | `items.${(typeof WORKS_DATA)[number]["id"]}.title`
-      | `items.${(typeof WORKS_DATA)[number]["id"]}.category`
+      | `items.${(typeof WORKS_DATA)[number]["id"]}.category`,
   ) => string;
 };
 
@@ -41,12 +41,16 @@ const WorkCard = ({ work, index, t }: WorkCardProps) => (
 
       {/* Content - always visible at bottom, enhanced on hover */}
       <div className="absolute bottom-0 left-0 right-0 p-6 text-white">
-        <span className="text-amber-400 text-xs font-semibold tracking-[0.15em] uppercase mb-2 block
-          transform transition-transform duration-500 group-hover:-translate-y-1">
+        <span
+          className="text-amber-400 text-xs font-semibold tracking-[0.15em] uppercase mb-2 block
+          transform transition-transform duration-500 group-hover:-translate-y-1"
+        >
           {t(`items.${work.id}.category`)}
         </span>
-        <h3 className="text-lg font-bold leading-snug
-          transform transition-transform duration-500 group-hover:-translate-y-1">
+        <h3
+          className="text-lg font-bold leading-snug
+          transform transition-transform duration-500 group-hover:-translate-y-1"
+        >
           {t(`items.${work.id}.title`)}
         </h3>
       </div>
@@ -59,7 +63,11 @@ export default function AreaWorks() {
   const revealRef = useScrollReveal();
 
   return (
-    <section id="works" className="section-padding bg-[var(--surface-muted)] dark:bg-[var(--dark-surface)]" ref={revealRef}>
+    <section
+      id="works"
+      className="section-padding bg-[var(--surface-muted)] dark:bg-[var(--dark-surface)]"
+      ref={revealRef}
+    >
       <div className="max-w-7xl mx-auto">
         <div className="text-center mb-16">
           <span className="reveal text-amber-600 dark:text-amber-400 text-sm font-semibold tracking-[0.15em] uppercase mb-4 block">

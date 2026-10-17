@@ -31,8 +31,10 @@ export default function AreaHero() {
             webhani
           </span>
         </div>
-        <h1 className="text-4xl md:text-6xl lg:text-7xl font-bold mb-8 fade-in leading-[1.15] tracking-tight"
-            style={{ animationDelay: "0.15s" }}>
+        <h1
+          className="text-4xl md:text-6xl lg:text-7xl font-bold mb-8 fade-in leading-[1.15] tracking-tight"
+          style={{ animationDelay: "0.15s" }}
+        >
           {t("title")
             .split("\n")
             .map((line, i, arr) => (
@@ -57,6 +59,7 @@ export default function AreaHero() {
         </p>
         <div className="fade-in" style={{ animationDelay: "0.45s" }}>
           <button
+            type="button"
             onClick={() => {
               document.getElementById("contact")?.scrollIntoView({
                 behavior: "smooth",
@@ -66,8 +69,18 @@ export default function AreaHero() {
             py-4 px-10 rounded-full transition-all duration-300 shadow-lg shadow-amber-500/25 hover:shadow-xl hover:shadow-amber-400/30"
           >
             {t("button")}
-            <svg className="w-4 h-4 transition-transform duration-300 group-hover:translate-x-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M17 8l4 4m0 0l-4 4m4-4H3" />
+            <svg
+              className="w-4 h-4 transition-transform duration-300 group-hover:translate-x-1"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              strokeWidth={2}
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M17 8l4 4m0 0l-4 4m4-4H3"
+              />
             </svg>
           </button>
         </div>
@@ -75,7 +88,9 @@ export default function AreaHero() {
 
       {/* Scroll indicator */}
       <div className="absolute bottom-10 left-1/2 transform -translate-x-1/2 flex flex-col items-center gap-2">
-        <span className="text-white/50 text-xs tracking-[0.2em] uppercase">Scroll</span>
+        <span className="text-white/50 text-xs tracking-[0.2em] uppercase">
+          Scroll
+        </span>
         <div className="w-px h-8 bg-gradient-to-b from-white/50 to-transparent animate-pulse" />
       </div>
     </section>

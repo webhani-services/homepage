@@ -17,11 +17,13 @@ export function useScrollReveal() {
           }
         });
       },
-      { threshold: 0.15, rootMargin: "0px 0px -40px 0px" }
+      { threshold: 0.15, rootMargin: "0px 0px -40px 0px" },
     );
 
     const revealElements = element.querySelectorAll(".reveal");
-    revealElements.forEach((el) => observer.observe(el));
+    revealElements.forEach((el) => {
+      observer.observe(el);
+    });
 
     return () => observer.disconnect();
   }, []);

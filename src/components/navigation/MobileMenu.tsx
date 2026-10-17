@@ -1,6 +1,6 @@
 import Link from "next/link";
-import { NavigationItem } from "@/components/navigation/types";
 import { useTranslations } from "next-intl";
+import type { NavigationItem } from "@/components/navigation/types";
 import LanguageToggle from "./LanguageToggle";
 
 type Props = {
@@ -45,6 +45,7 @@ export default function MobileMenu({
             <LanguageToggle />
           </div>
           <button
+            type="button"
             onClick={onToggleDarkMode}
             className="w-full text-center px-3 py-2 text-sm text-gray-600 dark:text-gray-400 hover:text-yellow-500 dark:hover:text-yellow-300 transition-colors duration-200"
           >

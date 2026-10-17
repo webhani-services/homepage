@@ -29,8 +29,14 @@ const CompanyBasicInfo = () => {
       <dl className="space-y-6">
         {[
           { label: t("basicInfo.companyName"), value: companyInfo.name },
-          { label: t("basicInfo.established"), value: companyInfo.establishedDate },
-          { label: t("basicInfo.representative"), value: companyInfo.representative },
+          {
+            label: t("basicInfo.established"),
+            value: companyInfo.establishedDate,
+          },
+          {
+            label: t("basicInfo.representative"),
+            value: companyInfo.representative,
+          },
         ].map((item) => (
           <div key={item.label}>
             <dt className="text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-1">

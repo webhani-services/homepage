@@ -26,17 +26,17 @@ interface HNItem {
 
 async function fetchHackerNews(limit = 30): Promise<NewsItem[]> {
   const res = await fetch(
-    "https://hacker-news.firebaseio.com/v0/topstories.json"
+    "https://hacker-news.firebaseio.com/v0/topstories.json",
   );
   const ids: number[] = await res.json();
 
   const items = await Promise.all(
     ids.slice(0, limit).map(async (id) => {
       const itemRes = await fetch(
-        `https://hacker-news.firebaseio.com/v0/item/${id}.json`
+        `https://hacker-news.firebaseio.com/v0/item/${id}.json`,
       );
       return (await itemRes.json()) as HNItem;
-    })
+    }),
   );
 
   return items
@@ -61,7 +61,7 @@ interface DevtoArticle {
 
 async function fetchDevto(limit = 20): Promise<NewsItem[]> {
   const res = await fetch(
-    `https://dev.to/api/articles?per_page=${limit}&top=1`
+    `https://dev.to/api/articles?per_page=${limit}&top=1`,
   );
   const articles: DevtoArticle[] = await res.json();
 
@@ -104,7 +104,7 @@ export function formatNewsForLLM(news: NewsItem[]): string {
   return news
     .map(
       (item, i) =>
-        `[${i + 1}] ${item.title}\n    URL: ${item.url}\n    Source: ${item.source}${item.score ? ` | Score: ${item.score}` : ""}${item.tags?.length ? ` | Tags: ${item.tags.join(", ")}` : ""}${item.description ? `\n    ${item.description}` : ""}`
+        `[${i + 1}] ${item.title}\n    URL: ${item.url}\n    Source: ${item.source}${item.score ? ` | Score: ${item.score}` : ""}${item.tags?.length ? ` | Tags: ${item.tags.join(", ")}` : ""}${item.description ? `\n    ${item.description}` : ""}`,
     )
     .join("\n\n");
 }

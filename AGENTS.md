@@ -12,7 +12,7 @@ Use Node `>=22` as defined in `package.json`.
 - `npm run dev`: start the local dev server on `http://localhost:8000`.
 - `npm run build`: produce a production build with Next.js.
 - `npm run start`: serve the built app.
-- `npm run lint`: run ESLint with the Next.js flat config.
+- `npm run lint`: run Biome check (lint + format + import order). `npm run format` applies fixes.
 - `npm run typecheck`: run `tsc --noEmit` in strict mode.
 
 Docker-based setup notes exist in `docs/dev.md`, but the current day-to-day workflow is the npm script set above.

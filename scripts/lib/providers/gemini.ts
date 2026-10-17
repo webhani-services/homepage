@@ -7,7 +7,7 @@
  * 3. LLM_PROVIDER=gemini で実行
  */
 
-import type { LLMProvider, LLMGenerateOptions } from "../types.js";
+import type { LLMGenerateOptions, LLMProvider } from "../types.js";
 
 const DEFAULT_MODEL = "gemini-2.5-flash";
 
@@ -27,14 +27,12 @@ export class GeminiProvider implements LLMProvider {
       geminiModule = await import("@google/generative-ai");
     } catch {
       throw new Error(
-        "Google Generative AI package not installed. Run: npm install @google/generative-ai"
+        "Google Generative AI package not installed. Run: npm install @google/generative-ai",
       );
     }
 
     const { GoogleGenerativeAI } = geminiModule;
-    const genAI = new GoogleGenerativeAI(
-      process.env.GEMINI_API_KEY ?? ""
-    );
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY ?? "");
     const model = genAI.getGenerativeModel({ model: this.model });
 
     const systemMessage = options.messages.find((m) => m.role === "system");
