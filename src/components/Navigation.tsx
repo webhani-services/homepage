@@ -26,9 +26,7 @@ const navigationData = {
   },
   menuItems: [
     { nameKey: "services", href: "/#services" },
-    { nameKey: "philosophy", href: "/#corporate-philosophy" },
-    { nameKey: "about", href: "/#about" },
-    { nameKey: "products", href: "/#products" },
+    { nameKey: "about", href: "/about" },
     { nameKey: "works", href: "/#works" },
     { nameKey: "blog", href: "/blog" },
     { nameKey: "contact", href: "/#contact" },
