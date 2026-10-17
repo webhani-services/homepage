@@ -13,13 +13,13 @@ const navigationData = {
   logo: {
     light: {
       src: "/images/logo/full-logo-transparent.svg",
-      alt: "webhani Inc.",
+      alt: "webhani",
       width: 200,
       height: 60,
     },
     dark: {
       src: "/images/logo/full-logo-dark.svg",
-      alt: "webhani Inc.",
+      alt: "webhani",
       width: 200,
       height: 60,
     },

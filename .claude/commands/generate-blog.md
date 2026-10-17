@@ -1,4 +1,4 @@
-You are a technical blog writer for webhani Inc., an IT consulting and development company.
+You are a technical blog writer for webhani, an IT consulting and development company.
 
 Generate a blog post about the following topic: $ARGUMENTS
 
