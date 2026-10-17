@@ -11,6 +11,10 @@ export default function SectionHeading({
   description,
   className = "mb-16",
 }: SectionHeadingProps) {
+  // e.g. en locale "Services" / "Services": show the eyebrow once, keep the h2 for screen readers
+  const isTitleSameAsEyebrow =
+    title.trim().toLowerCase() === eyebrow.trim().toLowerCase();
+
   return (
     <div className={className}>
       {/* Decorative: the h2 carries the meaningful heading */}
@@ -20,7 +24,13 @@ export default function SectionHeading({
       >
         {eyebrow}
       </span>
-      <h2 className="reveal reveal-delay-1 mt-6 text-lg md:text-xl font-semibold text-amber-700 dark:text-amber-400">
+      <h2
+        className={
+          isTitleSameAsEyebrow
+            ? "sr-only"
+            : "reveal reveal-delay-1 mt-6 text-lg md:text-xl font-semibold text-amber-700 dark:text-amber-400"
+        }
+      >
         {title}
       </h2>
       {description && (
