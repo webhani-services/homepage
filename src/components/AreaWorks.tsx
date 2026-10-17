@@ -12,6 +12,9 @@ const WORKS_DATA = [
   { id: "aiChatbot", image: "/images/works/ai-chatbot-motif.jpg" },
 ] as const;
 
+// Our own principles (philosophy.principles), not client testimonials
+const PRINCIPLE_IDS = ["innovation", "quality"] as const;
+
 type WorkCardProps = {
   work: (typeof WORKS_DATA)[number];
   index: number;
@@ -61,6 +64,7 @@ const WorkCard = ({ work, index, t }: WorkCardProps) => (
 
 export default function AreaWorks() {
   const t = useTranslations("works");
+  const tPhilosophy = useTranslations("philosophy");
   const revealRef = useScrollReveal();
 
   return (
@@ -79,6 +83,28 @@ export default function AreaWorks() {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           {WORKS_DATA.map((work, index) => (
             <WorkCard key={work.id} work={work} index={index} t={t} />
+          ))}
+        </div>
+
+        <div className="mt-24 pt-16 border-t border-gray-200 dark:border-gray-800 grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-16">
+          {PRINCIPLE_IDS.map((id, index) => (
+            <figure key={id} className={`reveal ${getRevealDelayClass(index)}`}>
+              <span
+                aria-hidden="true"
+                className="block h-8 text-6xl leading-none text-amber-500"
+              >
+                “
+              </span>
+              <blockquote className="text-2xl md:text-3xl font-normal leading-snug tracking-tight text-gray-900 dark:text-gray-100">
+                {tPhilosophy(`principles.${id}.description`)}
+              </blockquote>
+              <figcaption className="mt-6 text-sm text-gray-500 dark:text-gray-400">
+                <span className="font-semibold text-amber-700 dark:text-amber-400">
+                  webhani
+                </span>{" "}
+                — {tPhilosophy(`principles.${id}.title`)}
+              </figcaption>
+            </figure>
           ))}
         </div>
       </div>
