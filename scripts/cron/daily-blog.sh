@@ -44,11 +44,41 @@ if [ -f "${LOCK_FILE}" ]; then
 fi
 echo $$ > "${LOCK_FILE}"
 
+# === Slack 通知 (失敗時) ===
+# Webhook URL は repo に含めず、env か ~/.config/webhani/daily-blog.env (SLACK_WEBHOOK_URL=...) から読む
+SLACK_ENV_FILE="${HOME}/.config/webhani/daily-blog.env"
+if [ -z "${SLACK_WEBHOOK_URL:-}" ] && [ -f "${SLACK_ENV_FILE}" ]; then
+  # shellcheck disable=SC1090
+  . "${SLACK_ENV_FILE}"
+fi
+
+notify_slack() {
+  local message="$1"
+  if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+    echo "WARNING: SLACK_WEBHOOK_URL not set. Skipping Slack notification." >> "${LOG_FILE}"
+    return 0
+  fi
+  # JSON 文字列を python3 で安全にエスケープ。通知失敗で本処理の exit code を変えない
+  local payload
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' "${message}") || return 0
+  curl -sS -m 15 -X POST -H 'Content-type: application/json' --data "${payload}" \
+    "${SLACK_WEBHOOK_URL}" >> "${LOG_FILE}" 2>&1 || echo "WARNING: Slack notification failed." >> "${LOG_FILE}"
+  echo "" >> "${LOG_FILE}"
+}
+
 # === Cleanup Trap ===
 ORIGINAL_BRANCH=""
 cleanup() {
   local exit_code=$?
   rm -f "${LOCK_FILE}"
+
+  if [ ${exit_code} -ne 0 ]; then
+    local reason
+    reason=$(grep -E "Failed to authenticate|ERROR:" "${LOG_FILE}" 2>/dev/null | tail -1 || true)
+    notify_slack ":rotating_light: daily-blog failed (${DATE}, exit ${exit_code})
+${reason:-see log}
+Log: ${LOG_FILE}"
+  fi
 
   # 失敗時に master に戻す
   if [ ${exit_code} -ne 0 ] && [ -n "${ORIGINAL_BRANCH}" ]; then
