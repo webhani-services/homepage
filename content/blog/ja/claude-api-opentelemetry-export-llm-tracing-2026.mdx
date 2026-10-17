@@ -1,0 +1,112 @@
+---
+title: "Claude API呼び出しをOpenTelemetryでトレースする: SDKの新しいexportで何が変わるか"
+description: "AnthropicのSDKにMessages APIリクエスト向けのOpenTelemetry export(beta)が追加されました。既存のトレースへLLM呼び出しを組み込む方法、記録すべき属性、コスト情報の置き場所を整理します。"
+date: "2026-10-18"
+status: "published"
+tags: ["Claude", "OpenTelemetry", "Observability", "LLM", "Monitoring"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-api-opentelemetry-export-llm-tracing-2026"
+---
+
+10月14日、Claude Platformのリリースノートに、Messages APIリクエストとManaged AgentsセッションをトレースするOpenTelemetry export(beta)が追加されました。Python、TypeScript、C#、Go、Java、PHP、Ruby のSDKがspanを出力できるとされています。リリースノート自体は短いので、この記事では「既存のトレースの中にLLM呼び出しをどう置くか」「spanに何を記録するか」という実務側の論点を扱います。
+
+有効化の具体的な方法はbetaのため変わる可能性があります。公式ドキュメントで確認してください。以下の設計の考え方は、有効化の方法に関わらず当てはまります。
+
+## LLM呼び出しに専用のspanが必要な理由
+
+LLM呼び出しは、リクエスト全体の中で最も遅く、最も高コストなhopになりがちです。spanがなければ、遅いエンドポイントは「APIハンドラに9秒かかった」としか見えません。spanがあれば、8.2秒がモデル呼び出し1回に使われ、1回リトライされ、先週よりプロンプトが肥大化している、といったことが分かります。
+
+LLMのspanが通常のHTTPクライアントのspanと違う点は3つあります。
+
+- **レイテンシの幅が桁違いに大きい**: 出力長やthinkingのeffortで大きく変わるため、固定閾値のアラートは鳴りっぱなしか、まったく鳴らないかのどちらかになります。
+- **コストはリクエスト数ではなくトークン数で決まる**: 入力・出力・キャッシュ読み取りで単価が異なります。
+- **リトライとストリーミングで挙動が隠れる**: 40秒ストリーミングした呼び出しと、すぐ失敗してリトライした呼び出しは、単純なduration指標では似て見えます。
+
+## 既存のトレースへ組み込む
+
+SDKのexportを使う場合も、自分でspanを書く場合も、構造は同じです。LLM呼び出しをリクエストspanの子にして、ユーザーリクエスト、ビジネスロジック、モデル呼び出しを1つのtrace IDでつなぎます。
+
+以下は、安定版のOpenTelemetry APIだけで書いた例です。SDK exportがまだ使えない環境や、属性を自分で制御したい場合に使えます。
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+import { trace, SpanStatusCode } from "@opentelemetry/api";
+
+const tracer = trace.getTracer("llm-client");
+const client = new Anthropic();
+
+export async function tracedMessage(
+  params: Anthropic.MessageCreateParamsNonStreaming,
+  feature: string,
+) {
+  return tracer.startActiveSpan(`llm.messages ${params.model}`, async (span) => {
+    span.setAttributes({
+      "gen_ai.system": "anthropic",
+      "gen_ai.request.model": params.model,
+      "gen_ai.request.max_tokens": params.max_tokens,
+      "app.feature": feature,
+    });
+    try {
+      const res = await client.messages.create(params);
+      span.setAttributes({
+        "gen_ai.response.id": res.id,
+        "gen_ai.usage.input_tokens": res.usage.input_tokens,
+        "gen_ai.usage.output_tokens": res.usage.output_tokens,
+        "app.cache_read_tokens": res.usage.cache_read_input_tokens ?? 0,
+        "gen_ai.response.finish_reasons": [res.stop_reason ?? "unknown"],
+      });
+      return res;
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
+}
+```
+
+`gen_ai.*` の属性名はOpenTelemetryのGenAI semantic conventionsに由来します。これはまだexperimentalの扱いです。今から使っておけば、将来ベンダーが出力する属性とダッシュボードを揃えやすくなりますが、名前の変更は起こり得ます。`app.*` は自前の属性で、実務上の価値はこちらのほうが大きいことが多いです。
+
+## 記録するもの、記録しないもの
+
+**記録するもの**
+
+- モデル名と `max_tokens`: デプロイでモデルが意図せず変わったことに気づけます。
+- キャッシュ読み取りを含むトークン数: キャッシュ読み取りの急減は、プロンプトの先頭部分が変わりコストが上がる前触れとして最も早いシグナルです。
+- `feature` や `tenant` の属性: 「アシスタントは1日あたりXドルかかる」では動けませんが、「要約機能がXドルで、その6割が1テナント」なら対策を打てます。
+- stop reason: `max_tokens` による停止の割合が増えていれば、途中で切れた回答がユーザーに届いています。
+
+**デフォルトでは記録しないもの**
+
+- プロンプトと応答の本文: テレメトリ基盤に個人情報が入り込む最大の経路であり、保存コストも増えます。デバッグ用に必要なら、サンプリングし、マスキングし、別ストアで短い保持期間を設定してください。
+
+## traceだけでなくmetricsも
+
+traceは「このリクエストに何が起きたか」に答えます。アラートには、同じデータからmetricsを作ります。最低限の例です。
+
+| Metric | 目的 |
+| --- | --- |
+| モデル・feature別のトークン使用量 | コストの帰属 |
+| キャッシュ読み取り比率(読み取り/入力合計) | プロンプト先頭部分の退行検知 |
+| モデル別のp95 duration | モデルごとにレイテンシの基準が異なる |
+| ステータス種別ごとのエラー率(429、5xx、overloaded) | 自社のバグと容量逼迫を切り分ける |
+| `max_tokens` 停止の割合 | 出力品質のガード |
+
+Prometheus系のバックエンドでは、ラベルのcardinalityに注意してください。`feature` と `model` はラベルで問題ありませんが、リクエストIDやユーザーIDはmetricsではなくspanに載せます。
+
+## エージェントのセッションは別物
+
+マルチステップのエージェントでは、1リクエストが多数のモデル呼び出しとツール呼び出しに展開されます。見るべき単位はセッションです。親spanを1つ置き、各ターンとツール呼び出しを子にします。ここはネイティブexportが最も役立つ部分で、ループを手作業で再構築するのは面倒で間違えやすいからです。トレースをレビューするときは、個々の呼び出しのレイテンシよりも先にターン数を見てください。5ターンで済むはずが14ターンかかっているなら、ほぼ確実にプロンプトかツール説明の問題です。
+
+## webhaniの推奨
+
+1. まずステージング環境でSDK exportを有効にし、自作spanと比較してから自作側を外す。
+2. `app.feature`、`app.tenant`、キャッシュ読み取りトークンの3つのカスタム属性をサービス間で統一する。
+3. プロンプト本文はデフォルトでspanに入れない。
+4. レイテンシとエラーだけでなく、キャッシュ読み取り比率と `max_tokens` 停止割合にもアラートを設定する。
+5. betaであることを真剣に受け止める。SDKのバージョンを固定し、上記のような薄いラッパーを置いて、属性名が変わっても修正が1ファイルで済むようにする。
+
+LLM呼び出しは、多くのバックエンドで一級の依存先になりました。データベースや決済と同じ水準でトレースを整えるのは小さな作業ですが、請求額やレイテンシのグラフに驚かされたときに、その手間が確実に報われます。

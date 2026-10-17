@@ -1,0 +1,89 @@
+---
+title: "Kubernetes 1.34 Reaches End of Life on October 27: An Upgrade Playbook"
+description: "Upstream support for Kubernetes 1.34 ends this month, while managed services keep their own later dates. How to find removed APIs, sequence the upgrade, and avoid paying for extended support by accident."
+date: "2026-10-18"
+status: "published"
+tags: ["Kubernetes", "EKS", "Upgrade", "DevOps", "Cloud Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-34-end-of-life-upgrade-playbook-2026"
+---
+
+Upstream Kubernetes 1.34 reaches end of life on October 27, 2026. If your clusters run on a managed service, that date is not your deadline: Amazon EKS lists standard support for 1.34 ending on December 2, 2026, with paid extended support after that. GKE and AKS publish their own dates, which differ from both upstream and from each other. Check each provider's official lifecycle page; secondary trackers disagree with each other on some of these dates.
+
+The real risk is not the date itself. It is the quiet transition: an EKS cluster that is not upgraded rolls into extended support automatically, and extended support is billed at a much higher per-cluster rate than standard support. A cluster left alone for a year becomes a line item nobody chose.
+
+Current targets are 1.35 and 1.36. Since the control plane moves one minor version at a time, getting from 1.34 to 1.36 means two upgrade cycles. Plan for both.
+
+## Step 1: Inventory versions, including the forgotten clusters
+
+Start with what you actually have. On AWS:
+
+```bash
+for region in ap-northeast-1 us-east-1; do
+  for c in $(aws eks list-clusters --region "$region" --query 'clusters[]' --output text); do
+    aws eks describe-cluster --region "$region" --name "$c" \
+      --query '{name:cluster.name,version:cluster.version,policy:cluster.upgradePolicy.supportType}' \
+      --output json
+  done
+done
+```
+
+The `supportType` field shows whether a cluster is on standard or extended support. Staging and "temporary" clusters are the usual surprises.
+
+## Step 2: Find API usage that will break
+
+Each minor release removes some deprecated APIs. Before upgrading, look at what your cluster is actually being asked for:
+
+```bash
+# Deprecated APIs requested against the live API server
+kubectl get --raw /metrics | grep apiserver_requested_deprecated_apis
+
+# Scan manifests and Helm releases in the repo/cluster
+pluto detect-files -d ./k8s
+pluto detect-helm -o wide
+```
+
+The metric tells you about runtime clients (including controllers and CI jobs you forgot). `pluto` tells you about manifests. Run both: a manifest may be fine while an old operator still calls a removed endpoint.
+
+## Step 3: Check add-ons and skew
+
+Most upgrade failures come from components around the cluster, not from Kubernetes itself:
+
+- **Ingress and Gateway controllers, CNI, CSI drivers, cluster autoscaler or Karpenter**: confirm each has a version that supports the target Kubernetes version. The compatibility matrix in each project's docs is the source of truth.
+- **Kubelet skew**: kubelets may lag the API server by up to three minor versions, but do not use that as a plan. Upgrading node groups promptly keeps the next upgrade simple.
+- **Admission webhooks**: a webhook with `failurePolicy: Fail` that is unavailable during rollout can block all pod creation. Know which ones you have.
+
+## Step 4: Sequence the upgrade
+
+A sequence that has worked for us:
+
+1. Upgrade a non-production cluster first, with a workload mix similar to production.
+2. Upgrade the control plane. On EKS: `aws eks update-cluster-version --name <cluster> --kubernetes-version 1.35`. Wait for it to complete.
+3. Upgrade managed add-ons to versions compatible with the new control plane.
+4. Roll node groups. Make sure PodDisruptionBudgets exist for critical workloads and that they are not set so tightly that drains hang (`maxUnavailable: 0` with a single replica is a classic).
+5. Run smoke tests, then repeat for 1.36.
+
+Between 1.35 and 1.36, wait a few days rather than chaining them. The goal is to separate problems caused by the first upgrade from problems caused by the second.
+
+Node drains are where real outages hide. Before the production window, check:
+
+```bash
+kubectl get pdb -A
+kubectl get deploy -A -o json | jq -r '.items[] | select(.spec.replicas==1) | "\(.metadata.namespace)/\(.metadata.name)"'
+```
+
+Single-replica deployments will have downtime during node rolls. Either scale them to two for the window or accept and announce the gap.
+
+## Step 5: Avoid paying for extended support by default
+
+If you cannot finish before the standard support date, make that a decision, not a drift. Extended support can be a reasonable bridge for a cluster that is scheduled for decommissioning. It is a poor default for an actively maintained cluster. Put each cluster's end-of-standard-support date in a calendar or in your IaC as a tag, and set an alert 60 days ahead.
+
+## What we recommend
+
+- Treat Kubernetes upgrades as routine work, scheduled quarterly, instead of as projects triggered by an EOL notice.
+- Keep cluster definitions in Terraform or similar, so that a version bump is a reviewed change with a plan.
+- Automate the API-deprecation scan in CI, so removed APIs are caught when manifests are written rather than at upgrade time.
+- Keep the version gap between control plane and nodes small. A gap of one minor is easy; a gap of three is a project.
+
+Teams that upgrade on a cadence spend a few hours per release. Teams that wait for deadlines spend weeks and usually still end up in extended support for a while. The cost difference is mostly process, not technology.

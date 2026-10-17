@@ -1,0 +1,112 @@
+---
+title: "Tracing Claude API Calls with OpenTelemetry: What the New SDK Export Changes"
+description: "Anthropic's SDKs now have a beta OpenTelemetry export for Messages API requests. Here is how to fit LLM calls into your existing traces, which attributes are worth recording, and where cost data belongs."
+date: "2026-10-18"
+status: "published"
+tags: ["Claude", "OpenTelemetry", "Observability", "LLM", "Monitoring"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-api-opentelemetry-export-llm-tracing-2026"
+---
+
+On October 14, the Claude Platform release notes added a beta feature: OpenTelemetry export that traces Messages API requests and Managed Agents sessions, with span emission in the Python, TypeScript, C#, Go, Java, PHP, and Ruby SDKs. The release notes are short, so this post focuses on what matters in practice: how LLM calls should sit inside the traces you already have, and what you should record on those spans.
+
+Check the official docs for the exact opt-in mechanism, since it is a beta and may change. The design questions below apply regardless of how you enable it.
+
+## Why LLM calls need their own spans
+
+An LLM call is usually the slowest and most expensive hop in a request. Without a span around it, a slow endpoint looks like "the API handler took 9 seconds" and nothing more. With a span, you can see that 8.2 seconds went to one model call, that it retried once, and that the prompt had grown since last week.
+
+Three properties make LLM spans different from ordinary HTTP client spans:
+
+- **Latency varies by orders of magnitude**, depending on output length and thinking effort. A fixed latency alert will either fire constantly or never.
+- **Cost is a function of tokens**, not of request count. Input, output, and cache-read tokens are priced differently.
+- **Retries and streaming** hide behaviour. A call that streams for 40 seconds and one that fails fast and retries look similar in a simple duration metric.
+
+## Wiring it into an existing trace
+
+Whether you use the SDK export or write the span yourself, the shape is the same: the LLM call is a child of the request span, so a single trace ID connects the user request, your business logic, and the model call.
+
+Here is a hand-written version using only the stable OpenTelemetry API. It is useful where the SDK export is not available yet, or where you want control over attributes:
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+import { trace, SpanStatusCode } from "@opentelemetry/api";
+
+const tracer = trace.getTracer("llm-client");
+const client = new Anthropic();
+
+export async function tracedMessage(
+  params: Anthropic.MessageCreateParamsNonStreaming,
+  feature: string,
+) {
+  return tracer.startActiveSpan(`llm.messages ${params.model}`, async (span) => {
+    span.setAttributes({
+      "gen_ai.system": "anthropic",
+      "gen_ai.request.model": params.model,
+      "gen_ai.request.max_tokens": params.max_tokens,
+      "app.feature": feature,
+    });
+    try {
+      const res = await client.messages.create(params);
+      span.setAttributes({
+        "gen_ai.response.id": res.id,
+        "gen_ai.usage.input_tokens": res.usage.input_tokens,
+        "gen_ai.usage.output_tokens": res.usage.output_tokens,
+        "app.cache_read_tokens": res.usage.cache_read_input_tokens ?? 0,
+        "gen_ai.response.finish_reasons": [res.stop_reason ?? "unknown"],
+      });
+      return res;
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
+}
+```
+
+The `gen_ai.*` attribute names come from the OpenTelemetry GenAI semantic conventions, which are still marked experimental. Using them now means your dashboards will line up with what vendors emit later, but expect occasional renames. The `app.*` attributes are ours, and they carry most of the practical value.
+
+## What to record, and what not to
+
+**Record:**
+
+- Model name and `max_tokens`, so you can spot a deploy that silently changed models.
+- Token counts, including cache-read tokens. A sudden drop in cache reads is the earliest signal that a prompt prefix changed and your costs are about to rise.
+- A `feature` or `tenant` attribute. "The assistant costs $X per day" is not actionable; "the document-summary feature costs $X and 60% of it is one tenant" is.
+- Stop reason. A rising share of `max_tokens` stops means truncated answers reaching users.
+
+**Do not record by default:**
+
+- Prompt and completion text. It is the largest risk for personal data in your telemetry backend, and it multiplies storage cost. If you need it for debugging, sample it, redact it, and give it a short retention period in a separate store.
+
+## Metrics, not just traces
+
+Traces answer "what happened to this request." For alerting, derive metrics from the same data. A minimal useful set:
+
+| Metric | Why |
+| --- | --- |
+| Token usage by model and feature | Cost attribution |
+| Cache-read ratio (cache-read / total input) | Detect prompt-prefix regressions |
+| p95 duration by model | LLM latency has a different baseline per model |
+| Error rate by status class (429, 5xx, overloaded) | Separates your bugs from capacity events |
+| Share of `max_tokens` stop reasons | Output quality guard |
+
+With Prometheus-style backends, keep label cardinality under control. `feature` and `model` are fine as labels; request IDs and user IDs belong on spans, not metrics.
+
+## Agent sessions are different
+
+For multi-step agents, a single request fans out into many model calls and tool calls. The useful unit is the session: one parent span, with each model turn and tool call as a child. This is where native export is most helpful, because reconstructing the loop by hand is tedious and easy to get wrong. When you review these traces, look at the number of turns before looking at any single call's latency; a loop that takes 14 turns instead of 5 is almost always a prompt or tool-description problem.
+
+## Our recommendation
+
+1. Enable the SDK export in a staging environment first, and compare its spans against any hand-written ones before removing the latter.
+2. Standardize three custom attributes across services: `app.feature`, `app.tenant`, and cache-read tokens.
+3. Keep prompt content out of spans by default.
+4. Alert on cache-read ratio and `max_tokens` stop share, not only on latency and errors.
+5. Treat the beta label seriously. Pin SDK versions and keep a thin wrapper like the one above so a change in attribute names touches one file.
+
+LLM calls are now a first-class dependency in most backends. Giving them the same tracing discipline as your database and payment calls is a small amount of work that pays back the first time a bill or a latency graph surprises you.
