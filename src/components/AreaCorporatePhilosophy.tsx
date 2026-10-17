@@ -1,6 +1,7 @@
 "use client";
 import Image from "next/image";
 import { useTranslations } from "next-intl";
+import SectionHeading from "@/components/SectionHeading";
 import { useScrollReveal } from "@/hooks/useScrollReveal";
 
 const principles = [
@@ -21,15 +22,12 @@ export default function AreaCorporatePhilosophy() {
       <div className="max-w-7xl mx-auto">
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-16 items-center">
           <div>
-            <span className="reveal text-amber-600 dark:text-amber-400 text-sm font-semibold tracking-[0.15em] uppercase mb-4 block">
-              Philosophy
-            </span>
-            <h2 className="reveal reveal-delay-1 text-4xl md:text-5xl font-bold text-gray-900 dark:text-gray-100 tracking-tight mb-6">
-              {t("title")}
-            </h2>
-            <p className="reveal reveal-delay-2 text-lg text-gray-500 dark:text-gray-400 leading-relaxed mb-10">
-              {t("description")}
-            </p>
+            <SectionHeading
+              eyebrow="Philosophy"
+              title={t("title")}
+              description={t("description")}
+              className="mb-10"
+            />
             <div className="space-y-6">
               {principles.map((principle, index) => (
                 <div

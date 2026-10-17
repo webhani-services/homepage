@@ -1,6 +1,7 @@
 "use client";
 import Image from "next/image";
 import { useTranslations } from "next-intl";
+import SectionHeading from "@/components/SectionHeading";
 import { useScrollReveal } from "@/hooks/useScrollReveal";
 import { getRevealDelayClass } from "@/lib/constants";
 
@@ -57,17 +58,11 @@ export default function AreaServices() {
       ref={revealRef}
     >
       <div className="max-w-7xl mx-auto">
-        <div className="text-center mb-16">
-          <span className="reveal text-amber-600 dark:text-amber-400 text-sm font-semibold tracking-[0.15em] uppercase mb-4 block">
-            Services
-          </span>
-          <h2 className="reveal reveal-delay-1 text-4xl md:text-5xl font-bold text-gray-900 dark:text-gray-100 tracking-tight">
-            {t("title")}
-          </h2>
-          <p className="reveal reveal-delay-2 mt-4 text-lg text-gray-500 dark:text-gray-400 max-w-2xl mx-auto">
-            {t("description")}
-          </p>
-        </div>
+        <SectionHeading
+          eyebrow="Services"
+          title={t("title")}
+          description={t("description")}
+        />
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {SERVICE_IDS.map((service, index) => (

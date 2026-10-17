@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useTranslations } from "next-intl";
 import BlogCard from "@/components/blog/BlogCard";
+import SectionHeading from "@/components/SectionHeading";
 import { useScrollReveal } from "@/hooks/useScrollReveal";
 import type { BlogFrontmatter } from "@/lib/blog";
 import { getRevealDelayClass } from "@/lib/constants";
@@ -22,17 +23,11 @@ export default function AreaBlog({ posts }: AreaBlogProps) {
       ref={revealRef}
     >
       <div className="max-w-7xl mx-auto">
-        <div className="text-center mb-16">
-          <span className="reveal text-amber-600 dark:text-amber-400 text-sm font-semibold tracking-[0.15em] uppercase mb-4 block">
-            Blog
-          </span>
-          <h2 className="reveal reveal-delay-1 text-4xl md:text-5xl font-bold text-gray-900 dark:text-gray-100 tracking-tight">
-            {t("title")}
-          </h2>
-          <p className="reveal reveal-delay-2 mt-4 text-lg text-gray-500 dark:text-gray-400 max-w-2xl mx-auto">
-            {t("description")}
-          </p>
-        </div>
+        <SectionHeading
+          eyebrow="Blog"
+          title={t("title")}
+          description={t("description")}
+        />
 
         {posts.length === 0 ? (
           <p className="reveal text-center text-gray-500 dark:text-gray-400">

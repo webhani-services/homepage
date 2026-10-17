@@ -1,6 +1,7 @@
 "use client";
 
 import { useTranslations } from "next-intl";
+import SectionHeading from "@/components/SectionHeading";
 import { useContactForm } from "@/hooks/useContactForm";
 import { useScrollReveal } from "@/hooks/useScrollReveal";
 
@@ -29,17 +30,12 @@ export default function AreaContact() {
       ref={revealRef}
     >
       <div className="max-w-2xl mx-auto">
-        <div className="text-center mb-12">
-          <span className="reveal text-amber-600 dark:text-amber-400 text-sm font-semibold tracking-[0.15em] uppercase mb-4 block">
-            Contact
-          </span>
-          <h2 className="reveal reveal-delay-1 text-4xl md:text-5xl font-bold text-gray-900 dark:text-gray-100 tracking-tight">
-            {t("title")}
-          </h2>
-          <p className="reveal reveal-delay-2 mt-4 text-lg text-gray-500 dark:text-gray-400">
-            {t("description")}
-          </p>
-        </div>
+        <SectionHeading
+          eyebrow="Contact"
+          title={t("title")}
+          description={t("description")}
+          className="mb-12"
+        />
 
         {submitStatus.type && (
           <div
