@@ -6,10 +6,10 @@ import { useScrollReveal } from "@/hooks/useScrollReveal";
 import { getRevealDelayClass } from "@/lib/constants";
 
 const WORKS_DATA = [
-  { id: "cloudInfra", image: "/images/works/cloud.jpg" },
-  { id: "ecSite", image: "/images/works/ec.jpg" },
-  { id: "businessSystem", image: "/images/works/system.jpg" },
-  { id: "aiChatbot", image: "/images/works/ai-chatbot.jpg" },
+  { id: "cloudInfra", image: "/images/works/cloud-motif.jpg" },
+  { id: "ecSite", image: "/images/works/ec-motif.jpg" },
+  { id: "businessSystem", image: "/images/works/system-motif.jpg" },
+  { id: "aiChatbot", image: "/images/works/ai-chatbot-motif.jpg" },
 ] as const;
 
 type WorkCardProps = {
