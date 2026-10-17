@@ -1,0 +1,110 @@
+---
+title: "PostgreSQL 19 RC1: 업그레이드 전에 확인할 비호환 항목"
+description: "PostgreSQL 19가 10월 15일 첫 Release Candidate에 도달했습니다. 신기능 소개 대신, 기존 Database를 깨뜨릴 수 있는 기본값 변경과 제거된 동작을 확인용 Query와 함께 정리합니다."
+date: "2026-10-18"
+status: "published"
+tags: ["PostgreSQL", "Database", "Migration", "Upgrade", "Operations"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-19-rc1-upgrade-incompatibilities-checklist-2026"
+---
+
+PostgreSQL 19는 10월 15일에 첫 Release Candidate(RC1)가 나왔고, 정식 릴리스는 이번 달로 예정되어 있습니다. `REPACK` 명령, Plan 제어 확장, Sequence Replication 같은 신기능은 이미 많이 소개되었습니다. 이 글은 반대로, Release Notes의 "Migration to Version 19" 항목 중 운영 Database를 깨뜨릴 수 있는 것과, `pg_upgrade` 전에 이를 확인하는 방법을 정리합니다.
+
+내용은 RC1 Release Notes를 기준으로 합니다. 정식 릴리스 전에 바뀔 수 있으므로 19.0이 나오면 다시 확인하시기 바랍니다.
+
+## 조용히 동작을 바꾸는 기본값
+
+이 항목들은 Error를 내지 않고, 업그레이드 후의 동작만 바꿉니다.
+
+**JIT가 기본적으로 꺼집니다.** 큰 Table에 대한 분석 Query에서 JIT 혜택을 보고 있었다면 실행 시간이 달라질 수 있습니다. 판단 전에 비교해 보십시오. 많은 OLTP Workload에서는 영향이 없습니다. 이전 동작으로 되돌리려면 명시적으로 설정합니다.
+
+```sql
+ALTER SYSTEM SET jit = on;
+SELECT pg_reload_conf();
+```
+
+**`max_locks_per_transaction` 기본값이 128이 됩니다(기존 64).** Release Notes에 따르면 Lock 할당 방식이 바뀌었기 때문에, 직접 조정한 값은 같은 용량을 유지하려면 사실상 두 배로 늘려야 합니다. 직접 지정했는지 확인합니다.
+
+```sql
+SELECT name, setting, source FROM pg_settings
+WHERE name IN ('max_locks_per_transaction', 'jit', 'log_lock_waits', 'wal_compression');
+```
+
+`source = 'configuration file'`인 항목은 직접 정한 값이므로 재검토 대상입니다.
+
+**`log_lock_waits`가 기본으로 켜집니다.** 진단에는 좋지만, 종량제 Log 서비스로 보내고 있다면 부하가 높은 시스템에서 Log 줄 수가 늘어납니다.
+
+**TOAST 압축 기본값이 `lz4`가 됩니다.** 새 데이터에 적용되고 기존 데이터는 그대로입니다. 대체로 이득이지만, 버전 간 Table 크기를 비교할 때는 염두에 두십시오.
+
+## SQL과 도구의 동작 변경
+
+**`json_array()`는 Subquery 결과가 0행일 때 `NULL` 대신 빈 배열을 반환합니다.** 코드에서 검색해 보십시오.
+
+```bash
+grep -rn "json_array(" --include="*.sql" --include="*.py" --include="*.ts" .
+```
+
+`NULL`을 "항목 없음"으로 취급하던 Application 코드는 점검이 필요합니다.
+
+**`COPY FROM ... WHERE`에서 System Column을 참조할 수 없습니다.** 드문 경우이지만 `ctid`나 `tableoid`로 필터링하는 ETL Script는 실패합니다.
+
+**`standard_conforming_strings`가 항상 on입니다.** 이 설정이 off인 Database에서 이전 버전 `pg_dump`로 만든 Dump는 올바르게 복원되지 않습니다. off 상태의 레거시 DB가 있다면 Dump와 Restore를 별도로 검증하십시오.
+
+**`log_autovacuum_min_duration`은 이제 VACUUM Log만 제어합니다.** ANALYZE Log는 새로 생긴 `log_autoanalyze_min_duration`으로 옮겨졌습니다. Autovacuum Log를 Alert에 쓰고 있다면 새 설정을 추가하십시오.
+
+**Monitoring 관련 이름 변경.** `pg_stat_subscription_stats.sync_error_count`는 `sync_table_error_count`로, Wait Event 유형 `BUFFERPIN`은 `BUFFER`로 바뀌었습니다. 이전 이름을 참조하는 Dashboard와 Alert Rule은 Error 없이 비어 버리므로 알아채기 어렵습니다. Grafana와 Prometheus 설정을 검색하십시오.
+
+```bash
+grep -rEn "sync_error_count|BUFFERPIN" ./monitoring
+```
+
+## `pg_upgrade`를 막는 항목
+
+**`inet`/`cidr` GiST Index의 opclass.** 이 타입들의 기본 opclass는 반환해야 할 행을 제외할 수 있었던 `btree_gist` 쪽에서 변경되었습니다. 해당 Index가 있는 Cluster는 `pg_upgrade`가 거부합니다. 미리 찾아 두십시오.
+
+```sql
+SELECT n.nspname, c.relname AS index_name, o.opcname
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_opclass o ON o.oid = ANY (i.indclass::oid[])
+WHERE o.opcname IN ('gist_inet_ops', 'gist_cidr_ops');
+```
+
+이 Query는 출발점으로 사용하고, opclass 이름은 설치된 Extension의 Release Notes와 대조하십시오. 해당 Index는 업그레이드 전에 기존 Cluster에서 재생성합니다.
+
+**`MULE_INTERNAL` Encoding이 제거됩니다.** 사용 중인 Database가 있다면 다른 Encoding으로 Dump 후 Restore해야 합니다.
+
+```sql
+SELECT datname, pg_encoding_to_char(encoding) FROM pg_database;
+```
+
+**Carriage Return이나 줄바꿈이 포함된 이름**은 Database, Role, Tablespace에서 더 이상 허용되지 않으며, 해당 Cluster는 `pg_upgrade`가 거부합니다. 드문 경우이지만 10초짜리 Query가 실패한 점검 시간보다 훨씬 쌉니다.
+
+## 인증 관련 변경
+
+- **RADIUS 지원이 제거됩니다.** `pg_hba.conf`에 `radius`를 쓰는 줄이 있다면 업그레이드 전에 다른 방식으로 옮겨야 합니다.
+- **MD5 Password로 로그인에 성공하면 경고가 출력됩니다.** `md5_password_warnings`로 끌 수 있습니다. SCRAM 전환을 유도하는 변경입니다. MD5 Hash를 쓰는 Role은 쉽게 찾을 수 있습니다.
+
+```sql
+SELECT rolname FROM pg_authid WHERE rolpassword LIKE 'md5%';
+```
+
+이 Role들을 지금 SCRAM으로 옮기면 경고와 장기적인 취약점이 함께 사라집니다.
+
+## Extension과 Driver
+
+- **`postgres_fdw`가 `READ ONLY`와 `DEFERRABLE`을 원격 Session에 전달합니다.** 로컬의 read-only Transaction에서 Foreign Table을 통해 쓰기를 할 수 없게 됩니다. 이전 동작에 의존하던 코드를 확인하십시오.
+- **Extension 개발자**: `get_relation_info_hook`이 제거되고 `build_simple_rel_hook`으로 대체되었습니다. Index Access Method Handler는 정적 구조체를 반환해야 합니다. 자체 Build한 Extension이나 소규모 서드파티 Extension은 재빌드와 아마도 코드 수정이 필요합니다. 업그레이드 일정을 잡기 전에, 로드하는 모든 Extension에 19 호환 릴리스가 있는지 확인하십시오.
+
+## 권장 작업 순서
+
+1. 운영 Database를 복원한 Copy에서 위 점검을 실행합니다.
+2. `SELECT * FROM pg_extension;`으로 Extension을 나열하고 각각의 19 지원 여부를 확인합니다.
+3. 그 Copy에서 `pg_upgrade --check`를 리허설합니다. 차단 항목을 비용 없이 잡아낼 수 있습니다.
+4. Staging을 업그레이드하고 평소 Load Test를 수행합니다. JIT 영향을 받는 Query와 Lock 관련 Error에 특히 주목합니다.
+5. 이름이 바뀐 Object에 맞춰 Monitoring Query와 Dashboard를 업그레이드와 같은 변경에서 수정합니다.
+6. 중요한 시스템은 19.0과 첫 Minor Release를 기다린 뒤에 옮깁니다. Database의 `.0` 버전은 의도적으로 위험을 감수하는 선택입니다.
+
+이 목록에 극적인 항목은 없습니다. PostgreSQL Major 버전 업그레이드의 위험은 소수의 기본값 변경과 이름 변경에서 나오는 경우가 많고, 그래서 막연한 자신감보다 글로 적은 Checklist가 더 믿을 만합니다.

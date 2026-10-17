@@ -1,0 +1,110 @@
+---
+title: "PostgreSQL 19 RC1: アップグレード前に確認すべき非互換項目"
+description: "PostgreSQL 19が10月15日に最初のリリース候補に到達しました。新機能の紹介ではなく、既存のデータベースを壊し得るデフォルト変更と削除された挙動を、確認用のクエリ付きでまとめます。"
+date: "2026-10-18"
+status: "published"
+tags: ["PostgreSQL", "Database", "Migration", "Upgrade", "Operations"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-19-rc1-upgrade-incompatibilities-checklist-2026"
+---
+
+PostgreSQL 19は10月15日に最初のリリース候補(RC1)が出され、正式リリースは今月中の予定です。`REPACK` コマンド、プラン制御の拡張、シーケンスのレプリケーションといった新機能はすでに多く取り上げられています。この記事では視点を変え、リリースノートの「Migration to Version 19」にある項目のうち、本番データベースを壊し得るものと、`pg_upgrade` の前に確認する方法を整理します。
+
+内容はRC1のリリースノートに基づいています。正式版までに変わる可能性があるため、19.0のリリース時に読み直してください。
+
+## 気づかないうちに挙動が変わるデフォルト
+
+これらはエラーにならず、アップグレード後の挙動だけが変わります。
+
+**JITがデフォルトで無効になります。** 大きなテーブルへの分析クエリでJITの恩恵を受けているなら、実行時間が変わることがあります。判断する前に比較してください。多くのOLTPワークロードでは影響がありません。従来の挙動に戻す場合は明示的に設定します。
+
+```sql
+ALTER SYSTEM SET jit = on;
+SELECT pg_reload_conf();
+```
+
+**`max_locks_per_transaction` のデフォルトが128になります(従来は64)。** リリースノートによると、ロックの割り当て方式が変わったため、明示的に調整している値は同じ容量を保つには実質2倍にする必要があります。上書きしているか確認します。
+
+```sql
+SELECT name, setting, source FROM pg_settings
+WHERE name IN ('max_locks_per_transaction', 'jit', 'log_lock_waits', 'wal_compression');
+```
+
+`source = 'configuration file'` のものは自分で決めた値なので、見直しの対象です。
+
+**`log_lock_waits` がデフォルトで有効になります。** 診断には好都合ですが、従量課金のログサービスに送っている場合、負荷の高いシステムでは行数が増えます。
+
+**TOASTの圧縮方式のデフォルトが `lz4` になります。** 新しいデータに適用され、既存のデータは変わりません。多くは改善ですが、バージョン間でテーブルサイズを比較するときは念頭に置いてください。
+
+## SQLとツールの挙動変更
+
+**`json_array()` は、サブクエリが0行のとき `NULL` ではなく空配列を返します。** コードを検索してください。
+
+```bash
+grep -rn "json_array(" --include="*.sql" --include="*.py" --include="*.ts" .
+```
+
+`NULL` を「要素なし」として扱っているアプリケーションコードは確認が必要です。
+
+**`COPY FROM ... WHERE` でシステム列を参照できなくなります。** まれですが、`ctid` や `tableoid` で絞り込むETLスクリプトは失敗します。
+
+**`standard_conforming_strings` が常にonになります。** 旧バージョンの `pg_dump` で、この設定がoffのデータベースから作成したダンプは正しくリストアできません。offのレガシーDBがある場合は、ダンプとリストアを個別に検証してください。
+
+**`log_autovacuum_min_duration` はVACUUMのログのみを制御するようになります。** ANALYZEのログは新設の `log_autoanalyze_min_duration` に移りました。autovacuumログをアラートに使っているなら、新しい設定を追加します。
+
+**監視まわりのリネーム。** `pg_stat_subscription_stats.sync_error_count` は `sync_table_error_count` に、待機イベント種別 `BUFFERPIN` は `BUFFER` に変わりました。旧名を参照するダッシュボードやアラートルールは、エラーにならず空になるだけなので気づきにくくなります。GrafanaやPrometheusの設定を検索してください。
+
+```bash
+grep -rEn "sync_error_count|BUFFERPIN" ./monitoring
+```
+
+## `pg_upgrade` を止める項目
+
+**`inet`/`cidr` のGiSTインデックスのopclass。** これらの型のデフォルトopclassは、返すべき行を除外し得た `btree_gist` 側のものから変更されました。該当するインデックスがあるクラスターは `pg_upgrade` に拒否されます。先に見つけておきます。
+
+```sql
+SELECT n.nspname, c.relname AS index_name, o.opcname
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_opclass o ON o.oid = ANY (i.indclass::oid[])
+WHERE o.opcname IN ('gist_inet_ops', 'gist_cidr_ops');
+```
+
+このクエリは出発点として扱い、opclass名は導入している拡張のリリースノートと照合してください。該当するインデックスは、アップグレード前に旧クラスター上で再作成します。
+
+**`MULE_INTERNAL` エンコーディングが削除されます。** 使っているデータベースがあれば、別のエンコーディングでダンプしてリストアする必要があります。
+
+```sql
+SELECT datname, pg_encoding_to_char(encoding) FROM pg_database;
+```
+
+**キャリッジリターンや改行を含む名前**は、データベース、ロール、テーブルスペースで使えなくなり、該当するクラスターは `pg_upgrade` に拒否されます。珍しいケースですが、10秒のクエリのほうが、失敗したメンテナンスウィンドウより安上がりです。
+
+## 認証まわりの変更
+
+- **RADIUSのサポートが削除されます。** `pg_hba.conf` に `radius` を使う行があれば、アップグレード前に別の方式へ移行が必要です。
+- **MD5パスワードでのログイン成功時に警告が出ます。** `md5_password_warnings` で抑止できます。SCRAMへの移行を促す変更です。MD5ハッシュのロールは簡単に見つかります。
+
+```sql
+SELECT rolname FROM pg_authid WHERE rolpassword LIKE 'md5%';
+```
+
+これらのロールを今のうちにSCRAMへ移すと、警告と長期的な弱点の両方がなくなります。
+
+## 拡張とドライバー
+
+- **`postgres_fdw` が `READ ONLY` と `DEFERRABLE` をリモートセッションへ伝えます。** ローカルのread-onlyトランザクションから外部テーブル経由で書き込むことはできなくなります。従来の挙動に依存していたコードを確認してください。
+- **拡張の開発者向け**: `get_relation_info_hook` は削除され `build_simple_rel_hook` に置き換えられました。インデックスAMのハンドラーは静的な構造体を返す必要があります。自社でビルドしている拡張や小規模なサードパーティ製のものは、再ビルドと、おそらくコード修正が必要です。アップグレードを予定する前に、読み込んでいるすべての拡張に19対応版があることを確認してください。
+
+## 作業の進め方
+
+1. 本番をリストアしたコピーに対して、上記の確認を実行する。
+2. `SELECT * FROM pg_extension;` で拡張を一覧し、各拡張の19対応を確認する。
+3. そのコピーで `pg_upgrade --check` を予行する。ブロッキング項目を無料で検出できます。
+4. ステージングをアップグレードし、通常の負荷テストを実施する。JITの影響を受けるクエリとロック関連のエラーに注目する。
+5. リネームされたオブジェクトに合わせて、監視クエリとダッシュボードをアップグレードと同じ変更で更新する。
+6. 重要なシステムは、19.0と最初のマイナーリリースを待ってから移行する。データベースの `.0` は、意図的にリスクを取る選択です。
+
+このリストに劇的な項目はありません。PostgreSQLのメジャーバージョンアップのリスクは、少数のデフォルト変更とリネームから生じることが多く、だからこそ漠然とした自信よりも書き出したチェックリストのほうが頼りになります。

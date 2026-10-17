@@ -1,0 +1,110 @@
+---
+title: "PostgreSQL 19 RC1: The Incompatibilities to Check Before You Upgrade"
+description: "PostgreSQL 19 reached its first release candidate on October 15. Skip the feature tour; here are the changed defaults and removed behaviours that can break an existing database, with queries to check for each."
+date: "2026-10-18"
+status: "published"
+tags: ["PostgreSQL", "Database", "Migration", "Upgrade", "Operations"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-19-rc1-upgrade-incompatibilities-checklist-2026"
+---
+
+PostgreSQL 19 reached its first release candidate on October 15, with the final release planned for this month. The feature list (the `REPACK` command, plan advice extensions, sequence replication) has been covered widely, so this post goes the other way: which parts of the "Migration to Version 19" section in the release notes can break a production database, and how to check for each before you run `pg_upgrade`.
+
+This is based on the RC1 release notes. Details can still change before the final release, so re-read the notes when 19.0 ships.
+
+## Defaults that change behaviour silently
+
+These do not fail loudly. They change how your system behaves after the upgrade.
+
+**JIT is off by default.** If you run analytical queries against large tables and your plans benefit from JIT, expect different timings. Compare before deciding; many OLTP workloads see no loss. To restore the old behaviour, set it explicitly:
+
+```sql
+ALTER SYSTEM SET jit = on;
+SELECT pg_reload_conf();
+```
+
+**`max_locks_per_transaction` defaults to 128 (was 64).** The release notes point out that because lock allocation changed, an explicitly tuned value effectively needs to be doubled to keep the same capacity. Check whether you override it:
+
+```sql
+SELECT name, setting, source FROM pg_settings
+WHERE name IN ('max_locks_per_transaction', 'jit', 'log_lock_waits', 'wal_compression');
+```
+
+Anything with `source = 'configuration file'` is a value you chose and should revisit.
+
+**`log_lock_waits` is on by default.** Good news for diagnostics, but if you ship logs to a metered service, expect more lines on busy systems.
+
+**TOAST compression defaults to `lz4`.** New data will use it; existing data is unchanged. Usually a win, but note it if you compare table sizes across versions.
+
+## Behaviour changes in SQL and tools
+
+**`json_array()` returns an empty array instead of `NULL`** when its subquery produces no rows. Search your code for it:
+
+```bash
+grep -rn "json_array(" --include="*.sql" --include="*.py" --include="*.ts" .
+```
+
+Application code that treated `NULL` as "no items" needs a look.
+
+**`COPY FROM ... WHERE` can no longer reference system columns.** Rare, but ETL scripts that filter on `ctid` or `tableoid` will fail.
+
+**`standard_conforming_strings` is always on.** Dumps created by older `pg_dump` against a database where it was off will not restore correctly. If you have a legacy database with it off, test a dump and restore specifically.
+
+**`log_autovacuum_min_duration` now controls only vacuum logging.** Analyze logging moves to the new `log_autoanalyze_min_duration`. If you rely on autovacuum logs for alerting, add the new setting.
+
+**Monitoring renames.** `pg_stat_subscription_stats.sync_error_count` became `sync_table_error_count`, and the wait event type `BUFFERPIN` is now `BUFFER`. Dashboards and alert rules that reference the old names will go empty without erroring. Grep your Grafana and Prometheus configs:
+
+```bash
+grep -rEn "sync_error_count|BUFFERPIN" ./monitoring
+```
+
+## Things that block `pg_upgrade`
+
+**`inet`/`cidr` GiST index opclasses.** The default opclass for these types changed away from the `btree_gist` one, because the old opclass could exclude rows that should be returned. `pg_upgrade` refuses clusters that have such indexes. Find them first:
+
+```sql
+SELECT n.nspname, c.relname AS index_name, o.opcname
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_opclass o ON o.oid = ANY (i.indclass::oid[])
+WHERE o.opcname IN ('gist_inet_ops', 'gist_cidr_ops');
+```
+
+Treat this query as a starting point and compare the opclass names against the release notes for your installed extensions. Rebuild affected indexes on the old cluster before the upgrade.
+
+**`MULE_INTERNAL` encoding is removed.** If any database uses it, it must be dumped and restored with another encoding:
+
+```sql
+SELECT datname, pg_encoding_to_char(encoding) FROM pg_database;
+```
+
+**Names containing carriage returns or line feeds** are no longer allowed for databases, roles, and tablespaces, and `pg_upgrade` rejects such clusters. Unusual, but a 10-second query is cheaper than a failed maintenance window.
+
+## Authentication changes
+
+- **RADIUS support is removed.** If any `pg_hba.conf` line uses `radius`, you need another method before upgrading.
+- **MD5 passwords now produce a warning on successful login**, with `md5_password_warnings` to silence it. This is a nudge toward SCRAM. Finding MD5 hashes is straightforward:
+
+```sql
+SELECT rolname FROM pg_authid WHERE rolpassword LIKE 'md5%';
+```
+
+Migrating these roles to SCRAM now removes both the warning and a long-term weakness.
+
+## Extensions and drivers
+
+- **`postgres_fdw` forwards `READ ONLY` and `DEFERRABLE`** to remote sessions, so a read-only local transaction can no longer write through a foreign table. Check any code that relied on the old behaviour.
+- **Extension authors**: `get_relation_info_hook` is removed in favour of `build_simple_rel_hook`, and index access method handlers must return static structures. Anything compiled in-house or from a small third-party project needs a rebuild and probably a code change. Check that every extension you load has a 19-compatible release before scheduling the upgrade.
+
+## Suggested order of work
+
+1. Run the checks above against a restored copy of production.
+2. List extensions with `SELECT * FROM pg_extension;` and confirm 19 support for each.
+3. Rehearse `pg_upgrade --check` on that copy. It catches the blocking items for free.
+4. Upgrade a staging system and run your normal load test. Look specifically at JIT-sensitive queries and lock-related errors.
+5. Update monitoring queries and dashboards for the renamed objects in the same change as the upgrade.
+6. Wait for 19.0 and the first minor release before moving critical systems. A `.0` on a database is a deliberate risk choice.
+
+Nothing in this list is dramatic. The upgrade risk in a new PostgreSQL major version tends to come from a handful of defaults and renames, which is exactly why a written checklist beats general confidence.
