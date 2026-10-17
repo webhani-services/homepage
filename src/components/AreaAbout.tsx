@@ -1,5 +1,6 @@
 "use client";
 import { useTranslations } from "next-intl";
+import SectionHeading from "@/components/SectionHeading";
 import { useScrollReveal } from "@/hooks/useScrollReveal";
 
 const services = [
@@ -93,14 +94,7 @@ export default function AreaAbout() {
       ref={revealRef}
     >
       <div className="max-w-7xl mx-auto px-4 sm:px-6">
-        <div className="text-center mb-16">
-          <span className="reveal text-amber-600 dark:text-amber-400 text-sm font-semibold tracking-[0.15em] uppercase mb-4 block">
-            About
-          </span>
-          <h2 className="reveal reveal-delay-1 text-4xl md:text-5xl font-bold text-gray-900 dark:text-gray-100 tracking-tight">
-            {t("title")}
-          </h2>
-        </div>
+        <SectionHeading eyebrow="About" title={t("title")} />
 
         <div className="reveal reveal-delay-2 relative">
           <div className="bg-white dark:bg-[var(--dark-surface)] rounded-2xl overflow-hidden border border-gray-100 dark:border-gray-800 shadow-sm">

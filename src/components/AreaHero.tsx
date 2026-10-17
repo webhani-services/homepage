@@ -1,38 +1,23 @@
 "use client";
-import Image from "next/image";
 import { useTranslations } from "next-intl";
 
 export default function AreaHero() {
   const t = useTranslations("hero");
 
-  const backgroundImageSrc = "/images/hero-bg.jpg";
-
   return (
-    <section className="relative h-screen min-h-[600px] flex items-center justify-center overflow-hidden">
-      {/* Background image */}
-      <div className="absolute inset-0 z-0">
-        <Image
-          src={backgroundImageSrc}
-          alt={t("backgroundImage.alt")}
-          fill
-          sizes="100vw"
-          className="object-cover scale-105"
-          priority
-        />
-        {/* Multi-layer overlay for depth */}
-        <div className="absolute inset-0 bg-gradient-to-b from-black/60 via-black/40 to-black/70" />
-        <div className="absolute inset-0 bg-gradient-to-r from-amber-900/20 via-transparent to-amber-900/20" />
-      </div>
+    <section className="relative h-screen min-h-[600px] flex items-center overflow-hidden bg-[var(--dark-bg)]">
+      <div aria-hidden="true" className="hero-glow absolute inset-0" />
+      <div aria-hidden="true" className="hero-dots absolute inset-0" />
 
       {/* Content */}
-      <div className="relative z-10 text-center text-white px-4 max-w-4xl mx-auto">
-        <div className="inline-block mb-6 fade-in">
+      <div className="relative z-10 w-full max-w-7xl mx-auto px-4 md:px-8 lg:px-16 text-white">
+        <div className="inline-block mb-8 fade-in">
           <span className="text-amber-400 text-sm md:text-base font-medium tracking-[0.25em] uppercase">
             webhani
           </span>
         </div>
         <h1
-          className="text-4xl md:text-6xl lg:text-7xl font-bold mb-8 fade-in leading-[1.15] tracking-tight"
+          className="text-4xl md:text-6xl lg:text-7xl font-medium mb-8 fade-in leading-[1.2] tracking-tight"
           style={{ animationDelay: "0.15s" }}
         >
           {t("title")
@@ -45,7 +30,7 @@ export default function AreaHero() {
             ))}
         </h1>
         <p
-          className="text-lg md:text-xl mb-10 fade-in text-white/80 max-w-2xl mx-auto leading-relaxed"
+          className="text-lg md:text-xl mb-12 fade-in text-white/60 max-w-2xl leading-relaxed"
           style={{ animationDelay: "0.3s" }}
         >
           {t("subtitle")
@@ -65,8 +50,8 @@ export default function AreaHero() {
                 behavior: "smooth",
               });
             }}
-            className="group relative inline-flex items-center gap-2 bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold
-            py-4 px-10 rounded-full transition-all duration-300 shadow-lg shadow-amber-500/25 hover:shadow-xl hover:shadow-amber-400/30"
+            className="group relative inline-flex items-center gap-2 bg-amber-500 hover:bg-amber-400 text-gray-900 font-medium
+            py-4 px-10 rounded-full transition-colors duration-300"
           >
             {t("button")}
             <svg
