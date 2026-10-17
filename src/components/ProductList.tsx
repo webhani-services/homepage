@@ -1,8 +1,6 @@
 "use client";
 import Image from "next/image";
 import { useTranslations } from "next-intl";
-import SectionHeading from "@/components/SectionHeading";
-import { useScrollReveal } from "@/hooks/useScrollReveal";
 import { getRevealDelayClass } from "@/lib/constants";
 
 const PRODUCTS_DATA = [
@@ -41,9 +39,9 @@ const ProductCard = ({ product, index, t }: ProductCardProps) => (
       />
     </div>
     <div className="p-6">
-      <h3 className="text-xl font-bold text-gray-900 dark:text-gray-100 mb-2">
+      <h4 className="text-xl font-bold text-gray-900 dark:text-gray-100 mb-2">
         {t(`items.${product.id}.name`)}
-      </h3>
+      </h4>
       <p className="text-sm text-gray-500 dark:text-gray-400 leading-relaxed mb-4">
         {t(`items.${product.id}.description`)}
       </p>
@@ -84,34 +82,24 @@ const ProductCard = ({ product, index, t }: ProductCardProps) => (
   </div>
 );
 
-export default function AreaProducts() {
+// Rendered inside AreaServices, whose scroll-reveal observer covers these `.reveal` elements
+export default function ProductList() {
   const t = useTranslations("products");
-  const revealRef = useScrollReveal();
 
   return (
-    <section
-      id="products"
-      className="section-padding bg-white dark:bg-[var(--dark-bg)] relative"
-      ref={revealRef}
-    >
-      <div className="max-w-7xl mx-auto">
-        <SectionHeading
-          eyebrow="Products"
-          title={t("title")}
-          description={t("description")}
-        />
+    <div id="products" className="mt-24">
+      <h3 className="reveal text-2xl md:text-3xl font-medium text-gray-900 dark:text-gray-100">
+        {t("title")}
+      </h3>
+      <p className="reveal reveal-delay-1 mt-3 mb-10 text-lg text-gray-500 dark:text-gray-400 leading-relaxed max-w-2xl">
+        {t("description")}
+      </p>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-          {PRODUCTS_DATA.map((product, index) => (
-            <ProductCard
-              key={product.id}
-              product={product}
-              index={index}
-              t={t}
-            />
-          ))}
-        </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+        {PRODUCTS_DATA.map((product, index) => (
+          <ProductCard key={product.id} product={product} index={index} t={t} />
+        ))}
       </div>
-    </section>
+    </div>
   );
 }
