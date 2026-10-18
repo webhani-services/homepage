@@ -1,0 +1,81 @@
+---
+title: "More Code, Same Output: Why Review Capacity Is the Real Limit on AI Coding Agents"
+description: "Recent research on AI coding agent adoption shows commits and PRs rising while issue resolution barely moves. What that suggests about review capacity, and how to adjust team workflow."
+date: "2026-10-19"
+status: "published"
+tags: ["AI", "Code Review", "Developer Productivity", "Engineering Management", "Coding Agents"]
+thumbnail: ""
+author: "webhani"
+slug: "ai-agents-more-code-same-output-review-bottleneck-2026-10"
+---
+
+A study circulating this week covers more than 700 companies and compares teams before and after adopting AI coding agents. According to the secondary coverage we could find (the primary paper was not reachable from our environment, so treat the exact figures as approximate), commits rose by roughly 20% and pull requests by roughly 23%. Jira issue and epic resolution rates barely changed. A separate report claims PR merge times grew by about half at some adopters. The data reportedly ends in March 2026.
+
+We cannot vouch for every number. But the shape of the result matches what we see in client projects: agents make the writing step cheaper, and the cost moves somewhere else.
+
+## Where the cost moves
+
+A change only counts as delivered once someone has understood it, verified it, and merged it. Agents increase the volume of changes entering that pipeline without increasing the number of people qualified to approve them. Three effects follow.
+
+1. **Review queues grow.** More PRs arrive per reviewer, and each is often larger than a hand-written equivalent.
+2. **Review quality per PR drops under load.** Reviewers skim, or approve on the basis that tests pass.
+3. **Rework rises.** Code that looked plausible but misread the requirement comes back as follow-up PRs, which inflate the PR count without closing issues.
+
+If you measure output by commits or PRs, all three look like progress. If you measure by issues resolved, they look like nothing.
+
+## Measure the right thing
+
+Before changing process, change what you track. We suggest four numbers per repository, pulled from the GitHub API or your Git host:
+
+- PR open-to-merge time (median and 90th percentile)
+- PR size (lines changed, files touched)
+- Review wait time (open until first review)
+- Reopen/follow-up rate (PRs that reference a prior PR as a fix)
+
+A minimal script using the GitHub CLI gets you a baseline:
+
+```bash
+gh pr list --state merged --limit 200 \
+  --json number,createdAt,mergedAt,additions,deletions \
+  | jq -r '.[] |
+      [.number,
+       ((.mergedAt|fromdateiso8601) - (.createdAt|fromdateiso8601))/3600,
+       (.additions + .deletions)] | @csv'
+```
+
+Run it for a period before agent adoption and a period after. If the median hours-to-merge and PR size both climbed, you are looking at the pattern above.
+
+## Adjustments that help
+
+**Cap PR size, including for agents.** Put the limit in the agent's instructions (for example in `CLAUDE.md` or `AGENTS.md`): one concern per PR, a target under a few hundred changed lines, split otherwise. Small PRs are the cheapest review-capacity improvement available.
+
+**Make the agent write the review aid.** Ask for a PR description that states the intent, lists the files that matter, and names the risky parts. A reviewer who is told where to look spends less time rediscovering the change.
+
+**Move mechanical checks out of human review.** Type checking, linting, formatting, dependency policies, and secret scanning belong in CI. Reserve human attention for design, requirements fit, and security-sensitive paths.
+
+```yaml
+# .github/workflows/pr-checks.yml (excerpt)
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm test -- --coverage
+```
+
+**Tie work to issues before it starts.** Rework is cheaper to prevent than to review. Require a linked issue with acceptance criteria, and give the agent that text as its task. A vague prompt yields a plausible but misaligned change.
+
+**Budget review time explicitly.** If the team adopts agents, reserve calendar time for review the same way you reserve time for meetings. Otherwise review becomes the thing that slips.
+
+## What we would not do
+
+Using a second agent to rubber-stamp the first agent's PR can add useful signal, such as catching a missing null check, but it does not replace a human who understands the requirement. We treat automated review as a filter that shortens the human's list, not as an approver.
+
+We also would not set targets such as "30% more PRs per engineer". That metric rewards exactly the behavior the research suggests is not translating into shipped value.
+
+## Takeaway
+
+Adopting coding agents is an investment in generation capacity. The constraint most teams hit next is review and integration capacity. Measure merge time and resolution rate rather than commit counts, keep PRs small, push mechanical checks into CI, and plan reviewer time on purpose. If you want help establishing a baseline or tuning agent instructions for your repositories, that is work we do with clients regularly.

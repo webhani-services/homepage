@@ -1,0 +1,88 @@
+---
+title: "Valkey RESTORE and TLS CVEs: Patched Versions and an ACL Hardening Checklist"
+description: "Two Valkey vulnerabilities, a RESTORE stream flaw and a TLS use-after-free, were fixed in recent point releases. Which versions to run, and how ACLs limit the blast radius."
+date: "2026-10-19"
+status: "published"
+tags: ["Valkey", "Redis", "Security", "Caching", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "valkey-restore-tls-cves-patch-acl-hardening-2026-10"
+---
+
+Linux distributions have been shipping Valkey security updates since late summer. Red Hat's advisory (RHSA-2026:64807) rebases RHEL 9 and 10 to Valkey 8.0.10, and Ubuntu's USN-8771-1 followed in September. Two of the issues are worth understanding rather than just patching, because both can be narrowed by configuration you control. Details below come from the NVD entries and distribution advisories; note that aggregator sites disagreed on some advisory numbers, so confirm against your own vendor.
+
+## The two issues
+
+**CVE-2026-63639: malformed stream payload in RESTORE.** A crafted RDB stream payload sent through `RESTORE` can trigger memory corruption, with remote code execution as the worst case. The attacker must be able to issue `RESTORE`. NVD published it on 2026-08-18.
+
+**CVE-2026-56684: TLS pending-data use-after-free.** Incorrect handling of pending TLS data can crash the server and may allow code execution. Exploitation requires an authenticated client able to run `CLIENT KILL`.
+
+Both are fixed in 7.2.14, 8.0.10, 8.1.9, 9.0.5, and 9.1.1. Ubuntu's notice also includes a cluster slot migration denial of service (CVE-2026-85522).
+
+Both require an authenticated client with specific command permissions. That is the useful part: they are not unauthenticated internet-facing bugs, which changes how urgently you patch and how you reduce exposure while you do.
+
+## Step 1: Find what you run
+
+```bash
+valkey-cli INFO server | grep -E "valkey_version|redis_version"
+```
+
+Check every environment, including staging, CI service containers, and managed instances where you do not control the version. For managed services, check the provider's status page for patched engine versions rather than assuming.
+
+Compare against the fixed list above. If you are on 8.0 or 8.1, you need 8.0.10 or 8.1.9 respectively; do not jump branches during an emergency patch.
+
+## Step 2: Restrict dangerous commands with ACLs
+
+The default user in many deployments can run everything. Application code rarely needs `RESTORE` or `CLIENT KILL`. Create a least-privilege user:
+
+```text
+# valkey.conf or ACL file
+user default off
+user app on >REPLACE_WITH_STRONG_SECRET ~app:* &* +@read +@write +@connection -@dangerous -@admin
+user ops on >REPLACE_WITH_OTHER_SECRET ~* &* +@all
+```
+
+`-@dangerous` removes commands such as `KEYS`, `FLUSHALL`, and `DEBUG`. Verify what your server version puts in each category before relying on it:
+
+```bash
+valkey-cli ACL CAT dangerous
+valkey-cli ACL DRYRUN app RESTORE app:key 0 payload
+valkey-cli ACL DRYRUN app CLIENT KILL ID 1
+```
+
+`ACL DRYRUN` should report that `app` lacks permission for both. If a legitimate feature of your application uses `RESTORE` (some migration or cache-warming tools do), grant it to a dedicated user used only by that tool.
+
+## Step 3: Reduce network exposure
+
+- Bind to private interfaces only, and place Valkey in a network segment that only application hosts can reach.
+- Require authentication everywhere, including inside the VPC. A reachable unauthenticated instance makes these CVEs irrelevant because the attacker already has full control.
+- Enable TLS only where you need it, and patch promptly where you do, since CVE-2026-56684 affects TLS handling.
+- Do not expose the port through a load balancer or port-forward for debugging and leave it open.
+
+## Step 4: Patch with a rollback plan
+
+For replicated setups, patch replicas first, fail over, then patch the former primary. Check replication state before and after:
+
+```bash
+valkey-cli INFO replication
+```
+
+For a cache-only workload, a restart is cheap, but warm-up load on the database after a cold start can be significant. Stagger restarts and watch database CPU.
+
+## Step 5: Monitor for misuse
+
+Log or alert on `RESTORE` and `CLIENT KILL` from unexpected users. The ACL log helps:
+
+```bash
+valkey-cli ACL LOG 20
+```
+
+Repeated denials from the application user would indicate either a bug or probing.
+
+## If you are migrating from Redis
+
+If your fleet is on Redis, the same hardening applies, and the Red Hat advisory also lists a Redis RESTORE issue (CVE-2026-66373). Our earlier [Redis hardening checklist](/blog/redis-rce-cve-2026-hardening) covers the Redis-specific advisories from earlier in the year.
+
+## Takeaway
+
+Patch to a fixed point release in your current branch, remove `RESTORE` and `CLIENT KILL` from the application user, keep the service off untrusted networks, and monitor the ACL log. The ACL changes cost little and reduce risk from the next command-level vulnerability too. If you want help auditing caching infrastructure, including managed instances, webhani offers that as part of our cloud consulting work.

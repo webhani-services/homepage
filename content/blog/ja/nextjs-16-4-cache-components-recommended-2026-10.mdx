@@ -1,0 +1,87 @@
+---
+title: "Next.js 16.4：Cache Componentsが推奨デフォルトに。アップグレード前に確認すること"
+description: "Next.js 16.4は、すべてのアプリにCache Componentsを推奨し、新規プロジェクトでは有効化されます。既存コードベースへの影響と、段階的な導入手順を整理します。"
+date: "2026-10-19"
+status: "published"
+tags: ["Next.js", "React", "キャッシュ", "Turbopack", "Webパフォーマンス"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-4-cache-components-recommended-2026-10"
+---
+
+Next.js 16.4が10月初旬にstableとなりました。二次情報に基づく内容ですので（公式リリースノートを一行ずつ確認したわけではありません。実際に動く前にGitHubのv16.4.0タグをご確認ください）、要点は方針の変更です。Cache Componentsがすべてのアプリに推奨されるモデルとなり、`create-next-app`は新規プロジェクトで有効化します。そのほか、React 19.3の統合、Zstandard圧縮によるTurbopackのディスクキャッシュ約20〜25%削減、bundle analyzerへのルート別サマリー表示が報告されています。`ensureStatic`やprefetchの細かな制御、コーディングエージェント向けの`next upgrade --agent`も挙げられています。
+
+私たちが追っている週次ダイジェストは、stable版自体は大半が漸進的な変更だと評していました。コードの面ではその通りだと思います。重要なのは方向性です。フレームワークが進む先を示しており、Next.js 17ではCache Componentsがデフォルトになる見込みだとも伝えられています。
+
+## 既存アプリにとっての「推奨」の意味
+
+推奨は強制的な切り替えではないため、アップグレードで壊れることはありません。ただし、実務上は次の2点が効いてきます。
+
+1つ目は、ドキュメント、サンプル、ツールが明示的なキャッシュモデルを前提にしていくことです。新しいメンバーやコーディングエージェントは、デフォルトで`use cache`のコードを書くようになります。暗黙の`fetch`キャッシュに頼った既存のApp Routerコードは、その横で見慣れないものになります。
+
+2つ目は、暗黙のモデルにとどまる期間が長いほど、最終的な移行が大きくなることです。数十のルートにまたがって暗黙に決まったキャッシュの挙動は、後から棚卸しするのが困難です。
+
+## 1つの例で見るモデル
+
+Cache Componentsは、「フレームワークがキャッシュ可能かを推測する」方式を、明示的なディレクティブに置き換えます。
+
+```tsx
+// app/products/page.tsx
+import { Suspense } from "react";
+import { cacheLife } from "next/cache";
+
+async function getCategories() {
+  "use cache";
+  cacheLife("hours");
+  const res = await fetch("https://api.example.com/categories");
+  return res.json();
+}
+
+export default async function ProductsPage() {
+  const categories = await getCategories();
+  return (
+    <main>
+      <h1>Products</h1>
+      <ul>
+        {categories.map((c: { id: string; name: string }) => (
+          <li key={c.id}>{c.name}</li>
+        ))}
+      </ul>
+      <Suspense fallback={<p>Loading stock…</p>}>
+        <LiveStock />
+      </Suspense>
+    </main>
+  );
+}
+
+async function LiveStock() {
+  // キャッシュしない：リクエスト時のデータをSuspenseの内側でストリーミング
+  const res = await fetch("https://api.example.com/stock", { cache: "no-store" });
+  const stock = await res.json();
+  return <p>{stock.available} in stock</p>;
+}
+```
+
+キャッシュされたカテゴリ一覧を含む静的シェルはプリレンダリングできます。動的な部分は`Suspense`の内側でストリーミングされます。何がキャッシュされるかは推測ではなく、コードを見れば分かります。
+
+## 段階的な導入手順
+
+大きなアプリで、1つのプルリクエストで設定を切り替えることはお勧めしません。私たちの案件でうまくいった順序は次の通りです。
+
+1. **既存の設定のまま16.4へ上げる。** テストと本番ビルドを通します。単なるバージョンアップとして扱います。
+2. **データアクセスを棚卸しする。** ルートと、そこで行うfetchを一覧にし、静的、時間ベースの再検証、ユーザー単位、リクエスト単位に分類します。誤ってキャッシュされやすいのはユーザー単位のデータなので、ここは厳しく見ます。
+3. **ブランチでCache Componentsを有効にする。** リクエスト時のデータを`Suspense`境界の外で読んでいるルートが指摘されます。これはノイズではなく設計上の本物の問題ですので、最初に直します。
+4. **効果の出やすい箇所に`use cache`を付ける。** カテゴリ、ナビゲーション、料金表のような共有の参照データから始めます。デフォルトに頼らず、`cacheLife`を明示します。
+5. **ルートグループ単位で展開する。** マーケティングページが先、認証が必要な領域は最後です。
+6. **devではなく本番の挙動で検証する。** `next dev`と`next start`ではキャッシュの挙動が異なります。レスポンスヘッダーを確認し、可能ならデプロイ後にキャッシュヒット率も見ます。
+
+## 注意すべきリスク
+
+- **パーソナライズされた内容のキャッシュ。** Cookie、ヘッダー、セッションに由来するものをキャッシュ範囲の中に置いてはいけません。異なる2人のユーザーが異なる出力を受け取ることを確認するテストを追加してください。
+- **データの鮮度に関する認識のずれ。** 値がどれだけ古くてよいかは、プロダクトや事業側と合意しておきます。`cacheLife`を時間単位にするのは、技術判断であると同時にビジネス判断です。
+- **canaryとstableの差。** あるレポートでは、canaryビルドで`forbidden()`と`unauthorized()`の安定化が取り消されたとされています。これらを使う場合はstableに固定し、リリースノートで確認してください。
+- **エージェント任せのアップグレード。** `next upgrade --agent`は便利ですが、大きなリポジトリにcodemodを適用させても、キャッシュのセマンティクスは人間がレビューする必要があります。計画する際は、以前の記事「[レビュー容量](/blog/ai-agents-more-code-same-output-review-bottleneck-2026-10)」もご覧ください。
+
+## まとめ
+
+漸進的な改善のために16.4へ上げ、そのうえでCache Componentsは「切り替えるだけの設定」ではなく、計画的な移行として扱ってください。データアクセスを棚卸しし、共有の参照データから始め、本番の挙動で検証します。App Routerのコードベースを保守していて、移行計画のセカンドオピニオンが必要でしたら、webhaniでレビューをお手伝いできます。
