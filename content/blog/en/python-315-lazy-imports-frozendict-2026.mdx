@@ -1,0 +1,120 @@
+---
+title: "Python 3.15 in Practice: Lazy Imports, frozendict, and UTF-8 by Default"
+description: "Python 3.15 shipped in October with lazy imports, a frozendict built-in, sentinels, and UTF-8 as the default encoding. Here is what each change means for real codebases and how to upgrade safely."
+date: "2026-10-20"
+status: "published"
+tags: ["Python", "Python 3.15", "Performance", "Upgrade", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "python-315-lazy-imports-frozendict-2026"
+---
+
+Python 3.15 is out. According to python.org, the final release landed on October 9, 2026. Most release summaries list every PEP; this post covers the changes we expect to matter for web backends, CLIs, and data tooling, plus the one change that can break an existing deployment.
+
+Details below follow the official "What's new in Python 3.15" document. Confirm syntax and behavior against it before relying on anything here, since some of these features are new enough that edge cases are still being documented.
+
+## Lazy imports (PEP 810)
+
+Slow startup is the most common complaint about large Python applications. A CLI that imports a heavy dependency tree pays that cost on every invocation, even when the command the user ran touches none of it.
+
+Until now, the workarounds were imports inside functions or custom lazy-loader wrappers. Python 3.15 adds a `lazy` keyword so the language handles it:
+
+```python
+# cli.py
+lazy import pandas as pd
+lazy from sqlalchemy import create_engine
+
+def report(path: str) -> None:
+    # pandas is actually imported here, on first use
+    df = pd.read_csv(path)
+    print(df.describe())
+
+def version() -> None:
+    # this command never pays for pandas or sqlalchemy
+    print("1.4.2")
+```
+
+The documentation notes a restriction: lazy imports are permitted only at module scope, not inside functions, class bodies, or `try` blocks.
+
+Where we would use it:
+
+- **CLIs and developer tools** with many subcommands, where startup time is felt directly.
+- **Serverless functions**, where cold-start time is billed and visible.
+- **Large monoliths** whose import graph pulls in optional integrations most requests never use.
+
+The behavior change to watch is *when* import errors and import side effects occur. A missing dependency used to fail at startup; with `lazy`, it fails at first use, possibly in production, on a rarely used code path. If you adopt it, add a test that touches each lazily imported module, or a startup check that resolves them explicitly in CI.
+
+## frozendict and sentinels
+
+Two small built-ins close long-standing gaps.
+
+**`frozendict`** is an immutable, hashable mapping. Before this, teams reached for `types.MappingProxyType` (a read-only view, not hashable) or hand-written wrappers. A real immutable mapping is useful for configuration objects, cache keys, and anything you want to share across threads without defensive copying.
+
+**`sentinel`** (PEP 661) gives a standard way to create unique marker objects. The usual `_MISSING = object()` idiom works but has poor `repr` output and breaks under copying and pickling. A dedicated sentinel type fixes that:
+
+```python
+MISSING = sentinel("MISSING")
+
+def get_setting(name: str, default=MISSING):
+    value = _store.get(name, MISSING)
+    if value is MISSING:
+        if default is MISSING:
+            raise KeyError(name)
+        return default
+    return value
+```
+
+This matters most in APIs where `None` is a legitimate value and you need to tell "not provided" apart from "explicitly None". Check the documentation for the exact constructor signature before adopting it in a library.
+
+## Unpacking in comprehensions (PEP 798)
+
+The new syntax allows unpacking inside comprehensions, which removes a common nested-loop pattern:
+
+```python
+batches = [[1, 2], [3], [4, 5]]
+flat = [*batch for batch in batches]   # [1, 2, 3, 4, 5]
+
+configs = [{"a": 1}, {"b": 2}]
+merged = {**cfg for cfg in configs}    # {"a": 1, "b": 2}
+```
+
+It is a readability improvement, not a performance feature. We would not rewrite working code for it, but new code reads better.
+
+## UTF-8 as the default encoding (PEP 686)
+
+This is the change to plan for. Python 3.15 makes UTF-8 the default for `open()` and related calls instead of depending on the platform locale.
+
+For most Linux and macOS services this changes nothing, because the locale was already UTF-8. The risk is in two places:
+
+- **Windows or legacy-locale environments** where files were being read with a non-UTF-8 default encoding without anyone noticing. Those reads may now decode differently or raise `UnicodeDecodeError`.
+- **Data files written by older tools** in a regional encoding such as Shift_JIS or EUC-KR and opened without an explicit `encoding=`.
+
+This is relevant for Japanese and Korean data pipelines. The fix is to stop relying on defaults:
+
+```python
+# Be explicit for anything that is not UTF-8
+with open("legacy_export.csv", encoding="shift_jis", newline="") as f:
+    rows = list(csv.reader(f))
+```
+
+A practical audit: search for `open(` calls without `encoding=` and run your test suite under Python 3.15 with warnings enabled. Failures from this change are usually loud, which helps.
+
+## Performance and profiling
+
+The release also includes JIT improvements. Sources differ on figures: reports range from roughly 7% to 12% geometric-mean gains depending on platform, and the JIT remains experimental and off by default. Benchmark your own workload before enabling it; do not plan capacity around a headline number.
+
+A built-in statistical sampling profiler (the new `profiling` package, per the docs) can attach to a running process. That is useful for diagnosing a production slowdown without redeploying with instrumentation, but check the documentation for its overhead and permissions model first.
+
+## Upgrade approach
+
+1. Run your tests on 3.15 in CI alongside your current version for a few weeks before switching.
+2. Audit `open()` calls and subprocess text handling for implicit encodings.
+3. Wait for your key dependencies to publish 3.15 wheels. Native-extension packages are usually the bottleneck.
+4. Adopt `lazy import` first in CLI entry points, where the payoff is easy to measure.
+5. Treat `frozendict` and `sentinel` as opt-in cleanups for new code.
+
+## Takeaways
+
+Python 3.15 is a useful release without being disruptive. Lazy imports give a measurable startup win with a clear tradeoff, `frozendict` and `sentinel` replace hand-rolled patterns, and the UTF-8 default is the one item that deserves an explicit audit, especially for teams handling Japanese or Korean data files.
+
+webhani helps teams plan and test language-version upgrades for production Python services. If you want a second pair of eyes on your 3.15 migration, get in touch.

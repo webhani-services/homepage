@@ -1,0 +1,100 @@
+---
+title: "npm Trusted Publishing Fix: Why Repository Names Are Not Identity"
+description: "A flaw in how npm Trusted Publishing matched repositories was fixed on October 2. We explain the failure mode and how to harden your own publishing pipeline."
+date: "2026-10-20"
+status: "published"
+tags: ["Security", "npm", "Supply Chain", "GitHub Actions", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "npm-trusted-publishing-repo-id-binding-2026"
+---
+
+Trusted Publishing was meant to remove long-lived npm tokens from CI. Instead of storing a secret, the registry trusts a specific GitHub repository and workflow, and accepts a short-lived OIDC identity token when that workflow publishes. It is a good model, and we recommend it.
+
+According to reporting on research from Bloom Security, the trust relationship was keyed on the repository *name* rather than a permanent repository ID, and GitHub shipped a fix on October 2, nearly four months after the report. This post is based on those reports; we have not reproduced the issue, so treat the specifics as reported rather than verified.
+
+The lesson applies well beyond one registry: a name is a label, not an identity.
+
+## The failure mode
+
+A repository name can change hands. The scenarios that matter:
+
+1. A maintainer renames or transfers a repository, or deletes it.
+2. The old `owner/name` becomes available.
+3. Someone else registers that name and creates a repository there.
+4. If the registry still trusts `owner/name`, the new repository's workflow can request an OIDC token that matches the trust rule, and publish under the package's identity.
+
+Nothing in that chain requires stealing a token or compromising an account. The trust rule simply points at something that can be reassigned. Binding to a stable numeric repository ID closes this, because a recreated repository gets a new ID.
+
+This is the same class of problem as dangling DNS records or abandoned S3 bucket names. Any trust anchored to a reusable name needs a lifecycle plan.
+
+## Why it matters even after the fix
+
+If you publish to npm, the registry-side fix reduces this specific risk. It does not remove the surrounding exposure, and the same period saw other pipeline-targeting activity. For example, GitGuardian-reported account compromises in the GhostAction campaign aimed at stealing registry tokens from CI. The common thread is that the publishing path is a high-value target.
+
+Trusted Publishing improves your position, but only if the surrounding configuration is tight.
+
+## Hardening checklist
+
+**1. Scope the trust rule narrowly.** Configure the trusted publisher with the exact repository and workflow file, and an environment name if the registry supports it. A rule that accepts any workflow in the repository is broader than you need.
+
+**2. Gate publishing behind a protected environment.**
+
+```yaml
+# .github/workflows/release.yml
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm-release       # required reviewers configured in repo settings
+    permissions:
+      contents: read
+      id-token: write              # needed for the OIDC identity token
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm ci --ignore-scripts
+      - run: npm publish --provenance
+```
+
+Put `id-token: write` only on the publish job, not at the workflow level. Require reviewers on the `npm-release` environment so a pushed tag alone cannot publish. Pin third-party actions to full commit SHAs.
+
+**3. Protect the tags and branches that trigger releases.** If anyone with write access can push a `v*` tag, the environment reviewer is your only gate. Use tag protection rules or rulesets so release tags can only be created by a small group.
+
+**4. Never let a repository you published from lapse.** Archive instead of deleting. If you must rename or transfer, update the registry's trusted publisher configuration in the same change and verify afterward. Keep an inventory of which packages trust which repositories.
+
+**5. Remove leftover tokens.** After moving to Trusted Publishing, revoke old automation tokens and consider setting the package to disallow token-based publishing, if your registry plan offers that. A forgotten token negates the benefit.
+
+**6. Verify what consumers receive.** Publish with provenance, and run `npm audit signatures` in your own installs to check provenance and signatures for dependencies:
+
+```bash
+npm audit signatures
+```
+
+Provenance tells you which repository and workflow built a package. It is useful evidence, but it is only as meaningful as your trust in that repository's controls.
+
+## What to do this week
+
+- List every package you publish and note how each one authenticates today: token or Trusted Publishing.
+- For each trusted publisher rule, confirm the repository still exists under the same owner and that the workflow and environment are as narrow as you intend.
+- Check that renaming, transferring, or deleting a publishing repository requires a review step in your organization.
+- Look for stale automation tokens and revoke them.
+
+## Takeaways
+
+- Trusted Publishing is still the better option than long-lived tokens, and the reported flaw is fixed on the registry side.
+- Identity should be anchored to something that cannot be reassigned, such as a numeric ID, not a name.
+- Your own configuration still decides how much the feature protects you: narrow workflow scope, protected environments, protected tags, and no leftover tokens.
+- Treat repository lifecycle events (rename, transfer, delete) as security-relevant changes.
+
+If you want a review of your release pipeline and package publishing setup, webhani can walk through it with your team and prioritize the fixes that matter most.

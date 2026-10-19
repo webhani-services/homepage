@@ -1,0 +1,100 @@
+---
+title: "npm Trusted Publishing 수정: Repository 이름은 Identity가 아닙니다"
+description: "npm Trusted Publishing의 Repository 매칭 결함이 10월 2일에 수정되었습니다. 어떤 문제가 가능했는지, 자사 배포 Pipeline을 어떻게 단단하게 만들지 설명합니다."
+date: "2026-10-20"
+status: "published"
+tags: ["보안", "npm", "Supply Chain", "GitHub Actions", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "npm-trusted-publishing-repo-id-binding-2026"
+---
+
+Trusted Publishing은 CI에서 수명이 긴 npm Token을 없애기 위한 방식입니다. Secret을 저장하는 대신, Registry가 특정 GitHub Repository와 Workflow를 신뢰하고, 해당 Workflow가 배포할 때 발급되는 단기 OIDC Identity Token을 받아들입니다. 좋은 모델이며 저희도 권장합니다.
+
+Bloom Security의 조사에 관한 보도에 따르면, 이 신뢰 관계가 Repository의 영구적인 ID가 아니라 Repository "이름"에 묶여 있었고, 제보 후 약 4개월이 지난 10월 2일에 GitHub가 수정 사항을 배포했습니다. 이 글은 해당 보도에 근거한 것이며 저희가 직접 재현한 것은 아닙니다. 세부 내용은 "보고된 내용"으로 읽어 주십시오.
+
+여기서 얻을 교훈은 특정 Registry에 국한되지 않습니다. 이름은 Label일 뿐 Identity가 아닙니다.
+
+## 가능했던 문제
+
+Repository 이름은 다른 사람에게 넘어갈 수 있습니다. 문제가 되는 흐름은 다음과 같습니다.
+
+1. Maintainer가 Repository 이름을 바꾸거나, 이전하거나, 삭제합니다.
+2. 기존 `owner/name`이 비게 됩니다.
+3. 다른 누군가가 그 이름을 확보해 같은 이름의 Repository를 만듭니다.
+4. Registry가 여전히 `owner/name`을 신뢰하고 있다면, 새 Repository의 Workflow가 신뢰 규칙에 맞는 OIDC Token을 받아 해당 Package로 배포할 수 있습니다.
+
+이 흐름에는 Token 탈취도 계정 침해도 필요하지 않습니다. 신뢰 규칙이 재할당 가능한 대상을 가리키고 있을 뿐입니다. 영구적인 숫자 Repository ID에 묶으면, 다시 만든 Repository는 새 ID를 받으므로 이를 막을 수 있습니다.
+
+이는 Dangling DNS Record나 방치된 S3 Bucket 이름과 같은 종류의 문제입니다. 재사용 가능한 이름에 신뢰를 두는 경우에는 그 Lifecycle 관리 계획이 필요합니다.
+
+## 수정 이후에도 중요한 이유
+
+npm에 배포한다면 Registry 측 수정으로 이 특정 위험은 줄어듭니다. 그러나 주변 위험이 사라지는 것은 아니며, 같은 시기에 Pipeline을 노린 다른 활동도 있었습니다. 예를 들어 GitGuardian이 보고한 GhostAction 계열의 계정 침해는 CI에서 Registry Token을 훔치는 것을 목표로 했습니다. 공통점은 배포 경로가 가치가 높은 표적이라는 점입니다.
+
+Trusted Publishing은 상황을 개선하지만, 주변 설정이 제대로 좁혀져 있을 때에만 그렇습니다.
+
+## 보안 강화 Checklist
+
+**1. 신뢰 규칙의 범위를 좁게 설정합니다.** Trusted Publisher에는 정확한 Repository와 Workflow 파일을 지정하고, Registry가 지원한다면 Environment 이름도 지정합니다. Repository 내 모든 Workflow를 허용하는 규칙은 필요 이상으로 넓습니다.
+
+**2. 배포를 보호된 Environment 뒤에 둡니다.**
+
+```yaml
+# .github/workflows/release.yml
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm-release       # Repository 설정에서 필수 Reviewer 지정
+    permissions:
+      contents: read
+      id-token: write              # OIDC Identity Token 발급에 필요
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm ci --ignore-scripts
+      - run: npm publish --provenance
+```
+
+`id-token: write`는 Workflow 전체가 아니라 배포 Job에만 부여합니다. `npm-release` Environment에는 필수 Reviewer를 지정해, Tag를 push하는 것만으로는 배포되지 않게 합니다. 서드파티 Action은 전체 Commit SHA로 고정하십시오.
+
+**3. 릴리스를 트리거하는 Tag와 Branch를 보호합니다.** 쓰기 권한이 있는 누구나 `v*` Tag를 push할 수 있다면 Environment Reviewer가 유일한 관문이 됩니다. Tag 보호 규칙이나 Ruleset으로 릴리스 Tag를 만들 수 있는 사람을 소수로 제한하십시오.
+
+**4. 배포에 사용한 Repository를 방치하지 않습니다.** 삭제하지 말고 Archive합니다. 이름 변경이나 이전이 필요하다면 같은 변경 안에서 Registry의 Trusted Publisher 설정도 갱신하고, 이후에 검증합니다. 어떤 Package가 어떤 Repository를 신뢰하는지 목록도 관리하십시오.
+
+**5. 남아 있는 Token을 제거합니다.** Trusted Publishing으로 이전한 뒤에는 오래된 자동화용 Token을 폐기하고, Registry 요금제에서 지원한다면 Token 기반 배포를 금지하는 설정도 고려합니다. 잊힌 Token 하나가 남아 있으면 효과가 상쇄됩니다.
+
+**6. 소비하는 쪽이 받는 것을 검증합니다.** Provenance와 함께 배포하고, 자사 Install 환경에서 `npm audit signatures`를 실행해 의존 Package의 Provenance와 서명을 확인합니다.
+
+```bash
+npm audit signatures
+```
+
+Provenance는 어떤 Repository의 어떤 Workflow가 Package를 Build했는지 알려 줍니다. 유용한 증거이지만, 그 Repository의 통제를 신뢰할 수 있는 만큼만 의미가 있습니다.
+
+## 이번 주에 할 일
+
+- 배포하는 모든 Package를 목록으로 만들고, 현재 인증 방식(Token인지 Trusted Publishing인지)을 기록합니다.
+- Trusted Publisher 규칙마다 Repository가 같은 Owner 아래 존재하는지, Workflow와 Environment가 의도대로 좁혀져 있는지 확인합니다.
+- 배포용 Repository의 이름 변경, 이전, 삭제에 조직 내 검토 절차가 필요한지 확인합니다.
+- 오래된 자동화 Token을 찾아 폐기합니다.
+
+## 정리
+
+- Trusted Publishing은 여전히 수명이 긴 Token보다 나은 선택이며, 보고된 결함은 Registry 측에서 수정되었습니다.
+- Identity는 이름이 아니라 재할당할 수 없는 숫자 ID 같은 것에 묶어야 합니다.
+- 이 기능이 얼마나 보호해 주는지는 자사 설정에 달려 있습니다. Workflow 범위를 좁히고, Environment와 Tag를 보호하며, Token을 남기지 않는 것이 핵심입니다.
+- Repository Lifecycle 이벤트(이름 변경, 이전, 삭제)는 보안과 관련된 변경으로 다루십시오.
+
+릴리스 Pipeline과 Package 배포 설정의 검토가 필요하시면, webhani가 팀과 함께 살펴보고 효과가 큰 대책부터 우선순위를 정해 제안해 드립니다.

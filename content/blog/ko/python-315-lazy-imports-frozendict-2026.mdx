@@ -1,0 +1,120 @@
+---
+title: "Python 3.15 실무 포인트: Lazy Import, frozendict, UTF-8 기본 인코딩"
+description: "10월에 출시된 Python 3.15에는 Lazy Import, frozendict, sentinel, UTF-8 기본 인코딩이 포함되었습니다. 실제 Codebase에 미치는 영향과 안전한 Upgrade 방법을 정리합니다."
+date: "2026-10-20"
+status: "published"
+tags: ["Python", "Python 3.15", "성능", "업그레이드", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "python-315-lazy-imports-frozendict-2026"
+---
+
+Python 3.15가 출시되었습니다. python.org에 따르면 정식 릴리스 날짜는 2026년 10월 9일입니다. 릴리스 소개 글은 대부분 PEP를 빠짐없이 나열하지만, 이 글에서는 Web Backend, CLI, 데이터 도구에서 영향이 클 변경과 기존 배포 환경을 깨뜨릴 수 있는 변경 하나에 집중합니다.
+
+내용은 공식 문서 "What's new in Python 3.15"를 따릅니다. 일부 기능은 아직 Edge Case 문서화가 진행 중이므로, 사용 전에 문법과 동작을 공식 문서에서 확인하시기 바랍니다.
+
+## Lazy Import (PEP 810)
+
+대규모 Python Application에서 가장 흔한 불만은 느린 시작 시간입니다. 무거운 의존성 Tree를 import하는 CLI는 사용자가 실행한 Command가 그중 아무것도 쓰지 않아도 매번 그 비용을 치릅니다.
+
+지금까지는 함수 안에서 import하거나 직접 만든 Lazy Loader로 우회했습니다. Python 3.15는 `lazy` 키워드를 추가해 언어 차원에서 처리합니다.
+
+```python
+# cli.py
+lazy import pandas as pd
+lazy from sqlalchemy import create_engine
+
+def report(path: str) -> None:
+    # pandas는 처음 사용되는 이 시점에 실제로 import된다
+    df = pd.read_csv(path)
+    print(df.describe())
+
+def version() -> None:
+    # 이 Command는 pandas와 sqlalchemy를 로드하지 않는다
+    print("1.4.2")
+```
+
+문서에는 제약도 명시되어 있습니다. Lazy Import는 Module Scope에서만 허용되며, 함수, Class Body, `try` Block 안에서는 사용할 수 없습니다.
+
+활용하기 좋은 곳은 다음과 같습니다.
+
+- **Subcommand가 많은 CLI와 개발자 도구**: 시작 시간이 체감에 직접 영향을 줍니다.
+- **Serverless Function**: Cold Start 시간이 비용과 사용자 경험에 반영됩니다.
+- **대형 Monolith**: 대부분의 Request가 쓰지 않는 선택적 연동 Module을 import하고 있는 경우입니다.
+
+주의할 점은 import 오류와 Side Effect가 발생하는 "시점"이 바뀐다는 것입니다. 누락된 의존성은 예전에는 시작 시점에 실패했지만, `lazy`를 쓰면 처음 사용하는 시점, 즉 운영 환경에서 거의 쓰이지 않는 경로에서 처음 실패할 수 있습니다. 도입한다면 Lazy로 바꾼 모든 Module을 거치는 Test나, CI에서 명시적으로 해석하는 시작 점검을 추가하십시오.
+
+## frozendict와 sentinel
+
+작은 Built-in 두 가지가 오랜 공백을 메웁니다.
+
+**`frozendict`**는 불변이며 Hash 가능한 Mapping입니다. 기존에는 `types.MappingProxyType`(읽기 전용 View이며 Hash 불가)이나 직접 만든 Wrapper를 썼습니다. 설정 Object, Cache Key, 방어적 복사 없이 Thread 간에 공유하려는 데이터에 유용합니다.
+
+**`sentinel`**(PEP 661)은 고유한 Marker Object를 만드는 표준 방법입니다. 기존의 `_MISSING = object()` 관용구도 동작하지만 `repr`이 읽기 어렵고, 복사나 pickle 시 동일성이 깨집니다. 전용 sentinel 타입이 이를 해결합니다.
+
+```python
+MISSING = sentinel("MISSING")
+
+def get_setting(name: str, default=MISSING):
+    value = _store.get(name, MISSING)
+    if value is MISSING:
+        if default is MISSING:
+            raise KeyError(name)
+        return default
+    return value
+```
+
+`None`이 정상적인 값인 API에서 "전달되지 않음"과 "명시적으로 None을 전달함"을 구분해야 할 때 특히 유용합니다. Library에 도입하기 전에 Constructor의 정확한 Signature를 공식 문서에서 확인하십시오.
+
+## Comprehension 안의 Unpacking (PEP 798)
+
+새 문법은 Comprehension 안에서 Unpacking을 허용하여, 흔한 중첩 Loop 패턴을 없애 줍니다.
+
+```python
+batches = [[1, 2], [3], [4, 5]]
+flat = [*batch for batch in batches]   # [1, 2, 3, 4, 5]
+
+configs = [{"a": 1}, {"b": 2}]
+merged = {**cfg for cfg in configs}    # {"a": 1, "b": 2}
+```
+
+가독성을 높이는 기능이지 성능 기능은 아닙니다. 잘 동작하는 코드를 굳이 바꿀 필요는 없지만, 새로 작성하는 코드는 더 읽기 쉬워집니다.
+
+## 기본 인코딩이 UTF-8로 (PEP 686)
+
+반드시 대비해야 할 변경은 이것입니다. Python 3.15는 `open()` 등의 기본 인코딩을 Platform Locale에 의존하지 않고 UTF-8로 고정합니다.
+
+대부분의 Linux, macOS Service에서는 원래 Locale이 UTF-8이었으므로 달라지는 것이 없습니다. 위험한 곳은 두 군데입니다.
+
+- **Windows 또는 레거시 Locale 환경**: 아무도 모르게 UTF-8이 아닌 기본 인코딩으로 파일을 읽고 있었다면, 디코딩 결과가 달라지거나 `UnicodeDecodeError`가 발생할 수 있습니다.
+- **오래된 도구가 지역별 인코딩으로 저장한 데이터**: Shift_JIS나 EUC-KR 같은 인코딩의 파일을 `encoding=` 없이 열고 있는 경우입니다.
+
+일본어, 한국어 데이터 Pipeline에서는 특히 관련이 큽니다. 해결책은 기본값에 의존하지 않는 것입니다.
+
+```python
+# UTF-8이 아닌 파일은 명시한다
+with open("legacy_export.csv", encoding="euc-kr", newline="") as f:
+    rows = list(csv.reader(f))
+```
+
+현실적인 점검 방법은 `encoding=` 없는 `open(` 호출을 검색하고, 경고를 활성화한 상태로 Python 3.15에서 Test Suite를 실행하는 것입니다. 이 변경으로 인한 실패는 대체로 분명하게 드러나므로 찾기 어렵지 않습니다.
+
+## 성능과 Profiling
+
+JIT 개선도 포함됩니다. 수치는 출처마다 다르며, Platform에 따라 기하평균 약 7~12% 개선으로 보고됩니다. JIT는 여전히 실험적 기능이며 기본값은 비활성입니다. 자사 Workload에서 직접 측정한 뒤에 활성화하고, 헤드라인 수치로 Capacity를 계획하지는 마십시오.
+
+내장된 통계적 Sampling Profiler(문서상 새로운 `profiling` Package)는 실행 중인 Process에 Attach할 수 있습니다. 계측 코드를 넣고 재배포하지 않고도 운영 환경의 지연을 진단할 수 있어 유용하지만, Overhead와 필요한 권한은 먼저 문서에서 확인하십시오.
+
+## Upgrade 진행 방법
+
+1. 전환 전에 몇 주 동안 CI에서 현재 버전과 함께 3.15 Test를 병행 실행합니다.
+2. `open()`과 subprocess의 텍스트 처리에서 암묵적 인코딩 의존이 없는지 점검합니다.
+3. 주요 의존 Package가 3.15용 wheel을 배포할 때까지 기다립니다. Native Extension을 가진 Package가 병목이 되기 쉽습니다.
+4. `lazy import`는 효과를 측정하기 쉬운 CLI Entry Point에서 먼저 도입합니다.
+5. `frozendict`와 `sentinel`은 신규 코드에서 선택적으로 정리하는 용도로 다룹니다.
+
+## 정리
+
+Python 3.15는 크게 파괴적이지 않으면서 유용한 릴리스입니다. Lazy Import는 분명한 Trade-off와 함께 시작 시간 개선을 기대할 수 있고, `frozendict`와 `sentinel`은 직접 만든 패턴을 대체합니다. UTF-8 기본값 변경만큼은 특히 일본어, 한국어 데이터 파일을 다루는 팀에서 명시적인 점검이 필요합니다.
+
+webhani는 운영 중인 Python Service의 언어 버전 Upgrade 계획과 Test를 지원합니다. 3.15 마이그레이션에 대해 제3자의 검토가 필요하시면 언제든지 문의해 주십시오.
