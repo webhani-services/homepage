@@ -1,0 +1,91 @@
+---
+title: "Perplexity Open-Sources SPACE: What a Firecracker-per-Task Agent Sandbox Teaches Us"
+description: "Perplexity released its agent sandbox SPACE under Apache 2.0. We look at the design choices behind it and what they mean for teams running AI-generated code."
+date: "2026-10-20"
+status: "published"
+tags: ["AI Agents", "Sandbox", "Firecracker", "Security", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "perplexity-space-agent-sandbox-microvm-2026"
+---
+
+On October 15, Perplexity open-sourced SPACE (Sandboxed Platform for Agentic Code Execution), the sandbox layer it says runs every session of its Computer agent. It is released under Apache 2.0, written in Rust, and includes a wrapper compatible with the E2B Python SDK. Details come from press coverage and Perplexity's own statements, so treat the numbers as vendor-reported.
+
+The numbers matter less than the design. SPACE is a worked example of how a serious team answers a question many of us now face: where does code written by a model actually run?
+
+## The core design
+
+According to the coverage, SPACE follows four rules:
+
+1. **One microVM per task.** Each agent task gets its own Firecracker microVM, and the VM is destroyed when the task ends.
+2. **Credentials stay outside.** Secrets are not placed inside the sandbox. The sandbox asks for actions; something trusted outside performs them.
+3. **Egress is controlled at the node.** Outbound traffic is filtered by the host, not by configuration inside the guest, so code in the VM cannot loosen its own rules.
+4. **State is explicit.** Sandboxes can be paused, resumed, and branched, with rolling snapshots retained for a limited time.
+
+Perplexity reports a median creation time of about 60 ms. Whatever the exact figure, the principle is that isolation strong enough for untrusted code no longer has to cost seconds of startup.
+
+## Why containers are not enough here
+
+Many teams run agent code in a plain Docker container because it is the tool at hand. That is a reasonable default for your own trusted services. It is a weaker one for code generated from prompts that may include untrusted input, because containers share the host kernel. A kernel bug or a misconfigured capability turns a container escape into a host compromise.
+
+A microVM puts a hypervisor boundary between the guest and the host. You pay a little in memory and startup time, and in exchange the blast radius of a bad generated script shrinks to one disposable VM.
+
+If you already use a managed option such as E2B or a cloud vendor's sandbox, you have this boundary. The point of SPACE's release is that you can now read a production-grade implementation instead of guessing.
+
+## The security results deserve a careful read
+
+Reports on Perplexity's adversarial testing disagree on the numbers. One says there were no escapes across roughly 118 attempts. Another describes 108 attempts in which nine models never reached the host, but four bypassed some network restrictions, which Perplexity says it fixed and retested.
+
+We would draw two lessons from that, regardless of which report is more accurate:
+
+- The host boundary held, but the **network policy** was where models found gaps. Egress rules are the part of a sandbox most likely to be subtly wrong.
+- Red-teaming with models is now a practical technique. If you build your own sandbox, run capable models against it and treat bypasses as bugs to be tracked.
+
+## What to take from it if you are not Perplexity
+
+Most of our clients will not operate millions of sandboxes a day. The design still translates to smaller setups.
+
+**Keep credentials out of the execution environment.** This is the cheapest and highest-value change. Instead of injecting an API key into the sandbox, expose a narrow proxy that performs the call and returns the result:
+
+```ts
+// Host side: the agent asks for an action, the host holds the secret.
+type ToolCall = { name: "create_issue"; args: { title: string; body: string } };
+
+async function handleToolCall(call: ToolCall) {
+  switch (call.name) {
+    case "create_issue":
+      // Validate args against a schema before touching the real API.
+      return githubClient.issues.create({
+        owner: "example-org",
+        repo: "example-repo",
+        title: call.args.title.slice(0, 200),
+        body: call.args.body,
+      });
+    default:
+      throw new Error(`Tool not allowed: ${call.name}`);
+  }
+}
+```
+
+The sandbox never sees the token. If the generated code is hijacked by a prompt injection, the worst it can do is request allowed actions with validated arguments.
+
+**Default-deny egress.** Start with no outbound network access and add allowed hosts as a reviewed list. Enforce it outside the guest.
+
+**Make sandboxes disposable.** Create one per task or per session and destroy it afterward. Reusing a long-lived sandbox across users or tasks makes leaked state a cross-tenant problem.
+
+**Decide what survives.** Snapshots are convenient for long-running agents, but every persisted snapshot is data you must classify, expire, and secure. Set a retention period deliberately.
+
+## Where we would be cautious
+
+- **Operational weight.** Running Firecracker yourself needs KVM-capable hosts, image management, and networking work. For a small team, a managed sandbox service is usually the cheaper path.
+- **Maturity.** SPACE was open-sourced days ago. Read its issue tracker and security policy before adopting it, and expect rough edges.
+- **A sandbox is one layer.** It limits damage; it does not stop an agent from doing something harmful inside its allowed permissions. Scope tool access and require human approval for irreversible actions.
+
+## Takeaways
+
+- Treat model-generated code as untrusted and run it behind a hypervisor boundary where the risk justifies it.
+- Keep secrets outside the sandbox and mediate access through a validated tool layer.
+- Enforce network policy at the host, default-deny, and test it adversarially.
+- For most teams, adopt a managed sandbox first and use SPACE as a reference for what good looks like.
+
+If you are deciding how to run AI agents safely in your own environment, webhani can help review the architecture and the permission model before it reaches production.
