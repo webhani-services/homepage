@@ -1,0 +1,115 @@
+---
+title: "Grafana 13: Dynamic Dashboards and Git Workflows for Dashboards-as-Code"
+description: "Grafana 13 makes dynamic dashboards generally available and adds two-way Git workflows and a versioned dashboard API. How a small team can use them to keep dashboards reviewable and reproducible."
+date: "2026-10-21"
+status: "published"
+tags: ["Grafana", "Monitoring", "Observability", "Prometheus", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "grafana-13-dynamic-dashboards-git-workflows-2026"
+---
+
+Dashboards tend to rot in a specific way. Someone builds a useful one in the UI, a second person tweaks it during an incident, a third copies it for another service, and a year later nobody knows which version is correct or why a panel shows a number that disagrees with the alert. Grafana 13, announced at GrafanaCON 2026 in April, addresses part of this problem. According to the coverage of the launch, it makes dynamic dashboards generally available, adds two-way Git workflows (GitHub, GitLab, Bitbucket, and plain Git), provides a versioned dashboard API, and ships suggested dashboards and layouts based on DORA and USE/RED methods. This article covers how we would adopt these as a small team. Feature details come from vendor announcements and press coverage, so confirm exact behavior in the Grafana documentation for your version.
+
+## What the changes mean in practice
+
+**Dynamic dashboards.** Dashboards can adapt their layout and content to variables and conditions, for example showing a per-service section only for the services selected. This reduces the copy-paste pattern, where one dashboard per service diverges over time.
+
+**Two-way Git workflows.** Dashboard changes can flow to a repository and back. "Two-way" is the important part: edits in the UI can become pull requests, and merged changes in the repository can be applied to Grafana. That gives dashboards a history, a review step, and a rollback path.
+
+**Versioned dashboard API.** A stable, versioned API is what makes automation durable. Scripts written against an unversioned endpoint tend to break on upgrade.
+
+**DORA and USE/RED templates.** USE (Utilization, Saturation, Errors) fits resources such as hosts and queues. RED (Rate, Errors, Duration) fits request-driven services. Starting from a template that encodes one of these is better than starting from a blank panel.
+
+## A review-friendly layout
+
+Whatever sync mechanism you choose, the repository structure decides how pleasant this is. A layout that has worked for us:
+
+```text
+observability/
+  dashboards/
+    services/
+      api-red.json
+      worker-red.json
+    infra/
+      postgres-use.json
+  alerts/
+    api.rules.yaml
+  ci/
+    validate_dashboards.sh
+```
+
+Keep one dashboard per file, keep alert rules next to the dashboards that visualize them, and avoid committing machine-generated churn (such as dashboard IDs or modification timestamps) when your export tooling lets you strip it.
+
+## Design the panels around the alert
+
+The most common dashboard failure is a panel whose number disagrees with the alert that paged you. Use one query definition for both. For an API service with Prometheus, a RED set looks like this:
+
+```yaml
+# alerts/api.rules.yaml
+groups:
+  - name: api-red
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+      - record: job:http_errors:ratio5m
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+          /
+          sum by (job) (rate(http_requests_total[5m]))
+      - record: job:http_request_duration:p95_5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[5m])))
+      - alert: ApiHighErrorRatio
+        expr: job:http_errors:ratio5m{job="api"} > 0.02
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "API 5xx ratio above 2% for 10 minutes"
+```
+
+The dashboard panels then query the recording rules (`job:http_errors:ratio5m`) rather than re-deriving the expression. When someone changes the definition, the alert and the panel change together, and the diff shows both.
+
+## Validate in CI
+
+A dashboard JSON file that fails to parse, or that points at a datasource that does not exist, should fail the pull request rather than the on-call engineer's morning. A small check is enough to start:
+
+```bash
+#!/usr/bin/env bash
+# ci/validate_dashboards.sh
+set -euo pipefail
+
+status=0
+for f in observability/dashboards/**/*.json; do
+  jq -e '.title and (.panels | type == "array")' "$f" > /dev/null || {
+    echo "invalid dashboard structure: $f" >&2
+    status=1
+  }
+  # every panel query should use a recording rule or an allowed datasource
+  if jq -r '..|.datasource?.uid? // empty' "$f" | grep -qv -E '^(prometheus|loki)$'; then
+    echo "unexpected datasource uid in: $f" >&2
+    status=1
+  fi
+done
+exit $status
+```
+
+Adjust the allowed UIDs to your environment. Also run `promtool check rules` on the alert files in the same job. Your Grafana version may offer its own validation for the Git-synced format; if it does, prefer that over hand-rolled checks.
+
+## Where to be careful
+
+- **Decide the source of truth.** If both the UI and the repository can change a dashboard, define which wins on conflict and who may edit in the UI at all. Without this rule, two-way sync produces confusing overwrites.
+- **Do not export secrets.** Datasource credentials do not belong in the dashboard repository. Reference datasources by UID.
+- **Dynamic does not mean simple.** A dashboard with many conditional sections is harder to review than three plain ones. Use dynamic features to remove duplication, not to build one dashboard that does everything.
+- **Test upgrades on a copy.** Treat a major Grafana upgrade like any other: restore a backup into a staging instance and check that your key dashboards render.
+
+## Takeaways
+
+- Git-backed dashboards give you history, review, and rollback, which is most of the value.
+- Define panels and alerts from the same recording rules so they cannot disagree.
+- Start with RED for services and USE for resources; add DORA views once the basics are stable.
+- Validate dashboards and rules in CI.
+- Decide the source of truth before turning on sync.
+
+If you are consolidating scattered dashboards or setting up monitoring for a new service, webhani can help with the design and the rollout.
