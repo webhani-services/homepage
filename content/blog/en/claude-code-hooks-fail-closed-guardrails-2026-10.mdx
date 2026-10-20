@@ -1,0 +1,117 @@
+---
+title: "Claude Code Hooks as Guardrails: Designing Them to Fail Closed"
+description: "Recent Claude Code builds tighten how failing hooks are handled. Here is how exit codes and JSON decisions actually behave, and how to write a hook that blocks by default when it breaks."
+date: "2026-10-21"
+status: "published"
+tags: ["Claude Code", "AI", "Hooks", "Security", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-hooks-fail-closed-guardrails-2026-10"
+---
+
+Hooks are the part of Claude Code that turns "please don't do that" in a prompt into something enforced by your own code. They are also easy to get subtly wrong: a guardrail script that crashes is, in many setups, a guardrail that silently stops guarding. Release notes for the early-October Claude Code builds (v2.1.294 and v2.1.295, as summarized by third-party trackers) mention changes in how failing and instruction-based hooks are handled. We could not confirm the exact wording against Anthropic's own changelog, so treat the version details as pointers and check the official release notes. The design lesson holds regardless of version.
+
+## What the documented exit codes mean
+
+For command hooks, the documented contract is simple:
+
+- Exit `0`: success. The tool call proceeds.
+- Exit `2`: a blocking error. For `PreToolUse`, the call is stopped and stderr is returned to Claude so it can adjust.
+- Any other non-zero code: a non-blocking error. stderr is shown to the user, and execution continues.
+
+That last line is the trap. A Python script that dies with an unhandled exception exits with code `1`. Your "block destructive commands" hook has just become a no-op, and the only trace is a line of stderr.
+
+There are also reports of edge cases where exit `2` did not stop a call (see the public issue tracker for `anthropics/claude-code`). Whatever the current state, do not make a hook your only line of defense. Pair it with permission rules and, for anything irreversible, a credential that simply lacks the privilege.
+
+## Fail closed by construction
+
+The fix is to make "something went wrong" map to exit `2` explicitly. Wrap the whole hook so that any unexpected error blocks instead of passing:
+
+```python
+#!/usr/bin/env python3
+"""PreToolUse hook: block risky shell commands. Fails closed."""
+import json
+import re
+import sys
+
+BLOCKED = [
+    (re.compile(r"\bgit\s+push\b.*--force(?!-with-lease)"), "force push"),
+    (re.compile(r"\brm\s+-rf\s+(/|~|\$HOME)(\s|$)"), "recursive delete of a root path"),
+    (re.compile(r"\bterraform\s+(apply|destroy)\b"), "terraform apply/destroy"),
+]
+
+
+def main() -> int:
+    event = json.load(sys.stdin)
+    if event.get("tool_name") != "Bash":
+        return 0
+
+    command = event.get("tool_input", {}).get("command", "")
+    for pattern, label in BLOCKED:
+        if pattern.search(command):
+            print(f"Blocked by policy: {label}. Ask the user to run it.", file=sys.stderr)
+            return 2
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # malformed input, missing keys, anything
+        print(f"Guardrail hook error, blocking by default: {exc}", file=sys.stderr)
+        sys.exit(2)
+```
+
+Registering it in `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard_bash.py\"" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Two details matter here. First, the `try/except` at the bottom converts every failure into a block, including a missing Python interpreter inside the command wrapper if you add a shell fallback. Second, the message on stderr is written for the model: it says what was blocked and what to do next, so the agent does not just retry with a slightly different spelling.
+
+## Regexes are a speed bump, not a wall
+
+A pattern list catches the common mistakes. It does not stop `bash -c "$(echo cm0gLXJmIC8= | base64 -d)"`. If a hook is meant to protect something important, move the decision from "does the command string look dangerous" to "is the target allowed":
+
+- Allow-list instead of deny-list for the commands an agent may run in automation.
+- Check resolved paths (`realpath`) for file edits rather than raw strings.
+- Keep production credentials out of the agent's environment altogether.
+
+In our experience the allow-list version is a little more work up front and far less maintenance afterward, because new dangerous tools do not require a new regex.
+
+## Test the failure path, not just the happy path
+
+Hooks rarely get tests, and the failure branch is the one that matters. A minimal check:
+
+```bash
+# should block (exit 2)
+echo '{"tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}' | python3 guard_bash.py; echo $?
+# malformed input should also block (exit 2)
+echo 'not json' | python3 guard_bash.py; echo $?
+# unrelated tool should pass (exit 0)
+echo '{"tool_name":"Read","tool_input":{}}' | python3 guard_bash.py; echo $?
+```
+
+Put these in CI next to your other scripts. A hook change that accidentally turns the malformed-input case into exit `0` is exactly the regression you want to catch before it ships to the team.
+
+## Takeaways
+
+- Exit `2` blocks; every other non-zero code does not. Make failures exit `2` on purpose.
+- Write stderr messages for the agent, not only for humans.
+- Treat hooks as one layer. Permissions, scoped credentials, and review still do the heavy lifting.
+- Run hook tests in CI, including the malformed-input path.
+- Re-read the official hooks reference after each upgrade, since both exit-code handling and JSON decision fields have been changing quickly.
+
+If your team is rolling out agentic coding and wants help turning policy into enforceable checks, that is the kind of work we do at webhani.

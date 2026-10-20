@@ -1,0 +1,117 @@
+---
+title: "Claude Code Hooksをガードレールにする：失敗時にブロックする（fail closed）設計"
+description: "最近のClaude Codeでは、失敗したHookの扱いが見直されています。終了コードの実際の挙動と、Hook自体が壊れても止める書き方を整理します。"
+date: "2026-10-21"
+status: "published"
+tags: ["Claude Code", "AI", "Hooks", "セキュリティ", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-hooks-fail-closed-guardrails-2026-10"
+---
+
+Hooksは、プロンプトに書いた「やらないでください」を、自分たちのコードで強制する仕組みに変えてくれます。ただし、少しの書き損じで効かなくなりやすい部分でもあります。ガードレール用のスクリプトがクラッシュすると、環境によっては何も守らなくなるだけで、気づきにくいのです。10月上旬のClaude Code（v2.1.294、v2.1.295）のリリースノートには、失敗したHookや指示ベースのHookの扱いに関する変更が載っているという情報があります。これは第三者のまとめサイトの要約で、Anthropic公式のChangelogとは照合できていません。バージョンの詳細は目安とし、公式のリリースノートで確認してください。設計上の考え方は、バージョンに関係なく使えます。
+
+## ドキュメント上の終了コードの意味
+
+コマンド型Hookの基本ルールは次のとおりです。
+
+- 終了コード`0`：成功。ツール呼び出しは続行されます。
+- 終了コード`2`：ブロッキングエラー。`PreToolUse`では呼び出しが止まり、stderrがClaudeに返されます。
+- それ以外の非ゼロ：ブロックしないエラー。stderrはユーザーに表示されますが、処理は続行されます。
+
+最後の項目が落とし穴です。Pythonスクリプトが未処理の例外で終了すると、終了コードは`1`になります。つまり「危険なコマンドを止める」Hookが、何も止めないHookに変わり、痕跡はstderrの1行だけです。
+
+また、公開されている`anthropics/claude-code`のIssueには、終了コード`2`でも呼び出しが止まらなかったという報告があります。現状がどうであれ、Hookだけを唯一の防御線にしないでください。権限ルールを併用し、取り返しのつかない操作については、そもそもその権限を持たない認証情報を使うのが確実です。
+
+## 構造的にfail closedにする
+
+「何かがおかしい」ときは明示的に終了コード`2`にします。想定外のエラーを、通過ではなくブロックに変換するよう全体を包みます。
+
+```python
+#!/usr/bin/env python3
+"""PreToolUse hook: 危険なシェルコマンドをブロックする。fail closed。"""
+import json
+import re
+import sys
+
+BLOCKED = [
+    (re.compile(r"\bgit\s+push\b.*--force(?!-with-lease)"), "force push"),
+    (re.compile(r"\brm\s+-rf\s+(/|~|\$HOME)(\s|$)"), "ルート系パスの再帰削除"),
+    (re.compile(r"\bterraform\s+(apply|destroy)\b"), "terraform apply/destroy"),
+]
+
+
+def main() -> int:
+    event = json.load(sys.stdin)
+    if event.get("tool_name") != "Bash":
+        return 0
+
+    command = event.get("tool_input", {}).get("command", "")
+    for pattern, label in BLOCKED:
+        if pattern.search(command):
+            print(f"ポリシーによりブロック: {label}。ユーザーに実行を依頼してください。", file=sys.stderr)
+            return 2
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # 不正な入力、キー欠落など何でも
+        print(f"Hookでエラーが発生したため、既定でブロックします: {exc}", file=sys.stderr)
+        sys.exit(2)
+```
+
+`.claude/settings.json`への登録例です。
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard_bash.py\"" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+ポイントは2つです。1つ目は、末尾の`try/except`が、あらゆる失敗をブロックに変えていることです。2つ目は、stderrのメッセージをモデル向けに書いていることです。何をブロックし、次に何をすべきかを伝えることで、エージェントが綴りを少し変えて再試行するのを防げます。
+
+## 正規表現は減速帯であって壁ではない
+
+パターンのリストは、よくあるミスを防げます。しかし`bash -c "$(echo cm0gLXJmIC8= | base64 -d)"`のような呼び出しは止められません。重要なものを守るHookなら、判断基準を「コマンド文字列が危険そうか」から「対象が許可されているか」へ移してください。
+
+- 自動化で実行を許すコマンドは、拒否リストではなく許可リストにする。
+- ファイル編集は、生の文字列ではなく`realpath`で解決したパスで判定する。
+- 本番の認証情報は、エージェントの環境にそもそも置かない。
+
+許可リスト方式は初期の手間が少し増えますが、新しい危険なツールが出ても正規表現を足す必要がないため、運用の手間はずっと小さくなります。
+
+## 正常系だけでなく失敗経路もテストする
+
+Hookにテストが書かれることは少ないものの、重要なのは失敗側の分岐です。最小限の確認は次のとおりです。
+
+```bash
+# ブロックされる（終了コード2）
+echo '{"tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}' | python3 guard_bash.py; echo $?
+# 不正な入力もブロックされる（終了コード2）
+echo 'not json' | python3 guard_bash.py; echo $?
+# 無関係なツールは通過する（終了コード0）
+echo '{"tool_name":"Read","tool_input":{}}' | python3 guard_bash.py; echo $?
+```
+
+これらを他のスクリプトと同様にCIに入れておきます。不正入力のケースがうっかり終了コード`0`になる変更は、チームに配布される前に検出したい典型的な退行です。
+
+## まとめ
+
+- ブロックするのは終了コード`2`だけです。失敗時は意図して`2`で終了させましょう。
+- stderrのメッセージは、人間だけでなくエージェント向けにも書きます。
+- Hookは防御の1層です。権限設定、権限を絞った認証情報、レビューも併用してください。
+- 不正入力の経路も含め、HookのテストをCIで回します。
+- アップグレードのたびに公式のHooksリファレンスを読み直してください。終了コードの扱いもJSONの判定フィールドも、変化が速い領域です。
+
+エージェント開発の導入にあたり、ポリシーを実際に強制できるチェックへ落とし込むところで支援が必要でしたら、webhaniにご相談ください。

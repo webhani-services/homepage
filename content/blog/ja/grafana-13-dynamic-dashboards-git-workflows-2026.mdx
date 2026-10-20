@@ -1,0 +1,115 @@
+---
+title: "Grafana 13：ダッシュボードのコード管理を支えるDynamic DashboardsとGitワークフロー"
+description: "Grafana 13ではDynamic Dashboardsが一般提供となり、双方向のGitワークフローとバージョン管理されたダッシュボードAPIが加わりました。小規模なチームが、ダッシュボードをレビュー可能で再現可能な状態に保つ方法を解説します。"
+date: "2026-10-21"
+status: "published"
+tags: ["Grafana", "モニタリング", "オブザーバビリティ", "Prometheus", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "grafana-13-dynamic-dashboards-git-workflows-2026"
+---
+
+ダッシュボードは、決まったパターンで劣化していきます。誰かがUIで便利なものを作り、別の人が障害対応中に手を入れ、さらに別の人が他のサービス用にコピーします。1年後には、どれが正しい版なのか、なぜアラートと食い違う数字が表示されるのかを、誰も説明できなくなります。4月のGrafanaCON 2026で発表されたGrafana 13は、この問題の一部に対処しています。発表の報道によると、Dynamic Dashboardsが一般提供となり、双方向のGitワークフロー（GitHub、GitLab、Bitbucket、通常のGit）が加わり、バージョン管理されたダッシュボードAPIが提供され、DORAとUSE/REDの考え方に基づく推奨ダッシュボードとレイアウトが付属します。本稿では、小規模なチームがこれをどう取り入れるかを整理します。機能の詳細はベンダーの発表と報道に基づくため、実際の挙動は使用するバージョンのGrafanaドキュメントで確認してください。
+
+## 実務で何が変わるのか
+
+**Dynamic Dashboards。** 変数や条件に応じて、ダッシュボードのレイアウトや内容を変えられます。たとえば、選択したサービスについてだけ、サービスごとのセクションを表示できます。サービスごとにダッシュボードをコピーし、時間とともに食い違っていくパターンを減らせます。
+
+**双方向のGitワークフロー。** ダッシュボードの変更をリポジトリに送り、リポジトリから戻すことができます。重要なのは「双方向」である点です。UIでの編集をプルリクエストにでき、マージされた変更をGrafanaに反映できます。これで、ダッシュボードに履歴、レビューの段階、ロールバックの手段が備わります。
+
+**バージョン管理されたダッシュボードAPI。** 安定したバージョン付きAPIがあってこそ、自動化は長持ちします。バージョンのないエンドポイントに向けて書いたスクリプトは、アップグレードで壊れがちです。
+
+**DORAとUSE/REDのテンプレート。** USE（Utilization、Saturation、Errors）はホストやキューのようなリソースに向いています。RED（Rate、Errors、Duration）はリクエスト駆動のサービスに向いています。白紙のパネルから始めるより、どちらかを反映したテンプレートから始めるほうが優れています。
+
+## レビューしやすいディレクトリ構成
+
+どの同期方式を選ぶにしても、リポジトリの構成が使いやすさを左右します。私たちの現場でうまくいっている構成は次のとおりです。
+
+```text
+observability/
+  dashboards/
+    services/
+      api-red.json
+      worker-red.json
+    infra/
+      postgres-use.json
+  alerts/
+    api.rules.yaml
+  ci/
+    validate_dashboards.sh
+```
+
+ダッシュボードは1ファイルに1つとし、アラートルールは可視化するダッシュボードの隣に置きます。エクスポートツールで除外できる場合は、ダッシュボードIDや更新日時のような機械生成の差分をコミットしないようにしましょう。
+
+## パネルはアラートを軸に設計する
+
+ダッシュボードで最もよくある失敗は、通知を受けたアラートとパネルの数字が食い違うことです。両方で同じクエリ定義を使います。Prometheusを使うAPIサービスなら、REDの一式は次のようになります。
+
+```yaml
+# alerts/api.rules.yaml
+groups:
+  - name: api-red
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+      - record: job:http_errors:ratio5m
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+          /
+          sum by (job) (rate(http_requests_total[5m]))
+      - record: job:http_request_duration:p95_5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[5m])))
+      - alert: ApiHighErrorRatio
+        expr: job:http_errors:ratio5m{job="api"} > 0.02
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "APIの5xx比率が10分間2%を超えています"
+```
+
+ダッシュボードのパネルは、式を再び書き起こさず、レコーディングルール（`job:http_errors:ratio5m`）を参照します。定義を変えるとアラートとパネルが一緒に変わり、差分には両方が現れます。
+
+## CIで検証する
+
+パースできないダッシュボードのJSONや、存在しないデータソースを指すものは、翌朝のオンコール担当者ではなくプルリクエストで失敗させるべきです。最初は小さなチェックで十分です。
+
+```bash
+#!/usr/bin/env bash
+# ci/validate_dashboards.sh
+set -euo pipefail
+
+status=0
+for f in observability/dashboards/**/*.json; do
+  jq -e '.title and (.panels | type == "array")' "$f" > /dev/null || {
+    echo "ダッシュボードの構造が不正です: $f" >&2
+    status=1
+  }
+  # すべてのパネルは許可されたデータソースを使う
+  if jq -r '..|.datasource?.uid? // empty' "$f" | grep -qv -E '^(prometheus|loki)$'; then
+    echo "想定外のdatasource uidがあります: $f" >&2
+    status=1
+  fi
+done
+exit $status
+```
+
+許可するUIDは環境に合わせて調整してください。同じジョブで、アラートファイルに`promtool check rules`も実行しましょう。お使いのGrafanaにGit同期形式向けの検証機能がある場合は、自作のチェックよりそちらを優先してください。
+
+## 注意すべき点
+
+- **正を決めておく。** UIとリポジトリの両方でダッシュボードを変更できる場合、衝突時にどちらを優先するか、そもそもUIで編集できる人は誰かを決めます。この決まりがないと、双方向の同期は理解しにくい上書きを生みます。
+- **機密情報をエクスポートしない。** データソースの認証情報はダッシュボードのリポジトリに置くものではありません。データソースはUIDで参照します。
+- **動的であることは簡単であることを意味しない。** 条件分岐のセクションが多いダッシュボードは、素直な3枚よりレビューしにくくなります。動的な機能は重複を減らすために使い、何でもできる1枚を作るためには使わないでください。
+- **アップグレードはコピーで試す。** Grafanaのメジャーアップグレードも他と同様に扱います。バックアップをステージングに復元し、主要なダッシュボードが表示されるかを確認します。
+
+## まとめ
+
+- Gitで管理すると、ダッシュボードに履歴、レビュー、ロールバックが備わります。価値の大半はここにあります。
+- パネルとアラートを同じレコーディングルールから定義し、食い違いを防ぎます。
+- サービスにはRED、リソースにはUSEから始め、基本が安定してからDORAのビューを加えます。
+- ダッシュボードとルールをCIで検証します。
+- 同期を有効にする前に、正となる側を決めます。
+
+散らばったダッシュボードの統合や、新規サービスの監視体制づくりでお困りの場合は、設計から導入までwebhaniが支援します。

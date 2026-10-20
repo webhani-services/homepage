@@ -1,0 +1,99 @@
+---
+title: "Python 3.15 Profiling: The Tachyon Sampling Profiler and Frame Pointers by Default"
+description: "Python 3.15 adds a profiling package with a built-in sampling profiler and enables frame pointers by default. What changes for production performance work, and how to prepare."
+date: "2026-10-21"
+status: "published"
+tags: ["Python", "Performance", "Profiling", "Observability", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "python-315-tachyon-sampling-profiler-frame-pointers-2026"
+---
+
+Most coverage of Python 3.15 focuses on explicit lazy imports and the new `frozendict`. The less discussed changes may matter more for teams that run Python services in production: a reorganized `profiling` package that includes a built-in sampling profiler, and frame pointers enabled by default in the interpreter build. Both are about answering one question, "where is my process spending time right now," with less friction. Everything below is based on the draft "What's New in Python 3.15" document and the associated PEPs (799 and 831). The documentation is still marked as a draft, so verify details against the final release notes before you depend on them.
+
+## What is changing
+
+**PEP 799: a `profiling` package.** Python's profiling tools are grouped under one namespace:
+
+- `profiling.tracing`: the deterministic, call-by-call tracer, relocated from `cProfile`.
+- `profiling.sampling`: a new statistical sampling profiler, named Tachyon.
+
+`cProfile` stays as an alias for backward compatibility. The older `profile` module is deprecated and slated for removal in Python 3.17.
+
+**PEP 831: frame pointers on by default.** The interpreter is built so that native stack frames can be walked reliably. This is aimed at system-level tools such as `perf` and eBPF-based profilers, which have historically struggled to produce readable stacks for Python processes.
+
+## Why sampling matters
+
+A deterministic profiler like `cProfile` instruments every function call. That gives exact call counts, but the overhead distorts what you measure: small functions called millions of times look worse than they are, and you would rarely run it against a live service.
+
+A sampling profiler periodically looks at the process's stack and records where it is. The cost is low and roughly constant, so the result is representative enough to use against something close to production. The draft documentation describes Tachyon as capable of very high sampling rates; in practice you will pick a rate that balances detail and overhead, and you should measure that overhead on your own workload rather than trusting a headline figure.
+
+The practical shift is attaching to a running process. Instead of redeploying with instrumentation to chase a slow request, you point a sampler at the process that already has the problem.
+
+## A workload to try it on
+
+Here is a small, deliberately wasteful service function we use for demos. It has an accidental quadratic step that a sampler should surface clearly:
+
+```python
+# report.py
+import json
+
+
+def build_index(rows):
+    index = []
+    for row in rows:
+        # Linear scan on every insert: O(n^2) overall
+        if row["id"] not in [r["id"] for r in index]:
+            index.append(row)
+    return index
+
+
+def render(rows):
+    return json.dumps(build_index(rows))
+
+
+if __name__ == "__main__":
+    data = [{"id": i % 5000, "v": i} for i in range(20000)]
+    for _ in range(5):
+        render(data)
+```
+
+Once 3.15 is installed, check the exact invocation with `python3.15 -m profiling.sampling --help`, since the command-line surface may change before the final release. You should see `build_index` dominate the samples, and the list comprehension inside it called out specifically. The fix is a set of seen IDs:
+
+```python
+def build_index(rows):
+    seen = set()
+    index = []
+    for row in rows:
+        if row["id"] not in seen:
+            seen.add(row["id"])
+            index.append(row)
+    return index
+```
+
+Re-profile after the change and compare. A sampler is most useful as a before-and-after tool rather than a one-time diagnosis.
+
+## Frame pointers and system profilers
+
+With frame pointers present, `perf` can unwind native stacks cheaply. A typical workflow on Linux:
+
+```bash
+perf record -F 99 -g -p <pid> -- sleep 30
+perf report --stdio | head -50
+```
+
+This shows time across the interpreter, C extensions, and the kernel in one view, which a Python-only profiler cannot do. It is especially useful when the slowness is inside a native library such as a database driver or a numerical extension.
+
+Frame pointers carry a small cost, since one register is reserved. The Python project accepted that trade-off for observability; expect a minor performance difference rather than a dramatic one, and benchmark if you are latency-sensitive. Python code frames themselves still require interpreter-aware tooling to display function names, so check your profiler's Python 3.15 support before assuming flame graphs will be fully readable.
+
+## What we recommend
+
+1. **Do not migrate for this alone.** Python 3.15 is new, and library wheels for new minor versions lag. Test it in CI as an additional matrix entry first.
+2. **Audit direct imports of `profile`.** If any internal tooling uses it, switch to `cProfile` or `profiling.tracing` before 3.17.
+3. **Build a repeatable profiling runbook.** Decide in advance how an on-call engineer attaches a sampler to a production container, what permissions that needs (ptrace-related capabilities are commonly required), and where the output goes.
+4. **Keep the tracer for tests.** Deterministic profiling still has a place in micro-benchmarks and regression tests where call counts matter.
+5. **Treat numbers as local.** Sampling rates, overhead, and the effect of frame pointers all depend on your workload. Measure before and after.
+
+## Summary
+
+Python 3.15's profiling changes lower the cost of finding hotspots in running systems. The sampler gives you a Python-level view, and frame pointers improve the system-level one. Neither replaces good logging and metrics, but together they make "attach and look" a realistic first step in a performance incident. If you run Python backends and want help building profiling and observability into your operations, webhani can help.
