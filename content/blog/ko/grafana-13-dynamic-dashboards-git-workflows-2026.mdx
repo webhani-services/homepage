@@ -1,0 +1,115 @@
+---
+title: "Grafana 13: Dashboards-as-Code를 위한 Dynamic Dashboards와 Git Workflow"
+description: "Grafana 13에서는 Dynamic Dashboards가 정식 제공되고, 양방향 Git Workflow와 Version이 관리되는 Dashboard API가 추가되었습니다. 소규모 팀이 Dashboard를 Review 가능하고 재현 가능한 상태로 유지하는 방법을 정리합니다."
+date: "2026-10-21"
+status: "published"
+tags: ["Grafana", "Monitoring", "Observability", "Prometheus", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "grafana-13-dynamic-dashboards-git-workflows-2026"
+---
+
+Dashboard는 정해진 방식으로 낡아 갑니다. 누군가 UI에서 쓸 만한 Dashboard를 만들고, 다른 사람이 장애 대응 중에 손을 대고, 또 다른 사람이 다른 Service용으로 복사합니다. 1년 뒤에는 어느 Version이 맞는지, 왜 Alert와 다른 숫자가 Panel에 표시되는지 아무도 설명하지 못합니다. 4월 GrafanaCON 2026에서 발표된 Grafana 13은 이 문제의 일부를 다룹니다. 발표 관련 보도에 따르면 Dynamic Dashboards가 정식 제공(GA)되고, 양방향 Git Workflow(GitHub, GitLab, Bitbucket, 일반 Git)가 추가되며, Version이 관리되는 Dashboard API가 제공되고, DORA 및 USE/RED 방식에 기반한 추천 Dashboard와 Layout이 포함됩니다. 이 글에서는 소규모 팀이 이를 어떻게 도입할지 정리합니다. 기능의 세부 내용은 Vendor 발표와 언론 보도에 근거하므로, 실제 동작은 사용 중인 Version의 Grafana 문서에서 확인하시기 바랍니다.
+
+## 실무에서 무엇이 달라지는가
+
+**Dynamic Dashboards.** Variable과 조건에 따라 Dashboard의 Layout과 내용이 달라집니다. 예를 들어 선택한 Service에 대해서만 Service별 Section을 보여 줄 수 있습니다. Service마다 Dashboard를 복사해 두어 시간이 지날수록 서로 달라지는 패턴을 줄일 수 있습니다.
+
+**양방향 Git Workflow.** Dashboard 변경이 Repository로 전달되고, 다시 Repository에서 반영됩니다. 핵심은 "양방향"이라는 점입니다. UI에서 한 수정을 Pull Request로 만들 수 있고, Merge된 변경을 Grafana에 적용할 수 있습니다. 이로써 Dashboard에 이력, Review 단계, Rollback 수단이 생깁니다.
+
+**Version이 관리되는 Dashboard API.** 안정적이고 Version이 있는 API가 있어야 자동화가 오래 갑니다. Version이 없는 Endpoint를 대상으로 작성한 Script는 Upgrade 때 깨지기 쉽습니다.
+
+**DORA 및 USE/RED Template.** USE(Utilization, Saturation, Errors)는 Host나 Queue 같은 Resource에 적합합니다. RED(Rate, Errors, Duration)는 Request 중심의 Service에 적합합니다. 빈 Panel에서 시작하는 것보다 이 중 하나를 반영한 Template에서 시작하는 편이 낫습니다.
+
+## Review하기 쉬운 Directory 구성
+
+어떤 동기화 방식을 선택하든, Repository 구조가 사용 편의성을 좌우합니다. 저희 경험상 잘 맞았던 구성은 다음과 같습니다.
+
+```text
+observability/
+  dashboards/
+    services/
+      api-red.json
+      worker-red.json
+    infra/
+      postgres-use.json
+  alerts/
+    api.rules.yaml
+  ci/
+    validate_dashboards.sh
+```
+
+Dashboard는 파일 하나에 하나씩 두고, Alert Rule은 이를 시각화하는 Dashboard 옆에 둡니다. Export 도구에서 제외할 수 있다면 Dashboard ID나 수정 시각 같은 기계 생성 변경은 Commit하지 않는 편이 좋습니다.
+
+## Panel은 Alert를 기준으로 설계하기
+
+Dashboard에서 가장 흔한 실패는 호출을 받은 Alert와 Panel의 숫자가 서로 다른 것입니다. 둘 다 같은 Query 정의를 사용하십시오. Prometheus를 쓰는 API Service라면 RED 세트는 다음과 같습니다.
+
+```yaml
+# alerts/api.rules.yaml
+groups:
+  - name: api-red
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+      - record: job:http_errors:ratio5m
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+          /
+          sum by (job) (rate(http_requests_total[5m]))
+      - record: job:http_request_duration:p95_5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[5m])))
+      - alert: ApiHighErrorRatio
+        expr: job:http_errors:ratio5m{job="api"} > 0.02
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "API의 5xx 비율이 10분간 2%를 초과했습니다"
+```
+
+Dashboard Panel은 식을 다시 작성하지 않고 Recording Rule(`job:http_errors:ratio5m`)을 참조합니다. 정의를 바꾸면 Alert와 Panel이 함께 바뀌고, Diff에는 두 가지가 모두 나타납니다.
+
+## CI에서 검증하기
+
+Parsing되지 않는 Dashboard JSON이나 존재하지 않는 Datasource를 가리키는 파일은, 다음 날 아침 On-call 담당자가 아니라 Pull Request 단계에서 실패하도록 해야 합니다. 처음에는 작은 Check로 충분합니다.
+
+```bash
+#!/usr/bin/env bash
+# ci/validate_dashboards.sh
+set -euo pipefail
+
+status=0
+for f in observability/dashboards/**/*.json; do
+  jq -e '.title and (.panels | type == "array")' "$f" > /dev/null || {
+    echo "Dashboard 구조가 올바르지 않습니다: $f" >&2
+    status=1
+  }
+  # 모든 Panel은 허용된 Datasource를 사용해야 함
+  if jq -r '..|.datasource?.uid? // empty' "$f" | grep -qv -E '^(prometheus|loki)$'; then
+    echo "예상하지 못한 datasource uid가 있습니다: $f" >&2
+    status=1
+  fi
+done
+exit $status
+```
+
+허용할 UID는 환경에 맞게 조정하십시오. 같은 Job에서 Alert 파일에 `promtool check rules`도 함께 실행합니다. 사용 중인 Grafana에 Git 동기화 형식용 검증 기능이 있다면 직접 만든 Check보다 그쪽을 우선하십시오.
+
+## 주의할 점
+
+- **기준이 되는 쪽을 정하십시오.** UI와 Repository 양쪽에서 Dashboard를 바꿀 수 있다면, 충돌 시 어느 쪽이 우선하는지, 애초에 UI에서 수정할 수 있는 사람이 누구인지 정해야 합니다. 이 규칙이 없으면 양방향 동기화는 이해하기 어려운 덮어쓰기를 일으킵니다.
+- **Secret을 Export하지 마십시오.** Datasource의 Credential은 Dashboard Repository에 두는 것이 아닙니다. Datasource는 UID로 참조하십시오.
+- **동적이라고 해서 단순한 것은 아닙니다.** 조건부 Section이 많은 Dashboard는 평범한 세 개보다 Review하기 어렵습니다. 동적 기능은 중복을 제거하는 데 쓰고, 모든 것을 하는 Dashboard 하나를 만드는 데 쓰지 마십시오.
+- **Upgrade는 복사본에서 먼저 시험하십시오.** Grafana의 Major Upgrade도 다른 것과 똑같이 다룹니다. Backup을 Staging에 복원하여 핵심 Dashboard가 정상적으로 표시되는지 확인합니다.
+
+## 정리
+
+- Git 기반 Dashboard는 이력, Review, Rollback을 제공하며, 가치의 대부분이 여기에 있습니다.
+- Panel과 Alert를 같은 Recording Rule에서 정의하여 서로 어긋나지 않게 합니다.
+- Service에는 RED, Resource에는 USE로 시작하고, 기본이 안정된 후에 DORA View를 추가합니다.
+- Dashboard와 Rule을 CI에서 검증합니다.
+- 동기화를 켜기 전에 기준이 되는 쪽을 정합니다.
+
+흩어진 Dashboard를 통합하거나 새 Service의 Monitoring 체계를 구축하는 과정에서 도움이 필요하시다면, 설계부터 도입까지 webhani가 지원합니다.

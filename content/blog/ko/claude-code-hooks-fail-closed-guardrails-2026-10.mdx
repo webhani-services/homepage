@@ -1,0 +1,117 @@
+---
+title: "Claude Code Hooks를 Guardrail로 쓰기: 실패 시 차단하는 fail closed 설계"
+description: "최근 Claude Code Build에서는 실패한 Hook의 처리 방식이 달라지고 있습니다. Exit Code의 실제 동작과, Hook 자체가 깨져도 차단되도록 작성하는 방법을 정리합니다."
+date: "2026-10-21"
+status: "published"
+tags: ["Claude Code", "AI", "Hooks", "보안", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-hooks-fail-closed-guardrails-2026-10"
+---
+
+Hooks는 Prompt에 적어 둔 "이 작업은 하지 마세요"를 직접 작성한 Code로 강제하는 장치로 바꿔 줍니다. 다만 사소한 실수로도 쉽게 무력해지는 영역이기도 합니다. Guardrail Script가 Crash하면, 환경에 따라서는 조용히 아무것도 막지 않게 됩니다. 10월 초 Claude Code Build(v2.1.294, v2.1.295)의 Release Note에는 실패한 Hook과 Instruction 기반 Hook의 처리가 바뀌었다는 내용이 있다고 합니다. 다만 이는 서드파티 Tracker의 요약이며 Anthropic 공식 Changelog와는 대조하지 못했습니다. 버전별 세부 내용은 참고용으로만 보시고 공식 Release Note에서 확인하시기 바랍니다. 설계 원칙은 버전과 무관하게 유효합니다.
+
+## 문서에 명시된 Exit Code의 의미
+
+Command Hook의 기본 규칙은 다음과 같습니다.
+
+- Exit Code `0`: 성공. Tool 호출이 그대로 진행됩니다.
+- Exit Code `2`: Blocking Error. `PreToolUse`에서는 호출이 중단되고 stderr가 Claude에게 전달됩니다.
+- 그 외 0이 아닌 값: Non-blocking Error. stderr는 사용자에게 표시되지만 실행은 계속됩니다.
+
+마지막 항목이 함정입니다. Python Script가 처리되지 않은 Exception으로 종료되면 Exit Code는 `1`입니다. "위험한 명령을 막는" Hook이 아무것도 막지 않는 Hook이 되고, 남는 흔적은 stderr 한 줄뿐입니다.
+
+또한 공개된 `anthropics/claude-code` Issue에는 Exit Code `2`인데도 호출이 중단되지 않았다는 보고가 있습니다. 현재 상태가 어떻든 Hook만을 유일한 방어선으로 두지 마시기 바랍니다. Permission 규칙을 함께 사용하고, 되돌릴 수 없는 작업은 애초에 해당 권한이 없는 Credential을 쓰는 것이 확실합니다.
+
+## 구조적으로 fail closed 만들기
+
+"무언가 잘못됐다"는 상황은 명시적으로 Exit Code `2`가 되도록 합니다. 예상치 못한 오류가 통과가 아니라 차단이 되도록 전체를 감쌉니다.
+
+```python
+#!/usr/bin/env python3
+"""PreToolUse hook: 위험한 shell 명령을 차단합니다. fail closed."""
+import json
+import re
+import sys
+
+BLOCKED = [
+    (re.compile(r"\bgit\s+push\b.*--force(?!-with-lease)"), "force push"),
+    (re.compile(r"\brm\s+-rf\s+(/|~|\$HOME)(\s|$)"), "루트 계열 경로의 재귀 삭제"),
+    (re.compile(r"\bterraform\s+(apply|destroy)\b"), "terraform apply/destroy"),
+]
+
+
+def main() -> int:
+    event = json.load(sys.stdin)
+    if event.get("tool_name") != "Bash":
+        return 0
+
+    command = event.get("tool_input", {}).get("command", "")
+    for pattern, label in BLOCKED:
+        if pattern.search(command):
+            print(f"정책에 의해 차단: {label}. 사용자에게 직접 실행을 요청하세요.", file=sys.stderr)
+            return 2
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # 잘못된 입력, Key 누락 등 모든 경우
+        print(f"Hook 오류가 발생하여 기본값으로 차단합니다: {exc}", file=sys.stderr)
+        sys.exit(2)
+```
+
+`.claude/settings.json`에 등록하는 예시입니다.
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard_bash.py\"" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+핵심은 두 가지입니다. 첫째, 마지막의 `try/except`가 모든 실패를 차단으로 바꿉니다. 둘째, stderr Message를 모델이 읽는 것을 전제로 작성했습니다. 무엇이 차단됐고 다음에 무엇을 해야 하는지 알려 주면, Agent가 철자만 조금 바꿔 재시도하는 일을 줄일 수 있습니다.
+
+## 정규식은 과속 방지턱일 뿐 벽이 아닙니다
+
+Pattern 목록은 흔한 실수를 막아 줍니다. 하지만 `bash -c "$(echo cm0gLXJmIC8= | base64 -d)"` 같은 호출은 막지 못합니다. 중요한 대상을 보호하는 Hook이라면 판단 기준을 "명령 문자열이 위험해 보이는가"에서 "대상이 허용된 것인가"로 옮기시기 바랍니다.
+
+- 자동화에서 실행을 허용할 명령은 Deny List가 아니라 Allow List로 관리합니다.
+- 파일 수정은 원본 문자열이 아니라 `realpath`로 해석한 경로로 판정합니다.
+- 운영 Credential은 Agent의 환경에 아예 두지 않습니다.
+
+Allow List 방식은 초기 작업이 조금 더 들지만, 새로운 위험 Tool이 나와도 정규식을 추가할 필요가 없어 이후 유지보수 부담이 훨씬 작습니다.
+
+## 정상 경로만이 아니라 실패 경로도 Test하기
+
+Hook에 Test를 작성하는 경우는 드물지만, 중요한 것은 실패 쪽 분기입니다. 최소한의 확인은 다음과 같습니다.
+
+```bash
+# 차단되어야 함 (Exit Code 2)
+echo '{"tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}' | python3 guard_bash.py; echo $?
+# 잘못된 입력도 차단되어야 함 (Exit Code 2)
+echo 'not json' | python3 guard_bash.py; echo $?
+# 관련 없는 Tool은 통과해야 함 (Exit Code 0)
+echo '{"tool_name":"Read","tool_input":{}}' | python3 guard_bash.py; echo $?
+```
+
+이 Test를 다른 Script와 마찬가지로 CI에 넣어 두십시오. 잘못된 입력 Case가 실수로 Exit Code `0`이 되는 변경은 팀에 배포되기 전에 잡아내야 할 전형적인 Regression입니다.
+
+## 정리
+
+- 차단하는 것은 Exit Code `2`뿐입니다. 실패 시에는 의도적으로 `2`로 종료되게 하십시오.
+- stderr Message는 사람뿐 아니라 Agent를 위해서도 작성합니다.
+- Hook은 방어의 한 계층입니다. Permission, 권한을 좁힌 Credential, Review도 함께 사용하십시오.
+- 잘못된 입력 경로를 포함해 Hook Test를 CI에서 실행합니다.
+- 업그레이드할 때마다 공식 Hooks Reference를 다시 확인하십시오. Exit Code 처리와 JSON 판정 Field 모두 변화가 빠른 영역입니다.
+
+Agentic Coding을 도입하면서 정책을 실제로 강제할 수 있는 Check로 옮기는 단계에서 도움이 필요하시다면 webhani에 문의해 주십시오.

@@ -1,0 +1,99 @@
+---
+title: "Python 3.15 Profiling: Tachyon Sampling Profiler와 Frame Pointer 기본 활성화"
+description: "Python 3.15에는 profiling Package와 내장 Sampling Profiler가 추가되고 Frame Pointer가 기본으로 활성화됩니다. 운영 환경의 성능 분석에서 무엇이 달라지는지, 어떻게 준비할지 정리합니다."
+date: "2026-10-21"
+status: "published"
+tags: ["Python", "성능", "Profiling", "Observability", "Backend"]
+thumbnail: ""
+author: "webhani"
+slug: "python-315-tachyon-sampling-profiler-frame-pointers-2026"
+---
+
+Python 3.15 관련 소식은 대부분 명시적 lazy import와 새로운 `frozendict`에 집중되어 있습니다. 그러나 운영 환경에서 Python Service를 돌리는 팀에게는 상대적으로 덜 알려진 다음 두 가지가 더 중요할 수 있습니다. 내장 Sampling Profiler를 포함한 `profiling` Package의 재구성, 그리고 Interpreter Build에서 Frame Pointer가 기본으로 활성화되는 것입니다. 두 변경 모두 "지금 이 Process가 어디에서 시간을 쓰고 있는가"를 더 적은 수고로 알아내기 위한 것입니다. 아래 내용은 공식 "What's New in Python 3.15" Draft 문서와 관련 PEP(799, 831)를 근거로 합니다. 문서가 아직 Draft 상태이므로, 의존하기 전에 최종 Release Note에서 반드시 확인하시기 바랍니다.
+
+## 무엇이 바뀌는가
+
+**PEP 799: `profiling` Package.** Python의 Profiling 도구가 하나의 Namespace로 묶입니다.
+
+- `profiling.tracing`: 호출 단위로 기록하는 결정론적 Tracer입니다. `cProfile`에서 옮겨졌습니다.
+- `profiling.sampling`: 새로운 통계적 Sampling Profiler이며 이름은 Tachyon입니다.
+
+`cProfile`은 하위 호환을 위한 Alias로 남습니다. 오래된 `profile` Module은 Deprecated 되었고 Python 3.17에서 제거될 예정입니다.
+
+**PEP 831: Frame Pointer 기본 활성화.** Native Stack Frame을 안정적으로 따라갈 수 있도록 Interpreter가 Build됩니다. `perf`나 eBPF 기반 Profiler 같은 System 수준 도구를 위한 변경입니다. 이런 도구들은 그동안 Python Process에서 읽을 만한 Stack을 얻는 데 어려움을 겪었습니다.
+
+## Sampling이 중요한 이유
+
+`cProfile` 같은 결정론적 Profiler는 모든 함수 호출을 계측합니다. 호출 횟수는 정확히 알 수 있지만, Overhead가 측정 결과를 왜곡합니다. 수백만 번 호출되는 작은 함수가 실제보다 나쁘게 보이고, 운영 중인 Service에 적용하는 일도 거의 없습니다.
+
+Sampling Profiler는 Process의 Stack을 주기적으로 들여다보고 현재 위치를 기록합니다. 비용이 작고 거의 일정하므로, 운영 환경에 가까운 곳에서도 대표성 있는 결과를 얻을 수 있습니다. Draft 문서는 Tachyon이 매우 높은 Sampling Rate를 지원한다고 설명합니다. 실제로는 상세도와 Overhead의 균형에 맞춰 Rate를 선택하게 되며, 문서에 적힌 수치를 그대로 믿기보다 자신의 Workload에서 Overhead를 직접 측정해야 합니다.
+
+실무에서 달라지는 점은 실행 중인 Process에 Attach할 수 있다는 것입니다. 느린 Request를 추적하려고 계측 Code를 넣어 다시 Deploy하는 대신, 이미 문제가 생긴 Process에 Sampler를 바로 연결할 수 있습니다.
+
+## 시험해 볼 Workload
+
+Demo용으로 일부러 비효율적으로 만든 작은 함수입니다. 우연히 제곱 복잡도가 된 부분이 있어 Sampler에서 뚜렷하게 보일 것입니다.
+
+```python
+# report.py
+import json
+
+
+def build_index(rows):
+    index = []
+    for row in rows:
+        # 삽입할 때마다 선형 탐색: 전체 O(n^2)
+        if row["id"] not in [r["id"] for r in index]:
+            index.append(row)
+    return index
+
+
+def render(rows):
+    return json.dumps(build_index(rows))
+
+
+if __name__ == "__main__":
+    data = [{"id": i % 5000, "v": i} for i in range(20000)]
+    for _ in range(5):
+        render(data)
+```
+
+3.15를 설치한 후 `python3.15 -m profiling.sampling --help`로 정확한 호출 방법을 확인하십시오. Command-line 형태는 정식 Release 전에 바뀔 수 있습니다. Sample의 대부분을 `build_index`가 차지하고, 그 안의 List Comprehension이 두드러지게 나타날 것입니다. 해결책은 이미 본 ID를 Set으로 관리하는 것입니다.
+
+```python
+def build_index(rows):
+    seen = set()
+    index = []
+    for row in rows:
+        if row["id"] not in seen:
+            seen.add(row["id"])
+            index.append(row)
+    return index
+```
+
+수정 후 다시 Profile하여 비교합니다. Sampler는 한 번의 진단보다 수정 전후를 비교하는 도구로 쓸 때 가장 유용합니다.
+
+## Frame Pointer와 System Profiler
+
+Frame Pointer가 있으면 `perf`가 Native Stack을 낮은 비용으로 따라갈 수 있습니다. Linux에서의 일반적인 절차는 다음과 같습니다.
+
+```bash
+perf record -F 99 -g -p <pid> -- sleep 30
+perf report --stdio | head -50
+```
+
+Interpreter, C Extension, Kernel에 걸친 시간 분포를 하나의 View에서 확인할 수 있습니다. Python 전용 Profiler로는 불가능한 일입니다. 느림의 원인이 Database Driver나 수치 연산 Extension 같은 Native Library 내부에 있을 때 특히 유용합니다.
+
+Frame Pointer에는 Register 하나를 점유하는 작은 비용이 있습니다. Python 프로젝트는 Observability를 위해 이 Trade-off를 받아들였습니다. 큰 차이보다는 작은 성능 차이를 예상하되, Latency에 민감하다면 Benchmark를 해 보시기 바랍니다. 또한 Python Code의 Frame에 함수 이름을 표시하려면 여전히 Interpreter를 이해하는 도구가 필요합니다. Flame Graph가 완전히 읽힐 것이라고 가정하기 전에, 사용하는 Profiler가 Python 3.15를 지원하는지 확인하십시오.
+
+## webhani의 권장 사항
+
+1. **이것만을 이유로 Migration하지 마십시오.** Python 3.15는 새 버전이며, 새 Minor Version용 Library Wheel은 늦게 제공됩니다. 우선 CI Matrix에 항목을 추가해 시험하는 것이 현실적입니다.
+2. **`profile`을 직접 import하는 곳을 점검하십시오.** 사내 도구가 사용 중이라면 3.17 이전에 `cProfile`이나 `profiling.tracing`으로 바꿉니다.
+3. **재현 가능한 Profiling Runbook을 만드십시오.** On-call 담당자가 운영 Container에 Sampler를 Attach하는 방법, 필요한 권한(ptrace 관련 Capability가 필요한 경우가 많습니다), 출력 저장 위치를 미리 정해 둡니다.
+4. **Tracer는 Test용으로 유지하십시오.** 호출 횟수가 중요한 Micro-benchmark와 Regression Test에서는 결정론적 Profiling도 여전히 쓸모가 있습니다.
+5. **수치는 해당 환경의 값으로 취급하십시오.** Sampling Rate, Overhead, Frame Pointer의 영향은 Workload에 따라 달라집니다. 전후를 직접 측정하십시오.
+
+## 정리
+
+Python 3.15의 Profiling 관련 변경은 운영 중인 System에서 Hotspot을 찾는 비용을 낮춰 줍니다. Sampler는 Python 수준의 시야를, Frame Pointer는 System 수준의 시야를 개선합니다. 둘 다 적절한 Logging과 Metric을 대체하지는 못합니다. 그래도 성능 Incident가 발생했을 때 "Attach해서 확인해 본다"를 현실적인 첫 단계로 만들어 줍니다. Python Backend를 운영하면서 Profiling과 Observability를 운영 체계에 넣고 싶으시다면 webhani에 문의해 주십시오.
