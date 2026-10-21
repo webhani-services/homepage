@@ -1,0 +1,109 @@
+---
+title: "Dependency Cooldown 정책: npm·PyPI Worm에 대한 저비용 방어"
+description: "침해된 Package는 대개 몇 시간에서 며칠 안에 발견됩니다. 갓 공개된 Release를 피하는 Cooldown으로 그 시간을 벌 수 있습니다. Dependabot, pnpm, npm, uv 설정 방법과 효과가 없는 경우를 정리합니다."
+date: "2026-10-22"
+status: "published"
+tags: ["Security", "Supply Chain", "npm", "Python", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "dependency-cooldown-policy-npm-pypi-worms-2026"
+---
+
+올해 발생한 여러 Package 침해에는 공통된 패턴이 있습니다. 널리 쓰이는 Package의 악성 Version이 공개되고, 짧은 시간 동안 배포된 뒤 회수된다는 점입니다. Mini Shai-Hulud Worm에 대해서는 악성 Release가 격리되기까지 약 12~36시간 동안 공개되어 있었다고 보도되었습니다(Arctic Wolf 기준). RapidFort가 정리한 다른 사례로는 PyPI의 LiteLLM 1.82.7 / 1.82.8 침해, 그리고 GitLab Advisory가 다루는 npm의 axios 1.14.1 / 0.30.4가 있습니다.
+
+여기서 도출되는 방어책은 민망할 만큼 단순합니다. **공개된 당일의 Version을 설치하지 않는 것**입니다. Cooldown 정책은 새 Release의 도입을 며칠 늦춰, 커뮤니티와 Registry, 보안 업체가 문제 있는 Version을 발견할 시간을 확보합니다. 다른 통제를 대체하지는 않지만 비용이 적고, 바로 이 유형의 공격에 효과가 있습니다.
+
+## Cooldown이 하는 일과 하지 못하는 일
+
+효과가 있는 경우:
+
+- Maintainer 계정이 탈취되어 악성 Version이 공개되고, 몇 시간~며칠 안에 탐지되는 경우
+- 새로 공개된 Version을 통해 퍼지는 Worm형 공격
+- 공개 직후 신고되는 Typosquat이나 악성 신규 Release
+
+효과가 없는 경우:
+
+- 몇 주 동안 탐지되지 않는 악성 코드
+- 긴급하게 필요한 보안 수정 (보안 업데이트에는 명시적인 Bypass가 필요합니다)
+- Build Tool이나 CI Secret의 침해. 이는 별도의 공격 경로입니다
+
+Cooldown 기간은 조직의 위험 허용도에 맞춰 정합니다. Application 의존성에는 7일이 일반적인 출발점입니다. 보안 Patch는 짧게, Major Version은 길게 두는 방식도 합리적입니다.
+
+## Dependabot
+
+Dependabot은 `dependabot.yml`의 `cooldown` Block을 지원합니다.
+
+```yaml
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
+```
+
+이 설정으로 보안 업데이트가 지연되지는 않으며, 이것이 바람직한 동작입니다. Option 이름은 계속 바뀌어 왔으므로 최신 Dependabot Documentation에서 확인하십시오.
+
+## pnpm
+
+pnpm에는 기준보다 새로운 Version의 해석을 거부하는 `minimumReleaseAge`(분 단위) 설정이 있습니다.
+
+```yaml
+# pnpm-workspace.yaml
+minimumReleaseAge: 10080   # 7일(분 환산)
+minimumReleaseAgeExclude:
+  - "@your-org/*"          # 자사 Package는 즉시 설치 가능
+```
+
+자사 조직의 Package를 제외 목록에 넣어 두면 내부 Release가 차단되지 않습니다.
+
+## npm
+
+npm에는 자신 있게 권할 만한 영구적 동등 설정이 없지만, 지정한 시점 기준으로 Version을 해석하는 `--before`가 있습니다.
+
+```bash
+# 공개된 지 7일 이상 지난 Version만 설치
+npm install --before="$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+`date -d`는 GNU 문법입니다. macOS에서는 `date -u -v-7d +%Y-%m-%dT%H:%M:%SZ`를 사용합니다. 주로 Lockfile 없이 Clean Install을 수행하는 CI Job에 유용하지만, 그런 운영 자체를 피하는 편이 좋습니다. Lockfile을 Commit하고 `npm ci`를 사용하면 새 Version은 자체 업데이트 PR을 통해서만 들어오며, 이 부분은 Dependabot Cooldown이 커버합니다.
+
+## uv (Python)
+
+uv에는 지정한 시각 이후에 업로드된 배포 파일을 무시하는 `exclude-newer` Option이 있습니다.
+
+```toml
+# pyproject.toml
+[tool.uv]
+exclude-newer = "2026-10-15T00:00:00Z"
+```
+
+절대 시각은 재현성 면에서 좋지만 갱신이 필요합니다. 매주 날짜를 올리고 PR을 만드는 Scheduled Job을 두면 Review 단계가 있는 Rolling Cooldown이 됩니다. 상대 기간을 지원하는지는 사용 중인 uv Version의 Documentation에서 확인하십시오.
+
+## Bypass 절차를 명문화합니다
+
+Bypass가 없는 Cooldown은 실제 보안 Patch를 지연시켰을 때 그 자체로 사고의 원인이 됩니다. 절차를 문서로 남겨 두십시오.
+
+1. 악용이 확인된 CVE나 의존 Package의 수정 Version이 나오면 Cooldown과 무관하게 수동으로 업데이트합니다
+2. 담당자는 Repository뿐 아니라 공개된 Package의 changelog와 diff를 확인합니다
+3. 예외는 PR 설명에 기록합니다
+
+## 빈틈을 메우는 통제와 함께 사용합니다
+
+Cooldown은 하나의 계층일 뿐입니다. 다음과 함께 적용하십시오.
+
+- **Lockfile Commit과 강제** (`npm ci`, `pnpm install --frozen-lockfile`, `uv sync --locked`)
+- **Install Script 기본 비활성화** (Tool이 지원하는 경우). 정말 필요한 Package만 허용 목록에 추가
+- **수명이 짧고 범위가 제한된 CI 자격 증명**. 설치 단계가 침해되어도 장기 Secret을 읽을 수 없도록 함
+- **PR에서 신규 의존성 모니터링**. Worm은 간접 의존성 추가로 들어오는 경우가 많습니다
+
+## 권장 사항
+
+먼저 Dependabot과 pnpm에 7일 Cooldown을 적용하고, 보안 업데이트는 예외로 유지하며, Bypass 절차를 문서화하십시오. 설정은 반나절이면 끝나며, 올해 사고들의 배경인 "공개되고, 설치되고, 이후 회수되는" 패턴에 대한 노출을 상당 부분 줄일 수 있습니다.
+
+webhani는 컨설팅의 일환으로 CI/CD와 의존성 관리 체계를 점검하고 있습니다. Pipeline의 Gap Analysis가 필요하시면 문의해 주십시오.

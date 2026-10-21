@@ -1,0 +1,89 @@
+---
+title: "Polars 2.0 Makes Streaming the Default: Check Your Row-Order Assumptions"
+description: "Polars 2.0 runs LazyFrame queries on the streaming engine by default. The speedup is attractive, but joins, group-bys and unpivots may not preserve row order. A migration checklist with code."
+date: "2026-10-22"
+status: "published"
+tags: ["Python", "Polars", "Data Engineering", "Performance", "Migration"]
+thumbnail: ""
+author: "webhani"
+slug: "polars-2-streaming-default-row-order-migration-2026"
+---
+
+Polars 2.0 changes which engine runs your `LazyFrame` queries: the streaming engine is now the default. The Polars team's announcement expects it to be several times faster in aggregate, and early coverage reports that the final release landed on October 6, with an initial out-of-core (spill to disk) capability. We only found that release date in a single third-party write-up, so confirm it on pola.rs before you plan around it.
+
+The speed is the headline. The part that can hurt is smaller: **the streaming engine does not guarantee row order for some operations.** Coverage names joins, group-bys and unpivots. Code that happened to depend on the old in-memory ordering can start returning the same rows in a different order.
+
+## Why row order bites
+
+Most pipelines do not *intend* to depend on order. They depend on it by accident:
+
+- A report writes the first N rows of a grouped result and a downstream consumer assumes they are the top N.
+- A test compares a DataFrame to an expected one with `assert_frame_equal` and no sort.
+- A join result is written to CSV and a diff-based check flags every run as changed.
+- `.head()` is used as a "sample" on a result that was never sorted.
+
+With the old engine these happened to be stable. With the new one they can vary between runs or versions. Nothing crashes; the numbers are just in a different place.
+
+## Make order explicit
+
+The fix is cheap and makes the code more honest. Sort where you need order:
+
+```python
+import polars as pl
+
+orders = pl.scan_parquet("orders/*.parquet")
+customers = pl.scan_parquet("customers.parquet")
+
+result = (
+    orders
+    .join(customers, on="customer_id", how="left")
+    .group_by("region")
+    .agg(pl.col("amount").sum().alias("revenue"))
+    .sort("revenue", descending=True)   # explicit, not incidental
+    .collect()
+)
+```
+
+Where you need to preserve the input order of a join or group-by, the `maintain_order` argument exists for that (check the 2.0 API reference for the exact values accepted by each method, since options differ between `join` and `group_by`):
+
+```python
+grouped = orders.group_by("customer_id", maintain_order=True).agg(
+    pl.col("amount").sum()
+)
+```
+
+Expect `maintain_order` to cost some of the streaming speedup. Use it only where the order is part of the contract, and sort by a business key elsewhere.
+
+## Opting out during migration
+
+If you need time, you can keep a query on the in-memory engine explicitly at collect time. In recent Polars versions this looks like:
+
+```python
+df = lazy_query.collect(engine="in-memory")
+```
+
+The exact spelling of engine selection has changed across minor versions, and one report mentions an engine-affinity setting for making the old engine the default. Check the 2.0 docs for the current form. Treat this as a bridge, not a destination: the in-memory engine is the one being deprecated in practice.
+
+## A migration checklist
+
+1. **Pin and upgrade in a branch.** Upgrade to 2.0 in isolation and run the full test suite.
+2. **Search for order-sensitive tests.** Grep for `assert_frame_equal` and add `check_row_order=False` where order is not part of the behaviour, or add an explicit sort where it is.
+3. **Compare outputs old vs new.** Run each production query on both engines against a sample and diff the sorted results. If sorted results differ, you have a real bug, not an ordering artifact.
+4. **Audit `head()`, `first()`, `unique()` and `limit`.** These are the usual places where unsorted data becomes a visible answer.
+5. **Re-measure.** Benchmark your own workload. Aggregate claims about speed rarely match a specific pipeline, and the wins are largest on scans, filters and aggregations over data larger than memory.
+6. **Watch memory with spill enabled.** Out-of-core support is described as initial. Test with datasets bigger than RAM before relying on it in production.
+
+A quick equivalence check you can drop into a test:
+
+```python
+def assert_same_rows(a: pl.DataFrame, b: pl.DataFrame, key: list[str]) -> None:
+    a_sorted = a.sort(key)
+    b_sorted = b.sort(key)
+    assert a_sorted.equals(b_sorted), "results differ beyond row order"
+```
+
+## Our view
+
+This is a good default. Streaming execution suits the data sizes most teams actually have, and making the fast path the default is the right call. The cost is that a hidden assumption, "the engine returns rows in a convenient order," is now exposed. Treat that as a favour: pipelines that sort explicitly are easier to reason about, easier to test, and portable across engines.
+
+If your data pipelines run on Polars, schedule the upgrade as a small project with an output-diff step rather than a dependency bump. If you want a second pair of eyes on a migration, webhani can help.

@@ -1,0 +1,78 @@
+---
+title: "PostgreSQL 19, 11월로 연기: AI Code Review가 Triage에 던진 숙제"
+description: "LLM 기반 Review가 결함을 찾아내는 속도가 수정 속도를 넘어서면서 PostgreSQL 19 GA가 11월 19일로 밀렸습니다. Upgrade 계획에 미치는 영향과, AI 지적 사항에 팀이 묻히지 않는 운영 방법을 정리합니다."
+date: "2026-10-22"
+status: "published"
+tags: ["PostgreSQL", "AI", "Code Review", "Database", "개발 프로세스"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-19-delay-ai-code-review-triage-2026"
+---
+
+PostgreSQL 19는 10월 15일에 RC1이 공개되었지만, GA는 11월 19일로 연기되었고 RC2는 11월 12일로 예정되어 있습니다. The Register 보도를 바탕으로 한 2차 자료에 따르면, Committer인 Peter Eisentraut는 LLM 기반 Review가 수정 속도보다 빠르게 결함을 찾아냈다고 설명했으며, SQL/PGQ를 포함해 8~10개 정도의 주요 기능이 Release Branch에서 revert되었다고 합니다. 원본 pgsql-hackers 스레드는 확인하지 못했으므로, 건수와 발언은 "보도된 내용"으로 읽어 주시기 바랍니다.
+
+정확한 숫자와 관계없이 이 사례는 좋은 참고가 됩니다. 결함을 "찾는" 비용은 급격히 내려갔지만 "판단하고 고치는" 비용은 그대로일 때 어떤 일이 벌어지는지 보여 주기 때문입니다.
+
+## Upgrade 계획에 미치는 영향
+
+이번 분기에 PostgreSQL 19 도입을 계획하셨다면, 실무적인 영향은 크지 않습니다.
+
+- **RC를 운영 Primary에 사용하지 마십시오.** RC는 테스트용입니다.
+- **그래도 RC1 검증은 계속하십시오.** revert된 기능은 Branch에서 빠지지만, 기본값 변경과 제거된 동작은 여전히 Upgrade에서 문제가 생기기 쉬운 부분입니다. Schema와 느린 Query를 지금 RC1에 돌려 두면 11월 19일 이전에 문제를 발견할 수 있습니다.
+- **19.0 직후에 19.1이 나온다고 가정하고 계획하십시오.** 새 Major Version은 첫 Minor Release를 기다린 뒤 핵심 시스템에 적용하는 것이 저희의 습관입니다. 막판 변경이 많았던 Release라면 더욱 그렇습니다.
+
+일회용 RC1 Instance에서 수행하는 최소한의 Smoke Test 예시입니다.
+
+```bash
+# 최근 논리 Dump를 일회용 RC1 Container에 복원
+docker run --rm -d --name pg19rc -e POSTGRES_PASSWORD=test -p 5433:5432 postgres:19rc1
+pg_restore --no-owner -h localhost -p 5433 -U postgres -d postgres latest.dump
+
+# 가장 느린 Query 10개의 실행 계획 비교
+psql -h localhost -p 5433 -U postgres -f slow_queries_explain.sql > explain_pg19.txt
+diff explain_pg18.txt explain_pg19.txt
+```
+
+RC용 Image Tag는 Registry마다 다르므로, 실제로 공개된 Tag를 확인한 뒤 사용하십시오.
+
+## 핵심: 지적은 싸고, 판단은 비싸다
+
+많은 팀이 어떤 형태로든 AI Review를 도입하고 있습니다. 이번 연기는 저희가 고객 프로젝트에서도 보아 온 실패 패턴의 공개 사례입니다. AI Reviewer는 그럴듯한 지적을 대량으로 내놓습니다. 그리고 각 지적마다 사람이 다음 세 가지에 답해야 합니다.
+
+1. 실제 문제인가 (재현 가능하거나 코드로 증명할 수 있는가)
+2. 중요한가 (도달 가능한가, 사용자에게 보이는가, 보안상 의미가 있는가)
+3. 지금 안전하게 고칠 수 있는가
+
+지적이 늘어나는 속도가 이 세 질문에 답하는 속도를 넘어서면, 팀은 멈추거나 Reviewer를 무시하기 시작합니다. 둘 다 Reviewer가 없는 상태보다 나쁜 결과입니다.
+
+### 무너지지 않는 Triage 구조
+
+기존 Codebase에 AI Review를 도입할 때 저희가 권장하는 구성입니다.
+
+**재현 방법이나 근거 제시를 필수로 합니다.** File, 줄 범위, 구체적인 실패 입력을 제시하지 못하는 지적은 자동으로 폐기합니다. 다음과 같은 Prompt로 출력을 실용적으로 유지할 수 있습니다.
+
+```text
+각 지적에 대해 file, 줄 범위, severity(crash / data loss /
+incorrect result / style), 그리고 이를 일으키는 최소 입력 또는 호출 순서를 출력하십시오.
+재현 방법을 만들 수 없으면 "unverified"로 표시하고 한 줄로 끝내십시오.
+```
+
+**Merge를 막는 기준을 심각도로 나눕니다.** Merge를 차단하는 것은 재현 방법이 있는 "crash", "data loss", "incorrect result"뿐입니다. 나머지는 PR마다가 아니라 주 단위로 검토하는 Backlog로 보냅니다.
+
+**진행 중인 작업 수에 상한을 둡니다.** 어떤 Module에 처리되지 않은 AI 지적이 5건 있다면, 건수가 줄어들 때까지 그 Module의 신규 Scan을 멈춥니다. 관료적으로 보일 수 있지만, 아무도 읽지 않게 되는 무한 Queue를 막아 줍니다.
+
+**양이 아니라 정확도를 측정합니다.** 사람이 "실제 문제"로 인정한 지적의 비율을 추적합니다. 절반 아래로 떨어지면 Scan 범위를 넓히기 전에 Prompt나 대상을 좁히십시오. 건수는 허수 지표일 뿐입니다.
+
+**지적마다 담당자를 둡니다.** 담당자가 없는 지적은 아무도 닫지 않습니다. 생성 시점에 할당하십시오.
+
+### 일찍 revert합니다
+
+알려진 문제를 안고 출시하는 대신 기능을 빼는 Postgres 팀의 결정도 참고할 만합니다. 확신이 없는 변경은 Branch가 열려 있을 때는 싸게 되돌릴 수 있지만, 출시 후에는 비용이 커집니다. Application 팀에서는 기본값이 OFF인 Feature Flag가 같은 역할을 합니다. 막판에 의문이 제기되어도 해당 기능만 빼고 나머지를 출시할 수 있습니다.
+
+## webhani의 권장 사항
+
+Database 사용자에게: PostgreSQL 19 검증은 계속하되, 운영 전환 시점은 19.1 이후로 잡으십시오. 남는 몇 주 동안 Release Notes의 비호환 항목 점검을 진행할 수 있습니다.
+
+AI Review를 도입하는 Engineering Lead에게: Scan 범위를 넓히기 전에 Triage 체계에 먼저 투자하십시오. 부족한 자원은 Reviewer의 주의력이며, 재현 방법·담당자·명확한 심각도를 갖춘 지적에만 그 주의력을 쓰도록 설계하는 것이 핵심입니다.
+
+AI Review Workflow 설계나 PostgreSQL Major Version 마이그레이션에 도움이 필요하시면 webhani에 문의해 주십시오.

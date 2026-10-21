@@ -1,0 +1,109 @@
+---
+title: "A Dependency Cooldown Policy: Cheap Defence Against npm and PyPI Worms"
+description: "Compromised packages are usually caught within hours or days. A cooldown that refuses brand-new releases buys that time. How to set it up in Dependabot, pnpm, npm and uv, and where it does not help."
+date: "2026-10-22"
+status: "published"
+tags: ["Security", "Supply Chain", "npm", "Python", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "dependency-cooldown-policy-npm-pypi-worms-2026"
+---
+
+Several package compromises this year share a pattern. Malicious versions of widely used packages were published, were live for a short window, and were then pulled. Reports on the Mini Shai-Hulud worm say malicious releases stayed up for roughly 12 to 36 hours before quarantine (according to Arctic Wolf). Other incidents listed by RapidFort include compromised LiteLLM releases 1.82.7 and 1.82.8 on PyPI, and axios 1.14.1 and 0.30.4 on npm, covered by a GitLab advisory.
+
+The defence that falls out of this is almost embarrassingly simple: **do not install a version the day it is published.** A cooldown policy delays adoption of new releases by a few days, so that the community, registries and security vendors have time to notice a bad one. It does not replace other controls, but it is cheap and it works against exactly this class of attack.
+
+## What a cooldown does and does not do
+
+It helps against:
+
+- Maintainer account takeovers where a malicious version is published and detected within hours or days.
+- Worm-style attacks that spread through freshly published versions.
+- Typosquats and malicious new releases that are reported shortly after publication.
+
+It does not help against:
+
+- Malicious code that stays undetected for weeks.
+- A vulnerability fix you urgently need. You need an explicit bypass for security updates.
+- Compromised build tooling or CI secrets, which are a different attack path.
+
+Choose a cooldown length from your own risk tolerance. Seven days is a common starting point for application dependencies. A shorter window for security patches and a longer one for major versions is reasonable.
+
+## Dependabot
+
+Dependabot supports a `cooldown` block in `dependabot.yml`:
+
+```yaml
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
+```
+
+Security updates are not delayed by this setting, which is the behaviour you want. Verify that in the current Dependabot documentation, since option names have evolved.
+
+## pnpm
+
+pnpm has a `minimumReleaseAge` setting, expressed in minutes, which refuses to resolve versions younger than the threshold:
+
+```yaml
+# pnpm-workspace.yaml
+minimumReleaseAge: 10080   # 7 days in minutes
+minimumReleaseAgeExclude:
+  - "@your-org/*"          # your own packages can be installed immediately
+```
+
+Keep your own organisation's packages in the exclude list so your internal releases are not blocked.
+
+## npm
+
+npm does not have a persistent equivalent that we can recommend with confidence, but it offers `--before`, which resolves versions as of a date:
+
+```bash
+# install only versions published at least 7 days ago
+npm install --before="$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+The `date -d` syntax is GNU. On macOS use `date -u -v-7d +%Y-%m-%dT%H:%M:%SZ`. This is most useful for CI jobs that run fresh installs without a lockfile, which is a practice we would rather you avoid anyway. With a committed lockfile and `npm ci`, new versions only arrive through your own update pull requests, and the Dependabot cooldown covers those.
+
+## Python with uv
+
+uv has an `exclude-newer` option that ignores distributions uploaded after a given timestamp:
+
+```toml
+# pyproject.toml
+[tool.uv]
+exclude-newer = "2026-10-15T00:00:00Z"
+```
+
+An absolute timestamp is deterministic, which is good for reproducibility, but it needs updating. A scheduled job that bumps the date weekly and opens a pull request gives you a rolling cooldown with a review step. Check the uv documentation for whether relative durations are supported in your installed version.
+
+## Make the bypass explicit
+
+A cooldown without a bypass will eventually cause an incident of its own, when a real security patch is delayed. Write down the bypass path:
+
+1. A CVE with a known exploit or a fix for a package you depend on triggers a manual update outside the cooldown.
+2. The person doing it reads the changelog and the diff of the published package, not only the repository.
+3. The exception is recorded in the pull request description.
+
+## Combine it with controls that cover the gaps
+
+Cooldown is one layer. Pair it with:
+
+- **Lockfiles committed and enforced** (`npm ci`, `pnpm install --frozen-lockfile`, `uv sync --locked`).
+- **Install scripts disabled by default** where your tooling allows it, with an allowlist for packages that genuinely need them.
+- **Short-lived, scoped CI credentials**, so that a compromised install step cannot read long-lived secrets.
+- **Monitoring of new dependencies** in pull requests, since a worm often arrives as a transitive addition.
+
+## Recommendation
+
+Start with a seven-day cooldown in Dependabot and pnpm, keep security updates exempt, and document the bypass. The change is an afternoon of configuration and removes a meaningful share of exposure to the "published, installed, then pulled" pattern behind this year's incidents.
+
+webhani reviews CI/CD and dependency-management setups as part of our consulting work. If you want a gap analysis for your pipeline, get in touch.
