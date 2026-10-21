@@ -1,0 +1,78 @@
+---
+title: "PostgreSQL 19 Slips to November: What AI Code Review Changes About Triage"
+description: "PostgreSQL 19 GA moved to November 19 after LLM-assisted review surfaced defects faster than committers could fix them. What the delay means for upgrade plans, and how to keep AI findings from swamping your own team."
+date: "2026-10-22"
+status: "published"
+tags: ["PostgreSQL", "AI", "Code Review", "Database", "Engineering Process"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-19-delay-ai-code-review-triage-2026"
+---
+
+PostgreSQL 19 reached its first release candidate on October 15, but general availability has moved to November 19, with a second release candidate planned for November 12. According to secondary coverage that traces back to a report in The Register, committer Peter Eisentraut said LLM-assisted review had surfaced defects faster than the team could fix them, and that roughly eight to ten significant features were reverted from the release branch, SQL/PGQ among them. We could not locate the original pgsql-hackers thread, so treat counts and quotes as reported, not verified.
+
+Whatever the exact numbers, the episode is a useful case study. It shows what happens when the cost of *finding* a defect drops sharply while the cost of *judging and fixing* it does not.
+
+## What this means for your upgrade plan
+
+If you were planning a PostgreSQL 19 rollout this quarter, the practical consequences are small:
+
+- **Do not schedule production upgrades against the RC.** Release candidates are for testing, not for primary databases.
+- **Keep testing on RC1 anyway.** Reverted features are out of the branch, but the changed defaults and removed behaviours are still where upgrades break. Running your schema and your slowest queries against a RC1 instance now means you find problems before November 19, not after.
+- **Plan for 19.0 to be followed by 19.1 quickly.** For any new major version, we wait for the first minor release before moving critical systems. A release that shipped after heavy late-stage churn strengthens that habit.
+
+A minimal smoke test you can run today against a scratch RC1 instance:
+
+```bash
+# Restore a recent logical dump into a throwaway RC1 container
+docker run --rm -d --name pg19rc -e POSTGRES_PASSWORD=test -p 5433:5432 postgres:19rc1
+pg_restore --no-owner -h localhost -p 5433 -U postgres -d postgres latest.dump
+
+# Compare plans for your ten slowest queries
+psql -h localhost -p 5433 -U postgres -f slow_queries_explain.sql > explain_pg19.txt
+diff explain_pg18.txt explain_pg19.txt
+```
+
+Check the image tag against what is actually published before relying on that command; tags for release candidates vary by registry.
+
+## The broader lesson: findings are cheap, decisions are not
+
+Most teams are now adopting AI review in some form. The Postgres schedule slip is an early public example of a failure mode we have seen in client projects as well. An AI reviewer produces a long list of plausible issues. Each one needs a human to answer three questions:
+
+1. Is it real (reproducible, or provable from the code)?
+2. Does it matter (reachable, user-visible, security-relevant)?
+3. Is the fix safe to land now?
+
+When the list grows faster than people can answer those questions, the team either stalls or starts ignoring the reviewer. Both outcomes are worse than having no reviewer.
+
+### A triage structure that scales
+
+This is the setup we recommend when introducing AI review on an existing codebase.
+
+**Require a reproduction or a pointer.** Findings that cannot name a file, a line range, and a concrete failing input are discarded automatically. A prompt like this keeps the output actionable:
+
+```text
+For each issue, output: file, line range, severity (crash / data loss /
+incorrect result / style), and a minimal input or call sequence that triggers it.
+If you cannot construct one, label the issue "unverified" and keep it to one line.
+```
+
+**Separate severity tiers by what blocks a merge.** Only "crash", "data loss", and "incorrect result" findings with a reproduction block a merge. Everything else goes to a backlog that is reviewed weekly, not per pull request.
+
+**Cap work in progress.** If five AI-found issues are open on a module, new scans of that module are paused until the count drops. This sounds bureaucratic, but it prevents the unbounded queue that makes people stop reading.
+
+**Measure precision, not volume.** Track the share of AI findings that humans accept as real. If it falls below roughly half, tighten the prompt or narrow the scope before adding more scanning. Volume is a vanity metric here.
+
+**Keep a human owner per finding.** An unowned finding is a finding nobody will ever close. Assign on creation.
+
+### Revert early
+
+The Postgres team's decision to pull features rather than ship them with known open issues is also instructive. Reverting a half-trusted change is cheap while the branch is open and expensive after release. In application teams, the equivalent is a feature flag with a default of off: if AI review (or a human) raises doubts late, you can ship the rest of the release without the feature.
+
+## Our recommendation
+
+For database users: keep your PostgreSQL 19 testing running, but set your production date after 19.1. Use the extra weeks to run the incompatibility checks from the RC1 release notes.
+
+For engineering leads adopting AI review: invest in the triage pipeline before you widen the scanning scope. The scarce resource is reviewer attention, and the process should spend it only on findings with a reproduction, an owner, and a clear severity.
+
+If you would like help designing an AI-assisted review workflow or planning a PostgreSQL major-version migration, webhani works on both.
