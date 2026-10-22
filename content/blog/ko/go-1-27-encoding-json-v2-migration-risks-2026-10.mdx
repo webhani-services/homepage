@@ -1,0 +1,100 @@
+---
+title: "Go 1.27과 encoding/json/v2: import를 바꾸면 무엇이 깨지는가"
+description: "Go 1.27에서 encoding/json/v2가 실험 단계를 벗어났습니다. Toolchain 업그레이드는 안전하지만 import를 바꾸면 동작이 달라집니다. 중복 Key, 잘못된 UTF-8, nil Collection, Field 이름 매칭을 다루는 테스트 우선 마이그레이션 방법을 소개합니다."
+date: "2026-10-23"
+status: "published"
+tags: ["Go", "JSON", "Backend", "Migration", "Testing"]
+thumbnail: ""
+author: "webhani"
+slug: "go-1-27-encoding-json-v2-migration-risks-2026-10"
+---
+
+Go 1.27은 8월에 릴리스되었고 주요 기능은 Generic Method였습니다([이전 글](/blog/go-1-27-generic-methods-2026)에서 다뤘습니다). 그런데 더 많은 Production 코드에 영향을 주는 변화는 조용한 쪽입니다. `encoding/json/v2`가 `GOEXPERIMENT=jsonv2` 뒤에 있던 실험이 아니라 일반 Package가 되었고, Package 문서도 새로 작성하는 JSON 코드에는 v2를 권장합니다.
+
+계획을 세울 때 가장 중요한 것은 놓치기 쉬운 구분입니다. 2차 자료와 Package 문서에 따르면 Go Toolchain을 업그레이드하는 것만으로는 기존 `encoding/json` 코드의 동작이 바뀌지 않으며, v1은 기존 Semantics를 유지합니다. 위험은 import를 `encoding/json/v2`로 바꾸는 시점에 시작됩니다. 컴파일은 통과하지만 동작이 달라지는 유형의 마이그레이션이므로, 변경 이후가 아니라 이전에 테스트를 갖춰 두는 것이 좋습니다.
+
+## 동작이 달라지는 지점
+
+v2의 기본값은 더 엄격합니다. 문서에 나타난 차이 가운데 점검할 만한 영역은 다음과 같습니다.
+
+- **중복된 Object Member 이름.** `{"a":1,"a":2}`를 v1은 받아들이고(마지막 값 우선) v2는 Error를 반환합니다.
+- **잘못된 UTF-8.** v1은 잘못된 Sequence를 조용히 치환하고, v2는 기본적으로 거부합니다.
+- **nil Slice와 Map.** v1은 nil Slice를 `null`로 Encoding하고, v2는 별도 설정이 없으면 빈 배열로 Encoding합니다. `null`과 `[]`를 구분하는 Client는 차이를 느낍니다.
+- **Field 이름 매칭.** v1은 JSON Key와 Struct Field를 대소문자 구분 없이 매칭하고, v2는 기본적으로 구분합니다. `userId` Tag가 붙은 Field에 `UserID`를 보내는 Client는 이전에는 동작했지만 이제는 조용히 무시될 수 있습니다.
+- **Struct Tag.** v1의 일부 Tag Option은 v2에서 다르거나 이름이 바뀐 형태로 제공됩니다.
+
+어느 것도 특이한 경우가 아닙니다. 실제 Traffic, 특히 서드파티 Client와 오래된 Mobile App 버전은 관대한 동작에 의존하고 있을 수 있습니다.
+
+## 테스트를 먼저 작성하기
+
+목록을 읽고 기대하기보다, 실제 Payload로 현재 동작을 기록한 다음 같은 Corpus를 v2에도 실행합니다.
+
+```go
+package payload_test
+
+import (
+	jsonv1 "encoding/json"
+	jsonv2 "encoding/json/v2"
+	"reflect"
+	"testing"
+)
+
+type Order struct {
+	UserID string   `json:"userId"`
+	Items  []string `json:"items"`
+}
+
+var corpus = []string{
+	`{"userId":"u1","items":["a"]}`,
+	`{"UserID":"u1","items":["a"]}`,        // 대소문자 불일치
+	`{"userId":"u1","userId":"u2"}`,        // 중복 Key
+	`{"userId":"u1","items":null}`,         // null Slice
+	"{\"userId\":\"\xff\"}",                // 잘못된 UTF-8
+}
+
+func TestV1V2Decode(t *testing.T) {
+	for _, in := range corpus {
+		var a, b Order
+		errA := jsonv1.Unmarshal([]byte(in), &a)
+		errB := jsonv2.Unmarshal([]byte(in), &b)
+		if (errA == nil) != (errB == nil) || !reflect.DeepEqual(a, b) {
+			t.Errorf("divergence for %q:\n v1=%+v err=%v\n v2=%+v err=%v", in, a, errA, b, errB)
+		}
+	}
+}
+```
+
+Corpus는 가능하면 마스킹한 Production 요청 Log에서 만드십시오. 직접 작성한 예시로는 이미 떠올린 경우만 잡을 수 있습니다. 출력되는 차이 목록이 곧 마이그레이션 Backlog입니다.
+
+Encoding 쪽에서는 Response 타입의 Byte 출력을 비교합니다. `null`이 `[]`로 바뀌는 것은 Go 테스트가 모두 통과하더라도 API 소비자에게는 계약 변경이기 때문입니다.
+
+## 경계마다 엄격함을 선택하기
+
+모든 경계가 같은 방식으로 동작할 필요는 없습니다.
+
+| 경계 | 권장 방침 |
+|---|---|
+| 내부 Service 간 통신 | v2 기본값으로 이전. 엄격한 실패가 버그를 일찍 드러냄 |
+| 서드파티 입력을 받는 공개 API | 차이를 파악하기 전까지 v1 동작 유지 |
+| 직접 관리하는 설정 파일과 Webhook | v2의 엄격함이 대체로 개선 |
+| 나중에 다시 읽는 저장된 JSON | Decoder 전환 전에 오래된 Record로 테스트 |
+
+중복 Key에는 따로 덧붙일 점이 있습니다. 두 Component가 같은 문서를 읽고 해석이 엇갈리는 Parser Differential 버그의 원인으로 알려져 있기 때문입니다. Gateway와 Backend가 같은 요청을 다르게 해석하면 그 틈을 공격에 이용할 수 있습니다. 정상 Client가 중복 Key를 보내지 않는다는 것을 확인했다면, 중복을 거부하는 것은 타당한 보안 강화 조치입니다.
+
+## 단계적인 Rollout
+
+1. import는 그대로 두고 Toolchain을 1.27로 **업그레이드**합니다. Test Suite를 실행합니다. 별일 없어야 합니다.
+2. Log와 Fixture로 **Corpus를 구성**하고 위의 Differential Test를 실행합니다.
+3. 차이마다 **수정 또는 허용**을 결정합니다. 기본값에 의존하지 말고 Struct Tag와 Option을 명시합니다.
+4. 같은 Differential Test를 CI에 두고, 내부 코드부터 **Package 단위로 하나씩 이전**합니다.
+5. Package를 옮길 때마다 Production의 **Decode Error를 모니터링**합니다. 400 응답 증가가 신호입니다.
+
+## 정리
+
+- Toolchain 업그레이드와 import 변경은 서로 다른 결정이며 위험도 다릅니다.
+- v2의 엄격한 기본값은 실제 버그를 잡아내지만, Client가 의존하던 동작도 바꿉니다.
+- 마이그레이션 노트를 읽는 것보다 실제 Payload에 대한 Differential Test가 확실합니다.
+- 중복 Key 거부는 보안 개선으로 보되, 정상 Traffic에 영향이 없는지 확인하십시오.
+- Repository 전체를 Pull Request 하나로 바꾸지 말고 경계 단위로 이전하십시오.
+
+여기서 설명한 동작은 Go Package 문서와 서드파티 마이그레이션 글에 근거합니다. 사용 중인 버전의 정확한 사양은 Go 1.27 Release Notes에서 확인하시기 바랍니다.

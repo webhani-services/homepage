@@ -1,0 +1,100 @@
+---
+title: "Go 1.27 and encoding/json/v2: What Can Break When You Switch the Import"
+description: "Go 1.27 promotes encoding/json/v2 out of experiment. Upgrading the toolchain is safe; changing the import is where behavior shifts. A test-first migration approach for duplicate keys, invalid UTF-8, nil collections, and field matching."
+date: "2026-10-23"
+status: "published"
+tags: ["Go", "JSON", "Backend", "Migration", "Testing"]
+thumbnail: ""
+author: "webhani"
+slug: "go-1-27-encoding-json-v2-migration-risks-2026-10"
+---
+
+Go 1.27 shipped in August with generic methods as its headline feature, which we covered [earlier](/blog/go-1-27-generic-methods-2026). The change that will touch more production code is quieter: `encoding/json/v2` is now a regular package rather than an experiment behind `GOEXPERIMENT=jsonv2`, and the package documentation recommends it for new JSON code.
+
+The key point for planning is a distinction that is easy to miss. According to secondary coverage and the package docs, upgrading the Go toolchain does not by itself change how existing `encoding/json` code behaves; the v1 package keeps its historical semantics. The risk begins when you change an import to `encoding/json/v2`, because the code still compiles while the behavior shifts. That is the dangerous kind of migration, and it deserves tests before the change, not after.
+
+## Where behavior differs
+
+The v2 defaults are stricter. These are the areas worth auditing, based on the documented differences:
+
+- **Duplicate object member names.** Decoding `{"a":1,"a":2}` is accepted by v1 (last value wins) and returns an error under v2.
+- **Invalid UTF-8.** v1 replaces invalid sequences quietly; v2 rejects them by default.
+- **Nil slices and maps.** v1 encodes a nil slice as `null`; v2 encodes it as an empty array unless configured otherwise. A client that distinguishes `null` from `[]` will notice.
+- **Field name matching.** v1 matches JSON keys to struct fields case-insensitively; v2 is case-sensitive by default. A client sending `UserID` for a field tagged `userId` worked before and may now be silently ignored.
+- **Struct tags.** Some v1 tag options have different or renamed equivalents in v2.
+
+None of these is exotic. Each is a place where real traffic, especially from third-party clients and old mobile app versions, may rely on the lenient behavior.
+
+## A test-first approach
+
+Rather than reading a list and hoping, capture current behavior against real payloads, then run the same corpus against v2.
+
+```go
+package payload_test
+
+import (
+	jsonv1 "encoding/json"
+	jsonv2 "encoding/json/v2"
+	"reflect"
+	"testing"
+)
+
+type Order struct {
+	UserID string   `json:"userId"`
+	Items  []string `json:"items"`
+}
+
+var corpus = []string{
+	`{"userId":"u1","items":["a"]}`,
+	`{"UserID":"u1","items":["a"]}`,        // case mismatch
+	`{"userId":"u1","userId":"u2"}`,        // duplicate key
+	`{"userId":"u1","items":null}`,         // null slice
+	"{\"userId\":\"\xff\"}",                // invalid UTF-8
+}
+
+func TestV1V2Decode(t *testing.T) {
+	for _, in := range corpus {
+		var a, b Order
+		errA := jsonv1.Unmarshal([]byte(in), &a)
+		errB := jsonv2.Unmarshal([]byte(in), &b)
+		if (errA == nil) != (errB == nil) || !reflect.DeepEqual(a, b) {
+			t.Errorf("divergence for %q:\n v1=%+v err=%v\n v2=%+v err=%v", in, a, errA, b, errB)
+		}
+	}
+}
+```
+
+Feed the corpus from sanitized production request logs where possible; hand-written examples catch only the cases you already thought of. The output is a list of divergences, which is the actual migration backlog.
+
+For encoding, compare byte output for your response types, since a changed `null` to `[]` is a contract change for API consumers even if every Go test passes.
+
+## Choosing strictness per boundary
+
+Not every boundary should behave the same way.
+
+| Boundary | Suggested stance |
+|---|---|
+| Internal service-to-service | Move to v2 defaults; strict failures surface bugs early |
+| Public API accepting third-party input | Keep v1 behavior until divergences are understood |
+| Config files and webhooks you control | v2 strictness is usually an improvement |
+| Stored JSON read back later | Test old records before switching decoders |
+
+Duplicate keys deserve a separate note: they are a known source of parser-differential bugs, where two components read the same document and disagree. If a gateway and a backend parse the same request differently, an attacker can exploit the gap. Rejecting duplicates is a defensible hardening step, as long as you have verified that legitimate clients do not send them.
+
+## A staged rollout
+
+1. **Upgrade the toolchain** to 1.27 with imports unchanged. Run your suite; this should be uneventful.
+2. **Build the corpus** from logs and fixtures, and run the differential test above.
+3. **Fix or accept** each divergence. Add explicit struct tags or options instead of relying on defaults.
+4. **Migrate one package at a time**, starting with internal code, behind the same differential tests in CI.
+5. **Watch decode errors** in production after each package. A rise in 400 responses is the signal.
+
+## Takeaways
+
+- Toolchain upgrade and import change are separate decisions with separate risk.
+- v2's stricter defaults catch real bugs, but they alter behavior that clients may depend on.
+- Differential tests on real payloads beat reading migration notes.
+- Treat duplicate-key rejection as a security improvement, with a check that legitimate traffic is unaffected.
+- Migrate boundary by boundary, not repository-wide in one pull request.
+
+Behavior details here come from the Go package documentation and third-party migration write-ups; confirm each against the Go 1.27 release notes for the exact semantics in your version.

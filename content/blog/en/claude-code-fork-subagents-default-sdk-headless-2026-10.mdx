@@ -1,0 +1,85 @@
+---
+title: "Fork Subagents Are Now the Default in Claude Code's SDK and Headless Mode"
+description: "Claude Code 2.1.302 turns on fork subagents for claude -p, the Agent SDK, and the desktop and VS Code apps. What changes when a subagent inherits the full conversation, and how to review your automation before upgrading."
+date: "2026-10-23"
+status: "published"
+tags: ["Claude Code", "AI Agents", "Agent SDK", "Developer Tooling", "Security"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-fork-subagents-default-sdk-headless-2026-10"
+---
+
+Claude Code 2.1.302, released on October 16, 2026, extends fork subagents to `claude -p`, the Agent SDK, the desktop app, and the VS Code extension. According to secondary coverage of the release notes (we did not diff the official changelog line by line), the interactive terminal had already switched in an earlier version, so this release mostly affects people who run Claude Code from scripts, CI, or their own tooling.
+
+If you only use the terminal UI, little changes. If you have a pipeline that calls `claude -p` or builds on the Agent SDK, read on, because the behavior of delegated work is different in a way that matters for cost and for data exposure.
+
+## Fork versus regular subagent
+
+A regular subagent starts with a fresh context. The parent writes a prompt, the subagent works from that prompt plus whatever it reads itself, and a summary comes back. The parent decides what the child knows.
+
+A fork inherits the parent's full conversation history. Only the fork's final result returns to the main session, so the parent's context does not fill with the fork's intermediate tool calls. That is the appeal: you can say "investigate why this test is flaky" mid-session and the child already knows the repository layout, the failing output, and the decisions made so far, without you re-explaining any of it.
+
+The trade-offs follow directly from that design:
+
+| | Regular subagent | Fork |
+|---|---|---|
+| Initial context | Prompt written by parent | Full parent history |
+| Prompt quality dependence | High | Low |
+| Token cost at start | Small | Proportional to parent history |
+| What the child can see | Only what it is given or reads | Everything the parent saw |
+| Result returned | Summary | Final result only |
+
+## What to check before upgrading automation
+
+### 1. Cost at the start of each delegated task
+
+A fork begins with a context as large as the parent's. Prompt caching softens this when the prefix is shared and the cache is warm, but a headless job that fans out into several forks late in a long session can still pay for a large prefix several times. If your pipeline delegates a lot, measure token usage per run before and after the upgrade rather than assuming the cache absorbs it. Our earlier notes on [prompt cache TTL and idle compaction](/blog/claude-code-idle-compaction-prompt-cache-ttl-2026) apply here, since 2.1.302 also adds an idle-compaction toggle to `/config`.
+
+### 2. What the child can see
+
+This is the part that deserves a deliberate decision. A fork can see file contents and tool outputs the parent has already seen. In an interactive session that is usually what you want. In an automated job, the parent may have read a `.env` file, a customer export, or a secret-bearing log early on, and the fork now carries all of it. If you used regular subagents as a loose isolation boundary ("this one only gets the diff"), forks quietly remove that boundary.
+
+If a task needs real isolation, do not rely on subagent type. Narrow what the whole session is allowed to read, scope credentials per job, and keep sensitive reads out of the session that does delegation.
+
+### 3. Permission mode in headless runs
+
+The same release changes the default for `claude -p` and SDK sessions that do not set a permission mode: under third-party providers, with telemetry off, or on a fresh install, they now start in default mode. Passing `--permission-mode auto` explicitly keeps auto mode. A job that previously worked because of an implicit mode may now stop to ask for approval, and a headless job cannot answer. Make the mode explicit in every script:
+
+```bash
+claude -p "Run the test suite and summarize failures" \
+  --permission-mode auto \
+  --output-format json
+```
+
+### 4. The opt-out
+
+Setting `CLAUDE_CODE_FORK_SUBAGENT=0` disables forking. Per the release coverage, `claude mcp serve` never offers forks, so servers exposing Claude Code over MCP are unaffected.
+
+```bash
+# Pin behavior for a pipeline that depends on isolated subagents
+export CLAUDE_CODE_FORK_SUBAGENT=0
+```
+
+We suggest pinning it to `0` in existing automation first, then enabling forks per job once you have measured the effect.
+
+## A practical rollout
+
+1. **Inventory** the places where you call `claude -p` or the Agent SDK: CI jobs, scheduled tasks, internal bots.
+2. **Pin** `CLAUDE_CODE_FORK_SUBAGENT=0` and an explicit `--permission-mode` in each, so the upgrade is a no-op.
+3. **Upgrade** the CLI and confirm nothing else changed in your outputs.
+4. **Trial forks** on one low-risk job. Compare token usage and result quality against the pinned baseline.
+5. **Decide per job.** Research-style tasks that benefit from shared context are good fork candidates. Jobs that touch secrets or run against untrusted input are not.
+
+## Where forks help
+
+Forks fit work where the cost of re-explaining context exceeds the cost of carrying it: investigating a failure you have just reproduced, trying two alternative implementations in parallel from the same starting point, or running a review pass over changes the session just made. They fit poorly when the child's job is deliberately narrow and the parent's history is mostly noise or mostly sensitive.
+
+## Takeaways
+
+- The change is mainly for headless, SDK, desktop, and VS Code users; the terminal had already moved.
+- Forks trade prompt-writing effort for context size and reduced isolation.
+- Make permission mode explicit in every non-interactive invocation.
+- Pin `CLAUDE_CODE_FORK_SUBAGENT=0` during upgrade, then adopt forks deliberately.
+- Treat subagent type as a convenience, not a security boundary.
+
+Sources: details of the release were taken from third-party coverage (aiweekly.co, dev.classmethod.jp, byteiota). Verify exact wording against the official Claude Code changelog before changing production configuration.

@@ -1,0 +1,80 @@
+---
+title: "PgBouncer 1.26.1: A SCRAM Authentication Bypass and Two DoS Fixes"
+description: "PgBouncer 1.26.1 fixes three CVEs, including an authentication bypass between SCRAM users. How to find affected instances, what the behavior change means for search_path, and how to reduce exposure beyond upgrading."
+date: "2026-10-23"
+status: "published"
+tags: ["PostgreSQL", "PgBouncer", "Security", "Database", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "pgbouncer-1-26-1-scram-auth-bypass-cves-2026-10"
+---
+
+PgBouncer 1.26.1 was released on October 14, 2026 and fixes three CVEs. One of them is an authentication bypass, which makes this more than a routine point release for anyone running PgBouncer in front of PostgreSQL. The details below come from the PostgreSQL project's announcement and the Debian security tracker; CVE numbers in aggregator write-ups were inconsistent, so check them against your own vendor's advisory.
+
+## The three issues
+
+**CVE-2026-107350: authentication bypass.** A client that knows the password of one SCRAM user can log in as other SCRAM users, including admin and backend superuser accounts. The flaw lies in how a second startup message is processed during SCRAM authentication when the target database does not exist. This is the one to prioritize.
+
+**CVE-2026-107349: unauthenticated denial of service.** An empty option name in the startup options can trigger an infinite loop. It applies to versions 1.20.0 through 1.26.0 when `ignore_startup_parameters` is set but does not include `options`.
+
+**CVE-2026-107348: unauthenticated denial of service.** An integer overflow in packet buffer growth can cause an infinite loop. It matters only if `max_packet_size` has been raised above its default.
+
+The previous release, 1.26.0, fixed three other CVEs, so running 1.26.0 is not a safe resting point either.
+
+## Who is affected
+
+The denial-of-service issues depend on configuration. The authentication bypass is the concerning one because the precondition is modest: valid credentials for any one SCRAM user on the pooler. In a multi-tenant setup where tenants each have a database role, or where application services share a PgBouncer, "any one valid user" is a low bar. The impact is the privileges of whichever account the attacker can reach, including superusers if they are reachable through the pooler.
+
+First, find what you run:
+
+```bash
+# Version, from the admin console
+psql -h pgbouncer.internal -p 6432 -U pgbouncer pgbouncer -c 'SHOW VERSION;'
+
+# Settings that gate the DoS issues
+psql -h pgbouncer.internal -p 6432 -U pgbouncer pgbouncer -c 'SHOW CONFIG;' \
+  | grep -E 'ignore_startup_parameters|max_packet_size|auth_type'
+```
+
+Also check containers and distro packages. Debian lists 1.26.1-1 as fixed in unstable, with earlier packages still marked vulnerable, so a package manager that has not caught up will leave you exposed even if you "update regularly".
+
+## The behavior change to plan for
+
+1.26.1 also changes how `ignore_startup_parameters` interacts with tracked parameters: it now takes precedence. In 1.26.0, `search_path` was tracked; with this release, listing it in `ignore_startup_parameters` restores the 1.25 behavior of ignoring it.
+
+```ini
+; pgbouncer.ini
+[pgbouncer]
+ignore_startup_parameters = extra_float_digits,search_path
+```
+
+This matters if applications set `search_path` in connection options, for example per-tenant schemas. Decide deliberately whether you want PgBouncer to track it (and fail on mismatch or pass it through) or ignore it, then test with a staging copy of your real client library settings. Do not discover the difference during the security rollout.
+
+## Reducing exposure beyond the patch
+
+Upgrading is the fix. These measures limit damage from this class of bug:
+
+1. **Do not expose PgBouncer broadly.** It should be reachable only from application subnets. Security groups and network policies should reflect that, so "unauthenticated" bugs are not internet-reachable.
+2. **Keep superusers off the pooler.** Use `auth_query` and `auth_user` carefully, and avoid letting superuser roles authenticate through PgBouncer at all. Administrative access can go direct to PostgreSQL from a bastion, restricted in `pg_hba.conf`.
+3. **Separate poolers by trust boundary.** One shared pooler for every tenant and every service widens the effect of an authentication bug. Splitting by environment or sensitivity costs little.
+4. **Alert on unusual logins.** Compare the user presented against the database accessed. A login as a role that application never uses is worth a page.
+5. **Review `max_packet_size`.** If someone raised it for a large-payload use case, either lower it or accept the exposure until patched.
+
+## Rolling out the upgrade
+
+PgBouncer supports online restarts, but connection draining still needs care.
+
+```bash
+# Start the new process, take over the listening sockets
+pgbouncer -R /etc/pgbouncer/pgbouncer.ini
+```
+
+For Kubernetes deployments, a standard rolling update with a readiness probe on the pooler port is usually enough, provided your clients retry on connection errors. Run the staging pass first, verify `search_path` behavior, then proceed to production in small batches.
+
+## Takeaways
+
+- Upgrade to 1.26.1 (or your distro's fixed package). Version 1.26.0 is not sufficient.
+- The SCRAM bypass needs only one valid user, so treat shared poolers as high priority.
+- Check `ignore_startup_parameters` and test `search_path` handling before rollout.
+- Restrict network reach to the pooler and keep superuser access off it.
+- Verify against your own vendor's advisory, since CVE references varied across sources.

@@ -1,0 +1,85 @@
+---
+title: "Claude Code의 fork subagent, SDK와 headless 실행에서도 기본값으로"
+description: "Claude Code 2.1.302부터 claude -p, Agent SDK, Desktop/VS Code 앱에서도 fork subagent가 기본으로 켜집니다. 대화 전체를 상속하는 subagent가 비용, 정보 노출, Permission Mode에 미치는 영향과 점검 방법을 정리합니다."
+date: "2026-10-23"
+status: "published"
+tags: ["Claude Code", "AI Agents", "Agent SDK", "Developer Tooling", "Security"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-fork-subagents-default-sdk-headless-2026-10"
+---
+
+2026년 10월 16일에 공개된 Claude Code 2.1.302는 fork subagent를 `claude -p`, Agent SDK, Desktop 앱, VS Code 확장에서도 기본으로 활성화합니다. Release Notes를 다룬 2차 자료(공식 changelog를 한 줄씩 대조한 것은 아닙니다)에 따르면 대화형 Terminal은 이전 버전에서 이미 전환되었으므로, 이번 변경의 영향은 주로 Script, CI, 자체 Tooling에서 Claude Code를 호출하는 경우에 해당합니다.
+
+Terminal UI만 사용한다면 달라지는 점은 거의 없습니다. 반면 `claude -p`나 Agent SDK를 사용하는 Pipeline이 있다면, 위임된 작업의 동작 방식이 비용과 정보 노출 양쪽에서 달라지므로 확인해 둘 필요가 있습니다.
+
+## fork와 일반 subagent의 차이
+
+일반 subagent는 새 Context에서 시작합니다. 부모가 Prompt를 작성하고, 자식은 그 Prompt와 스스로 읽은 파일을 바탕으로 작업한 뒤 요약을 반환합니다. 자식이 무엇을 아는지는 부모가 결정합니다.
+
+fork는 부모의 대화 History 전체를 상속합니다. 부모에게 돌아오는 것은 fork의 최종 결과뿐이므로, 중간 Tool 호출이 부모 Context를 채우지도 않습니다. 작업 도중 "이 테스트가 flaky한 이유를 조사해 줘"라고 요청하면, 자식은 Repository 구조와 실패 출력, 지금까지의 판단을 이미 알고 있어 다시 설명할 필요가 없습니다.
+
+대신 설계상 Trade-off가 따릅니다.
+
+| | 일반 subagent | fork |
+|---|---|---|
+| 초기 Context | 부모가 작성한 Prompt | 부모의 History 전체 |
+| Prompt 품질 의존도 | 높음 | 낮음 |
+| 시작 시 Token 비용 | 작음 | 부모 History에 비례 |
+| 자식이 볼 수 있는 정보 | 전달받았거나 직접 읽은 것 | 부모가 본 모든 것 |
+| 반환 내용 | 요약 | 최종 결과만 |
+
+## 업그레이드 전에 확인할 사항
+
+### 1. 위임마다 발생하는 시작 비용
+
+fork는 부모와 같은 크기의 Context로 시작합니다. 공유 Prefix가 Cache에 올라 있으면 Prompt Caching이 비용을 줄여 주지만, 긴 Session 후반에 여러 fork로 갈라지는 headless Job은 큰 Prefix 비용을 여러 번 지불할 수 있습니다. Cache가 흡수해 줄 것이라고 가정하지 말고, 업그레이드 전후로 실행 1회당 Token 사용량을 측정하십시오. 2.1.302에서는 `/config`에 idle compaction 토글도 추가되었으므로 [prompt cache TTL과 idle compaction 글](/blog/claude-code-idle-compaction-prompt-cache-ttl-2026)도 참고하시기 바랍니다.
+
+### 2. 자식이 볼 수 있는 정보
+
+의식적으로 판단해야 하는 부분입니다. fork는 부모가 이미 본 파일 내용과 Tool 출력을 볼 수 있습니다. 대화형 Session에서는 대체로 바람직한 동작이지만, 자동화 Job에서는 부모가 초반에 `.env`, 고객 데이터 Export, 비밀 정보가 담긴 Log를 읽었다면 fork도 그 내용을 모두 가진 채 동작합니다. "이 자식에게는 diff만 준다"는 느슨한 격리 수단으로 subagent를 써 왔다면, fork는 그 경계를 조용히 없앱니다.
+
+실제 격리가 필요한 작업이라면 subagent 종류에 의존하지 마십시오. Session 전체가 읽을 수 있는 범위를 좁히고, Job별로 인증 정보의 Scope를 분리하며, 민감한 읽기 작업을 위임을 수행하는 Session과 분리하는 것이 안전합니다.
+
+### 3. headless 실행의 Permission Mode
+
+같은 Release에서 Permission Mode를 지정하지 않은 `claude -p`와 SDK Session의 기본값도 바뀌었습니다. 서드파티 Provider 사용 시, Telemetry를 끈 경우, 새로 설치한 경우에는 default mode로 시작합니다. `--permission-mode auto`를 명시하면 auto mode가 유지됩니다. 암묵적인 Mode에 의존해 동작하던 Job이 승인 대기 상태에서 멈출 수 있고, headless에서는 응답할 수 없습니다. Script마다 Mode를 명시하십시오.
+
+```bash
+claude -p "Run the test suite and summarize failures" \
+  --permission-mode auto \
+  --output-format json
+```
+
+### 4. 비활성화 방법
+
+`CLAUDE_CODE_FORK_SUBAGENT=0`으로 fork를 끌 수 있습니다. Release 내용을 다룬 자료에 따르면 `claude mcp serve`는 fork를 제공하지 않으므로, MCP로 Claude Code를 노출하는 Server는 영향을 받지 않습니다.
+
+```bash
+# 격리된 subagent에 의존하는 Pipeline의 동작을 고정
+export CLAUDE_CODE_FORK_SUBAGENT=0
+```
+
+기존 자동화에는 먼저 `0`으로 고정하고, 효과를 측정한 뒤 Job 단위로 fork를 켜는 방식을 권장합니다.
+
+## 현실적인 적용 순서
+
+1. `claude -p`와 Agent SDK를 호출하는 위치(CI, 예약 Job, 사내 Bot)를 **목록화**합니다.
+2. 각 위치에 `CLAUDE_CODE_FORK_SUBAGENT=0`과 명시적인 `--permission-mode`를 **고정**하여, 업그레이드가 동작을 바꾸지 않게 합니다.
+3. CLI를 **업그레이드**하고 출력에 다른 변화가 없는지 확인합니다.
+4. 위험이 낮은 Job 하나에서 **fork를 시험**합니다. 고정한 기준선과 Token 사용량 및 결과 품질을 비교합니다.
+5. Job별로 **결정**합니다. 공유 Context의 이점이 큰 조사형 작업은 fork에 적합하고, 비밀 정보를 다루거나 신뢰할 수 없는 입력을 처리하는 Job은 적합하지 않습니다.
+
+## fork가 유용한 경우
+
+다시 설명하는 비용이 Context를 들고 가는 비용보다 큰 작업에 어울립니다. 방금 재현한 장애의 원인 조사, 같은 출발점에서 두 가지 구현을 병렬로 시도하는 작업, Session에서 만든 변경에 대한 리뷰 등이 그 예입니다. 반대로 자식의 역할이 의도적으로 좁고 부모의 History가 대부분 잡음이거나 민감한 정보라면 맞지 않습니다.
+
+## 정리
+
+- 변경의 영향은 주로 headless, SDK, Desktop, VS Code 사용자이며, Terminal은 이미 전환되어 있었습니다.
+- fork는 Prompt 작성 수고를 줄이는 대신 Context 크기와 격리 수준을 내줍니다.
+- 비대화형 호출에서는 Permission Mode를 반드시 명시하십시오.
+- 업그레이드 시 `CLAUDE_CODE_FORK_SUBAGENT=0`으로 고정하고, fork는 의도적으로 도입하십시오.
+- subagent 종류는 보안 경계가 아니라 편의 기능으로 취급해야 합니다.
+
+출처: Release 내용은 서드파티 보도(aiweekly.co, dev.classmethod.jp, byteiota)를 참고했습니다. Production 설정을 변경하기 전에 공식 Claude Code changelog에서 정확한 내용을 확인하시기 바랍니다.
