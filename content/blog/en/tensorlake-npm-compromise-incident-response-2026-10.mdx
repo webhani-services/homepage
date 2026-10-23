@@ -1,0 +1,75 @@
+---
+title: "The Tensorlake npm Compromise: Why Valid Provenance Was Not Enough, and What to Rotate"
+description: "A compromised release of an AI infrastructure SDK shipped through a legitimate release workflow. Lessons on install scripts, provenance limits, and the order in which to respond."
+date: "2026-10-24"
+status: "published"
+tags: ["Security", "npm", "Supply Chain", "CI/CD", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "tensorlake-npm-compromise-incident-response-2026-10"
+---
+
+Early in October, version 0.5.144 of the `tensorlake` npm package was reported as compromised in a campaign tracked as ChainDrop (a Shai-Hulud-style worm). Socket and The Hacker News covered it; Stingrai published a response checklist. Sources disagree on whether the malicious version went out on October 7 or 8, so we will not rely on exact timestamps.
+
+We have a general post on [dependency cooldowns and npm worms](/blog/dependency-cooldown-policy-npm-pypi-worms-2026). This one focuses on what this particular incident teaches about response ordering, because that is where teams are most likely to make things worse.
+
+## What was reported
+
+From the coverage:
+
+- The malicious release used a `preinstall` hook, so merely running `npm install` was enough. Nothing had to import the SDK.
+- The hook launched an obfuscated loader, which started a credential-stealing, self-propagating payload using the Bun runtime.
+- Targets included local files, CI environments, Kubernetes and Vault credentials, and configuration for AI development tools.
+- According to Stingrai, the release went out through Tensorlake's own release workflow **with valid provenance**.
+- Stingrai also reports a destructive behavior: a monitor that deletes the home directory if a stolen GitHub token is revoked.
+
+That last point deserves caution. We could not verify it independently, but it changes the correct order of operations if true.
+
+## Provenance proves where, not whether
+
+Provenance attestations tell you a package was built by a specific workflow from a specific repository. They do not tell you the workflow was running trustworthy code or that the publishing credentials had not been abused. If an attacker controls the release pipeline, they get valid attestations for free.
+
+So treat provenance as one input. It catches a stolen laptop token publishing from outside CI; it does not catch a compromised CI.
+
+## Reduce install-time execution
+
+The cheapest control in this scenario is refusing to run lifecycle scripts by default:
+
+```bash
+# .npmrc in the project
+ignore-scripts=true
+```
+
+Then allow scripts only for the few packages that need them (native builds, for example) through an explicit step. Recent npm and pnpm releases move in this direction; check your version's documentation for the exact opt-in mechanism rather than assuming.
+
+Pair it with a minimum release age so brand-new versions are not installed automatically. A short cooldown, even 24 to 72 hours, would have turned many of these incidents into near-misses, since malicious versions are usually detected within hours.
+
+```yaml
+# Renovate example: wait before proposing new versions
+{
+  "minimumReleaseAge": "3 days"
+}
+```
+
+## If you installed it: response order
+
+1. **Identify exposure.** Search lockfiles and CI logs for the affected version:
+   ```bash
+   grep -rn "tensorlake" package-lock.json pnpm-lock.yaml yarn.lock 2>/dev/null
+   ```
+   Check every machine and CI runner that ran an install during the window, not just developer laptops.
+2. **Isolate before you revoke.** If the reported home-directory-wipe behavior is real, revoking the GitHub token first could trigger it. Take the host off the network, snapshot or back up what you need, and remove the persistence mechanism before rotating tokens.
+3. **Rotate everything reachable from that environment.** Cloud keys, GitHub tokens, npm tokens, Kubernetes service account tokens, Vault tokens, and API keys for AI tools stored in config files.
+4. **Review audit logs** for activity from those credentials, including new repositories, workflow changes or published packages that you did not make. Self-propagating worms spread through the victim's own publishing rights.
+5. **Rebuild, don't clean.** Reimage affected runners and developer machines where practical.
+
+## Why AI tooling is a rich target
+
+Developer machines that use AI coding tools tend to hold many long-lived API keys in dotfiles and environment variables. An SDK in the agent infrastructure space is also installed in exactly the places where those keys live. Move keys to short-lived credentials or a secret manager where you can, and keep CI runners ephemeral so a compromised install does not persist.
+
+## Takeaways
+
+- Disable install scripts by default and allowlist exceptions.
+- Add a release-age cooldown to automated dependency updates.
+- Do not equate valid provenance with a safe package.
+- In a suspected worm incident, isolate first, rotate second, and read the current advisory before touching tokens.
