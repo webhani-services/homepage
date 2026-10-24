@@ -1,0 +1,96 @@
+---
+title: "Node.js 20에서 벗어나기: Docker, CI, Hosting 업그레이드 Runbook"
+description: "10월 Security Release에서 Node.js 20에는 수정이 제공되지 않았고, Vercel도 10월 1일 Node 20을 Deprecated 처리했습니다. Node 20이 숨어 있는 모든 곳을 찾아 지원되는 Line으로 옮기는 절차를 정리합니다."
+date: "2026-10-25"
+status: "published"
+tags: ["Node.js", "DevOps", "Docker", "CI/CD", "Migration"]
+thumbnail: ""
+author: "webhani"
+slug: "node-20-eol-upgrade-runbook-docker-ci-2026-10"
+---
+
+Node.js 10월 Security Release는 22.x, 24.x, 26.x Line을 대상으로 했습니다. Node 20은 포함되지 않았습니다. 프로젝트의 Advisory에는 EOL 버전도 이 문제들의 영향을 받으므로 지원되는 Release로 업그레이드하라고 적혀 있습니다. 별도로 Vercel은 2026년 10월 1일부로 Node.js 20을 Deprecated 처리한다고 안내했습니다. 아직 Node 20이 남아 있다면 옮겨야 할 이유가 서로 독립적으로 두 가지 있는 셈입니다. 수정이 제공되지 않는다는 점, 그리고 Hosting Platform이 지원을 종료한다는 점입니다.
+
+이 글은 기능 소개가 아니라 Runbook입니다. Node 업그레이드에서 어려운 부분은 코드 자체보다 Version이 고정된 모든 위치를 찾아내는 일입니다.
+
+## Step 1: Node 20이 어디에 있는지 목록을 만듭니다
+
+Version 번호는 `package.json` 말고도 여러 곳에 숨어 있습니다. 다음 명령으로 모두 찾습니다.
+
+```bash
+# Dockerfile과 compose 파일
+grep -RInE "node:(20|lts)|NODE_VERSION" --include="Dockerfile*" --include="*.yml" --include="*.yaml" .
+
+# Version 관리 파일과 engines 필드
+cat .nvmrc .node-version .tool-versions 2>/dev/null
+grep -n '"engines"' -A3 package.json
+
+# CI Workflow
+grep -RIn "node-version" .github/workflows/
+
+# Serverless 및 Hosting 설정
+grep -RInE "nodejs20|runtime" vercel.json vercel.ts serverless.yml template.yaml 2>/dev/null
+```
+
+특히 주의할 함정이 두 가지 있습니다. `node:lts`, `node:lts-alpine` 같은 Tag는 시간이 지나면 가리키는 대상이 바뀝니다. Build 당시 Node 20이었던 Image가 재Build 후에는 다른 Version이 될 수 있습니다. 또한 Lambda 등의 Function Runtime 문자열(`nodejs20.x` 등)은 별도의 고정이며 Lock 파일에서는 드러나지 않습니다.
+
+## Step 2: 이전 대상 Line을 정합니다
+
+Advisory에 언급된 지원 Line인 22, 24, 26 중에서 고릅니다. 대부분의 Application 팀에게 무난한 선택은 Active LTS에 들어간 최신 Line입니다. Node 26은 프로젝트가 채택한 연 1회 Major Release 모델에 따라 이번 달 LTS에 진입할 예정입니다(이 변경은 이전 글에서 다루었습니다). Dependency가 보수적이고 서둘러야 한다면 22나 24가 변경 폭이 더 작습니다. 무엇을 고르든 한 곳에 기록하고, 나머지는 모두 그곳을 읽도록 만드십시오.
+
+단일 진실 공급원(Single Source of Truth)을 두면 앞으로 생길 불일치의 대부분이 사라집니다.
+
+```bash
+# .nvmrc는 nvm, fnm, actions/setup-node가 읽습니다
+echo "24" > .nvmrc
+```
+
+```yaml
+# .github/workflows/ci.yml
+- uses: actions/setup-node@v4
+  with:
+    node-version-file: ".nvmrc"
+```
+
+```dockerfile
+# Dockerfile: Major를 고정하고 --pull로 재Build하여 Patch를 반영
+ARG NODE_VERSION=24
+FROM node:${NODE_VERSION}-alpine AS base
+```
+
+Version을 Build Argument로 받으면 Dockerfile을 수정하지 않고도 CI에서 다른 Major를 시험할 수 있습니다.
+
+## Step 3: Production보다 먼저 깨지는 곳을 찾습니다
+
+Branch에서 업그레이드하고 Toolchain이 문제를 알려 주도록 합니다.
+
+1. **처음부터 다시 설치합니다.** `node_modules`를 삭제하고 Native Module을 다시 Build합니다. Compile된 Addon을 포함한 Package가 가장 자주 실패하므로, 사용 중인 Version이 새 Node의 ABI용 Binary를 배포하는지 확인하십시오.
+2. **전체 Test Suite를 두 번 실행합니다.** 이전 Node와 새 Node에서 각각 실행하여 기존 실패와 새 실패를 구분합니다.
+3. **Deprecation 경고를 읽습니다.** `node --trace-deprecation`으로 앱을 실행하고 나타나는 항목을 지금 고칩니다. 이후 Major에서 경고가 Error로 바뀌기 전에 대응할 수 있습니다.
+4. **영향이 있는 내장 동작 변경을 확인합니다.** fetch와 URL 처리, Test Runner 기본 동작 등 건너뛰는 Major마다 Release Note를 읽으십시오. 20에서 24로 가면 Major 두 개 분량의 변경을 지나게 됩니다.
+
+```bash
+# 새 Binary가 필요한 Native Addon 간이 확인
+npm ls --all 2>/dev/null | grep -iE "node-gyp|bindings|prebuild" | head
+npm rebuild
+```
+
+## Step 4: 되돌릴 수 있게 Rollout합니다
+
+Runtime 변경도 다른 Production 변경과 똑같이 다룹니다.
+
+- Staging에 Deploy하고 E2E Test와 대표적인 부하 Test를 실행합니다. 메모리 Profile과 시작 시간은 모두 달라질 수 있습니다.
+- Platform이 지원한다면 먼저 일부 Traffic에만 배포하고 Error율과 Latency를 비교합니다.
+- 이전 Image Tag를 남겨 두어 Rollback이 재Build가 아니라 재Deploy로 끝나게 합니다.
+
+## Step 5: 재발을 막습니다
+
+- `.nvmrc`, Dockerfile, `engines`가 서로 다르면 CI가 실패하는 Check를 추가합니다.
+- Base Image와 `setup-node` Action의 자동 업데이트를 활성화하여 새 Patch Release가 Pull Request로 도착하게 합니다.
+- Node Release 일정을 팀 Calendar에 넣습니다. 각 Line의 종료일은 미리 알 수 있으므로, 6개월 전 알림이 있으면 긴급 상황이 일반 Ticket이 됩니다.
+
+## webhani의 권장 사항
+
+아직 Node 20을 쓰고 있다면 이번 주 안에 목록 작성부터 하십시오. 금방 끝나고 작업의 실제 규모를 알 수 있습니다. 이전은 "언젠가"가 아니라 다음 Sprint에 넣으십시오. Patch가 없는 Runtime은 단순히 오래된 상태에 머물지 않기 때문입니다. Node 20이 제외된 바로 그 Release 주기에서, 프로젝트는 지원 Line에 대해 Brotli 메모리 안전성 버그와 인증서 신원 검증 관련 문제 여러 건을 수정했습니다. 이 수정들은 Node 20에는 전달되지 않습니다.
+
+대부분의 Web Application에서 업그레이드 자체는 Review 주기에 걸쳐 하루나 이틀 분량의 작업입니다. 비용이 큰 경우는 Incident 이후 쫓기며 하게 되는 쪽입니다.

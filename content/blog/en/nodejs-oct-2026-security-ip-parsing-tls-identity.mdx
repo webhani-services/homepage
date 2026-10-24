@@ -1,0 +1,82 @@
+---
+title: "Node.js October Security Release: When Two Parsers Disagree About an IP Address"
+description: "Node.js shipped ten fixes on October 21. Four are rated high, and three of those share a theme: one component reads a hostname or IP differently from another. Here is what to patch and what to audit in your own code."
+date: "2026-10-25"
+status: "published"
+tags: ["Node.js", "Security", "TLS", "DevOps", "Patch Management"]
+thumbnail: ""
+author: "webhani"
+slug: "nodejs-oct-2026-security-ip-parsing-tls-identity"
+---
+
+The Node.js project published its October 2026 security releases on October 21: v26.12.1, v24.22.1 and v22.23.4. Ten CVEs are fixed, four rated high. The release notes are worth reading in full, but if you only have ten minutes, the pattern is more useful than the list. Several of these bugs are not memory corruption. They are two pieces of code disagreeing about what the same string means.
+
+## The high-severity items
+
+According to the official advisory:
+
+- **CVE-2026-111497**: the Brotli decoder writes past an 8-byte buffer on malformed input, which can lead to a crash, memory disclosure or code execution. Any service that decompresses untrusted Brotli data (HTTP responses from third parties, uploaded files) is exposed.
+- **CVE-2026-105483**: `tls.checkServerIdentity()` does not treat fullwidth-digit IP strings such as `１２７.0.0.1` as IP addresses, so a certificate with a DNS SAN can authenticate them. Affects 26.x and 24.x.
+- **CVE-2026-106069**: a host like `0127.0.0.1` is read as octal by the WHATWG URL parser but as decimal by the OS resolver, so a certificate issued for a different IP can be accepted.
+- **CVE-2026-105482**: `dns.resolve*()` and `dns.reverse()` truncate names at a NUL byte. This is described as an incomplete fix of an earlier CVE.
+
+The medium item CVE-2026-106072 is the same family: non-canonical spellings such as `0x7f.0.0.1`, `2130706433` or `127.1` let a DNS-only SAN authenticate an IP endpoint.
+
+## Why this class of bug keeps coming back
+
+Certificate validation has two inputs: the name the client intended to reach, and the names in the certificate. The check is only sound if the client's notion of "the host I am connecting to" is the same one the network stack uses. When a URL parser, a validator and a resolver each apply their own rules for IPv4 shorthand, octal literals or Unicode digits, an attacker gets room to craft a string that passes one check and means something else to the next.
+
+The practical lesson for application code is to canonicalize once and compare the canonical form. Do not validate a raw string and then hand the raw string to something else.
+
+```ts
+import { isIP } from "node:net";
+
+// Reject anything that is not a plain, canonical IP or a normal DNS name
+function normalizeHost(input: string): string {
+  const url = new URL(`https://${input}`);
+  const host = url.hostname; // WHATWG normalization applied
+
+  // If it looks numeric but is not a canonical dotted-quad / IPv6, refuse it
+  const looksNumeric = /^[0-9.xX:\[\]a-fA-F]+$/.test(host);
+  if (looksNumeric && isIP(host.replace(/^\[|\]$/g, "")) === 0) {
+    throw new Error(`Non-canonical IP-like host: ${input}`);
+  }
+  return host;
+}
+```
+
+This is a defensive pattern, not a replacement for the patch. It helps in places that Node's fix does not reach, such as SSRF allow-lists and webhook URL validation, where the same ambiguity applies. If you maintain an allow-list of internal ranges, compare parsed numeric addresses, not strings.
+
+## Who needs to move first
+
+Triage by exposure rather than by version number:
+
+1. **Services that call out to user-supplied URLs** (webhooks, link previews, import-from-URL features). The IP-parsing issues matter most here.
+2. **Services that decompress external Brotli content.** Check reverse proxies and HTTP clients; Brotli is common on `Accept-Encoding`.
+3. **Everything else** on a supported line: patch on your normal cadence, but within days, not weeks.
+
+The advisory also lists dependency updates in the same releases: c-ares, undici, OpenSSL (24.x and 22.x), SQLite (22.x), and a CA certificate change tied to a compromised intermediate. If you pin an alternative CA bundle in containers, check that it has the same removal.
+
+Two smaller notes from the table. The Permission Model issues (CVE-2026-106071 and CVE-2026-106073) only matter if you run with `--allow-fs-read` or `--allow-fs-write`; wildcard grants matched shorter paths than intended. And CVE-2026-106074 means startup snapshots and single executable applications could repeat `randomUUID()` and `randomInt()` output. If you build SEAs or snapshots, upgrade and rebuild them rather than just redeploying the old artifact.
+
+## Checking what you actually run
+
+```bash
+# In a container or CI image
+node --version
+
+# Across a fleet of Dockerfiles
+grep -R "FROM node:" --include=Dockerfile* . | sort | uniq -c
+```
+
+Image tags like `node:24` float, but cached layers do not. A rebuild with `--pull` (or `docker compose build --pull`) is what actually picks up v24.22.1. Verify with `node --version` inside the running container, not in the Dockerfile.
+
+## What we recommend
+
+- Upgrade to v22.23.4, v24.22.1 or v26.12.1 and redeploy. Prioritize anything that fetches URLs on behalf of users.
+- Add a regression test for host handling in your own validators using the inputs from the advisory (`0127.0.0.1`, `0x7f.0.0.1`, `127.1`, fullwidth digits). If those pass your allow-list, you have your own instance of this bug.
+- Treat the advisory as a reminder that end-of-life lines receive nothing. The Node.js team notes that EOL versions are affected and recommends moving to a supported release; see our companion post on planning that migration.
+
+The fixes here are not exotic, but the underlying issue, inconsistent parsing between components, is one that application teams reproduce constantly. The patch closes Node's instances of it. Your own URL and host validation is worth a quick review while the advisory is fresh.
+
+Source: Node.js project, "Wednesday, October 21, 2026 Security Releases" (nodejs.org).
