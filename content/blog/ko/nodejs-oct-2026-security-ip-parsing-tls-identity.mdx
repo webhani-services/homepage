@@ -1,0 +1,82 @@
+---
+title: "Node.js 10월 Security Release: 두 Parser가 IP 주소를 다르게 해석할 때"
+description: "Node.js가 10월 21일 10건의 취약점을 수정했습니다. 4건이 High이며, 그중 여럿은 컴포넌트마다 Host 이름이나 IP를 다르게 해석하는 문제입니다. 패치 대상과 자체 코드에서 점검할 부분을 정리합니다."
+date: "2026-10-25"
+status: "published"
+tags: ["Node.js", "Security", "TLS", "DevOps", "Patch Management"]
+thumbnail: ""
+author: "webhani"
+slug: "nodejs-oct-2026-security-ip-parsing-tls-identity"
+---
+
+Node.js 프로젝트가 10월 21일 Security Release(v26.12.1, v24.22.1, v22.23.4)를 공개했습니다. 수정된 CVE는 10건이고 4건이 High입니다. 전체 목록을 읽을 시간이 없다면 개별 항목보다 "패턴"을 파악하는 편이 더 유용합니다. 이번 수정 상당수는 메모리 손상이 아니라, 같은 문자열을 두 코드가 서로 다른 의미로 해석하는 문제이기 때문입니다.
+
+## High 등급 수정 사항
+
+공식 Advisory 기준으로 다음과 같습니다.
+
+- **CVE-2026-111497**: Brotli Decoder가 잘못된 입력에서 8바이트 Buffer 바깥에 씁니다. Crash, 메모리 내용 노출, 코드 실행으로 이어질 수 있습니다. 외부에서 온 Brotli 데이터(제3자 HTTP Response, 업로드 파일)를 압축 해제하는 Service가 대상입니다.
+- **CVE-2026-105483**: `tls.checkServerIdentity()`가 `１２７.0.0.1` 같은 전각 숫자 IP 문자열을 IP 주소로 취급하지 않아, DNS SAN을 가진 인증서로 인증이 통과됩니다. 26.x와 24.x가 영향을 받습니다.
+- **CVE-2026-106069**: `0127.0.0.1` 같은 Host를 WHATWG URL은 8진수로, OS Resolver는 10진수로 해석합니다. 그 결과 다른 IP용 인증서가 받아들여질 수 있습니다.
+- **CVE-2026-105482**: `dns.resolve*()`와 `dns.reverse()`가 NUL 바이트에서 이름을 잘라냅니다. 이전 CVE의 수정이 불완전했던 사례로 설명됩니다.
+
+Medium인 CVE-2026-106072도 같은 계열입니다. `0x7f.0.0.1`, `2130706433`, `127.1` 같은 비정규 표기로 DNS 전용 SAN이 IP Endpoint를 인증하게 만들 수 있습니다.
+
+## 이런 유형의 버그가 반복되는 이유
+
+인증서 검증에는 두 가지 입력이 있습니다. Client가 의도한 접속 대상 이름과 인증서에 들어 있는 이름입니다. 이 검증은 Client가 생각하는 "접속 대상 Host"와 Network Stack이 실제로 쓰는 Host가 같을 때만 성립합니다. URL Parser, Validator, Resolver가 각자 IPv4 축약 표기, 8진 리터럴, Unicode 숫자를 다르게 처리하면, 공격자는 한 검사는 통과하지만 다음 단계에서는 다른 의미가 되는 문자열을 만들 여지가 생깁니다.
+
+Application 코드에 주는 교훈은 정규화를 한 번만 수행하고, 그 정규형으로 비교하라는 것입니다. 원본 문자열을 검증한 뒤 같은 원본 문자열을 다른 처리에 넘기면 안 됩니다.
+
+```ts
+import { isIP } from "node:net";
+
+// 정규 IP 또는 일반 DNS 이름이 아니면 거부
+function normalizeHost(input: string): string {
+  const url = new URL(`https://${input}`);
+  const host = url.hostname; // WHATWG 정규화 적용
+
+  // 숫자처럼 보이는데 정규 dotted-quad / IPv6가 아니면 거부
+  const looksNumeric = /^[0-9.xX:\[\]a-fA-F]+$/.test(host);
+  if (looksNumeric && isIP(host.replace(/^\[|\]$/g, "")) === 0) {
+    throw new Error(`Non-canonical IP-like host: ${input}`);
+  }
+  return host;
+}
+```
+
+이 코드는 패치를 대체하는 것이 아니라 방어적인 작성 방식입니다. SSRF allow-list나 Webhook URL 검증처럼 Node 본체 수정이 닿지 않는 곳에서 효과가 있습니다. 내부 대역 allow-list를 운영한다면 문자열이 아니라 Parsing된 숫자 주소로 비교하십시오.
+
+## 어디부터 대응할 것인가
+
+버전 번호가 아니라 노출 정도로 우선순위를 정합니다.
+
+1. **사용자가 지정한 URL을 호출하는 Service**(Webhook, Link Preview, URL Import 기능). IP 해석 문제의 영향이 가장 큽니다.
+2. **외부 Brotli Content를 압축 해제하는 Service**. Reverse Proxy와 HTTP Client도 확인하십시오. `Accept-Encoding`에서 Brotli는 널리 쓰입니다.
+3. **그 외** 지원되는 Line. 일반 운영 주기로 처리해도 되지만, 몇 주가 아니라 며칠 안에 반영하십시오.
+
+같은 Release에는 Dependency 업데이트도 포함되어 있습니다. c-ares, undici, OpenSSL(24.x, 22.x), SQLite(22.x), 그리고 침해된 중간 CA와 관련된 CA 인증서 변경입니다. Container에서 별도의 CA Bundle을 고정해 두었다면 같은 제거가 반영되었는지 확인하십시오.
+
+부가 사항이 두 가지 있습니다. Permission Model 관련 항목(CVE-2026-106071, CVE-2026-106073)은 `--allow-fs-read`나 `--allow-fs-write`를 사용할 때만 해당합니다. 와일드카드 지정이 의도보다 짧은 경로와도 일치했습니다. 또한 CVE-2026-106074로 인해 Startup Snapshot이나 Single Executable Application(SEA)에서 `randomUUID()`와 `randomInt()` 출력이 반복될 수 있었습니다. SEA나 Snapshot을 만든다면 기존 산출물을 다시 Deploy하지 말고, 업그레이드 후 다시 Build하십시오.
+
+## 실제로 실행 중인 버전 확인
+
+```bash
+# Container 또는 CI Image 안에서
+node --version
+
+# 여러 Dockerfile을 가로질러 확인
+grep -R "FROM node:" --include=Dockerfile* . | sort | uniq -c
+```
+
+`node:24` 같은 Tag는 유동적이지만, Cache된 Layer는 갱신되지 않습니다. v24.22.1을 반영하려면 `--pull` 옵션을 붙인 재Build(`docker compose build --pull`)가 필요합니다. Dockerfile의 기재 내용이 아니라 실행 중인 Container 안에서 `node --version`으로 확인하십시오.
+
+## webhani의 권장 사항
+
+- v22.23.4, v24.22.1, v26.12.1 중 하나로 업그레이드하고 다시 Deploy합니다. 사용자 지정 URL을 다루는 Service를 최우선으로 처리하십시오.
+- 자체 Host 검증에도 Advisory의 입력 예시(`0127.0.0.1`, `0x7f.0.0.1`, `127.1`, 전각 숫자)로 Regression Test를 추가합니다. 이 값들이 allow-list를 통과한다면 같은 유형의 버그가 자체 코드에 있다는 뜻입니다.
+- EOL Line에는 수정이 제공되지 않는다는 점을 다시 확인하십시오. Node.js 측도 EOL 버전이 영향을 받으므로 지원되는 Release로 옮기도록 권고합니다. 이전 계획은 별도 글에서 다룹니다.
+
+이번 수정 자체가 특이한 것은 아닙니다. 다만 근본 원인인 "컴포넌트 간 Parsing 불일치"는 Application 개발에서도 자주 재현되는 문제입니다. 패치는 Node 쪽 해당 부분을 막아 주지만, 자체 URL·Host 검증도 이 시점에 한 번 점검해 볼 가치가 있습니다.
+
+출처: Node.js project, "Wednesday, October 21, 2026 Security Releases" (nodejs.org)

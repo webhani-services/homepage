@@ -1,0 +1,96 @@
+---
+title: "Leaving Node.js 20: An Upgrade Runbook for Docker, CI and Hosting"
+description: "Node.js 20 receives no fixes in the October security releases, and Vercel deprecates it on October 1. A step-by-step runbook for finding every place Node 20 hides and moving to a supported line."
+date: "2026-10-25"
+status: "published"
+tags: ["Node.js", "DevOps", "Docker", "CI/CD", "Migration"]
+thumbnail: ""
+author: "webhani"
+slug: "node-20-eol-upgrade-runbook-docker-ci-2026-10"
+---
+
+The Node.js October security releases covered the 22.x, 24.x and 26.x lines. Node 20 was not among them, and the project's advisory notes that end-of-life versions are affected by the issues and should be upgraded to a supported release. Separately, Vercel has announced that Node.js 20 is deprecated as of October 1, 2026. If you still have Node 20 anywhere, there are now two independent reasons to move: you will not get fixes, and your hosting platform is retiring it.
+
+This post is a runbook, not a feature tour. The hard part of a Node upgrade is rarely the code; it is finding every place the version is pinned.
+
+## Step 1: Inventory where Node 20 lives
+
+Version numbers hide in more places than `package.json`. Search for all of them:
+
+```bash
+# Dockerfiles and compose files
+grep -RInE "node:(20|lts)|NODE_VERSION" --include="Dockerfile*" --include="*.yml" --include="*.yaml" .
+
+# Version manager files and engine fields
+cat .nvmrc .node-version .tool-versions 2>/dev/null
+grep -n '"engines"' -A3 package.json
+
+# CI workflows
+grep -RIn "node-version" .github/workflows/
+
+# Serverless and hosting configuration
+grep -RInE "nodejs20|runtime" vercel.json vercel.ts serverless.yml template.yaml 2>/dev/null
+```
+
+Two traps are worth calling out. Tags such as `node:lts` and `node:lts-alpine` move over time, so an image that was Node 20 when it was built may be a different version after a rebuild. And a Lambda or other function runtime string such as `nodejs20.x` is a separate pin that no lockfile will reveal.
+
+## Step 2: Pick the target line
+
+Choose among the supported lines named in the advisory: 22, 24 and 26. A reasonable default for most application teams is the newest line that is in Active LTS; Node 26 is scheduled to enter LTS this month according to the project's single-major-per-year release model (see our earlier post on that change). If you need to move quickly and your dependencies are conservative, 22 or 24 is a smaller jump. Whichever you choose, write it down in one place and make everything else read from it.
+
+A single source of truth removes most future drift:
+
+```bash
+# .nvmrc is read by nvm, fnm, and actions/setup-node
+echo "24" > .nvmrc
+```
+
+```yaml
+# .github/workflows/ci.yml
+- uses: actions/setup-node@v4
+  with:
+    node-version-file: ".nvmrc"
+```
+
+```dockerfile
+# Dockerfile: pin the major, rebuild with --pull to pick up patches
+ARG NODE_VERSION=24
+FROM node:${NODE_VERSION}-alpine AS base
+```
+
+Passing the version as a build argument lets you test a different major in CI without editing the Dockerfile.
+
+## Step 3: Find the breakage before production does
+
+Upgrade in a branch and let the toolchain tell you what is wrong:
+
+1. **Reinstall from scratch.** Delete `node_modules` and rebuild native modules. Packages with compiled addons are the most common source of failures; check that your versions publish binaries for the new Node ABI.
+2. **Run the full test suite twice**, once on the old Node and once on the new, so you can separate pre-existing failures from new ones.
+3. **Read the deprecation warnings.** Start the app with `node --trace-deprecation` and fix what shows up now, before a later major turns warnings into errors.
+4. **Check built-in behavior changes** that affect you, such as fetch and URL handling or default test-runner behavior, by reading the release notes for each major you are skipping. Going from 20 to 24 crosses two majors' worth of changes.
+
+```bash
+# Quick check for native addons that need new binaries
+npm ls --all 2>/dev/null | grep -iE "node-gyp|bindings|prebuild" | head
+npm rebuild
+```
+
+## Step 4: Roll out with a way back
+
+Treat the runtime like any other production change:
+
+- Deploy to staging and run your end-to-end suite and a representative load test. Memory profile and startup time can both shift.
+- Release to a small fraction of traffic first if your platform supports it, and compare error rate and latency.
+- Keep the previous image tag so rollback is a redeploy, not a rebuild.
+
+## Step 5: Stop it happening again
+
+- Add a CI check that fails when `.nvmrc`, the Dockerfile and `engines` disagree.
+- Enable automated dependency updates for base images and the `setup-node` action, so a new patch release becomes a pull request.
+- Put the Node release schedule in your team calendar. Each line has a predictable end date, and a reminder six months ahead turns an emergency into a ticket.
+
+## What we recommend
+
+If you are still on Node 20, do the inventory this week; it is quick and it tells you the real size of the job. Plan the migration for the next sprint rather than "someday", because an unpatched runtime does not stay merely old. In the same release cycle that skipped Node 20, the project fixed a Brotli memory-safety bug and several certificate-identity issues in the supported lines. Those fixes will not reach you.
+
+For most web applications, the upgrade itself is a day or two of work spread across a review cycle. The expensive version of this task is the one done under pressure after an incident.
