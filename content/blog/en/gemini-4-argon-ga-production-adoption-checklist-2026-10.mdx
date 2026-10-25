@@ -1,0 +1,87 @@
+---
+title: "Gemini 4 Argon Is GA: A Checklist Before You Switch Production Traffic"
+description: "Google's Gemini 4 Argon reached general availability in mid-October. What to verify before moving production traffic: ignored sampling parameters, thinking levels, introductory pricing, and a model-agnostic wrapper."
+date: "2026-10-26"
+status: "published"
+tags: ["Gemini", "LLM", "AI", "API Design", "Cost Management"]
+thumbnail: ""
+author: "webhani"
+slug: "gemini-4-argon-ga-production-adoption-checklist-2026-10"
+---
+
+Google released Gemini 4 Argon to developers on October 13, 2026, after an earlier limited preview for security partners. Reports from third-party developer guides describe a stable model ID (`gemini-4-argon`), a context window of roughly one million tokens, and an introductory price of $2 per million input tokens and $10 per million output tokens. Those figures come from secondary sources and some of them disagree on details, so treat everything below as "verify against Google's documentation first."
+
+This post is not a review of the model. It is the checklist we use at webhani when a new frontier model lands and a client asks, "Should we switch?"
+
+## Differences that break code, not benchmarks
+
+Benchmark gains rarely cause incidents. API behavior changes do. According to the developer guides we read, Argon has a few traits worth checking in your own integration:
+
+- **Sampling parameters may be ignored.** If your code sends `temperature`, `top_p`, or `top_k` and relies on them for determinism, the model may silently disregard them. Output variance then changes without any error.
+- **Thinking is configured by level**, not by token budget (low / medium / high, with medium reported as the default). Thinking tokens share the context window with input and output, so a high level on a long prompt can crowd out the answer.
+- **Explicit caching may not be supported**, while implicit caching is on by default. If your cost model assumed explicit cache handles, it needs a rewrite.
+- **Introductory pricing expires.** Sources disagree on whether it ends November 30 or December 1, but all indicate roughly double pricing afterward. Budget for the higher number.
+
+None of these is a problem. Each is a reason to run your own evaluation instead of trusting a leaderboard.
+
+## Keep the model ID out of your business logic
+
+The cheapest insurance is a thin wrapper that owns model selection, per-model parameter rules, and fallback. Here is a minimal TypeScript sketch of the idea (the provider call is deliberately left abstract):
+
+```ts
+type ModelProfile = {
+  id: string;
+  supportsSampling: boolean;
+  thinking?: "low" | "medium" | "high";
+  maxOutputTokens: number;
+};
+
+const PROFILES: Record<string, ModelProfile> = {
+  primary: {
+    id: process.env.LLM_PRIMARY_MODEL ?? "gemini-4-argon",
+    supportsSampling: false,
+    thinking: "medium",
+    maxOutputTokens: 8192,
+  },
+  fallback: {
+    id: process.env.LLM_FALLBACK_MODEL ?? "gemini-3-5-flash",
+    supportsSampling: true,
+    maxOutputTokens: 4096,
+  },
+};
+
+export async function generate(
+  call: (p: ModelProfile, prompt: string) => Promise<string>,
+  prompt: string,
+): Promise<{ text: string; model: string }> {
+  for (const name of ["primary", "fallback"] as const) {
+    const profile = PROFILES[name];
+    try {
+      const text = await call(profile, prompt);
+      return { text, model: profile.id };
+    } catch (err) {
+      console.warn(`model ${profile.id} failed`, err);
+    }
+  }
+  throw new Error("all models failed");
+}
+```
+
+The `call` function is where you translate a profile into the provider's request shape, dropping `temperature` for profiles with `supportsSampling: false`. Logging the returned `model` field with every response is what lets you compare cost and quality per model later.
+
+## A migration checklist
+
+1. **Replay real traffic.** Take 200 to 500 anonymized production prompts and run them through the old and new model. Compare outputs with a rubric, not by eye.
+2. **Check structured output.** If you rely on JSON schemas or tool calls, measure the parse-failure rate separately. This is where regressions hide.
+3. **Measure total tokens, not just price per token.** A model that thinks more can cost more per request even at a lower unit price. Compare cost per successful task.
+4. **Test the latency tail.** p95 and p99 matter more than the median for user-facing flows, especially with higher thinking levels.
+5. **Canary at 5 to 10 percent**, with the fallback path exercised on purpose.
+6. **Set a decision date for pricing.** Put the end of the introductory period in the calendar and re-run the cost comparison before it.
+
+## Our recommendation
+
+Do not switch everything because a new model exists. Switch the workloads where you have evidence: long-context analysis, code review assistance, and extraction tasks are good candidates because they are easy to score. Leave latency-sensitive chat on the cheaper tier until you have measured it.
+
+The more durable investment is the abstraction layer and the evaluation set. Models will change every quarter; a replay harness that tells you in an afternoon whether a new one is better is worth more than any single model choice.
+
+If you are planning a model migration and want help building the evaluation harness, that is work we do regularly.

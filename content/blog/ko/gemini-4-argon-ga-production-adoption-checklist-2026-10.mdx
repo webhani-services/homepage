@@ -1,0 +1,87 @@
+---
+title: "Gemini 4 Argon GA: Production Traffic을 전환하기 전 Checklist"
+description: "Gemini 4 Argon이 10월 중순 GA로 공개되었습니다. Sampling Parameter 무시, Thinking Level, 도입 가격, 모델 독립적인 Wrapper 등 전환 전에 확인할 항목을 정리합니다."
+date: "2026-10-26"
+status: "published"
+tags: ["Gemini", "LLM", "AI", "API 설계", "비용 관리"]
+thumbnail: ""
+author: "webhani"
+slug: "gemini-4-argon-ga-production-adoption-checklist-2026-10"
+---
+
+Google은 2026년 10월 13일 Gemini 4 Argon을 개발자에게 공개했습니다. 그 전에는 보안 관련 파트너에게만 제한적으로 공개되었습니다. 서드파티 개발자 가이드에 따르면 안정 버전 Model ID는 `gemini-4-argon`, Context Window는 약 100만 Token, 도입 가격은 입력 100만 Token당 $2, 출력은 $10입니다. 다만 이 수치는 2차 자료이고 세부 내용이 서로 다른 곳도 있으므로, 아래 내용은 반드시 Google 공식 문서로 확인하시기 바랍니다.
+
+이 글은 모델 리뷰가 아닙니다. 새로운 Frontier Model이 나왔을 때 고객이 "전환해야 하나요?"라고 물으면 webhani가 실제로 사용하는 Checklist입니다.
+
+## Benchmark가 아니라 코드를 깨뜨리는 차이
+
+Benchmark 점수 향상이 장애를 일으키는 경우는 드뭅니다. 장애의 원인은 대개 API 동작의 변화입니다. 참고한 가이드에 따르면 Argon은 연동 시 확인해야 할 특징이 몇 가지 있습니다.
+
+- **Sampling Parameter가 무시될 수 있습니다.** `temperature`, `top_p`, `top_k`를 보내고 출력의 일관성에 의존하는 코드는 오류 없이 동작이 달라질 수 있습니다.
+- **Thinking은 Token 수가 아니라 Level로 지정합니다** (low / medium / high, 기본값은 medium으로 보고됨). Thinking Token은 입력·출력과 Context Window를 공유하므로, 긴 Prompt에 high를 쓰면 답변 공간이 줄어듭니다.
+- **명시적 Cache는 지원하지 않고 암묵적 Cache가 기본으로 켜져 있다**고 합니다. 명시적 Cache를 전제로 한 비용 산정은 다시 해야 합니다.
+- **도입 가격에는 기한이 있습니다.** 11월 30일까지라는 자료와 12월 1일부터라는 자료가 있지만, 이후 약 2배가 된다는 점은 같습니다. 예산은 높은 단가를 기준으로 잡아야 합니다.
+
+모두 문제는 아닙니다. 다만 Leaderboard를 믿는 대신 자체 평가를 해야 하는 이유가 됩니다.
+
+## Model ID를 Business Logic에 넣지 않기
+
+가장 저렴한 보험은 모델 선택, 모델별 Parameter 규칙, Fallback을 담당하는 얇은 Wrapper입니다. 아이디어를 보여주는 TypeScript 최소 예시입니다 (Provider 호출은 의도적으로 추상화했습니다).
+
+```ts
+type ModelProfile = {
+  id: string;
+  supportsSampling: boolean;
+  thinking?: "low" | "medium" | "high";
+  maxOutputTokens: number;
+};
+
+const PROFILES: Record<string, ModelProfile> = {
+  primary: {
+    id: process.env.LLM_PRIMARY_MODEL ?? "gemini-4-argon",
+    supportsSampling: false,
+    thinking: "medium",
+    maxOutputTokens: 8192,
+  },
+  fallback: {
+    id: process.env.LLM_FALLBACK_MODEL ?? "gemini-3-5-flash",
+    supportsSampling: true,
+    maxOutputTokens: 4096,
+  },
+};
+
+export async function generate(
+  call: (p: ModelProfile, prompt: string) => Promise<string>,
+  prompt: string,
+): Promise<{ text: string; model: string }> {
+  for (const name of ["primary", "fallback"] as const) {
+    const profile = PROFILES[name];
+    try {
+      const text = await call(profile, prompt);
+      return { text, model: profile.id };
+    } catch (err) {
+      console.warn(`model ${profile.id} failed`, err);
+    }
+  }
+  throw new Error("all models failed");
+}
+```
+
+`call` 함수 안에서 Profile을 Provider의 Request 형식으로 변환합니다. `supportsSampling: false`인 Profile에서는 `temperature`를 보내지 않습니다. 응답마다 `model` 값을 기록해 두면 나중에 모델별 비용과 품질을 비교할 수 있습니다.
+
+## 전환 Checklist
+
+1. **실제 Traffic으로 Replay합니다.** 익명화한 Production Prompt 200~500건을 이전 모델과 새 모델에 모두 실행합니다. 비교는 눈대중이 아니라 Rubric으로 합니다.
+2. **Structured Output을 확인합니다.** JSON Schema나 Tool Call에 의존한다면 Parse 실패율을 따로 측정합니다. 퇴행은 여기에 숨어 있는 경우가 많습니다.
+3. **단가가 아니라 총 Token 수를 측정합니다.** 더 오래 생각하는 모델은 단가가 낮아도 Request당 비용이 더 클 수 있습니다. 성공한 Task당 비용으로 비교하십시오.
+4. **Latency의 Tail을 봅니다.** 사용자 대상 Flow에서는 중앙값보다 p95, p99가 중요합니다. Thinking Level을 높일 때는 특히 그렇습니다.
+5. **5~10%로 Canary를 진행합니다.** Fallback 경로도 의도적으로 지나가 보십시오.
+6. **가격 변경 판단일을 정합니다.** 도입 가격 종료일을 Calendar에 넣고, 그 전에 비용 비교를 다시 수행합니다.
+
+## webhani의 의견
+
+새 모델이 나왔다고 모든 것을 바꿀 필요는 없습니다. 근거가 있는 Workload부터 전환하십시오. 긴 Context 분석, Code Review 보조, 정보 추출은 채점하기 쉬워 좋은 후보입니다. Latency에 민감한 Chat은 측정이 끝날 때까지 저렴한 Tier에 두는 편이 안전합니다.
+
+오래 남는 투자는 추상화 Layer와 평가 Set입니다. 모델은 분기마다 바뀝니다. 새 모델이 더 나은지 반나절 안에 판단할 수 있는 Replay 환경은 어떤 모델 선택보다 가치가 있습니다.
+
+모델 전환 계획이나 평가 Harness 구축에 도움이 필요하시면 webhani에 문의해 주십시오.
