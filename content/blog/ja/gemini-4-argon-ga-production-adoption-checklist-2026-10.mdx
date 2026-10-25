@@ -1,0 +1,87 @@
+---
+title: "Gemini 4 Argon が GA に: 本番トラフィックを切り替える前のチェックリスト"
+description: "Gemini 4 Argon が10月中旬に GA となりました。サンプリングパラメータの無視、thinking level、導入価格、モデル非依存のラッパーなど、本番移行前に確認すべき点を整理します。"
+date: "2026-10-26"
+status: "published"
+tags: ["Gemini", "LLM", "AI", "API設計", "コスト管理"]
+thumbnail: ""
+author: "webhani"
+slug: "gemini-4-argon-ga-production-adoption-checklist-2026-10"
+---
+
+Google は 2026年10月13日、Gemini 4 Argon を開発者向けに提供開始しました。それ以前はセキュリティ関連パートナー向けの限定公開でした。サードパーティの開発者ガイドによると、安定版のモデルID は `gemini-4-argon`、コンテキストウィンドウは約100万トークン、導入価格は入力100万トークンあたり $2、出力は $10 とされています。ただしこれらは二次情報で、細部が食い違っている箇所もあります。以下の内容は、必ず Google の公式ドキュメントで確認してください。
+
+この記事はモデルのレビューではありません。新しいフロンティアモデルが出たときに「切り替えるべきか」と聞かれた際、webhani が実際に使っているチェックリストです。
+
+## ベンチマークではなく、コードを壊す差分
+
+ベンチマークの向上が障害を起こすことはほとんどありません。障害の原因になるのは API の挙動の変化です。参照したガイドによると、Argon には統合時に確認すべき特徴がいくつかあります。
+
+- **サンプリングパラメータが無視される可能性があります。** `temperature`、`top_p`、`top_k` を送って出力の安定性に頼っているコードは、エラーなしに挙動が変わることがあります。
+- **thinking はトークン数ではなくレベル指定です**（low / medium / high、デフォルトは medium と報告されています）。thinking トークンは入力・出力とコンテキストウィンドウを共有するため、長いプロンプトで high にすると回答分が圧迫されます。
+- **明示的なキャッシュは非対応で、暗黙的キャッシュがデフォルトで有効**とされています。明示キャッシュ前提のコスト試算は見直しが必要です。
+- **導入価格には期限があります。** 11月30日までとする情報と12月1日からとする情報がありますが、その後はおよそ2倍になるという点は共通しています。予算は高い方の単価で組むべきです。
+
+どれも問題ではありません。ただ、リーダーボードを信じるのではなく自社で評価すべき理由にはなります。
+
+## モデルIDをビジネスロジックに持ち込まない
+
+最も安上がりな保険は、モデル選択、モデルごとのパラメータ規則、フォールバックを担う薄いラッパーです。考え方を示す TypeScript の最小例です（プロバイダ呼び出しは意図的に抽象化しています）。
+
+```ts
+type ModelProfile = {
+  id: string;
+  supportsSampling: boolean;
+  thinking?: "low" | "medium" | "high";
+  maxOutputTokens: number;
+};
+
+const PROFILES: Record<string, ModelProfile> = {
+  primary: {
+    id: process.env.LLM_PRIMARY_MODEL ?? "gemini-4-argon",
+    supportsSampling: false,
+    thinking: "medium",
+    maxOutputTokens: 8192,
+  },
+  fallback: {
+    id: process.env.LLM_FALLBACK_MODEL ?? "gemini-3-5-flash",
+    supportsSampling: true,
+    maxOutputTokens: 4096,
+  },
+};
+
+export async function generate(
+  call: (p: ModelProfile, prompt: string) => Promise<string>,
+  prompt: string,
+): Promise<{ text: string; model: string }> {
+  for (const name of ["primary", "fallback"] as const) {
+    const profile = PROFILES[name];
+    try {
+      const text = await call(profile, prompt);
+      return { text, model: profile.id };
+    } catch (err) {
+      console.warn(`model ${profile.id} failed`, err);
+    }
+  }
+  throw new Error("all models failed");
+}
+```
+
+`call` 関数の中で、プロファイルをプロバイダのリクエスト形式に変換します。`supportsSampling: false` のプロファイルでは `temperature` を送らないようにします。レスポンスごとに `model` を記録しておけば、後でモデル別のコストと品質を比較できます。
+
+## 移行チェックリスト
+
+1. **実トラフィックでリプレイする。** 匿名化した本番プロンプトを200〜500件用意し、旧モデルと新モデルの両方で実行します。比較は目視ではなくルーブリックで行います。
+2. **構造化出力を確認する。** JSON スキーマやツール呼び出しに依存している場合は、パース失敗率を別に測定します。退行はここに隠れがちです。
+3. **単価ではなく総トークン数を測る。** よく考えるモデルは、単価が安くてもリクエストあたりのコストが高くなることがあります。成功タスクあたりのコストで比較してください。
+4. **レイテンシの裾を見る。** ユーザー向けのフローでは、中央値より p95・p99 が重要です。thinking level を上げる場合は特に注意が必要です。
+5. **5〜10% でカナリアする。** フォールバック経路も意図的に通します。
+6. **価格改定の判断日を決める。** 導入価格の終了日をカレンダーに入れ、その前にコスト比較をやり直します。
+
+## webhani の見解
+
+新しいモデルが出たからといって、すべてを切り替える必要はありません。根拠のあるワークロードから切り替えます。長文コンテキストの分析、コードレビュー支援、情報抽出は採点しやすく、良い候補です。レイテンシに敏感なチャットは、測定が済むまで安価なティアに残すのが無難です。
+
+長く効く投資は、抽象化レイヤーと評価セットです。モデルは四半期ごとに入れ替わります。新しいモデルが良いかどうかを半日で判断できるリプレイ環境は、どのモデル選定よりも価値があります。
+
+モデル移行の計画や評価ハーネスの構築でお困りの場合は、webhani にご相談ください。
