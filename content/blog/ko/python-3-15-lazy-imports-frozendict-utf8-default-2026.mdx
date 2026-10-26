@@ -1,0 +1,83 @@
+---
+title: "Python 3.15의 Lazy Import, frozendict, UTF-8 기본값: 업그레이드 전 점검 사항"
+description: "Python 3.15.0이 10월 9일 출시되었습니다. 명시적 Lazy Import, 내장 frozendict와 sentinel, 기존 코드의 동작을 바꿀 수 있는 UTF-8 기본값 변경을 실무 관점에서 정리합니다."
+date: "2026-10-27"
+status: "published"
+tags: ["Python", "Backend", "Performance", "Migration", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "python-3-15-lazy-imports-frozendict-utf8-default-2026"
+---
+
+Python 3.15.0은 2026년 10월 9일에 출시되었고, 이어서 3.15.1과 3.15.2 유지보수 릴리스도 나왔습니다. Release Note는 길지만 Application 개발 팀에 중요한 항목은 네 가지입니다. 명시적 Lazy Import, 내장 `frozendict`, 내장 `sentinel`, 그리고 텍스트 인코딩의 UTF-8 기본값입니다. 이 중 손대지 않은 기존 코드의 동작을 바꿀 수 있는 것은 마지막 항목뿐입니다. 아래 구문 예시는 공식 "What's New" 문서를 기준으로 하였으므로, 세부 동작에 의존하기 전에 원문을 확인하시기 바랍니다.
+
+## 명시적 Lazy Import (PEP 810)
+
+CLI, Serverless Handler, Test Runner에서는 시작할 때 무거운 Module을 열두 개쯤 import해 놓고 실제로는 두 개만 쓰는 경우가 흔합니다. 3.15는 `lazy` Soft Keyword를 추가해, 이름이 처음 사용될 때까지 Load를 미룰 수 있게 합니다.
+
+```python
+lazy import json
+lazy from pathlib import Path
+
+print("starting")            # 두 Module 모두 아직 완전히 import되지 않음
+data = json.loads('{"a": 1}')  # 여기서 json이 import됨
+```
+
+알아 두어야 할 제약은 다음과 같습니다.
+
+- `lazy`는 Module Scope에서만 허용됩니다. 함수 내부, Class Body, `try`/`except`/`finally` Block 안에서는 `SyntaxError`입니다.
+- `lazy from x import *`와 `lazy from __future__ import ...`도 `SyntaxError`입니다.
+- 전역 Switch로 `-X lazy_imports` 또는 `PYTHON_LAZY_IMPORTS`가 있으며, `all` 또는 `normal`(기본값)을 받습니다.
+
+실무에서는 `try`/`except` 제약이 걸림돌이 됩니다. 선택적 Dependency를 `try: import x except ImportError`로 감싸는 흔한 Pattern은 Lazy로 만들 수 없습니다. 또한 import 실패가 드러나는 시점도 달라집니다. Lazy Import에서는 Module 누락이나 순환 import가 시작 시점이 아니라 첫 사용 시점에 나타납니다. 시작 때 바로 알 수 있던 실패가, 거의 실행되지 않는 Code Path의 Runtime Error로 바뀔 수 있습니다.
+
+**활용하기 좋은 곳:** Subcommand가 많은 CLI Entry Point, Cold Start가 중요한 Lambda 방식 Handler, 대규모 Test Suite. **피하고 싶은 곳:** Plugin 등록, Patch 적용, Logging 설정처럼 import 시점의 Side Effect가 있는 Module. 지연시키면 실행 순서가 바뀌기 때문입니다.
+
+도입 전후로 반드시 측정하십시오. `python -X importtime -c "import yourapp"`으로 Module별 비용을 볼 수 있으며, 보통 두세 개의 Module이 대부분을 차지합니다.
+
+## frozendict (PEP 814)와 sentinel (PEP 661)
+
+`frozendict`는 변경 불가능하고 Hash 가능한 Mapping입니다. `dict`가 아니라 `object`를 직접 상속합니다.
+
+```python
+config = frozendict(region="ap-northeast-1", retries=3)
+config["retries"] = 5   # TypeError: 항목 할당 불가
+```
+
+모든 Key와 Value가 Hash 가능하면 Hash 가능하며, 동등 비교에서 삽입 순서는 무시됩니다. 변경되면 안 되는 기본 Option Mapping, 현재는 dict를 정렬된 Tuple로 변환해 만드는 Cache Key, Module 수준 상수 등에 쓸 수 있습니다.
+
+`dict`를 상속하지 않으므로 `isinstance(x, dict)`는 `False`입니다. `dict`로 Type 검사를 하는 코드(Serializer, Validator)에 `frozendict`를 넘기기 전에 점검이 필요합니다.
+
+내장 `sentinel`은 읽기 쉬운 repr을 가진 고유 Marker Object를 제공합니다. 문서에 따르면 복사해도 Identity가 유지되고, Type 표현식에서 `|`와 함께 사용할 수 있습니다. Log에서 repr이 읽기 어렵고 Typing도 번거로웠던 `_MISSING = object()` 직접 구현 Pattern을 대체합니다.
+
+## UTF-8이 기본값으로 (PEP 686)
+
+`encoding` 없이 `open("notes.txt")`를 호출하면 3.15는 Locale과 무관하게 UTF-8을 사용합니다. 이전에는 Locale이 결정했기 때문에, 레거시 Code Page(일본어는 cp932, 한국어는 cp949)를 쓰는 Windows와 Linux Container의 동작이 달랐습니다.
+
+대부분의 팀에는 버그를 해결해 주는 변경입니다. 위험은 반대 경우입니다. 오래된 사내 시스템이 내보내는 cp949 CSV를 Locale 기본값에 의존해 읽던 Script는 3.15에서 `UnicodeDecodeError`가 나거나, 더 나쁘게는 오류 없이 잘못 Decode됩니다. 레거시 Software와 파일을 주고받는 한국·일본 시스템에서는 이 부분이 점검 대상입니다.
+
+```bash
+# encoding 없는 open() 호출 찾기
+grep -rnE "open\([^)]*\)" --include='*.py' src | grep -v "encoding="
+```
+
+임시 방편으로 `PYTHONUTF8=0` 또는 `-X utf8=0`이 있지만 장기 해결책으로는 권하지 않습니다. 레거시 입력이 실제로 있는 곳에는 `encoding="cp949"`를, 그 외에는 `encoding="utf-8"`을 명시해 Interpreter Mode에 동작이 좌우되지 않게 하십시오.
+
+## 그 밖의 변경 사항
+
+문서의 Deprecation 및 Removal 목록에서 눈에 띄는 항목입니다.
+
+- `profile` Module은 Deprecated이며 3.17에서 제거될 예정입니다. 대체재는 `cProfile`입니다.
+- Module 속성 `__cached__`가 제거되었습니다. `__spec__.cached`를 사용하십시오.
+- `re.match()`와 `Pattern.match()`는 Soft Deprecated이며, `re.prefixmatch()`와 `Pattern.prefixmatch()`가 권장됩니다.
+- 실험적 JIT는 크게 개선되었다고 설명됩니다. 2차 출처에서는 x86-64 Linux 기준 약 7~8% 향상으로 보도했지만, Platform과 Workload에 따라 다르고 JIT는 여전히 실험 단계입니다. Benchmark 없이 Production에서 활성화하는 것은 권하지 않습니다.
+
+## 업그레이드 계획
+
+1. **CI에서 3.15로 Test Suite를 실행합니다.** 현재 Version 옆에 Matrix로 추가하고, 한 번에 교체하지 않습니다.
+2. **`open()`, `read_text()`, `subprocess`의 Text Mode 호출**에서 암묵적 인코딩에 의존하는 곳을 찾아냅니다.
+3. **Dependency가 3.15용 Wheel을 제공하는지 확인합니다.** C Extension이 포함된 Package가 보통 가장 늦게 대응합니다.
+4. **Lazy Import는 CLI 또는 Handler 하나에서 선별적으로 도입합니다.** `-X importtime`으로 측정하면서 진행합니다.
+5. **Production Service는 패치 릴리스 몇 번을 기다립니다.** 3.15.2가 이미 나온 것은 긍정적 신호이지만, 저희는 보통 두세 번째 패치와 자체 Test의 안정을 확인한 뒤 Service를 옮깁니다.
+
+Python 3.15는 큰 단절을 가져오는 릴리스가 아닙니다. 언어 추가 기능은 Opt-in입니다. 요청하지 않아도 적용되는 것은 UTF-8 기본값뿐이며, 업그레이드 전에 의도적으로 grep을 돌려 볼 가치가 있습니다.

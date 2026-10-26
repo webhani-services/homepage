@@ -1,0 +1,83 @@
+---
+title: "Python 3.15: Lazy Imports, frozendict, and UTF-8 by Default — What to Check Before Upgrading"
+description: "Python 3.15.0 shipped on October 9. A practical look at explicit lazy imports, the built-in frozendict and sentinel, and the UTF-8 default that can change behavior in existing code."
+date: "2026-10-27"
+status: "published"
+tags: ["Python", "Backend", "Performance", "Migration", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "python-3-15-lazy-imports-frozendict-utf8-default-2026"
+---
+
+Python 3.15.0 was released on October 9, 2026, and the first maintenance releases (3.15.1 and 3.15.2) have followed. The release notes are long. Four items matter most for application teams: explicit lazy imports, a built-in `frozendict`, a built-in `sentinel`, and UTF-8 as the default text encoding. The last one is the only one likely to change behavior in code you have not touched. The syntax examples below come from the official "What's New" document; check it for the exact semantics before relying on edge cases.
+
+## Explicit lazy imports (PEP 810)
+
+Import cost is a familiar problem in CLIs, serverless handlers, and test runners: a program imports a dozen heavy modules at startup, then uses two of them. 3.15 adds a `lazy` soft keyword that defers loading until the name is first used.
+
+```python
+lazy import json
+lazy from pathlib import Path
+
+print("starting")            # neither module is fully imported yet
+data = json.loads('{"a": 1}')  # json is imported here
+```
+
+Constraints worth knowing:
+
+- `lazy` is allowed only at module scope. Inside functions, class bodies, or `try`/`except`/`finally` blocks it is a `SyntaxError`.
+- `lazy from x import *` and `lazy from __future__ import ...` are `SyntaxError`.
+- A global switch exists: `-X lazy_imports` or `PYTHON_LAZY_IMPORTS`, accepting `all` or `normal` (the default).
+
+The restriction on `try`/`except` matters in practice. The common pattern of wrapping an optional dependency import in `try: import x except ImportError` cannot be made lazy. Import failures also move: with a lazy import, a missing module or a circular import surfaces at first use, not at startup. That can turn a fast, obvious boot failure into a runtime error on a rarely executed code path.
+
+**Where we would use it:** CLI entry points with many subcommands, Lambda-style handlers where cold start matters, and large test suites. **Where we would not:** modules with import-time side effects (registering plugins, patching, configuring logging), because deferring them changes ordering.
+
+Measure before and after. `python -X importtime -c "import yourapp"` gives per-module cost, and it usually shows that two or three modules dominate.
+
+## frozendict (PEP 814) and sentinel (PEP 661)
+
+`frozendict` is an immutable, hashable mapping. It inherits from `object`, not from `dict`.
+
+```python
+config = frozendict(region="ap-northeast-1", retries=3)
+config["retries"] = 5   # TypeError: item assignment not supported
+```
+
+It is hashable when all keys and values are hashable, and equality ignores insertion order. Practical uses: default option mappings that must not be mutated, cache keys that currently require converting a dict to a sorted tuple, and module-level constants.
+
+One consequence of not subclassing `dict`: `isinstance(x, dict)` is `False`. Code that type-checks with `dict` (serializers, validators) needs review before you pass a `frozendict` into it.
+
+The `sentinel` built-in gives you unique marker objects with a readable repr. According to the documentation, instances keep their identity when copied and can be used with `|` in type expressions. This replaces the hand-rolled `_MISSING = object()` pattern, whose repr was unhelpful in logs and whose typing was awkward.
+
+## UTF-8 by default (PEP 686)
+
+When you call `open("notes.txt")` without an `encoding` argument, 3.15 uses UTF-8 regardless of locale. Previously the locale decided, which meant Windows machines with legacy code pages (cp932 for Japanese, cp949 for Korean) behaved differently from Linux containers.
+
+For most teams this fixes bugs. The risk is the reverse case: a script that has been reading cp932 CSV exports from an older internal system, relying on the locale default, will now raise `UnicodeDecodeError` or, worse, decode incorrectly without failing. For Japanese and Korean systems that exchange files with legacy software, this is the item to audit.
+
+```bash
+# Find open() calls with no explicit encoding
+grep -rnE "open\([^)]*\)" --include='*.py' src | grep -v "encoding="
+```
+
+The escape hatch is `PYTHONUTF8=0` or `-X utf8=0`. We recommend not using it as a long-term fix. Add `encoding="cp932"` where legacy input is real, and `encoding="utf-8"` elsewhere so behavior no longer depends on the interpreter's mode.
+
+## Other changes to note
+
+From the deprecation and removal lists in the documentation:
+
+- The `profile` module is deprecated and scheduled for removal in 3.17; `cProfile` is the replacement.
+- The `__cached__` module attribute is removed; use `__spec__.cached`.
+- `re.match()` and `Pattern.match()` are soft-deprecated in favor of `re.prefixmatch()` and `Pattern.prefixmatch()`.
+- The experimental JIT is described as significantly upgraded. One secondary report puts the gain at roughly 7–8% on x86-64 Linux, but it is platform- and workload-dependent, and the JIT remains experimental, so we would not enable it in production without benchmarks.
+
+## Upgrade plan
+
+1. **Run your test suite on 3.15 in CI** next to your current version. Add the version to the matrix first; do not switch outright.
+2. **Audit `open()`, `read_text()`, and `subprocess` text-mode calls** for implicit encodings.
+3. **Check dependencies** for 3.15 wheels. C-extension packages are usually the slowest to catch up.
+4. **Adopt lazy imports selectively** in one CLI or handler, measured with `-X importtime`.
+5. **Wait for a few patch releases** for production services. 3.15.2 is already out, which is a reasonable sign, but we generally move services after the second or third patch and a clean run of our own tests.
+
+Python 3.15 is not a disruptive release. The language additions are opt-in. The UTF-8 default is the one change that applies without your asking, and it deserves a deliberate grep before you upgrade.

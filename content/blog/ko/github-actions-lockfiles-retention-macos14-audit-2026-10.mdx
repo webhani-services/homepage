@@ -1,0 +1,81 @@
+---
+title: "2026년 10월 GitHub Actions 변경: Workflow Lockfile, Retention 확대, macOS 14 Runner 종료"
+description: "GitHub Actions에서 세 가지 변경이 연달아 적용됩니다. Preview 중인 Workflow 의존성 Lockfile, Check와 Run까지 확대된 Retention, 11월 2일 macOS 14 Runner 종료입니다. CI 담당자를 위한 점검 Checklist를 정리합니다."
+date: "2026-10-27"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "보안", "DevOps", "Supply Chain"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-lockfiles-retention-macos14-audit-2026-10"
+---
+
+GitHub의 10월 Changelog에는 CI 담당자가 한꺼번에 살펴봐야 할 Actions 변경 세 가지가 있습니다. 극적인 변화는 아니지만, 각각 Pipeline이나 Compliance 전제를 조용히 깨뜨릴 수 있습니다. 아래 내용은 검색 결과로 요약된 GitHub Changelog 항목을 기반으로 합니다. 일부 날짜와 세부 사항은 제3자 Index를 통해 확인한 것이므로, 조치하기 전에 github.blog/changelog에서 직접 확인하시기 바랍니다.
+
+## 1. Workflow 의존성 Lockfile (Public Preview, 10월 14일)
+
+`uses: some-org/some-action@v3`은 Tag를 가리키는데, Tag는 이동시킬 수 있습니다. 이 약점은 잘 알려져 있으며, 2025년 Tag 덮어쓰기 사고 이후로는 Action을 전체 Commit SHA로 고정하는 것이 표준 권고가 되었습니다. 효과적이지만 수작업 유지가 번거롭고, 중첩된 의존성(Action이 다른 Action을 호출하는 경우)은 눈에 잘 띄지 않습니다.
+
+GitHub는 Workflow 의존성 Lockfile을 Enterprise Cloud, Team, Free 플랜 대상 Public Preview로 공개했습니다. Changelog Index의 설명에 따르면, Tag나 Branch가 이후에 이동하더라도 Lock한 정확한 Commit으로 실행되며, `gh actions-lock` Extension이 Lockfile을 관리합니다.
+
+저희는 아직 자체 Repository 전체에 적용해 보지 않았으므로, 아래는 권고가 아니라 평가 계획으로 읽어 주십시오.
+
+- 위험이 낮은 Repository 한 곳에서 먼저 시험하고, 생성된 Lockfile을 Pull Request에서 확인합니다.
+- Reusable Workflow와 Composite Action을 어떻게 처리하는지 확인합니다. 숨은 전이 의존성이 있는 곳이 바로 그 지점입니다.
+- Lockfile을 누가 갱신할지 정합니다. Dependabot이나 Renovate가 관리하지 않으면 "Tag가 조용히 이동한다"는 문제를 "아무도 Lock을 갱신하지 않는다"는 문제로 바꾸는 데 그칠 수 있습니다.
+- 당분간 SHA 고정은 유지합니다. 중첩 참조까지 Lockfile이 다루는지 확인하기 전까지 둘은 대체재가 아니라 보완 관계입니다.
+
+오늘 바로 적용할 수 있는 최소 기준은 다음과 같습니다.
+
+```yaml
+steps:
+  - uses: actions/checkout@<full-commit-sha>  # v5.x.y
+    with:
+      persist-credentials: false
+```
+
+SHA 옆에 사람이 읽을 수 있는 Version을 Comment로 남기면 Review가 현실적으로 가능해집니다.
+
+## 2. Retention이 Check, Workflow Run, Status까지 확대 (10월 1일)
+
+이전에는 Repository Retention 설정이 Artifact와 Log만 관리했습니다. Changelog에 따르면 10월 1일부터는 Check, Workflow Run, Status에도 적용됩니다. Organization 및 Enterprise 상한은 계속 유효하며, Public Repository의 최대 Retention은 90일입니다.
+
+실무상 영향은 다음과 같습니다.
+
+- **감사 증적이 짧아집니다.** "이 Commit은 CI를 통과했다"는 근거가 Actions Run이나 Status Check라면, 그 근거는 Retention 일정에 따라 만료됩니다. 수개월 전 변경을 샘플링하는 SOC 2 또는 ISO 27001 감사 대상 팀은 무엇을 제출할 수 있는지 확인하십시오.
+- **Debug 이력이 줄어듭니다.** 불안정한 Test의 분기 단위 성공률을 비교하려면, GitHub에 더 이상 남아 있지 않은 Data가 필요할 수 있습니다.
+- **과거 Run을 조회하는 Tool**(Dashboard, DORA 지표 수집기, 비용 Report)에서 Data 공백이 생길 수 있습니다.
+
+대응 방법은 다음과 같습니다.
+
+```bash
+# Repository의 현재 Retention 설정 확인
+gh api repos/OWNER/REPO/actions/permissions/artifact-and-log-retention
+```
+
+이 Endpoint 이름은 저희가 확인하지 못했으므로, 사용 중인 플랜의 REST 문서에서 확인하시기 바랍니다. 그런 다음 Repository별로 결정합니다. 감사 기간에 맞춰 Retention을 설정하거나, 필요한 것(Run Metadata, Test Report, SBOM)을 직접 관리하는 Storage로 주기적으로 Export합니다. 설정은 누군가 바꿀 수 있으므로, Compliance 증적에는 Export가 더 견고합니다.
+
+## 3. macOS 14 Runner는 11월 2일 종료
+
+macOS 14 Runner Image는 2026년 11월 2일에 종료될 예정이며, 앞으로 6일 남았습니다. 또한 10월 15일에는 Xcode 27 Runner Image가 정식 출시(GA)되었습니다.
+
+`macos-14`를 지정한 Job은 종료 적용 방식에 따라 동작하지 않거나 다른 Image로 대체됩니다. 지금 찾아 두십시오.
+
+```bash
+grep -rn "macos-14" .github/workflows
+```
+
+`macos-15` 이상으로 옮기십시오(Image가 바뀌는 것을 감수한다면 `macos-latest`도 선택지입니다). iOS 및 macOS Build는 Xcode Version 변경을 먼저 Branch에서 검증하십시오. Runner 이전은 깔끔하게 통과하기보다 Simulator나 SDK 차이가 드러나는 경우가 많습니다.
+
+## 관련 참고: 허용 목록의 Host
+
+10월 22일자 Changelog에서 Actions Blob Storage용 meta API Endpoint가 갱신되었습니다. 2차 Index에 따르면 Self-hosted Runner를 위해 Host 단위 허용 목록을 운영하는 조직은 새 Host를 추가하지 않으면 Job Summary와 Log가 끊길 수 있습니다. Runner가 외부 통신 허용 목록 뒤에 있다면, 이번 주 안에 meta API 출력과 Firewall 규칙을 대조하십시오.
+
+## webhani의 Checklist
+
+1. 11월 2일 전에 `macos-14`를 검색해 이전합니다.
+2. Retention 설정을 확인하고, 기간을 늘릴지 증적을 Export할지 결정합니다.
+3. Runner에 외부 통신 허용 목록을 쓴다면 meta API 기준으로 갱신합니다.
+4. Lockfile은 Repository 한 곳에서 시범 운영하고, 그 사이 SHA 고정은 유지합니다.
+5. 이 네 항목을 일회성 Ticket이 아니라 CI 담당자의 분기 Review에 포함합니다. 이런 Platform 변경은 우리가 통제할 수 없는 일정으로 찾아옵니다.
+
+CI 설정은 Production 인프라입니다. 배포 대상 Service와 같은 수준으로 변경을 추적해야 합니다.
