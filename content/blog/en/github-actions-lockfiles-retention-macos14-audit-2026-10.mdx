@@ -1,0 +1,81 @@
+---
+title: "GitHub Actions in October 2026: Workflow Lockfiles, Retention Changes, and the macOS 14 Retirement"
+description: "Three GitHub Actions changes land within weeks of each other: workflow dependency lockfiles in preview, retention now covering checks and runs, and the macOS 14 runner retiring on November 2. An audit checklist for CI owners."
+date: "2026-10-27"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "Security", "DevOps", "Supply Chain"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-lockfiles-retention-macos14-audit-2026-10"
+---
+
+GitHub's October changelog contains three Actions changes that CI owners should look at together. None is dramatic, but each can quietly break a pipeline or a compliance assumption. The facts below come from GitHub's changelog entries as summarized in search results; some dates and details came through third-party indexes, so confirm them against github.blog/changelog before you act on them.
+
+## 1. Workflow dependency lockfiles (public preview, October 14)
+
+Most teams know the weakness: `uses: some-org/some-action@v3` points at a tag, and tags can move. After the 2025 tag-rewrite incidents, the standard advice became pinning actions to a full commit SHA. That works but is tedious to maintain by hand, and nested dependencies (an action that itself calls other actions) are hard to see.
+
+GitHub has now put workflow dependency lockfiles into public preview for Enterprise Cloud, Team, and Free plans. As described in the changelog index, the idea is that runs stay on the exact commits you locked even if tags or branches move afterward, and a `gh actions-lock` extension maintains the lockfile.
+
+We have not run it across our own repositories yet, so treat the following as an evaluation plan rather than a recommendation:
+
+- Try it on one low-risk repository first and read the generated lockfile in a pull request.
+- Check how it handles reusable workflows and composite actions, since those are where hidden transitive dependencies live.
+- Decide who updates the lockfile. If Dependabot or Renovate does not manage it yet, you may be trading "tags move silently" for "nobody updates the lock".
+- Keep SHA pinning on in the meantime. The two are complementary, not alternatives, until you have confirmed the lockfile covers nested references.
+
+A reasonable baseline you can apply today:
+
+```yaml
+steps:
+  - uses: actions/checkout@<full-commit-sha>  # v5.x.y
+    with:
+      persist-credentials: false
+```
+
+A comment with the human-readable version next to each SHA keeps review practical.
+
+## 2. Retention now covers checks, workflow runs, and statuses (October 1)
+
+Previously the repository retention setting governed artifacts and logs. As of October 1, according to the changelog, it also applies to checks, workflow runs, and statuses. Organization and enterprise caps still apply, and for public repositories the maximum retention is 90 days.
+
+The practical effects:
+
+- **Audit trails shorten.** If your evidence for "this commit passed CI" is the Actions run or status check, that evidence now expires on the retention schedule. Teams subject to SOC 2 or ISO 27001 audits that sample changes from months ago should check what they can still produce.
+- **Debugging history shrinks.** Comparing a flaky test's pass rate across a quarter needs data you may no longer have in GitHub.
+- **Tooling that queries old runs** (dashboards, DORA metric collectors, cost reports) may start returning gaps.
+
+What to do:
+
+```bash
+# Inspect current retention for a repository
+gh api repos/OWNER/REPO/actions/permissions/artifact-and-log-retention
+```
+
+Verify that endpoint name against the REST docs for your plan, as we have not confirmed it. Then decide per repository: either set retention to match your audit window, or export what you need (run metadata, test reports, SBOMs) to storage you control on a schedule. Export is the more robust choice for compliance evidence, because it does not depend on a setting someone can change.
+
+## 3. macOS 14 runner retires on November 2
+
+The macOS 14 runner image is scheduled for retirement on November 2, 2026, which is six days away. GitHub also made the Xcode 27 runner image generally available on October 15.
+
+Jobs that specify `macos-14` will stop working or be redirected, depending on how the retirement is applied. Find them now:
+
+```bash
+grep -rn "macos-14" .github/workflows
+```
+
+Move them to `macos-15` or later (or `macos-latest` if you accept the image changing under you). For iOS and macOS builds, test the Xcode version change on a branch first. A runner migration often surfaces a simulator or SDK difference rather than a clean pass.
+
+## A small related note: allowlisted hosts
+
+A changelog entry dated October 22 updated meta API endpoints for Actions blob storage. According to a secondary index, organizations that allowlist individual hosts for self-hosted runners must add the new ones, or job summaries and logs may be interrupted. If your runners sit behind an egress allowlist, check the meta API output against your firewall rules this week.
+
+## Our checklist
+
+1. Search for `macos-14` before November 2.
+2. Check retention settings and decide between extending and exporting evidence.
+3. If you use egress allowlists for runners, refresh them from the meta API.
+4. Pilot lockfiles on one repository; keep SHA pinning meanwhile.
+5. Put these four items in your CI owner's quarterly review, not a one-off ticket. Platform changes like these arrive on a schedule you do not control.
+
+CI configuration is production infrastructure, and it deserves the same change tracking as the services it deploys.
