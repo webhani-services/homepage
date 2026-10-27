@@ -1,0 +1,110 @@
+---
+title: "Claude Duet와 Proactive Agent: 자체 자동화에 Approval Gate를 설계하는 방법"
+description: "Anthropic의 Duet는 연결된 앱을 백그라운드에서 확인하고 중요한 작업 전에 승인을 요청하는 Research Preview입니다. 현재는 미국 한정이지만, Approval Gate 패턴은 지금 만드는 Agent에도 그대로 적용할 수 있습니다."
+date: "2026-10-28"
+status: "published"
+tags: ["Claude", "AI Agents", "Security", "Design Pattern", "LLM"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-duet-proactive-agents-approval-gate-design-2026-10"
+---
+
+10월 21일 Anthropic은 Claude Duet의 Research Preview를 시작했습니다. 사용자가 자리를 비운 동안에도 연결된 앱들을 오가며 작업을 이어가는 Agent입니다. 보도에 따르면 미국의 Pro/Max 구독자 대상 Waitlist 방식이고, 연결된 계정은 상시가 아니라 몇 시간 간격으로 확인하며, 이메일 발송·결제·서명 같은 중요한 작업 전에는 승인을 요청합니다. Anthropic의 공식 발표 페이지는 확인하지 못했고, 기반 모델 등 세부 사항은 2차 자료마다 내용이 다릅니다. 이 글은 제품 리뷰가 아니라 패턴에 대한 논평으로 읽어 주십시오.
+
+대부분의 독자는 아직 Duet를 쓸 수 없습니다. 그래도 이 제품이 던지는 설계 질문은 지금 당장의 과제입니다. **Proactive Agent는 실행 시점에 사람이 개입하지 않습니다. 그렇다면 사람은 어디에 들어가야 할까요?** Duet의 답은 Approval Gate이고, 이는 의도적으로 잘 만들어 둘 가치가 있는 패턴입니다.
+
+## Reactive와 Proactive는 Risk Model이 다릅니다
+
+챗 어시스턴트는 사람이 입력할 때 동작합니다. Proactive Agent는 스케줄이나 이벤트로 동작합니다. 달라지는 점은 세 가지입니다.
+
+- **입력이 더 이상 내 것이 아닙니다.** 입력은 이메일, 캘린더 초대, 티켓이며 제3자가 쓴 텍스트가 포함될 수 있습니다. 전형적인 Prompt Injection 경로이고, 무인 실행에서는 영향이 더 커집니다.
+- **아무도 지켜보지 않습니다.** 잘못된 작업은 발생 시점이 아니라 나중에 발견됩니다.
+- **작업이 외부에 영향을 줍니다.** 메시지 발송이나 청구서 결제는 탭을 닫는다고 되돌릴 수 없습니다.
+
+Approval Gate는 두 번째와 세 번째 문제에 직접 대응하고, 첫 번째 문제의 피해도 줄여 줍니다.
+
+## Tool이 아니라 가역성으로 작업을 분류합니다
+
+흔한 실수는 Tool 이름으로 Gate를 거는 것입니다("이메일 Tool을 쓰기 전에 확인"). 너무 거칩니다. 초안 작성은 무해하지만 발송은 그렇지 않습니다. 작업이 무엇을 하는지로 분류해야 합니다.
+
+```typescript
+type Effect = "read" | "write-internal" | "write-external" | "financial";
+
+interface ActionRequest {
+  tool: string;
+  effect: Effect;
+  summary: string;      // 승인 화면에 표시할 사람용 설명
+  payload: unknown;
+}
+
+type Decision = "allow" | "require-approval" | "deny";
+
+export function decide(action: ActionRequest, ctx: { unattended: boolean }): Decision {
+  switch (action.effect) {
+    case "read":
+      return "allow";
+    case "write-internal":
+      // 초안 생성, Label 추가 등 되돌릴 수 있는 작업
+      return "allow";
+    case "write-external":
+      return ctx.unattended ? "require-approval" : "allow";
+    case "financial":
+      return "require-approval"; // 자동 승인하지 않음
+  }
+}
+```
+
+`unattended` 플래그가 중요합니다. 사용자가 화면 앞에서 지켜보고 있을 때는 괜찮은 작업도, 스케줄로 기동된 경우에는 승인 대기로 보내야 합니다.
+
+## 승인 화면에는 근거를 담습니다
+
+"Agent가 이메일을 보내려 합니다. 허용하시겠습니까?"라는 문구만으로는 사람이 습관적으로 "허용"을 누르게 됩니다. 무슨 일이 일어나는지, 왜 그런지를 보여 주어야 합니다.
+
+```typescript
+interface ApprovalRequest {
+  id: string;
+  action: ActionRequest;
+  trigger: string;          // "캘린더 이벤트: 벤더 리뷰, 10/29"
+  sourceExcerpt: string;    // 이 작업으로 이어진, 신뢰할 수 없는 입력의 해당 부분
+  expiresAt: Date;
+}
+```
+
+`sourceExcerpt`를 포함하는 것은 의도적입니다. Agent가 문서를 전달하려는 이유가 수신 이메일의 한 문장이라면, 검토자에게 그 문장을 보여 주어야 합니다. 주입된 지시를 알아채는 가장 빠른 방법입니다.
+
+## Fail Closed와 승인 만료
+
+구현은 쉽지만 놓치기 쉬운 기본값이 두 가지 있습니다.
+
+- **만료.** 일정 시간 안에 승인이 없으면 작업을 폐기합니다. 오래된 Context로 나중에 실행해서는 안 됩니다.
+- **Fail Closed.** Policy 함수가 예외를 던지거나 승인 Service에 접근할 수 없으면 `deny`로 처리합니다. 이 원칙은 이전 Claude Code Hooks 글에서도 다루었는데, 여기서도 같습니다.
+
+```typescript
+export async function execute(action: ActionRequest, ctx: { unattended: boolean }) {
+  let decision: Decision;
+  try {
+    decision = decide(action, ctx);
+  } catch {
+    decision = "deny";
+  }
+  if (decision === "deny") return { status: "blocked" as const };
+  if (decision === "require-approval") {
+    return { status: "pending" as const, approvalId: await queueApproval(action) };
+  }
+  return { status: "done" as const, result: await run(action) };
+}
+```
+
+## 작업만이 아니라 "판단"을 기록합니다
+
+감사와 튜닝을 위해 모든 판단을 입력과 함께 기록합니다. 작업 내용, Effect 분류, 무인 실행 여부, 승인자입니다. 몇 주가 쌓이면 항상 승인되는 항목(완화 후보)과 자주 거부되는 항목(강화하거나 Agent 지시문을 고쳐야 하는 후보)이 드러납니다. Anthropic도 Duet의 "긴급도 판단"을 계속 조정 중이라고 밝혔습니다. 자체 Agent에서도 같은 조정이 필요하며, 그러려면 데이터가 있어야 합니다.
+
+## 정리
+
+- Proactive Agent는 챗 어시스턴트와 다른 Risk Class로 다룹니다. 무인, 외부 트리거, 외부 영향이라는 특성이 있습니다.
+- Tool이 아니라 작업의 효과를 기준으로 Gate를 겁니다.
+- 검토자에게 기동 원인과 신뢰할 수 없는 입력의 원문을 보여 줍니다.
+- 대기 중인 승인에는 만료를 두고 Fail Closed로 처리합니다.
+- 판단 Log를 남기고 정기적으로 검토합니다.
+
+사내 업무에 백그라운드 Agent를 도입한다면, 읽기 전용과 초안 작성부터 시작해 외부 쓰기에 승인을 붙이고, 판단 Log가 뒷받침하는 만큼만 권한을 넓혀 가는 방식을 권합니다.
