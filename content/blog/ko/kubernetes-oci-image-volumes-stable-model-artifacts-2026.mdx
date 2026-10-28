@@ -1,0 +1,107 @@
+---
+title: "Kubernetes OCI Image Volume Stable 승격: 거대한 Image 없이 Model과 Asset 배포하기"
+description: "Kubernetes 1.36에서 Image Volume이 Stable이 되었습니다. Registry의 Model이나 Dataset을 읽기 전용 Volume으로 마운트하는 방법과, 도입 전에 확인할 운영상 제약을 정리합니다."
+date: "2026-10-29"
+status: "published"
+tags: ["Kubernetes", "Container", "OCI", "AI", "인프라"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-oci-image-volumes-stable-model-artifacts-2026"
+---
+
+Kubernetes 1.36은 2026년 4월에 출시되었습니다. 그 Release Note 가운데 ML Workload를 운영하는 팀이 더 주목해야 할 항목이 있습니다. OCI Image Volume이 Stable이 된 것입니다. 이 기능을 쓰면 Pod가 OCI Image(또는 Artifact)의 내용을 읽기 전용 Volume으로 마운트할 수 있습니다. Init Container도, 복사 단계도, Application Image에 포함시키는 작업도 필요 없습니다.
+
+모두에게 새로운 기능은 아닙니다. 여러 Release 동안 Alpha와 Beta로 제공되었습니다. 다만 Stable이 되면 도입 판단의 기준이 달라집니다. Feature Gate를 신경 쓸 필요가 없어지고, API 형태가 호환성 약속이 됩니다. Container Image에 큰 Payload를 넣는 우회책을 써 왔다면 검토할 가치가 있습니다.
+
+## 해결하는 문제
+
+일반적인 Inference Service에는 수명 주기가 전혀 다른 두 부분이 있습니다.
+
+- **Server**: 코드와 의존성. Release마다 바뀝니다.
+- **Payload**: Model 가중치, Tokenizer, Embedding, 지리 Database, 정적 Asset 등. 자체 일정에 따라 바뀌며 용량이 큽니다.
+
+흔한 우회책은 모두 불편합니다.
+
+1. **Payload를 앱 Image에 포함**: 코드를 바꿀 때마다 수 GB짜리 Image를 다시 Build하고 Push해야 합니다. Registry와 Node가 그 비용을 부담합니다.
+2. **Init Container로 Object Storage에서 다운로드**: 인증 정보, 재시도 로직, 쓰기 가능한 Volume이 필요합니다. 기동 시간이 매번 네트워크 전송에 좌우됩니다.
+3. **외부에서 채운 PersistentVolume 사용**: 동작은 하지만, Deploy와 별개의 Storage 수명 주기를 직접 관리하게 됩니다.
+
+Image Volume은 Payload를 버전이 관리되는 Registry상의 일급 Artifact로 만들고 Pod Spec에서 참조하게 합니다.
+
+## 실제 작성 예
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: classifier
+spec:
+  containers:
+    - name: server
+      image: registry.example.com/classifier-server:1.8.2
+      volumeMounts:
+        - name: model
+          mountPath: /models
+          readOnly: true
+  volumes:
+    - name: model
+      image:
+        reference: registry.example.com/models/classifier@sha256:4f1c...e9
+        pullPolicy: IfNotPresent
+```
+
+kubelet은 Container Runtime을 통해 참조된 Artifact를 Pull하여 마운트합니다. Server에는 `/models`가 읽기 전용 Directory로 보입니다. Model 업데이트는 Pod Spec 변경이므로 일반적인 Rollout, Rollback, GitOps 리뷰 흐름에 그대로 올라탑니다.
+
+실무상 주의점이 두 가지 있습니다.
+
+- **운영에서는 Digest로 고정하십시오**: `:latest`는 물론 `:v3` 같은 Tag도 움직일 수 있습니다. 실행 중인 Deployment 아래에서 Model이 조용히 바뀌는 상황은 나중에 재구성하기 어려운 장애입니다.
+- **마운트에서 `subPath`를 사용할 수 있습니다**: 하나의 Artifact에 여러 파일을 담고, Container는 필요한 파일 하나만 마운트할 수 있습니다.
+
+## Artifact 만들기
+
+OCI 호환 Registry라면 어디든 사용할 수 있습니다. Model Artifact는 `FROM scratch`로 만든 최소 Image로 충분합니다.
+
+```dockerfile
+FROM scratch
+COPY classifier-v3/ /
+```
+
+```bash
+docker build -t registry.example.com/models/classifier:v3 .
+docker push registry.example.com/models/classifier:v3
+```
+
+실행 파일이 없으므로 실행할 것도, Base Image의 CVE도 없습니다. 하지만 서명과 일반적인 공급망 위험에 대한 스캔은 여전히 필요합니다. Application Image에 이미 cosign이나 Registry 측 Policy를 쓰고 있다면 Model Artifact에도 적용하십시오. Image는 엄격하게 잠가 두고 Model 가중치는 서명 없는 Bucket에서 가져오는 팀을 종종 봅니다.
+
+## webhani의 프로젝트에 맞는 이유
+
+Web Application에 LLM Component를 결합하는 고객 프로젝트에서는 이 분리가 책임 경계를 깔끔하게 만듭니다.
+
+- Application 팀은 `server:1.8.2`를 주 몇 회 Release합니다.
+- Data/ML 쪽은 새 평가를 통과했을 때 `classifier@sha256:...`를 내놓습니다.
+- 둘이 만나는 곳은 Pod Spec 한 곳뿐입니다. "이 문의가 들어온 시점에 어떤 Model이 돌고 있었는가"가 `git log`로 답할 수 있는 질문이 됩니다.
+
+Warm 상태의 Node에서 Cold Start에도 도움이 됩니다. Layer는 Runtime에 Cache되므로 Model Layer를 가진 Node에서는 Pod 재생성이나 재시작 때도 재사용됩니다. Init Container 다운로드는 매번 처음부터 다시 합니다.
+
+## 도입 전에 확인할 제약
+
+**Runtime 지원**: kubelet은 Container Runtime에 처리를 위임하므로 Runtime이 Image Volume을 구현해야 합니다. 사용 중인 Cluster Release에 해당하는 Kubernetes 문서에서 containerd 또는 CRI-O의 최소 버전을 확인하십시오. Managed Kubernetes라면 Node Image가 이를 포함하는지도 확인합니다. API가 Stable이라고 해서 Node가 지원한다는 보장은 없습니다.
+
+**읽기 전용만 가능**: Volume에는 쓸 수 없습니다. Model 옆에 파생 데이터를 Cache하는 Service라면 그 용도로 `emptyDir`를 마운트하십시오. 일부 Framework는 가중치 옆에 Lock 파일이나 컴파일된 Cache를 쓰려다가 예상치 못한 방식으로 실패합니다. 초기에 읽기 전용 마운트로 테스트하십시오.
+
+**Pull 비용은 그대로입니다**: Node의 첫 Pod는 여전히 Artifact 전체를 다운로드합니다. 수십 GB급 Model이라면 DaemonSet으로 사전 Pull하거나 Node와 가까운 Registry Mirror를 검토하십시오. Image Volume이 없애 주는 것은 배관이지 대역폭이 아닙니다.
+
+**공유 가변 Storage의 대체재가 아닙니다**: 시간 단위로 갱신되는 Vector Index처럼 Payload가 끊임없이 바뀐다면 PersistentVolume이나 외부 Service가 더 적합합니다.
+
+**Memory-mapped 로딩**: 많은 Framework가 가중치를 mmap합니다. Runtime의 Snapshotter와 하위 Filesystem에 따라 로컬 디스크와 성능이 다를 수 있습니다. 가정하지 말고 자체 Loader로 측정하십시오.
+
+## 도입 순서
+
+1. Payload가 500MB를 넘는 중요도 낮은 Service 하나를 고릅니다.
+2. Payload를 `FROM scratch` Artifact로 묶어 Digest와 함께 Push합니다.
+3. Staging Node Pool에서 Runtime 지원을 확인하고, 읽기 전용 마운트로 Server를 실행합니다.
+4. 도입 전후의 Pod 기동 시간과 Registry Egress를 측정합니다.
+5. 운영에 적용하기 전에 Admission Policy에 서명 검증을 추가합니다.
+6. Digest 갱신 절차를 문서화하여 Model 업데이트가 Pull Request를 거치도록 합니다.
+
+Image Volume이 Model을 학습하고 제공하는 방식을 바꾸지는 않습니다. 접착제 같은 코드 한 종류를 없애고, Model 버전 관리를 Manifest의 다른 요소와 같은 리뷰 경로로 옮겨 줍니다. 이미 GitOps로 배포하는 팀에게는 작은 변경으로 효과가 눈에 보입니다.

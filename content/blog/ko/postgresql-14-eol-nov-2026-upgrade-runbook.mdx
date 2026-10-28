@@ -1,0 +1,106 @@
+---
+title: "PostgreSQL 14, 11월 12일 지원 종료: pg_upgrade 실전 Runbook"
+description: "PostgreSQL 14의 마지막 Minor Release는 2026년 11월 12일입니다. pg_upgrade로 18에 이전하는 절차, 현장에서 자주 걸리는 함정, 그리고 아직 19를 목표 버전으로 잡지 않는 이유를 정리합니다."
+date: "2026-10-29"
+status: "published"
+tags: ["PostgreSQL", "Database", "업그레이드", "운영", "인프라"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-14-eol-nov-2026-upgrade-runbook"
+---
+
+PostgreSQL은 Major 버전마다 5년간 지원합니다. PostgreSQL 14는 2021년 9월에 출시되었고, 프로젝트의 Release 일정과 이를 추적하는 서드파티 업그레이드 가이드에 따르면 마지막 정기 Minor Release는 2026년 11월 12일입니다. 그 이후에는 보안 패치가 나오지 않습니다. 운영 환경에 아직 14가 남아 있다면 약 2주가 남은 셈입니다.
+
+한편 PostgreSQL 19는 10월 15일에 첫 Release Candidate가 공개되었고, 프로젝트 공지에는 GA 예정일이 11월 19일로 적혀 있습니다. 목표 버전 선택은 단순합니다. 지금 당장 이전해야 하는 운영 DB라면, 성숙도가 높고 Minor Release도 여러 번 거친 18로 갑니다. 19는 첫 몇 차례 Point Release가 나온 뒤에 다시 검토하십시오.
+
+아래는 자체 운영(Self-managed) 인스턴스에 사용하는 절차입니다. RDS, Cloud SQL 같은 Managed Service에는 자체 연장 지원 규정과 요금이 있으므로 사업자의 일정을 확인하십시오. 흐름 자체는 동일하게 적용할 수 있습니다.
+
+## 방식 선택
+
+현실적인 선택지는 세 가지입니다.
+
+| 방식 | Downtime | 복잡도 | 적합한 경우 |
+|---|---|---|---|
+| `pg_upgrade --link` | 수 분 | 낮음 | 대부분의 단일 노드 DB |
+| `pg_upgrade` (복사) | 데이터 크기에 비례 | 낮음 | 손대지 않은 Rollback용 사본이 필요할 때 |
+| Logical Replication | 전환 시 수 초 | 높음 | 대용량 DB, 거의 무중단이 필요할 때 |
+
+점검 시간을 확보할 수 있는 수 TB 이하 DB라면 `--link`가 현실적인 기본값입니다. 데이터 파일을 복사하지 않고 Hard Link로 연결하므로 소요 시간은 데이터 크기보다 Object 수에 좌우됩니다. 대신 새 Cluster를 기동하는 순간 기존 Cluster는 안전하게 사용할 수 없게 됩니다. 반드시 먼저 Backup이나 파일시스템 Snapshot을 확보하십시오.
+
+## 1단계: 손대기 전에 현황 파악
+
+```sql
+-- Extension과 버전
+SELECT extname, extversion FROM pg_extension ORDER BY 1;
+
+-- Database별 Locale 설정
+SELECT datname, datcollate, datctype FROM pg_database;
+```
+
+모든 Extension에 대해 새 Major 버전용 호환 Binary 패키지가 설치되어 있어야 합니다. 리허설이 실패하는 가장 흔한 원인은 Extension 패키지 누락입니다.
+
+## 2단계: 복원한 Backup으로 리허설
+
+처음 실행하는 `pg_upgrade`를 운영 환경에서 하면 안 됩니다. 어젯밤 Backup을 검증용 Host에 복원하고, 시간을 측정하면서 전체 절차를 수행하십시오.
+
+```bash
+# 18 Binary를 14와 나란히 설치한 뒤:
+/usr/lib/postgresql/18/bin/initdb -D /var/lib/postgresql/18/main
+
+pg_upgrade \
+  -b /usr/lib/postgresql/14/bin \
+  -B /usr/lib/postgresql/18/bin \
+  -d /var/lib/postgresql/14/main \
+  -D /var/lib/postgresql/18/main \
+  --link --check
+```
+
+`--check`는 아무것도 변경하지 않고 호환성 검사를 모두 수행합니다. 출력을 끝까지 읽고, 지적된 사항을 고쳐 다시 실행한 다음, 문제가 없을 때 `--check`를 제거합니다.
+
+## 함정 1: Data Checksum
+
+PostgreSQL 18은 `initdb`로 만드는 새 Cluster에서 Data Checksum을 기본으로 활성화합니다. `pg_upgrade`는 신구 Cluster의 설정이 일치해야 합니다. 14 Cluster를 Checksum 없이 만들었다면, 업그레이드용으로 18을 `--no-data-checksums`로 초기화하거나, 별도 작업 시간에 `pg_checksums`로 활성화하는 계획을 세우십시오. 정확한 옵션 이름은 사용 중인 Minor 버전의 18 Release Note에서 확인하십시오.
+
+## 함정 2: 정렬 규칙(Collation) 변화는 OS 업그레이드에 숨어 있습니다
+
+Postgres 업그레이드와 함께 OS 이미지도 바뀌면 glibc의 Collation 버전이 더 새로워질 수 있습니다. 텍스트 컬럼의 Index가 미묘하게 불일치할 수 있습니다. 업그레이드 후 다음을 비교하십시오.
+
+```sql
+SELECT collname, collversion, pg_collation_actual_version(oid)
+FROM pg_collation
+WHERE collversion IS DISTINCT FROM pg_collation_actual_version(oid);
+```
+
+결과 행이 있으면 해당 Collation에 의존하는 Index에 `REINDEX`가 필요합니다. 가능하면 OS와 Postgres 업그레이드는 별개의 변경으로 분리하십시오.
+
+## 함정 3: 업그레이드 후 통계 정보
+
+이전 Major 버전은 `pg_upgrade` 중 Planner 통계를 버려서 전환 직후 쿼리가 느려지는 원인이 되었습니다. 18에서는 이 부분이 개선되어 대부분의 Optimizer 통계가 이어지지만, 확장 통계처럼 일부는 제외됩니다. 새 Cluster를 기동한 뒤 다음을 실행합니다.
+
+```bash
+vacuumdb --all --analyze-in-stages --missing-stats-only
+```
+
+이 Flag는 통계가 없는 Relation으로만 작업을 한정합니다. 사용 중인 Client가 이 옵션을 받지 않으면 일반 `--analyze-in-stages`가 안전한 대안입니다.
+
+## 3단계: 전환 체크리스트
+
+1. 작업 시간을 공지하고 Application의 쓰기를 중단합니다.
+2. Snapshot 또는 Base Backup을 확보하고 위치를 Ticket에 기록합니다.
+3. 14를 정상 종료합니다(`pg_ctl stop -m fast`).
+4. `--check` 없이 `pg_upgrade --link`를 실행합니다.
+5. 18을 기동하고 위의 `vacuumdb`를 실행한 뒤 Extension을 업데이트합니다(`ALTER EXTENSION ... UPDATE`).
+6. `psql`만이 아니라 실제 Application으로 Smoke Test를 수행합니다.
+7. 쓰기를 재개하고 에러율과 p95 Latency를 1시간 동안 관찰합니다.
+8. 기존 데이터 Directory는 삭제를 결정할 때까지 건드리지 않습니다. 새 Cluster가 쓰기를 받은 뒤의 Rollback은 14를 다시 띄우는 것이 아니라 Backup에서 복원하는 것을 의미합니다.
+
+## 놓치기 쉬운 항목
+
+- **Connection Pooler와 Driver**: PgBouncer와 Driver 버전이 18의 인증 기본값을 지원하는지 확인하십시오. 최근 다룬 PgBouncer 보안 권고의 패치 수준도 염두에 두시기 바랍니다.
+- **Replica**: Primary를 `--link`로 업그레이드해도 Standby는 업그레이드되지 않습니다. 따라오기를 기대하지 말고 새 Primary에서 재구축하거나 pg_upgrade 문서의 `rsync` 방식을 사용하십시오.
+- **모니터링 Dashboard**: 일부 `pg_stat_*` 컬럼은 버전 간에 변경되었습니다. Exporter와 Dashboard가 정상 표시되는지 확인하십시오.
+- **Backup 도구**: `pgBackRest`나 `wal-g` 설정을 새 데이터 Directory에 맞게 수정하고 즉시 Full Backup을 수행하십시오.
+
+## webhani의 권장 사항
+
+11월 12일은 목표가 아니라 움직일 수 없는 기한으로 다루십시오. 리허설은 이번 주, 운영 작업은 다음 주로 잡고, 최소 한 번은 실제로 복원해 본 Rollback 산출물을 확보해 둡니다. 지금은 18로 착지하고, 19는 새해에 여유를 두고 진행하는 별도 프로젝트로 계획하는 것이 좋습니다.

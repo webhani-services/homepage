@@ -1,0 +1,106 @@
+---
+title: "PostgreSQL 14 Reaches End of Life on November 12: A Practical pg_upgrade Runbook"
+description: "PostgreSQL 14 gets its final minor release on November 12, 2026. A step-by-step runbook for moving to 18 with pg_upgrade, the gotchas that bite in practice, and why we would not target 19 yet."
+date: "2026-10-29"
+status: "published"
+tags: ["PostgreSQL", "Database", "Upgrade", "Operations", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-14-eol-nov-2026-upgrade-runbook"
+---
+
+PostgreSQL's versioning policy supports each major release for five years. PostgreSQL 14 came out in September 2021, and its final scheduled minor release lands on November 12, 2026, according to the project's release schedule and third-party upgrade guides that track it. After that date, no security fixes. If you still have a 14 instance in production, you have about two weeks.
+
+Meanwhile, PostgreSQL 19 reached its first release candidate on October 15, and the project's announcement gives November 19 as the planned GA date. That makes the target choice easy: for a production database being forced to move right now, go to 18, which is mature and has had several minor releases. Revisit 19 once its first couple of point releases are out.
+
+This is the runbook we use for self-managed instances. Managed services (RDS, Cloud SQL, and similar) have their own extended-support rules and pricing, so check your provider's calendar; the flow below still applies in spirit.
+
+## Choose the method
+
+There are three realistic options:
+
+| Method | Downtime | Complexity | When to use |
+|---|---|---|---|
+| `pg_upgrade --link` | Minutes | Low | Most single-node databases |
+| `pg_upgrade` (copy) | Proportional to data size | Low | When you need an untouched rollback copy |
+| Logical replication | Seconds at cutover | High | Large databases, near-zero downtime requirement |
+
+For databases up to a few terabytes with a maintenance window, `--link` is the pragmatic default. It hard-links data files instead of copying, so the upgrade time depends mostly on the number of objects, not the data size. The trade-off: once you start the new cluster, the old one is no longer safely usable. Take a backup or a filesystem snapshot first.
+
+## Step 1: Inventory before touching anything
+
+```sql
+-- Extensions and versions
+SELECT extname, extversion FROM pg_extension ORDER BY 1;
+
+-- Locale settings per database
+SELECT datname, datcollate, datctype FROM pg_database;
+```
+
+Every extension must have a compatible binary package installed for the new major version. Missing extension packages are the most common reason a rehearsal fails.
+
+## Step 2: Rehearse on a restored backup
+
+Never run `pg_upgrade` for the first time on production. Restore last night's backup to a scratch host and run the full procedure there, with timing.
+
+```bash
+# Install 18 binaries side by side with 14, then:
+/usr/lib/postgresql/18/bin/initdb -D /var/lib/postgresql/18/main
+
+pg_upgrade \
+  -b /usr/lib/postgresql/14/bin \
+  -B /usr/lib/postgresql/18/bin \
+  -d /var/lib/postgresql/14/main \
+  -D /var/lib/postgresql/18/main \
+  --link --check
+```
+
+`--check` runs every compatibility test without changing anything. Read its output fully. Fix what it reports, rerun, and only then drop `--check`.
+
+## Gotcha 1: data checksums
+
+PostgreSQL 18 enables data checksums by default for new clusters created with `initdb`. `pg_upgrade` requires the old and new clusters to agree. If your 14 cluster was created without checksums, either initialise the 18 cluster with `--no-data-checksums` for the upgrade, or plan to enable checksums afterwards with `pg_checksums` during a separate window. Check the 18 release notes for the exact option names on your minor version.
+
+## Gotcha 2: collation changes hide inside OS upgrades
+
+If the host OS image changes alongside the Postgres upgrade, glibc may have a newer collation version. Indexes on text columns can become subtly inconsistent. After upgrading, compare:
+
+```sql
+SELECT collname, collversion, pg_collation_actual_version(oid)
+FROM pg_collation
+WHERE collversion IS DISTINCT FROM pg_collation_actual_version(oid);
+```
+
+Any rows mean a `REINDEX` is due for indexes depending on that collation. Keep the OS and Postgres upgrades as separate changes when you can.
+
+## Gotcha 3: statistics after the upgrade
+
+Older major versions threw away planner statistics during `pg_upgrade`, which caused slow queries right after cutover. Version 18 improved this by carrying over most optimizer statistics, but not everything, such as extended statistics. After starting the new cluster, run:
+
+```bash
+vacuumdb --all --analyze-in-stages --missing-stats-only
+```
+
+The flag restricts work to relations lacking statistics. If your client version does not accept it, a plain `--analyze-in-stages` is the safe fallback.
+
+## Step 3: Cutover checklist
+
+1. Announce the window; stop application writes.
+2. Take a snapshot or base backup. Record its location in the ticket.
+3. Stop 14 cleanly (`pg_ctl stop -m fast`).
+4. Run `pg_upgrade --link` without `--check`.
+5. Start 18, run the `vacuumdb` command above, then run extension updates (`ALTER EXTENSION ... UPDATE`).
+6. Run smoke tests against the real application, not only `psql`.
+7. Re-enable writes. Watch error rate and p95 latency for an hour.
+8. Keep the old data directory untouched until you decide to delete it; once the new cluster has accepted writes, rollback means restoring from your backup, not restarting 14.
+
+## Things people forget
+
+- **Connection poolers and drivers.** Confirm your PgBouncer and driver versions support 18's authentication defaults. We covered a related PgBouncer advisory recently; keep that patch level in mind.
+- **Replicas.** A `--link` upgrade of the primary does not upgrade standbys. Rebuild them from the new primary (or use the `rsync` method in the pg_upgrade docs) rather than expecting them to follow.
+- **Monitoring and extensions in dashboards.** Some `pg_stat_*` columns changed across versions. Check that your exporter and dashboards still render.
+- **Backup tooling.** Update `pgBackRest` or `wal-g` configs for the new data directory and run a full backup immediately.
+
+## Our recommendation
+
+Treat November 12 as a hard deadline, not a target. Schedule the rehearsal this week, the production window next week, and keep a rollback artifact you have actually restored at least once. Land on 18 now, and plan 19 as a separate, calmer project in the new year.
