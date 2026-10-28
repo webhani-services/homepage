@@ -1,0 +1,107 @@
+---
+title: "Kubernetes OCI Image Volumes Are Stable: Shipping Models and Assets Without Fat Images"
+description: "Image volumes graduated to stable in Kubernetes 1.36. What they do, how to mount a model or dataset from a registry as a read-only volume, and the operational limits to check before adopting them."
+date: "2026-10-29"
+status: "published"
+tags: ["Kubernetes", "Containers", "OCI", "AI", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-oci-image-volumes-stable-model-artifacts-2026"
+---
+
+Kubernetes 1.36 shipped in April 2026, and one item in its release notes deserves more attention from teams running ML workloads: OCI image volumes reached stable. The feature lets a Pod mount the contents of an OCI image or artifact as a read-only volume. No init container, no copy step, no baking the payload into your application image.
+
+It is not new for everyone: it has been available as alpha and beta for several releases. But stable status changes the adoption calculus. Feature gates stop being a concern, and the API shape is now a compatibility promise. If you have been working around large payloads in container images, this is worth a look.
+
+## The problem it solves
+
+A typical inference service has two parts with very different lifecycles:
+
+- **The server**: code and dependencies. It changes with each release.
+- **The payload**: model weights, tokenizer files, embeddings, a geo database, or static assets. It changes on its own schedule, and it is large.
+
+The common workarounds are all awkward:
+
+1. **Bake the payload into the app image.** Every code change rebuilds and re-pushes a multi-gigabyte image. Registries and nodes pay for it.
+2. **Init container that downloads from object storage.** Needs credentials, retry logic, and a writable volume. Start-up time depends on a network fetch every time.
+3. **Persistent volume populated out of band.** Works, but you now own a storage lifecycle separate from your deployment.
+
+Image volumes make the payload a first-class, versioned, registry-hosted artifact referenced from the Pod spec.
+
+## What it looks like
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: classifier
+spec:
+  containers:
+    - name: server
+      image: registry.example.com/classifier-server:1.8.2
+      volumeMounts:
+        - name: model
+          mountPath: /models
+          readOnly: true
+  volumes:
+    - name: model
+      image:
+        reference: registry.example.com/models/classifier@sha256:4f1c...e9
+        pullPolicy: IfNotPresent
+```
+
+The kubelet pulls the referenced artifact through the container runtime and mounts it. The server sees `/models` as a read-only directory. Updating the model is a Pod spec change, so it flows through your normal rollout, rollback, and GitOps review.
+
+Two practical notes:
+
+- **Pin by digest** in production. A tag like `:latest` or even `:v3` can move, and a model silently changing under a running Deployment is a hard incident to reconstruct.
+- **`subPath` is supported on the mount**, so a single artifact can hold several files and a container can mount just the one it needs.
+
+## Building the artifact
+
+Any OCI-compatible registry works. A model artifact can be a minimal image built `FROM scratch`:
+
+```dockerfile
+FROM scratch
+COPY classifier-v3/ /
+```
+
+```bash
+docker build -t registry.example.com/models/classifier:v3 .
+docker push registry.example.com/models/classifier:v3
+```
+
+Because the artifact has no executable, there is nothing to run and no base-image CVEs to scan, but you still want to sign it and scan for the usual supply-chain risks. If your pipeline already uses cosign or registry-side policy for application images, apply it to model artifacts too. We have seen teams carefully lock down images and then pull model weights from an unsigned bucket.
+
+## Why this fits webhani-style delivery
+
+For client projects that combine a web application with an LLM component, the split gives clean ownership:
+
+- The application team ships `server:1.8.2` several times a week.
+- The data or ML side ships `classifier@sha256:...` when a new evaluation passes.
+- The Pod spec is the single place where the two meet, which makes "which model was running when this complaint came in?" a `git log` question.
+
+It also helps cold starts on warm nodes. Because layers are cached by the runtime, a node that already holds the model layers reuses them across Pods and restarts, whereas an init-container download starts over.
+
+## Limits to check before adopting
+
+**Runtime support.** The kubelet delegates to the container runtime, so the runtime must implement image volumes. Check the minimum containerd or CRI-O version against the Kubernetes documentation for your cluster's release, and confirm that your managed Kubernetes provider's node images include it. A stable API does not guarantee your nodes support it.
+
+**Read-only only.** The volume cannot be written to. If your service caches derived data next to the model, mount an `emptyDir` for that. Some frameworks try to write lock files or compiled caches beside the weights and will fail in surprising ways; test with a read-only mount early.
+
+**Pull cost is still pull cost.** The first Pod on a node still downloads the full artifact. For models in the tens of gigabytes, consider pre-pulling with a DaemonSet or using a registry mirror close to the nodes. Image volumes remove the plumbing, not the bandwidth.
+
+**Not a replacement for shared mutable storage.** If the payload changes continuously, such as a vector index updated hourly, a persistent volume or an external service remains the better model.
+
+**Memory-mapped loading.** Many frameworks mmap weights. Depending on the runtime's snapshotter and the underlying filesystem, performance may differ from a local disk. Benchmark your own loader rather than assuming.
+
+## A short adoption plan
+
+1. Pick one non-critical service with a payload over 500 MB.
+2. Package the payload as a `FROM scratch` artifact and push it with a digest.
+3. Verify runtime support on a staging node pool; run the server with the read-only mount.
+4. Measure Pod start time and registry egress before and after.
+5. Add signature verification to admission policy before touching production.
+6. Document the digest-bump workflow so model updates go through pull requests.
+
+Image volumes will not change how you train or serve models. They remove one category of glue code, and move model versioning into the same review path as everything else in the manifest. For teams already deploying through GitOps, that is a small change with a visible payoff.
