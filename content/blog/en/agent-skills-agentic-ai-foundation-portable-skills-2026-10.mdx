@@ -1,0 +1,83 @@
+---
+title: "Agent Skills Moves to the Linux Foundation: Writing Skills That Outlive Any One Vendor"
+description: "Anthropic has handed the Agent Skills standard to the Agentic AI Foundation. What changes for teams that already maintain skills, and how to structure them so they stay portable across coding agents."
+date: "2026-10-30"
+status: "published"
+tags: ["AI", "Agent Skills", "Claude Code", "Open Standards", "Developer Tooling"]
+thumbnail: ""
+author: "webhani"
+slug: "agent-skills-agentic-ai-foundation-portable-skills-2026-10"
+---
+
+On October 22, Anthropic announced that it is transferring the Agent Skills standard to the Agentic AI Foundation (AAIF), a directed fund under the Linux Foundation. According to the announcement and coverage of it, the transfer includes the name, logo, GitHub organization and the agentskills.io domain. The format stays open and free to implement.
+
+This follows the same path as MCP, which moved to the Linux Foundation in December 2025. If your team has started writing skills for coding agents, the practical question is not "who owns the spec" but "how do we write skills that don't break when we switch tools?"
+
+## What a skill actually is
+
+A skill is a directory. The only required file is `SKILL.md`, which starts with YAML frontmatter and continues with plain Markdown instructions. Everything else — scripts, reference documents, templates — is optional and loaded on demand.
+
+```text
+skills/
+└── db-migration-review/
+    ├── SKILL.md
+    ├── references/
+    │   └── naming-rules.md
+    └── scripts/
+        └── check_migration.py
+```
+
+```markdown
+---
+name: db-migration-review
+description: Review SQL migration files for locking risks and missing rollbacks. Use when a PR adds or changes files under db/migrations.
+---
+
+# Database migration review
+
+1. List changed files under `db/migrations/`.
+2. Run `scripts/check_migration.py <file>` for each one.
+3. Flag statements that take an exclusive lock on large tables.
+4. Read `references/naming-rules.md` only if a filename looks wrong.
+```
+
+The design is deliberately small. The agent reads only the `name` and `description` of every installed skill at startup, and pulls in the body (and the files it references) when the description matches the task. That progressive loading is why you can install dozens of skills without filling the context window.
+
+## Why the foundation move matters
+
+Adoption numbers cited by Anthropic and the Linux Foundation — roughly one million published skills, close to 280 million installs, more than 70 integrating platforms — are vendor figures, so treat them as directional. The more useful signal is structural: a spec governed by a neutral body is safer to build internal tooling around than one controlled by a single vendor.
+
+You can already see this in the wild. Framework maintainers now ship skills alongside their code. Next.js, for example, distributes a bundle-optimization skill that you add with a single `npx skills add` command. When a framework publishes its own skills, the skill becomes part of the dependency surface, much like a linter config or a codegen template.
+
+## Writing skills that stay portable
+
+We maintain skills for client projects, and a few habits have held up across different agents.
+
+**Keep the description specific and trigger-oriented.** The description is the routing signal. "Helps with databases" will fire constantly or never. "Review SQL migration files for locking risks. Use when a PR changes `db/migrations`" will fire when it should.
+
+**Put deterministic work in scripts, not prose.** If a step can be a script that returns a pass/fail result, write the script. Agents follow prose instructions with some variance; a script returns the same answer every time. The skill then only needs to say when to run it and how to read the output.
+
+**Avoid tool-specific vocabulary in the body.** Instructions like "use the Task tool to spawn a subagent" tie the skill to one runtime. Prefer "check each file independently" and let the agent decide how to parallelize. Where a vendor-specific feature is genuinely required, isolate it in a clearly labeled section.
+
+**Reference files by relative path.** Absolute paths and references to a particular agent's config directory are the most common reason a skill fails when copied to another machine or another agent.
+
+**Keep `SKILL.md` short.** If the body grows past a few hundred lines, split detail into `references/` files and tell the agent when to read each. Long bodies cost tokens every time the skill triggers.
+
+## Treat skills as code
+
+Once skills carry real instructions — "run this script," "never touch these files" — they deserve the same hygiene as any other executable asset.
+
+- **Version them in the repository.** Skills in `.claude/skills/` or an equivalent directory go through pull requests like anything else.
+- **Review third-party skills before installing.** A skill can include scripts and instructions that the agent will follow. Read the `SKILL.md` and every file under `scripts/` before adding one from a public registry, and pin it to a specific commit where the installer allows it.
+- **Test the trigger.** Write down three prompts that should activate the skill and three that should not, and check them whenever you edit the description. It takes ten minutes and catches most routing regressions.
+
+A related risk we have written about before: instruction files in a repository are an input channel that agents trust. Skills from outside your organization widen that channel, so the review step is not optional.
+
+## What we would do now
+
+1. **Inventory the skills you already have.** Many teams have accumulated ad-hoc prompt snippets and slash commands that are skill-shaped but not packaged as skills.
+2. **Convert the stable ones to the `SKILL.md` layout.** Start with workflows that are repeated weekly: release checklists, migration reviews, incident templates.
+3. **Move logic into scripts.** Anything that can be checked mechanically should be.
+4. **Don't wait for the ecosystem to settle before starting.** A governance change affects who steers the spec, not whether the current format works. The directory-plus-Markdown layout is simple enough that migrating later, if the spec shifts, is a small job.
+
+The foundation move does not change how you write a skill today. It does lower the risk of investing in them, and that is a reasonable moment to treat your team's agent instructions as maintained assets rather than scratch files.

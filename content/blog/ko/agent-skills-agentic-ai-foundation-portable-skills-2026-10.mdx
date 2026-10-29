@@ -1,0 +1,83 @@
+---
+title: "Agent Skills, Linux Foundation으로 이관: 특정 Vendor에 묶이지 않는 Skill 작성법"
+description: "Anthropic이 Agent Skills 표준을 Agentic AI Foundation에 이관했습니다. 이미 Skill을 운영 중인 팀에 미치는 영향과, 여러 Coding Agent에서 재사용할 수 있는 Skill 설계 방식을 정리합니다."
+date: "2026-10-30"
+status: "published"
+tags: ["AI", "Agent Skills", "Claude Code", "오픈 표준", "개발 도구"]
+thumbnail: ""
+author: "webhani"
+slug: "agent-skills-agentic-ai-foundation-portable-skills-2026-10"
+---
+
+10월 22일, Anthropic은 Agent Skills 표준을 Agentic AI Foundation(AAIF)으로 이관한다고 발표했습니다. AAIF는 Linux Foundation 산하의 directed fund입니다. 발표 및 관련 보도에 따르면 이름, 로고, GitHub organization, agentskills.io 도메인이 이관 대상이며, 포맷 자체는 계속 공개되어 누구나 무료로 구현할 수 있습니다.
+
+MCP가 2025년 12월에 Linux Foundation으로 이관된 것과 같은 흐름입니다. 이미 Coding Agent용 Skill을 작성하기 시작한 팀에게 중요한 질문은 "스펙을 누가 소유하는가"보다 "도구를 바꿔도 깨지지 않는 Skill을 어떻게 쓸 것인가"입니다.
+
+## Skill의 실체
+
+Skill은 Directory입니다. 필수 파일은 `SKILL.md` 하나이며, 상단에 YAML frontmatter를 두고 그 뒤에 Markdown으로 지침을 작성합니다. Script, 참고 문서, Template은 선택 사항이며 필요할 때만 로드됩니다.
+
+```text
+skills/
+└── db-migration-review/
+    ├── SKILL.md
+    ├── references/
+    │   └── naming-rules.md
+    └── scripts/
+        └── check_migration.py
+```
+
+```markdown
+---
+name: db-migration-review
+description: SQL Migration 파일의 Lock 위험과 Rollback 누락을 리뷰한다. db/migrations 아래 파일을 추가하거나 변경하는 PR에서 사용한다.
+---
+
+# DB Migration 리뷰
+
+1. `db/migrations/` 아래의 변경 파일을 나열한다.
+2. 각 파일에 `scripts/check_migration.py <file>`을 실행한다.
+3. 큰 Table에 Exclusive Lock을 잡는 구문이 있으면 지적한다.
+4. 파일명이 이상해 보일 때만 `references/naming-rules.md`를 읽는다.
+```
+
+설계는 의도적으로 작게 만들어져 있습니다. Agent는 시작할 때 설치된 Skill의 `name`과 `description`만 읽고, 작업과 일치할 때 비로소 본문과 참조 파일을 불러옵니다. 이러한 단계적 로딩 덕분에 Skill을 수십 개 설치해도 Context Window가 가득 차지 않습니다.
+
+## 재단 이관이 의미하는 것
+
+Anthropic과 Linux Foundation이 제시한 수치(공개 Skill 약 100만 개, 설치 약 2억 8천만 회, 연동 Platform 70개 이상)는 Vendor 측 발표치이므로 경향을 보는 정도로 받아들이는 편이 안전합니다. 더 중요한 것은 구조적 변화입니다. 중립적인 단체가 관리하는 스펙은 단일 Vendor가 쥐고 있는 스펙보다 사내 Tooling의 기반으로 삼기에 부담이 적습니다.
+
+이미 실제 사례도 있습니다. Framework 개발 측이 코드와 함께 Skill을 배포하기 시작했습니다. 예를 들어 Next.js는 Bundle 최적화용 Skill을 제공하며, `npx skills add` 한 줄로 추가할 수 있습니다. Framework가 직접 Skill을 내놓는다면 그 Skill은 linter 설정이나 Code 생성 Template처럼 Dependency의 일부가 됩니다.
+
+## 이식성 높은 Skill 작성 방법
+
+고객사 프로젝트용 Skill을 운영하면서, Agent가 바뀌어도 효과가 있었던 습관이 몇 가지 있습니다.
+
+**description은 구체적으로, Trigger를 의식해서 작성합니다.** description은 Routing의 단서입니다. "데이터베이스를 돕는다"라고 쓰면 거의 항상 발동하거나 전혀 발동하지 않습니다. "SQL Migration의 Lock 위험을 리뷰한다. `db/migrations`를 변경하는 PR에서 사용한다"라고 쓰면 의도한 상황에서 동작합니다.
+
+**결정적인 작업은 문장이 아니라 Script로 만듭니다.** 통과/실패를 반환할 수 있는 절차는 Script로 작성합니다. Agent는 문장 지침을 매번 조금씩 다르게 실행하지만, Script는 항상 같은 답을 돌려줍니다. Skill에는 언제 실행하고 출력을 어떻게 읽는지만 적으면 됩니다.
+
+**본문에 특정 Tool 전용 용어를 넣지 않습니다.** "Task Tool로 Subagent를 생성한다" 같은 지침은 특정 Runtime에 묶입니다. "각 파일을 독립적으로 확인한다"라고 쓰고 병렬화 방식은 Agent에 맡깁니다. Vendor 고유 기능이 꼭 필요하다면 명시적으로 구분한 Section에 분리합니다.
+
+**파일은 상대 경로로 참조합니다.** 절대 경로나 특정 Agent의 설정 Directory를 가리키는 참조는 다른 Machine이나 다른 Agent로 복사했을 때 가장 흔하게 깨지는 원인입니다.
+
+**`SKILL.md`는 짧게 유지합니다.** 본문이 수백 줄을 넘으면 상세 내용을 `references/`로 나누고, 어떤 경우에 읽어야 하는지 적어 둡니다. 긴 본문은 Skill이 발동할 때마다 Token을 소모합니다.
+
+## Skill도 Code로 다룹니다
+
+Skill에 "이 Script를 실행한다", "이 파일은 건드리지 않는다"와 같은 실질적인 지침이 담긴다면, 다른 실행 가능한 자산과 동일한 위생 관리가 필요합니다.
+
+- **Repository에서 버전 관리합니다.** `.claude/skills/` 등에 둔 Skill도 일반 Pull Request를 거칩니다.
+- **Third-party Skill은 설치 전에 리뷰합니다.** Skill에는 Script와 Agent가 따르는 지침이 포함됩니다. 공개 Registry에서 추가하기 전에 `SKILL.md`와 `scripts/` 아래 모든 파일을 읽고, Installer가 지원한다면 특정 commit에 고정합니다.
+- **Trigger를 테스트합니다.** 발동해야 하는 Prompt와 발동하지 말아야 하는 Prompt를 3개씩 적어 두고, description을 수정할 때마다 확인합니다. 10분이면 되고 Routing 회귀의 대부분을 막을 수 있습니다.
+
+앞서 여러 번 다룬 내용이지만, Repository 안의 지침 파일은 Agent가 신뢰하는 입력 경로입니다. 조직 외부의 Skill은 이 경로를 넓히므로 리뷰 단계는 생략할 수 없습니다.
+
+## 지금 바로 할 일
+
+1. **기존 Skill을 정리합니다.** Skill의 형태를 띠고 있지만 Skill로 패키징되지 않은 Prompt 조각이나 Slash Command가 많은 팀에 쌓여 있습니다.
+2. **안정적인 것부터 `SKILL.md` 형식으로 변환합니다.** Release Checklist, Migration 리뷰, 장애 대응 Template처럼 매주 반복하는 작업부터 시작합니다.
+3. **로직은 Script로 옮깁니다.** 기계적으로 확인할 수 있는 것은 기계에 맡깁니다.
+4. **Ecosystem이 안정되기를 기다리지 않습니다.** Governance 변경으로 바뀌는 것은 스펙의 방향을 누가 정하느냐이지, 현재 포맷을 쓸 수 있느냐가 아닙니다. Directory와 Markdown이라는 구성은 단순해서 나중에 스펙이 바뀌더라도 이전 작업은 크지 않습니다.
+
+재단 이관으로 오늘부터 Skill을 쓰는 방식이 달라지지는 않습니다. 다만 Skill에 투자하는 위험은 낮아졌습니다. 팀의 Agent 지침을 일회성 메모가 아니라 유지보수하는 자산으로 다루기 시작하기에 좋은 시점입니다.
