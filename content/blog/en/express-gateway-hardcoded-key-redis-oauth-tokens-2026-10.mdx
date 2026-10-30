@@ -1,0 +1,109 @@
+---
+title: "Express Gateway CVE-2026-107177: When a Default Encryption Key Turns Redis Read Access into Account Takeover"
+description: "A hardcoded default encryption key in Express Gateway lets anyone who can read Redis decrypt stored OAuth token secrets. We walk through the failure pattern and how to audit for it in your own stack."
+date: "2026-10-31"
+status: "published"
+tags: ["Security", "OAuth", "Redis", "Node.js", "API Gateway"]
+thumbnail: ""
+author: "webhani"
+slug: "express-gateway-hardcoded-key-redis-oauth-tokens-2026-10"
+---
+
+CVE-2026-107177 affects Express Gateway through version 1.16.11. According to the SentinelOne vulnerability database entry, which lists the NVD publication date as October 7, 2026, the flaw is a hardcoded default encryption key. An attacker who can read the gateway's Redis instance can decrypt stored OAuth token secrets and impersonate any user authenticated through the gateway.
+
+We have not verified a patched release or vendor advisory, so check the project's repository and the NVD record before acting on version numbers. What we can say with confidence is that the failure pattern is common, and worth auditing for regardless of whether you run this gateway.
+
+## Why this is more serious than it looks
+
+"Attacker can read Redis" sounds like a precondition that is already game over. In practice it is a much lower bar than people assume:
+
+- A Redis instance exposed on an internal network without authentication.
+- A backup or snapshot (an RDB file) copied to a less protected location.
+- A debugging session where someone runs `KEYS *` or `MONITOR` and pastes output into a ticket.
+- A compromised sidecar or a neighbouring workload on a shared cluster.
+
+Encrypting secrets at rest is supposed to turn these incidents from "everything is compromised" into "ciphertext leaked". A hardcoded default key removes that protection. The key is the same on every installation, so anyone who has read the source or the package can decrypt data from any deployment that did not override it.
+
+## The general pattern
+
+This is not specific to Express Gateway. The shape is:
+
+1. A library needs a secret to encrypt data.
+2. For convenience, it ships a default so that the quick-start works.
+3. Production deployments copy the quick-start configuration and never change it.
+
+The same pattern shows up as default JWT signing secrets, default session secrets, and default admin passwords. The fix is always to make the unsafe state impossible rather than unlikely.
+
+## How to audit your own stack
+
+### 1. Find defaults that are still in use
+
+Search configuration and environment files for values that match documented examples:
+
+```bash
+# Look for secrets that appear in repo history or sample configs
+git grep -nE "(secret|key|password)\s*[:=]\s*['\"][A-Za-z0-9+/=_-]{8,}['\"]" -- \
+  ':!*.lock' ':!node_modules'
+
+# Compare deployed config against the sample shipped with the package
+diff <(jq -S . config/gateway.config.yml.sample 2>/dev/null) \
+     <(jq -S . deployed/gateway.config.json)
+```
+
+If a value in production equals a value in documentation or a sample file, treat it as public.
+
+### 2. Make startup fail without a real key
+
+If you maintain a service that encrypts data, do not ship a default. Fail fast:
+
+```ts
+import { randomBytes } from "node:crypto";
+
+export function loadEncryptionKey(): Buffer {
+  const raw = process.env.TOKEN_ENCRYPTION_KEY;
+  if (!raw) {
+    throw new Error("TOKEN_ENCRYPTION_KEY is required (32 bytes, base64)");
+  }
+  const key = Buffer.from(raw, "base64");
+  if (key.length !== 32) {
+    throw new Error("TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes");
+  }
+  return key;
+}
+
+// Generate one with: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+void randomBytes;
+```
+
+A service that refuses to start is annoying for five minutes. A service that starts with a public key is a liability for years.
+
+### 3. Reduce what Redis holds
+
+Prefer storing token hashes rather than reversible secrets where the protocol allows it. If you must store reversible values, scope their lifetime with a TTL and keep it short.
+
+### 4. Lock down Redis itself
+
+- Require authentication and use ACLs to give each application only the commands and key prefixes it needs.
+- Enable TLS for connections that cross hosts.
+- Keep Redis off routable networks, and restrict who can pull backups.
+
+### 5. Plan for rotation
+
+Assume a key will leak eventually. Support a key identifier alongside each ciphertext so you can introduce a new key, decrypt with the old one during a transition, and retire it. If rotation requires downtime or a code change, it will not happen when you need it.
+
+## If you run Express Gateway
+
+Until you have confirmed a fixed version from the project, we would treat any deployment that used the default key as exposed:
+
+1. Set a unique, random encryption key through configuration.
+2. Revoke and reissue OAuth tokens and client secrets stored by the gateway, since previously stored values may have been readable.
+3. Review Redis access logs and network exposure for the period the default key was in use.
+4. Restrict Redis access as described above.
+
+Step 2 is the one teams skip. Changing the key protects future data; it does nothing for secrets that were already readable.
+
+## Takeaway
+
+This CVE is a reminder to ask, for every encrypted store in your system: where does the key come from, is it unique per environment, and can we rotate it without a rewrite? If any answer is "we use the default", that is the finding to fix this week.
+
+Source: [SentinelOne vulnerability database entry for CVE-2026-107177](https://www.sentinelone.com/vulnerability-database/cve-2026-107177/).
