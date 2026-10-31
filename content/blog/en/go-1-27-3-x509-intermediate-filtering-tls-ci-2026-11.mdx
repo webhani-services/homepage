@@ -1,0 +1,167 @@
+---
+title: "Go 1.27.3 and 1.26.10: crypto/x509 Now Filters Blocked Intermediates, and Your CI Should Notice"
+description: "The October Go point releases change how crypto/x509 builds certificate chains when a CA's intermediates are being blocked. Here is what changed, who is exposed, and how to test TLS behavior and Go version pinning in CI."
+date: "2026-11-01"
+status: "published"
+tags: ["Go", "Security", "TLS", "CI/CD", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "go-1-27-3-x509-intermediate-filtering-tls-ci-2026-11"
+---
+
+Go 1.27.3 and 1.26.10 shipped in mid-October with a single announced security fix, in `crypto/x509`. According to the Go team's announcement on the oss-security list (dated October 20), `Certificate.Verify` now filters out certificate chains that contain intermediates belonging to a certificate authority whose intermediates are being blocked. It is tracked as CVE-2026-111943. We are deliberately not naming the CA here: the announcement describes it as a mitigation for a specific CA, and the exact details are best read from the primary source at go.dev and oss-security rather than from our summary.
+
+This is a small patch with an unusual shape. Most Go security fixes close a bug. This one changes a trust decision: chains that verified yesterday may not verify today. That makes it worth a deliberate rollout instead of a routine dependency bump.
+
+## What changes for your code
+
+If your service or tool only talks to endpoints whose chains do not involve the affected intermediates, nothing happens. If one of your upstream dependencies, an internal PKI, or a third-party API presents a chain that runs through them, `Verify` will find no acceptable path and the handshake will fail with an `x509` error such as `certificate signed by unknown authority`.
+
+Two characteristics make this easy to miss:
+
+- It is **deterministic per binary, not per environment**. The failure appears only when you rebuild with the new toolchain. Your staging cluster running last month's image will keep working while a freshly built image fails.
+- Go programs often bundle their own logic for TLS. If you build static binaries in scratch or distroless images, the trust behavior ships with the binary, not with the base image's CA bundle. Updating the OS packages does not help you here.
+
+We also saw reports that earlier 1.27.x builds had TLS regressions affecting simple outbound calls, such as `http.Get`. We could not verify the cause from the sources available to us, so treat that as a reason to test rather than as a finding.
+
+## Find out what you actually run
+
+The first job is an inventory. Which services are built with which Go version?
+
+```bash
+# Version embedded in a built binary
+go version -m ./bin/my-service | head -n 3
+
+# Across a directory of binaries
+for f in ./dist/*; do
+  printf '%s: ' "$f"
+  go version "$f"
+done
+```
+
+For containers, the same check works against the binary inside the image:
+
+```bash
+docker create --name tmp registry.example.com/my-service:latest
+docker cp tmp:/app/my-service ./my-service
+docker rm tmp
+go version ./my-service
+```
+
+Binaries built before October 19 do not have the new filtering. That is a statement about exposure to the fix, not about safety: they also lack the mitigation.
+
+## Pin the toolchain, then move it deliberately
+
+Since Go 1.21, the `go` and `toolchain` directives in `go.mod` control which toolchain builds the module. Pinning avoids surprise rebuilds on a newer patch version when you did not intend one.
+
+```text
+module example.com/my-service
+
+go 1.27
+
+toolchain go1.27.3
+```
+
+In Docker builds, pin the builder image to a specific patch version, and ideally a digest:
+
+```dockerfile
+FROM golang:1.27.3 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/my-service ./cmd/my-service
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /out/my-service /my-service
+ENTRYPOINT ["/my-service"]
+```
+
+Pinning has a cost: you now own the upgrade. The answer is to make the upgrade a routine, tested change, not a reason to stay on an old toolchain.
+
+## Test the TLS paths that matter
+
+The failure mode here is "an outbound connection that used to work no longer does", so the useful test is a real handshake against each critical dependency. Keep this list short and specific: your database host, your payment provider, your identity provider, any internal service behind a private CA.
+
+```go
+package tlscheck_test
+
+import (
+	"crypto/tls"
+	"net"
+	"testing"
+	"time"
+)
+
+var endpoints = []string{
+	"api.example.com:443",
+	"idp.example.com:443",
+}
+
+func TestCriticalEndpointsHandshake(t *testing.T) {
+	if testing.Short() {
+		t.Skip("network test")
+	}
+	for _, addr := range endpoints {
+		addr := addr
+		t.Run(addr, func(t *testing.T) {
+			d := &net.Dialer{Timeout: 5 * time.Second}
+			conn, err := tls.DialWithDialer(d, "tcp", addr, &tls.Config{
+				MinVersion: tls.VersionTLS12,
+			})
+			if err != nil {
+				t.Fatalf("handshake failed: %v", err)
+			}
+			defer conn.Close()
+
+			state := conn.ConnectionState()
+			t.Logf("verified chains: %d", len(state.VerifiedChains))
+		})
+	}
+}
+```
+
+Run it as a separate CI job, scheduled as well as on pull requests. The scheduled run catches the case where an upstream rotates certificates without any change on your side.
+
+## Scan with govulncheck
+
+Go publishes vulnerability data through its vulnerability database, and `govulncheck` reports only the issues reachable from your code. It is the cheapest way to learn which of your modules need the new toolchain.
+
+```yaml
+name: govulncheck
+on:
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: govulncheck ./...
+```
+
+Because `setup-go` reads `go.mod`, the scan uses the toolchain you pinned. Remember that standard-library issues are reported against the toolchain version, so a pinned old patch release will keep flagging them until you move it.
+
+## Rollout order
+
+1. Inventory binaries and their Go versions.
+2. Add the handshake test and run it against the **current** toolchain, to establish a baseline.
+3. Bump the pin to 1.27.3 (or 1.26.10 on the older line) on one low-risk service.
+4. Run the handshake test and the service's integration tests. Watch outbound error rates after deploy.
+5. Roll the change out service by service, ordering by how many external trust relationships each one has.
+
+## What we recommend
+
+- Treat this as a trust-policy change, not a routine patch. Rebuild and test before promoting.
+- Read the primary announcement for the CA details and the affected scope before deciding urgency.
+- Keep a short list of critical TLS endpoints, and check them in CI on a schedule.
+- Pin `toolchain` and base images, and make upgrades a regular, small activity.
+- Do not rely on updating the OS CA bundle to fix a Go-specific verification outcome.
+
+Point releases like this one are a reminder that "patch" does not always mean "no behavior change". A single handshake test per critical dependency turns an unpleasant production surprise into a failed CI job.

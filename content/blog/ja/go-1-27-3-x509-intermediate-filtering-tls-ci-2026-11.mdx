@@ -1,0 +1,167 @@
+---
+title: "Go 1.27.3 / 1.26.10:crypto/x509がブロック対象の中間証明書を除外するようになりました。CIで検知しましょう"
+description: "10月のGoパッチリリースで、あるCAの中間証明書がブロックされている場合のcrypto/x509の証明書チェーン構築が変わりました。変更内容、影響を受けるケース、TLSの挙動とGoバージョン固定をCIで検証する方法を解説します。"
+date: "2026-11-01"
+status: "published"
+tags: ["Go", "Security", "TLS", "CI/CD", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "go-1-27-3-x509-intermediate-filtering-tls-ci-2026-11"
+---
+
+Go 1.27.3と1.26.10は10月中旬にリリースされ、公表されたセキュリティ修正は`crypto/x509`の1件のみです。10月20日付のoss-securityリストへのGoチームの告知によると、`Certificate.Verify`は、中間証明書がブロックされているあるCAに属する中間証明書を含むチェーンを除外するようになりました。CVE-2026-111943として管理されています。ここではCA名をあえて記載しません。告知には特定のCAに対する緩和策として説明されており、詳細は私たちの要約ではなく、go.devとoss-securityの一次情報で確認するのが確実だからです。
+
+小さなパッチですが、性質は珍しいものです。多くのGoのセキュリティ修正はバグを塞ぎます。今回の修正は信頼の判断そのものを変えます。昨日まで検証を通っていたチェーンが、今日は通らない可能性があります。そのため、通常の依存関係更新ではなく、意図的な展開手順を踏む価値があります。
+
+## コードへの影響
+
+対象の中間証明書を経由しないエンドポイントとだけ通信しているサービスやツールには、何も起きません。上流の依存先、社内PKI、外部APIのいずれかが該当する中間証明書を経由するチェーンを提示する場合、`Verify`は許容できる経路を見つけられず、`certificate signed by unknown authority`のような`x509`エラーでハンドシェイクが失敗します。
+
+見落としやすい特徴が2つあります。
+
+- **環境単位ではなく、バイナリ単位で決まります。** 新しいToolchainで再ビルドしたときにだけ失敗が現れます。先月のImageで動いているステージング環境は動き続け、新しくビルドしたImageだけが失敗します。
+- Goのプログラムは、TLSのロジックを自分で抱えていることが多くあります。scratchやdistrolessのImageで静的バイナリをビルドしている場合、信頼の挙動はベースImageのCAバンドルではなく、バイナリとともに配布されます。OSパッケージを更新しても効果はありません。
+
+また、1.27系の以前のビルドで`http.Get`のような単純な外向き通信に影響するTLSの不具合が出たという報告も見かけました。手元の情報源では原因を確認できていないため、これは検証すべき理由として受け取り、事実としては扱わないでください。
+
+## まず実際に動いているものを把握する
+
+最初の作業は棚卸しです。どのサービスがどのGoバージョンでビルドされているかを確認します。
+
+```bash
+# ビルド済みバイナリに埋め込まれたバージョン
+go version -m ./bin/my-service | head -n 3
+
+# ディレクトリ内の複数バイナリ
+for f in ./dist/*; do
+  printf '%s: ' "$f"
+  go version "$f"
+done
+```
+
+コンテナの場合も、Image内のバイナリに対して同じ確認ができます。
+
+```bash
+docker create --name tmp registry.example.com/my-service:latest
+docker cp tmp:/app/my-service ./my-service
+docker rm tmp
+go version ./my-service
+```
+
+10月19日より前にビルドされたバイナリには、新しいフィルタリングが入っていません。これは修正の影響を受けないという意味であって、安全だという意味ではありません。緩和策も入っていないからです。
+
+## Toolchainを固定し、意図したタイミングで上げる
+
+Go 1.21以降、`go.mod`の`go`ディレクティブと`toolchain`ディレクティブが、モジュールをビルドするToolchainを制御します。固定しておけば、意図しないタイミングで新しいパッチバージョンに切り替わることを防げます。
+
+```text
+module example.com/my-service
+
+go 1.27
+
+toolchain go1.27.3
+```
+
+Dockerビルドでは、ビルダーImageを特定のパッチバージョン、できればDigestで固定します。
+
+```dockerfile
+FROM golang:1.27.3 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/my-service ./cmd/my-service
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /out/my-service /my-service
+ENTRYPOINT ["/my-service"]
+```
+
+固定にはコストがあります。更新の責任を自分たちで持つことになります。その答えは、古いToolchainに留まることではなく、更新を日常的でテスト済みの作業にすることです。
+
+## 重要なTLS経路をテストする
+
+今回の失敗の形は「これまで動いていた外向き接続が動かなくなる」なので、有効なテストは、重要な依存先ごとの実際のハンドシェイクです。リストは短く具体的に保ちます。データベースのホスト、決済プロバイダ、IDプロバイダ、プライベートCAの背後にある社内サービスなどです。
+
+```go
+package tlscheck_test
+
+import (
+	"crypto/tls"
+	"net"
+	"testing"
+	"time"
+)
+
+var endpoints = []string{
+	"api.example.com:443",
+	"idp.example.com:443",
+}
+
+func TestCriticalEndpointsHandshake(t *testing.T) {
+	if testing.Short() {
+		t.Skip("network test")
+	}
+	for _, addr := range endpoints {
+		addr := addr
+		t.Run(addr, func(t *testing.T) {
+			d := &net.Dialer{Timeout: 5 * time.Second}
+			conn, err := tls.DialWithDialer(d, "tcp", addr, &tls.Config{
+				MinVersion: tls.VersionTLS12,
+			})
+			if err != nil {
+				t.Fatalf("handshake failed: %v", err)
+			}
+			defer conn.Close()
+
+			state := conn.ConnectionState()
+			t.Logf("verified chains: %d", len(state.VerifiedChains))
+		})
+	}
+}
+```
+
+これは独立したCIジョブとして、Pull Requestだけでなく定期実行でも走らせてください。自分たちの側に変更がなくても、上流が証明書をローテーションした場合に検知できます。
+
+## govulncheckでスキャンする
+
+Goは脆弱性データベースを通じて情報を公開しており、`govulncheck`はコードから到達可能な問題だけを報告します。どのモジュールで新しいToolchainが必要かを知る、最も手軽な方法です。
+
+```yaml
+name: govulncheck
+on:
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: govulncheck ./...
+```
+
+`setup-go`が`go.mod`を読むため、スキャンは固定したToolchainで行われます。標準ライブラリの問題はToolchainのバージョンに対して報告されるので、古いパッチリリースに固定したままだと、更新するまで警告が出続ける点に注意してください。
+
+## 展開の順序
+
+1. バイナリとGoバージョンの棚卸しをします。
+2. ハンドシェイクのテストを追加し、**現行の**Toolchainで実行して基準値を取ります。
+3. リスクの低いサービス1つで、固定を1.27.3(旧系列なら1.26.10)に上げます。
+4. ハンドシェイクのテストとサービスの結合テストを実行し、デプロイ後は外向き通信のエラー率を観察します。
+5. 外部との信頼関係が多いサービスの順に、1サービスずつ展開します。
+
+## webhaniの推奨
+
+- 通常のパッチではなく、信頼ポリシーの変更として扱い、昇格の前に再ビルドとテストを行ってください。
+- 緊急度を決める前に、一次情報の告知でCAの詳細と影響範囲を確認してください。
+- 重要なTLSエンドポイントの短いリストを持ち、CIで定期的に確認します。
+- `toolchain`とベースImageを固定し、更新を定期的な小さな作業にします。
+- Go固有の検証結果を、OSのCAバンドル更新で解決しようとしないでください。
+
+こうしたパッチリリースは、「パッチ」が常に「挙動の変更なし」を意味するわけではないことを思い出させてくれます。重要な依存先ごとに1つハンドシェイクのテストを置くだけで、本番での不快な驚きが、失敗したCIジョブに変わります。

@@ -1,0 +1,126 @@
+---
+title: "When Agents Open 40% of Pull Requests: Protecting Your Team's Review Capacity"
+description: "Reporting on GitHub's Octoverse 2026 says AI agents now start a large share of pull requests. Review capacity, not code generation, is the new bottleneck. Here is a practical policy and a small GitHub Actions setup."
+date: "2026-11-01"
+status: "published"
+tags: ["AI", "GitHub", "Code Review", "CI/CD", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "agent-authored-prs-review-capacity-2026-11"
+---
+
+Coverage of GitHub's Octoverse 2026 report this week says AI agents started more than 40% of pull requests on the platform in September, up from roughly 17% in March. We read this through secondary reporting rather than the full report, so treat the exact numbers as approximate. The direction, though, matches what we see in client repositories: the cost of producing a diff has dropped sharply, and the cost of reading one has not.
+
+That asymmetry is the real story for engineering teams. If agents can open ten PRs in the time a person used to open one, the limiting resource is the attention of the humans who approve them. A team that does nothing will drift toward one of two bad outcomes: a growing review queue, or rubber-stamp approvals.
+
+## Why throughput is the wrong metric
+
+Teams adopting coding agents tend to measure PR count and merge time. Both go up, and both look like success. What they hide:
+
+- Review depth falls as queue length grows. Reviewers skim.
+- Agent PRs are often individually plausible. Each one is "fine", so nobody asks whether the sum of them still fits the architecture.
+- Ownership blurs. When nobody wrote the code by hand, nobody feels responsible for it at 2 a.m.
+
+A more useful set of numbers is review wait time, the share of PRs that receive a substantive comment, and the revert rate over 30 days. If wait time rises while revert rate also rises, you are paying for speed with quality.
+
+## A policy that scales
+
+We suggest treating agent-authored PRs as a distinct category with explicit rules, instead of pretending they are the same as human PRs. A minimal policy:
+
+1. **Every agent PR has a human owner.** The person who assigned the task is the author of record and the first reviewer. Approval from someone else is still required.
+2. **Size caps.** Agent PRs above a line-count threshold are split before review. A 1,500-line diff is not reviewable, whoever wrote it.
+3. **Stated intent.** The PR description must say what the task was, what was verified, and what was not. A template enforces this.
+4. **Automated checks first.** Tests, type checks, and lint must pass before a human is requested. Humans should never be the first line of defense against a broken build.
+5. **WIP limits.** Cap the number of open agent PRs per person. This is the single most effective control, because it forces the queue to drain before more work is created.
+
+## Labeling agent PRs automatically
+
+You cannot manage what you cannot see. A small workflow that labels PRs by author type and flags oversized diffs gives you the data and the guardrail. This uses only the documented `pull_request` event and the GitHub REST API through `actions/github-script`.
+
+```yaml
+name: pr-triage
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const labels = [];
+
+            // Adjust to match how your agents authenticate
+            const agentLogins = ["copilot-swe-agent[bot]", "my-org-agent[bot]"];
+            if (agentLogins.includes(pr.user.login)) labels.push("agent-authored");
+
+            const changed = pr.additions + pr.deletions;
+            if (changed > 600) labels.push("needs-split");
+
+            if (labels.length > 0) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: pr.number,
+                labels,
+              });
+            }
+
+            if (changed > 600) {
+              core.setFailed(
+                `Diff is ${changed} lines. Split it before requesting review.`
+              );
+            }
+```
+
+Pair this with branch protection that requires the check to pass. The failing check is deliberate: it is cheaper to ask an agent to split a PR than to ask a human to review one that is too big.
+
+## A PR template that forces intent
+
+```markdown
+## Task
+What was the agent asked to do? Link the issue.
+
+## Verified
+- [ ] Tests added or updated
+- [ ] Ran locally / in preview
+- [ ] Checked for changes outside the stated scope
+
+## Not verified
+What was not checked, and why.
+
+## Human owner
+@username
+```
+
+The "Not verified" section matters most. It turns an implicit risk into text a reviewer can react to.
+
+## Use AI review as a filter, not a verdict
+
+Tools such as Copilot code review can handle the first pass: style, obvious bugs, missing tests. Use them to reduce noise before a human looks. Do not use them as the approver. Automated reviewers share blind spots with the agents that wrote the code, since both are language models trained on similar material. A second opinion from the same family of tools is less independent than it appears.
+
+A reasonable split of responsibilities:
+
+- **Automated:** formatting, lint, type errors, dependency and secret scanning, test results.
+- **AI-assisted:** summarizing the diff, flagging risky areas, suggesting missing test cases.
+- **Human:** does this change belong here, does it respect module boundaries, is the failure mode acceptable.
+
+## CODEOWNERS still does the heavy lifting
+
+If agents touch many parts of a repo, `CODEOWNERS` keeps review routed to people who understand each area. Review rules should be stricter, not looser, for the paths where mistakes are expensive: authentication, billing, infrastructure definitions, migrations. For those paths, require an approval from a code owner even if the PR came from an agent with a clean test run.
+
+## What we recommend
+
+- Add the `agent-authored` label this week, and watch review wait time for a month before changing anything else.
+- Introduce a WIP limit per owner. Start at three open agent PRs and adjust.
+- Make "Not verified" a mandatory section.
+- Track 30-day revert rate alongside merge time.
+- Keep a human as the final approver for anything touching auth, data, or infrastructure.
+
+Agent-driven development is not a problem to resist, and the numbers suggest it is already normal. The teams that benefit will be the ones who treat review capacity as a constrained resource and design their process around it, rather than discovering the constraint through an incident.
