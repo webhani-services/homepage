@@ -1,0 +1,95 @@
+---
+title: "Bring Your Own Agent: What Android Studio's ACP Support Means for Editor-Neutral AI Tooling"
+description: "Android Studio now lets you plug in third-party coding agents through the Agent Client Protocol. Why an editor-to-agent protocol matters, and how to keep your agent setup portable."
+date: "2026-11-02"
+status: "published"
+tags: ["AI", "Agent Client Protocol", "Developer Tooling", "Claude Code", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "acp-bring-your-own-agent-editor-neutral-2026-11"
+---
+
+Google's Android Studio release notes for the Rabbit 2 line describe a "Bring Your Own Agent" feature: you pick an external coding agent from the Agents menu, sign in with your own subscription or API key, and the IDE runs it as a separate agent instance. The agents named in the notes include Claude Agent, OpenAI Codex, and Google's own Antigravity. Connected agents can use IDE capabilities such as build diagnostics, SDK tooling, terminal execution, and emulator management.
+
+One detail to check before you rely on it: the official notes list Rabbit 2 under Canary, while at least one secondary article calls the workflow stable. Confirm the channel you actually install.
+
+The Android angle is useful, but the more interesting part for most teams is the mechanism underneath: the Agent Client Protocol (ACP).
+
+## What ACP is, and why it is not MCP
+
+The two protocols get confused because both involve AI and JSON-RPC-style messaging, but they sit at different boundaries.
+
+| Protocol | Connects | Question it answers |
+| --- | --- | --- |
+| MCP | Agent ↔ tools and data | "What can the agent call?" |
+| ACP | Editor ↔ agent | "How does the editor drive the agent and show its work?" |
+
+MCP gives an agent access to a database, an issue tracker, or a browser. ACP is the layer between the human's editor and the agent process: sending a prompt, streaming back progress, surfacing file edits for review, and asking for permission before a risky action.
+
+Before a shared protocol, every pairing of editor and agent needed its own integration. N editors times M agents meant N×M adapters. With a common protocol it becomes N+M, and the user chooses the pair.
+
+## Why this matters beyond Android
+
+Teams we work with tend to standardize on an agent for cost, quality, or compliance reasons, and then discover that half the developers use VS Code, a quarter use JetBrains IDEs, and a few use Neovim or Zed. If the agent is only reachable through one vendor's plugin, the standard gets enforced unevenly.
+
+An editor-neutral protocol shifts the decision point:
+
+- **Agent choice becomes a team policy**, not a side effect of which IDE someone installed.
+- **Editor choice stays a personal preference**, which developers care about more than managers assume.
+- **Switching cost drops.** Moving from one agent to another is a configuration change instead of a workflow migration.
+
+The caveat is that a protocol only standardizes the conversation. Capabilities still differ: what an agent can do inside the Android Studio integration depends on what the IDE exposes, and the editor decides how much of the agent's activity is visible to the user.
+
+## How an ACP-style session looks
+
+ACP is built on JSON-RPC and, in common setups, the editor launches the agent as a subprocess and talks to it over standard input and output. The exact method names and schemas are defined in the protocol specification, so treat the sketch below as an illustration of the shape of an exchange, not a copy-paste client.
+
+```ts
+// Illustrative only: consult the ACP specification for real method names.
+import { spawn } from "node:child_process";
+
+const agent = spawn("my-agent", ["--acp"], { stdio: ["pipe", "pipe", "inherit"] });
+
+let nextId = 1;
+function send(method: string, params: unknown) {
+  const msg = { jsonrpc: "2.0", id: nextId++, method, params };
+  agent.stdin.write(JSON.stringify(msg) + "\n");
+}
+
+agent.stdout.on("data", (chunk) => {
+  for (const line of chunk.toString().split("\n").filter(Boolean)) {
+    const message = JSON.parse(line);
+    // Editor-side responsibilities: render streamed progress,
+    // show proposed file edits as diffs, and ask the user
+    // before the agent runs commands or writes outside the project.
+    console.log("agent ->", message);
+  }
+});
+
+send("initialize", { clientCapabilities: { fileEdits: true } });
+```
+
+The point is the division of labor. The agent does the reasoning and proposes actions. The editor owns the surface: diffs, permission prompts, and the working directory. That split is what makes it possible for one agent to run in several editors.
+
+## Practical implications for your setup
+
+**Keep agent instructions out of editor settings.** If your conventions live in a repository file that any agent reads (an `AGENTS.md` or equivalent), they follow the project, not the IDE. Instructions buried in one plugin's settings screen do not travel.
+
+**Check the permission model per integration.** The same agent can behave differently depending on what the host editor allows. Before enabling an agent in a new editor, verify what it can run without confirmation, which directories it can write to, and whether network access is gated. We covered the risk of untrusted instruction files in our post on [AGENTS.md hijacking](/blog/agents-md-hijack-coding-agents-untrusted-instructions-2026-10); the same care applies when a new host starts launching agents on your behalf.
+
+**Separate instance means separate state.** Android Studio launches its own agent process rather than attaching to one already running in your terminal. Session history, memory, and any unsaved context do not carry over. If you alternate between a terminal agent and an IDE agent, expect to restate context.
+
+**Prefer subscription-based sign-in for individuals, managed keys for teams.** Per-developer keys scattered across IDE settings are hard to rotate and audit. Where an organization needs usage reporting, route through a central gateway or enterprise plan.
+
+## Where webhani lands
+
+We think an editor-to-agent protocol is the right place for standardization, for the same reason language servers worked: it let editors and language tooling evolve independently. Adoption by a large vendor IDE is a stronger signal than any single plugin announcement.
+
+We would not yet design a team workflow that depends on ACP behaving identically everywhere. The protocol is young, host support varies, and the stability label on the Android Studio feature is itself ambiguous. A reasonable approach today:
+
+1. Pick one primary agent for the team and document it.
+2. Keep conventions in repository files, not in editor-specific configuration.
+3. Pilot the ACP route in one editor with a small group before rolling it out.
+4. Review what each host exposes to the agent, and write that down as part of your security baseline.
+
+If you are evaluating agents for a mixed-editor team and want help setting guardrails, that is work we do regularly.

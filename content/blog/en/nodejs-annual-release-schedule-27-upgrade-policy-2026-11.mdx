@@ -1,0 +1,118 @@
+---
+title: "Node.js Moves to One Major Release per Year: Rewriting Your Upgrade Policy"
+description: "Starting with Node.js 27, the project ships one major release a year. What changes in version numbering, Alpha and Current phases, and how to adjust CI matrices, Docker images, and upgrade cadence."
+date: "2026-11-02"
+status: "published"
+tags: ["Node.js", "CI/CD", "Docker", "DevOps", "Upgrade Strategy"]
+thumbnail: ""
+author: "webhani"
+slug: "nodejs-annual-release-schedule-27-upgrade-policy-2026-11"
+---
+
+The Node.js project has announced a new release schedule: one major release per year, starting with Node.js 27. Node.js 26 is the last line under the old model of two majors a year. The project describes the schedule as provisional and open to amendment, so treat the details below as the current plan rather than a contract.
+
+Most teams have a rule of thumb like "stay on the latest LTS, upgrade when the next one lands." That rule still works, but several of its assumptions change. This post covers what the new schedule says and what to update in your own policy.
+
+## What the new schedule says
+
+According to the project's announcement:
+
+- **One major per year**, released in April, with promotion to LTS in October.
+- **Version numbers follow the calendar year** of the first Current release. Node.js 27.0.0 arrives in 2027, 28.0.0 in 2028, and so on.
+- **A new Alpha phase** of roughly six months (October to March) precedes the Current phase. Semver-major changes are still allowed during Alpha, and the Alpha channel for Node.js 27 opens in October 2026.
+- **Current** runs about six months (April to October) as a stabilization phase.
+- **LTS** lasts 30 months. For Node.js 27 the plan is LTS starting October 2027 and end of life in April 2030.
+
+The practical reading: there is one line to track per year instead of two, odd-numbered releases no longer exist as a distinct category, and the version number tells you the year it was first released.
+
+## What does not change
+
+LTS is still where production workloads should live. The first half of the year after a release, the line is Current and is not meant for production. The LTS window is long enough that you will often have two LTS lines supported at the same time, which gives a comfortable overlap for migration.
+
+If you are still on a line that has reached end of life, none of this is relevant yet; fix that first. We wrote a runbook for that case in our post on [the Node 20 end-of-life upgrade](/blog/node-20-eol-upgrade-runbook-docker-ci-2026-10).
+
+## What to update in your policy
+
+### 1. Define upgrade cadence in terms of the LTS date
+
+Rather than "upgrade when a new version comes out," write down a rule tied to a calendar. For example: "Evaluate the new LTS in the quarter it enters LTS, and be on it before the previous LTS enters maintenance-only." With one release a year, this gives a predictable annual upgrade project instead of ad hoc work.
+
+### 2. Pin versions in one place
+
+Scattered version strings are the usual source of drift between local, CI, and production. Keep one source of truth and derive the rest.
+
+```text
+# .nvmrc
+26
+```
+
+```json
+{
+  "engines": {
+    "node": ">=26 <27"
+  }
+}
+```
+
+```dockerfile
+ARG NODE_VERSION=26
+FROM node:${NODE_VERSION}-slim AS base
+```
+
+```yaml
+# .github/workflows/ci.yml (excerpt)
+- uses: actions/setup-node@v4
+  with:
+    node-version-file: ".nvmrc"
+```
+
+Using `node-version-file` means a version bump is a one-line change that CI and local development both pick up. Adjust the pinned major to the line you actually run.
+
+### 3. Test the next line early, but only as a non-blocking job
+
+The Alpha phase exists so that downstream projects can find breakage before a release is cut. You do not need to run your whole suite against it on every commit. A scheduled, allowed-to-fail job is enough to catch the surprises that matter.
+
+```yaml
+name: node-next
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # weekly
+jobs:
+  test-next:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "27.0.0-alpha"   # adjust to the identifier the project publishes
+      - run: npm ci
+      - run: npm test
+```
+
+The exact version string for pre-release builds depends on how the project publishes them, so check the download page or `nvm ls-remote` before relying on the placeholder above. Treat any failures as information to track, not as blockers.
+
+### 4. Revisit native addons and build tooling
+
+The costs of a major upgrade are rarely in your own code. They are in native modules that need prebuilt binaries for a new ABI, in lockfile churn, and in base images. With an annual cadence, these costs arrive once a year and can be batched. Audit the dependencies that compile native code and check whether they publish binaries for the new line before you commit to a date.
+
+### 5. Align Docker and runtime images
+
+Pin the major in your image tags, not `latest`, and rebuild on a schedule so you pick up patch releases within a line. Security fixes land in point releases; being on the right major but months behind on patches is a more common problem than being on the wrong major.
+
+## Trade-offs worth naming
+
+An annual cadence reduces churn, but it also concentrates change. Each major carries a year of semver-major changes instead of six months, so individual upgrades may be somewhat larger. The Alpha phase is the project's answer to that, and it only helps if someone on your side actually exercises it.
+
+The calendar-year version numbering is also a small readability gain. "Node 28" now tells you roughly when it was first released, which makes audit conversations about how old a runtime is a bit easier.
+
+## Our recommendation
+
+For most client projects we would:
+
+1. Stay on LTS only, and write down the date by which the new LTS must be adopted.
+2. Centralize the version pin (`.nvmrc` or equivalent) and drive CI and Docker from it.
+3. Add a weekly non-blocking job against the upcoming line once its Alpha builds are available.
+4. Schedule one upgrade window per year, around the time the new line enters LTS, instead of reacting to each release.
+
+None of these require waiting for Node.js 27. They are worth doing now, because the same structure also makes your current upgrades cheaper.
