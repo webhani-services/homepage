@@ -1,0 +1,95 @@
+---
+title: "Bring Your Own Agent: Android Studio의 ACP 지원이 말해 주는 Editor 독립형 AI Tooling"
+description: "Android Studio가 Agent Client Protocol을 통해 서드파티 Coding Agent를 연결할 수 있게 되었습니다. Editor와 Agent를 분리하는 Protocol의 의미와, Agent 구성을 이식 가능하게 유지하는 방법을 정리합니다."
+date: "2026-11-02"
+status: "published"
+tags: ["AI", "Agent Client Protocol", "Developer Tooling", "Claude Code", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "acp-bring-your-own-agent-editor-neutral-2026-11"
+---
+
+Android Studio Rabbit 2 계열의 Release Notes에는 "Bring Your Own Agent"라는 기능이 소개되어 있습니다. Agents 메뉴에서 외부 Coding Agent를 고르고 본인의 Subscription이나 API Key로 로그인하면, IDE가 해당 Agent를 별도 Instance로 실행하는 방식입니다. Release Notes에 언급된 Agent는 Claude Agent, OpenAI Codex, Google의 Antigravity 등입니다. 연결된 Agent는 Build 진단, SDK Tool, Terminal 실행, Emulator 관리 같은 IDE 기능을 사용할 수 있습니다.
+
+도입 전에 확인할 점이 하나 있습니다. 공식 Release Notes는 Rabbit 2를 Canary로 분류하지만, 일부 2차 자료는 이 Workflow를 Stable로 소개합니다. 실제로 설치할 Channel은 직접 확인하시기 바랍니다.
+
+Android 이야기처럼 보이지만, 대부분의 팀에게 더 중요한 것은 그 아래에서 쓰이는 Agent Client Protocol(ACP)이라는 메커니즘입니다.
+
+## ACP란 무엇이고 MCP와 무엇이 다른가
+
+두 Protocol 모두 AI 주변의 JSON-RPC 계열이라 자주 혼동되지만, 연결하는 대상이 다릅니다.
+
+| Protocol | 연결 대상 | 답하는 질문 |
+| --- | --- | --- |
+| MCP | Agent ↔ Tool·Data | "Agent가 무엇을 호출할 수 있는가" |
+| ACP | Editor ↔ Agent | "Editor가 Agent를 어떻게 구동하고 작업을 어떻게 보여 주는가" |
+
+MCP는 Database, 이슈 Tracker, Browser 같은 대상에 대한 접근을 Agent에게 줍니다. ACP는 그 앞단, 즉 사람이 쓰는 Editor와 Agent Process 사이의 계층입니다. Prompt 전송, 진행 상황 Streaming, 파일 수정 사항의 Review 표시, 위험한 작업 전의 승인 요청이 여기서 이루어집니다.
+
+공통 Protocol이 없으면 Editor와 Agent 조합마다 별도의 연동이 필요해서, Editor N개와 Agent M개면 N×M개의 Adapter가 필요합니다. 공통화하면 N+M으로 줄고, 조합은 사용자가 선택합니다.
+
+## Android를 넘어서 의미가 있는 이유
+
+저희가 지원하는 팀들은 비용, 품질, Compliance 때문에 Agent를 하나로 정하는 경우가 많습니다. 그런데 실제로는 구성원의 절반이 VS Code, 4분의 1이 JetBrains 계열, 나머지가 Neovim이나 Zed를 쓰는 일도 흔합니다. Agent가 특정 벤더의 Plugin으로만 접근 가능하다면, 표준화는 고르지 않게 적용될 수밖에 없습니다.
+
+Editor 독립형 Protocol은 결정의 위치를 바꿉니다.
+
+- **Agent 선택이 팀 Policy가 됩니다.** 누가 어떤 IDE를 설치했는지에 좌우되지 않습니다.
+- **Editor 선택은 개인 취향으로 남습니다.** 관리자가 생각하는 것보다 개발자들이 훨씬 중요하게 여기는 부분입니다.
+- **전환 비용이 줄어듭니다.** Agent를 바꾸는 일이 Workflow 이전이 아니라 Configuration 변경으로 끝납니다.
+
+다만 Protocol이 표준화하는 것은 대화 부분뿐입니다. 능력의 차이는 남습니다. Android Studio 연동에서 Agent가 무엇을 할 수 있는지는 IDE가 무엇을 노출하는지에 달려 있고, Agent의 활동을 사용자에게 얼마나 보여 줄지도 Editor가 결정합니다.
+
+## ACP 방식 Session의 모습
+
+ACP는 JSON-RPC를 기반으로 하며, 일반적인 구성에서는 Editor가 Agent를 Subprocess로 실행하고 표준 입출력으로 통신합니다. 정확한 Method 이름과 Schema는 Protocol 명세에 정의되어 있으므로, 아래 코드는 교환의 형태를 보여 주기 위한 예시일 뿐 그대로 쓸 수 있는 Client가 아닙니다.
+
+```ts
+// 설명용 예시입니다. 실제 Method 이름은 ACP 명세를 확인하세요.
+import { spawn } from "node:child_process";
+
+const agent = spawn("my-agent", ["--acp"], { stdio: ["pipe", "pipe", "inherit"] });
+
+let nextId = 1;
+function send(method: string, params: unknown) {
+  const msg = { jsonrpc: "2.0", id: nextId++, method, params };
+  agent.stdin.write(JSON.stringify(msg) + "\n");
+}
+
+agent.stdout.on("data", (chunk) => {
+  for (const line of chunk.toString().split("\n").filter(Boolean)) {
+    const message = JSON.parse(line);
+    // Editor 쪽 책임: Streaming되는 진행 상황 표시,
+    // 제안된 파일 수정의 Diff 표시,
+    // Command 실행이나 Project 밖 쓰기 전의 사용자 확인.
+    console.log("agent ->", message);
+  }
+});
+
+send("initialize", { clientCapabilities: { fileEdits: true } });
+```
+
+핵심은 역할 분담입니다. Agent는 추론하고 작업을 제안하며, Editor는 Diff, 승인 Prompt, 작업 Directory 같은 화면 쪽을 맡습니다. 이 분담 덕분에 하나의 Agent를 여러 Editor에서 실행할 수 있습니다.
+
+## 운영 시 실무 포인트
+
+**Agent 지침을 Editor 설정에 두지 않습니다.** 규칙을 Repository 안의 파일(`AGENTS.md` 등)에 두면 IDE가 아니라 Project를 따라갑니다. 특정 Plugin의 설정 화면 안에 들어 있는 지침은 옮겨 갈 수 없습니다.
+
+**연동마다 권한 Model을 확인합니다.** 같은 Agent라도 Host Editor가 무엇을 허용하느냐에 따라 동작이 달라집니다. 새로운 Editor에서 활성화하기 전에 확인 없이 실행할 수 있는 작업, 쓰기 가능한 Directory, Network 접근 제한 여부를 점검하십시오. 신뢰할 수 없는 지침 파일의 위험은 [AGENTS.md 탈취 사례](/blog/agents-md-hijack-coding-agents-untrusted-instructions-2026-10) 글에서 다룬 적이 있으며, 새로운 Host가 Agent를 대신 실행하는 경우에도 같은 주의가 필요합니다.
+
+**별도 Instance는 별도 상태를 가집니다.** Android Studio는 Terminal에서 이미 실행 중인 Agent에 붙는 것이 아니라 전용 Agent Process를 띄웁니다. Session 이력, Memory, 저장되지 않은 Context는 이어지지 않습니다. Terminal과 IDE를 오가며 쓴다면 Context를 다시 설명해야 한다고 생각하는 편이 좋습니다.
+
+**개인은 Subscription, 팀은 관리되는 Key로.** 개발자별 API Key가 IDE 설정에 흩어지면 Rotation과 감사가 어려워집니다. 사용량 Report가 필요한 조직이라면 중앙 Gateway나 Enterprise Plan을 경유시키는 것이 현실적입니다.
+
+## webhani의 시각
+
+Editor와 Agent 사이를 표준화하는 것은 올바른 설계라고 생각합니다. Language Server가 성공한 이유와 같이, Editor와 언어 Tooling을 독립적으로 발전시킬 수 있기 때문입니다. 대형 벤더의 IDE가 채택했다는 점은 개별 Plugin 발표보다 강한 신호입니다.
+
+다만 ACP가 어디서나 동일하게 동작한다는 가정 위에 팀 Workflow를 설계하는 것은 아직 이르다고 봅니다. Protocol은 젊고, Host별 지원 수준도 다르며, 이번 Android Studio 기능 자체도 Stable 여부 표기가 엇갈립니다. 현재로서는 다음 순서가 안정적입니다.
+
+1. 팀의 주 Agent를 하나 정하고 문서화합니다.
+2. 규칙은 Editor 고유 설정이 아니라 Repository 파일에 둡니다.
+3. ACP 경로는 먼저 하나의 Editor에서 소규모로 시험한 뒤 확대합니다.
+4. 각 Host가 Agent에게 무엇을 노출하는지 확인하고, 보안 기준의 일부로 기록합니다.
+
+Editor가 섞여 있는 팀의 Agent 선정이나 Guardrail 설계는 저희가 일상적으로 지원하는 영역입니다.

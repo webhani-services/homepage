@@ -1,0 +1,107 @@
+---
+title: "Router and Worker Sessions: An Architecture Pattern for Autonomous Coding Agents"
+description: "DeepSeek's new coding agent prototype splits work into a Router layer and multiple Worker sessions. Whatever you think of the product, the pattern is worth understanding. A TypeScript sketch and the failure modes to plan for."
+date: "2026-11-02"
+status: "published"
+tags: ["AI", "Architecture", "Multi-Agent", "Design Patterns", "LLM"]
+thumbnail: ""
+author: "webhani"
+slug: "router-worker-pattern-autonomous-coding-agents-2026-11"
+---
+
+DeepSeek has released an open-source prototype of a more autonomous coding agent, positioned as a challenger to Claude Code. By its own description it is an architectural exploration, not a mature product, and we have not benchmarked it. Press coverage describes one structural idea: the system separates a Router layer from multiple Worker sessions.
+
+We are not going to review the product. The split itself is a useful pattern, and it maps onto things engineers already know. This post explains what it is, when it pays off, and what tends to go wrong.
+
+## The pattern
+
+A single agent session accumulates context as it works: files read, commands run, dead ends explored. That context is both its strength and its limit. Long sessions get slower and more expensive, and quality tends to degrade when the window fills with stale detail.
+
+The Router/Worker split separates two jobs:
+
+- **Router:** holds the overall goal and a short plan. It decides what to do next, hands a bounded task to a worker, and receives a compact result. It rarely touches code directly.
+- **Worker:** a fresh session given one well-scoped task, the files it needs, and acceptance criteria. It does the reading and editing, then returns a summary and a diff, and its context is discarded.
+
+If you have used a job queue, this will look familiar. The Router is a coordinator, Workers are stateless consumers, and the summary is the message contract between them.
+
+## Why it helps
+
+- **Context stays small where it matters.** The Router sees summaries, not every file a worker read. Workers see only their slice of the repository.
+- **Parallelism becomes possible.** Independent tasks, such as updating tests for three unrelated modules, can run in separate workers at the same time.
+- **Failures are contained.** A worker that goes down a bad path can be discarded and retried without polluting the main session.
+- **Review is easier.** Each worker produces a discrete, reviewable change with a stated purpose.
+
+## A minimal sketch
+
+The following TypeScript is an original illustration of the control flow, not any vendor's implementation. `runWorker` stands in for whatever starts an agent session in your environment.
+
+```ts
+type Task = {
+  id: string;
+  goal: string;
+  files: string[];          // the slice this worker may touch
+  acceptance: string[];     // checks that define "done"
+};
+
+type WorkerResult = {
+  taskId: string;
+  status: "ok" | "failed";
+  summary: string;          // short, written for the router
+  changedFiles: string[];
+};
+
+// Stand-in: start a fresh agent session scoped to one task.
+declare function runWorker(task: Task): Promise<WorkerResult>;
+
+async function runPlan(tasks: Task[], maxParallel = 3): Promise<WorkerResult[]> {
+  const results: WorkerResult[] = [];
+  const queue = [...tasks];
+
+  async function lane() {
+    for (let task = queue.shift(); task; task = queue.shift()) {
+      let result = await runWorker(task);
+      if (result.status === "failed") {
+        // One bounded retry with the failure summary as extra context.
+        result = await runWorker({
+          ...task,
+          goal: `${task.goal}\n\nPrevious attempt failed: ${result.summary}`,
+        });
+      }
+      results.push(result);
+    }
+  }
+
+  await Promise.all(Array.from({ length: maxParallel }, lane));
+  return results;
+}
+```
+
+Two details matter more than the code. First, the `files` field: a worker should declare, or be given, the files it may modify. Second, `acceptance`: a worker without objective checks will report success because it believes it succeeded.
+
+## Failure modes to plan for
+
+**Overlapping edits.** Two workers modifying the same file will conflict. Partition tasks by file ownership before running them in parallel, and fall back to serial execution when the partition is unclear. This is the same problem as parallel branches in git, with the same remedies.
+
+**Lossy summaries.** The Router decides based on what workers report. If a worker omits a caveat, the Router cannot recover it. Require a structured summary with explicit fields such as assumptions made and tests not run, rather than free prose only.
+
+**Router drift.** A Router that keeps replanning can loop. Cap the number of replans and the total number of worker launches, and surface the cap to a human.
+
+**Cost multiplication.** Parallel workers each pay for their own context. The pattern reduces per-session bloat but can raise total spend if tasks are poorly scoped. Measure tokens per completed task, not per session.
+
+**Confident wrong answers.** More autonomy means fewer chances for a human to notice a bad assumption early. We argued in an earlier post that [review capacity is the real bottleneck](/blog/ai-agents-more-code-same-output-review-bottleneck-2026-10) when agents produce more code. A fan-out of workers makes that sharper.
+
+## Guardrails that carry over from other agents
+
+None of this depends on a particular model or vendor. The controls we recommend for any multi-session setup:
+
+1. **Least privilege per worker.** Give each worker a working copy or branch, and scope credentials to the task.
+2. **Deterministic gates.** Tests, type checks, and linters run outside the agent and decide whether a result is accepted.
+3. **Hooks that fail closed.** If a policy check cannot run, the action should be refused rather than allowed. See our note on [fail-closed hooks](/blog/claude-code-hooks-fail-closed-guardrails-2026-10).
+4. **Human checkpoints at merge, not at every step.** Review the integrated result, with each worker's summary and diff available as supporting detail.
+5. **An audit trail.** Record which worker produced which change and from which task description.
+
+## Should you adopt this now?
+
+If you already use an agent with sub-agent or fork support, you have the building blocks, and you can try the pattern incrementally: let a primary session delegate well-bounded tasks such as test generation or mechanical migrations, and keep architecture decisions in the main session.
+
+Be cautious about treating a fresh prototype as production tooling. A new project can validate an idea without being ready to run unattended in a repository that matters. Our suggestion is to evaluate the architecture on a throwaway repository, compare cost and review burden against your current single-session workflow, and only then decide whether any specific product earns a place in your toolchain.
