@@ -1,0 +1,135 @@
+---
+title: "DeepSeek's Super-agent: How to Sandbox a Coding Agent That Acts Before You Ask"
+description: "DeepSeek released dsh-superagent, an MIT-licensed research prototype of a proactive coding agent. Here is what it does, what it does not do yet, and how to isolate it before evaluating it."
+date: "2026-11-03"
+status: "published"
+tags: ["AI", "AI Agents", "DeepSeek", "Security", "Docker"]
+thumbnail: ""
+author: "webhani"
+slug: "deepseek-superagent-proactive-coding-agent-isolation-2026-11"
+---
+
+On November 1, DeepSeek's Harness team released a coding agent called Super-agent. Bloomberg and others framed it as a challenger to Claude Code, but the repository (`deepseek-ai/dsh-superagent-prototype`) tells a more modest story: it is an **MIT-licensed research prototype**, created on October 31, with one commit at the time of release.
+
+It is still worth paying attention to. Coding agents have so far been request-driven: a human asks, the agent works. Super-agent is built to watch developer conversations, notice what needs fixing, and propose changes without being asked. That shift from reactive to proactive changes the assumptions your permission model rests on.
+
+## What the public material says
+
+Cross-checking the repository with the main coverage, this is what we can confirm:
+
+- **Scope:** a proactive agent for a single GitHub repository, packaged as a bundle for DeepSeek Harness (DSH).
+- **Execution model:** when an authorized user makes a request, the agent opens a work item, handles it in its own agent session and working directory, and replies in the original conversation. Requests fan out to parallel worker sessions.
+- **Requirements:** a dedicated DSH profile, a GitHub account reserved for the agent, a configured model provider, Node.js 22.19+, pnpm, git, tmux, Python, and the GitHub CLI.
+- **Warnings:** according to Dataconomy, DeepSeek states that the agent runs with full OS-user access and should be isolated before use. DSH itself is a developer preview with breaking changes announced.
+- **Performance:** DeepSeek's simulated tests reportedly show a median task completion time of 12.4 minutes and a p95 of 15.7 minutes. These are simulation numbers, not field data.
+
+The key takeaway: sessions get separate working directories, but **OS-level sandboxing is your job**. Miss that, and a tool you installed "just to try" can read your SSH keys and cloud credentials.
+
+## Why proactive agents carry different risk
+
+With a request-driven agent, the human's request doubles as a checkpoint. A proactive agent removes it.
+
+1. **The trust boundary widens.** Chat messages, issue bodies, CI logs: anything the agent reads as a hint for what to fix is also a prompt-injection channel.
+2. **Humans no longer choose when work starts.** A late-night thread can trigger a run nobody is watching.
+3. **Parallel workers amplify mistakes.** The more sessions run at once, the further one bad judgment spreads.
+
+So the controls belong in permissions, networking, and accounts, not in prompt text or config files asking the agent to behave.
+
+## A minimal evaluation setup
+
+We recommend three layers when evaluating it internally.
+
+### 1. A disposable container
+
+No host home directory mounts, and a non-root user.
+
+```dockerfile
+# Dockerfile.agent-sandbox
+FROM node:22-bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git tmux python3 ca-certificates curl gh \
+    && rm -rf /var/lib/apt/lists/* \
+    && corepack enable
+
+RUN useradd --create-home --shell /bin/bash agent
+USER agent
+WORKDIR /home/agent/work
+```
+
+```bash
+docker build -f Dockerfile.agent-sandbox -t agent-sandbox .
+
+docker run --rm -it \
+  --name superagent-eval \
+  --network agent-egress \
+  --memory 4g --cpus 2 \
+  --cap-drop ALL --security-opt no-new-privileges \
+  -e GH_TOKEN="$(cat ./secrets/agent-gh-token)" \
+  -e MODEL_API_KEY="$(cat ./secrets/model-key)" \
+  agent-sandbox bash
+```
+
+Put an egress proxy on `agent-egress` that only allows GitHub and your model provider. If the container can reach only those hosts, most exfiltration paths are gone.
+
+### 2. A dedicated GitHub account with a narrow token
+
+The "dedicated account" requirement matters most during evaluation.
+
+- Use a fine-grained personal access token limited to one repository.
+- Grant read/write on Contents and Pull requests, read on Issues, and little else.
+- Revoke the token and suspend the account when the evaluation ends.
+
+### 3. No direct pushes to the default branch
+
+Whatever the agent does, its output should reach `main` only through a reviewed pull request.
+
+```bash
+gh api -X POST repos/your-org/sandbox-repo/rulesets \
+  --input - <<'JSON'
+{
+  "name": "protect-main-from-agents",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
+  "rules": [
+    { "type": "pull_request", "parameters": {
+        "required_approving_review_count": 1,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": false,
+        "require_last_push_approval": true,
+        "required_review_thread_resolution": false } },
+    { "type": "non_fast_forward" },
+    { "type": "deletion" }
+  ]
+}
+JSON
+```
+
+`require_last_push_approval` ensures that if the agent pushes again after approval, the PR cannot be merged without a fresh review.
+
+## What to measure
+
+Skip judging the polish of the demo. Ask whether it fits your workflow.
+
+| Dimension | How to check |
+| --- | --- |
+| Trigger decisions | Can you trace which conversation led to each work item? |
+| False positive rate | Share of PRs opened for things that did not need fixing |
+| Diff granularity | Does each PR stay on one concern? |
+| Stoppability | Can you halt a running worker cleanly? |
+| Cost | Total model usage, and whether it scales with worker count |
+
+False positives cost more with proactive agents. A handful of unnecessary PRs a day drains reviewer attention and makes it easier to miss the change that actually matters.
+
+## Our take
+
+Super-agent is a prototype of agents moving from tools you invoke to teammates that stay resident in the team. The direction is interesting. It does not belong in a production repository yet.
+
+If you want to try it, this is the order we recommend:
+
+1. Prepare a non-sensitive sandbox repository and a dedicated account.
+2. Wrap the agent in all three layers: container, egress restrictions, and branch protection.
+3. Run it for about two weeks and record the false positive rate and review load as numbers.
+
+The real value of experimenting now is deciding how your team will govern work no human requested, before proactive agents are mature enough that you are forced to decide in a hurry.

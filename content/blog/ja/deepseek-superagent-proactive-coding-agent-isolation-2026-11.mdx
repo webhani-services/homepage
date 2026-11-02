@@ -1,0 +1,135 @@
+---
+title: "DeepSeek の Super-agent を読む：「頼まれる前に動く」コーディングエージェントを評価するための隔離設計"
+description: "DeepSeek が MIT ライセンスで公開した proactive なコーディングエージェントの研究プロトタイプ dsh-superagent。何ができて何がまだできないのか、そして試すならどう隔離すべきかを整理します。"
+date: "2026-11-03"
+status: "published"
+tags: ["AI", "AIエージェント", "DeepSeek", "セキュリティ", "Docker"]
+thumbnail: ""
+author: "webhani"
+slug: "deepseek-superagent-proactive-coding-agent-isolation-2026-11"
+---
+
+11月1日、DeepSeek の Harness チームが coding agent「Super-agent」を公開しました。Bloomberg などは Claude Code の対抗馬として報じていますが、リポジトリ（`deepseek-ai/dsh-superagent-prototype`）を見ると、位置づけは製品ではなく **MIT ライセンスの研究プロトタイプ** です。リポジトリの作成は10月31日で、公開時点のコミットは1件だけでした。
+
+それでも注目する価値はあります。これまでのコーディングエージェントは「人間が依頼して初めて動く」ものでした。Super-agent は、開発者のチャットを見て修正が必要そうな箇所を自分で見つけ、頼まれる前に修正案を出す方向を目指しています。この「proactive」という性質が、権限設計の前提を変えます。
+
+## 公開情報から分かること
+
+一次情報と主要な報道を突き合わせると、現時点で確認できる内容は次のとおりです。
+
+- **対象範囲**：1つの GitHub リポジトリを担当する proactive なエージェント。DeepSeek Harness（DSH）向けの bundle として配布される
+- **動作モデル**：許可されたユーザーが依頼すると work item を作成し、専用のエージェントセッションと作業ディレクトリで処理して、元の会話に結果を返す。複数の依頼は並列の worker セッションに振り分けられる
+- **導入要件**：DSH の専用 profile、エージェント専用の GitHub アカウント、モデルプロバイダの設定、Node.js 22.19 以上、pnpm、git、tmux、Python、GitHub CLI
+- **注意書き**：Dataconomy によると、DeepSeek 自身が「OS ユーザーの全権限で動作するため、使う前に隔離すること」と明記しています。DSH 本体も developer preview で、互換性を壊す変更が入ると予告されています
+- **性能**：DeepSeek のシミュレーションテストでは、タスク完了時間の中央値が12.4分、95パーセンタイルが15.7分と報じられています。実環境の数値ではない点に注意が必要です
+
+つまり「セッションごとに作業ディレクトリは分ける」ものの、**OS レベルのサンドボックスは利用者が用意する前提**です。ここを読み違えると、評価用に入れたつもりのツールが開発マシンの SSH 鍵やクラウドの認証情報に触れられる状態になります。
+
+## proactive エージェント特有のリスク
+
+依頼型のエージェントでは、人間が依頼するタイミングがそのまま確認ポイントになっていました。proactive 型ではこのポイントがなくなります。
+
+1. **入力の信頼境界が広がる**：チャットのメッセージ、Issue の本文、CI のログなど、エージェントが「修正のヒント」として読むテキストはすべてプロンプトインジェクションの経路になります
+2. **実行タイミングを人間が選べない**：深夜のチャットのやり取りをきっかけに作業が始まることもあります
+3. **並列 worker が被害を増やす**：同時に動くセッションが多いほど、誤った判断が一度に広がる範囲も大きくなります
+
+そのため、プロンプトや設定ファイルに書く注意書きではなく、**権限・ネットワーク・アカウントの層で制限する**ことが基本になります。
+
+## 評価環境の最小構成
+
+社内で試すときは、次の3層で囲むことを勧めています。
+
+### 1. 使い捨てコンテナで動かす
+
+ホストのホームディレクトリをマウントせず、root ではないユーザーで動かします。
+
+```dockerfile
+# Dockerfile.agent-sandbox
+FROM node:22-bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git tmux python3 ca-certificates curl gh \
+    && rm -rf /var/lib/apt/lists/* \
+    && corepack enable
+
+RUN useradd --create-home --shell /bin/bash agent
+USER agent
+WORKDIR /home/agent/work
+```
+
+```bash
+docker build -f Dockerfile.agent-sandbox -t agent-sandbox .
+
+docker run --rm -it \
+  --name superagent-eval \
+  --network agent-egress \
+  --memory 4g --cpus 2 \
+  --cap-drop ALL --security-opt no-new-privileges \
+  -e GH_TOKEN="$(cat ./secrets/agent-gh-token)" \
+  -e MODEL_API_KEY="$(cat ./secrets/model-key)" \
+  agent-sandbox bash
+```
+
+`agent-egress` には、GitHub とモデルプロバイダのエンドポイントだけを許可する egress proxy を置きます。通信先が限られていれば、情報を外へ持ち出す手段もほぼなくなります。
+
+### 2. エージェント専用の GitHub アカウントとスコープの狭い token
+
+要件にある「エージェント専用アカウント」は、評価のときこそ徹底すべき部分です。
+
+- fine-grained personal access token で、対象リポジトリ1つに限定する
+- 権限は Contents と Pull requests の read/write、Issues の read 程度に抑える
+- 評価が終わったら token を失効させ、アカウントも停止する
+
+### 3. リポジトリ側で main への直接 push を禁止する
+
+エージェントが何をしても、成果物は Pull Request として人間のレビューを通るようにします。
+
+```bash
+gh api -X POST repos/your-org/sandbox-repo/rulesets \
+  --input - <<'JSON'
+{
+  "name": "protect-main-from-agents",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
+  "rules": [
+    { "type": "pull_request", "parameters": {
+        "required_approving_review_count": 1,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": false,
+        "require_last_push_approval": true,
+        "required_review_thread_resolution": false } },
+    { "type": "non_fast_forward" },
+    { "type": "deletion" }
+  ]
+}
+JSON
+```
+
+`require_last_push_approval` を有効にしておくと、エージェントが承認後に追加 push しても、そのまま merge されることはありません。
+
+## 評価で見るべきポイント
+
+デモの完成度より、自社のワークフローに載せられるかを確認します。
+
+| 観点 | 確認方法 |
+| --- | --- |
+| 着手の判断 | どの会話をきっかけに work item を作ったか、ログで追えるか |
+| 誤検知率 | 修正不要な箇所に PR を出した割合 |
+| 差分の粒度 | 1つの PR が1つの論点に収まっているか |
+| 停止のしやすさ | 実行中の worker を安全に止められるか |
+| コスト | モデル呼び出しの総量。並列 worker 数に比例して増えるか |
+
+proactive 型では誤検知のコストが大きくなります。不要な PR が1日に何件も来れば、レビュアーの注意力が削られ、本当に必要な指摘を見落とす原因になります。
+
+## webhani の見解
+
+Super-agent は、エージェントが「依頼に応じる道具」から「チームの一員として常駐するもの」へ移りつつあることを示す試作です。方向性は興味深いものの、現段階では本番リポジトリに入れるものではありません。
+
+試すなら、次の順番で進めることを推奨します。
+
+1. 機密性のないサンドボックス用リポジトリと専用アカウントを用意する
+2. コンテナ、egress 制限、ブランチ保護の3層で囲む
+3. 2週間ほど動かし、誤検知率とレビュー負荷を数値で記録する
+
+proactive なエージェントが実用段階に入ったときに慌てないよう、「人間が依頼しない実行」をどう統制するかを今のうちに決めておくことが、プロトタイプを触る一番の意義だと考えています。
