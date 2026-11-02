@@ -1,0 +1,130 @@
+---
+title: "Cilium 1.20 へのアップグレード：Gateway API 1.6 の前提条件と、TCPRoute・ListenerSet で変わる運用"
+description: "Cilium 1.20 では Gateway API が 1.6 に上がり、TCPRoute・UDPRoute・ListenerSet・ExternalAuth に対応しました。アップグレード前に必ず確認すべき CRD の前提条件と、チーム運用の観点から見た変化を整理します。"
+date: "2026-11-03"
+status: "published"
+tags: ["Kubernetes", "Cilium", "Gateway API", "eBPF", "インフラ"]
+thumbnail: ""
+author: "webhani"
+slug: "cilium-1-20-gateway-api-1-6-upgrade-checklist-2026-11"
+---
+
+Cilium 1.20 は9月にリリースされ、パッチリリースは 1.20.4 まで進みました。InfoQ が10月に取り上げたこともあり、来週 Salt Lake City で開かれる KubeCon + CloudNativeCon North America を前に、アップグレードを計画しているチームも多いと思います。
+
+1.20 の変更は幅広いですが、運用への影響が大きいのは **Gateway API が 1.4 から 1.6 に上がったこと** です。新機能は便利な一方、CRD の前提条件を満たさないままアップグレードすると TLSRoute が使えなくなる可能性があります。この記事では、前提条件の確認手順を先に示し、そのあとで新機能が運用をどう変えるかを見ていきます。
+
+## まず確認：Gateway API CRD は v1.6.1 以上が必要
+
+Cilium の公式 Upgrade Guide では、1.20 の Gateway API サポートには **Gateway API v1.6.1 以上の CRD** が必要とされています。主な理由は TLSRoute です。v1.6.1 で TLSRoute が v1 に昇格したため、クラスタは常に v1 を提供できる状態でなければなりません。
+
+これまで TLSRoute（v1alpha2）を使っていた場合は、v1alpha2 の CRD バージョンも含む **v1.6.1 の Experimental 版 TLSRoute** をインストールするよう案内されています。作業前に TLSRoute リソースのバックアップも推奨されています。
+
+```bash
+# 1. 現在の Gateway API CRD のバージョンを確認
+kubectl get crd gateways.gateway.networking.k8s.io \
+  -o jsonpath='{.metadata.annotations.gateway\.networking\.k8s\.io/bundle-version}{"\n"}'
+
+# 2. TLSRoute を使っているか確認し、使っていればバックアップ
+kubectl get tlsroutes.gateway.networking.k8s.io -A 2>/dev/null \
+  && kubectl get tlsroutes.gateway.networking.k8s.io -A -o yaml > tlsroutes-backup.yaml
+
+# 3. 提供されている API バージョンを確認
+kubectl api-resources --api-group=gateway.networking.k8s.io
+```
+
+CRD の更新は Cilium 本体より **先に** 行います。TCPRoute や UDPRoute を使う予定があるなら、それらを含むチャネルの manifest を選んでください。
+
+```bash
+kubectl apply --server-side \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml
+```
+
+なお、Gateway や GAMMA の infrastructure metadata に付けた `cec.cilium.io/*` アノテーションは、生成される CiliumEnvoyConfig にコピーされなくなりました。Service 側には残りますが、効果はありません。このアノテーションに依存した設定があれば、事前に見直しが必要です。
+
+## アップグレード手順の骨子
+
+公式ガイドにある preflight チェックを省略しないことが重要です。
+
+```bash
+# preflight（イメージの事前 pull と互換性チェック）
+helm template cilium cilium/cilium --version 1.20.4 \
+  --namespace kube-system \
+  --set preflight.enabled=true \
+  --set agent=false \
+  --set operator.enabled=false \
+  > cilium-preflight.yaml
+kubectl apply -f cilium-preflight.yaml
+kubectl -n kube-system rollout status ds/cilium-pre-flight-check
+
+# preflight を削除して本体を更新
+kubectl delete -f cilium-preflight.yaml
+helm upgrade cilium cilium/cilium --version 1.20.4 \
+  --namespace kube-system --reuse-values
+
+# 検証
+cilium status --wait
+cilium connectivity test
+```
+
+InfoQ によると、レガシーな Mutual Authentication、Kafka を認識する Network Policy、Envoy の Go 拡張、カスタムの CNI 設定を使っている場合は、1.20 のリリースノートで追加の対応が必要かどうかを確認するよう案内されています。私たちの経験では、カスタム CNI 設定は「誰かが昔入れたまま忘れられている」ことが多い項目です。
+
+## 新機能が運用をどう変えるか
+
+### ListenerSet：共有 Gateway の所有権を分けられる
+
+これまで、共有 Gateway に listener を1つ追加するだけでも、Gateway を所有するプラットフォームチームへの依頼が必要でした。ListenerSet を使うと、**Gateway 自体はプラットフォームチームが持ったまま、アプリケーションチームが自分の listener を追加・管理** できます。
+
+マルチテナントのクラスタでは、これは RBAC の設計を見直す機会になります。アプリケーションチームには ListenerSet の作成権限だけを与え、Gateway の変更権限は渡さない、という分け方が自然です。
+
+### TCPRoute・UDPRoute：HTTP 以外も同じモデルで
+
+データベース、DNS、ゲームサーバーのような非 HTTP のトラフィックを、HTTP や gRPC と同じ Gateway API のモデルで扱えるようになりました。
+
+```yaml
+# API バージョンは導入した CRD に合わせてください
+# （kubectl explain tcproute で確認できます）
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: postgres
+  namespace: data
+spec:
+  parentRefs:
+    - name: shared-gateway
+      namespace: infra
+      sectionName: postgres-tcp
+  rules:
+    - backendRefs:
+        - name: postgres-primary
+          port: 5432
+```
+
+これまで LoadBalancer 型の Service を個別に作っていた構成を、Gateway に集約できます。ただし、L4 のトラフィックを Gateway に集めると、障害時の影響範囲も集まります。重要なデータベースは、移行を急がず、まずステートレスな TCP サービスから試すのが安全です。
+
+### ExternalAuth・CORS：Gateway で認証を前に出せる
+
+ExternalAuth を使うと、外部の認証サービスへの問い合わせを Gateway の段階で行えます。各アプリケーションに認証 Middleware を重複して実装していた構成を整理できる可能性があります。CORS の filter も Gateway 側で設定できるようになりました。
+
+### datapath プラグイン（Beta）は慎重に
+
+1.20 では、サードパーティのコードを別プロセスとして Cilium に接続し、eBPF datapath を拡張できる仕組みが Beta で入りました。登録には CiliumDatapathPlugin カスタムリソースを使います。InfoQ が指摘しているように、問題のあるプラグインは Cilium 自体を壊したり、セキュリティを弱めたりする可能性があります。本番クラスタでは、ベンダーのサポート状況が明確になるまで有効にしないことを勧めます。
+
+### その他
+
+- `bpf.datapathMode=auto`：カーネルが対応していれば netkit を、そうでなければ veth を自動で選びます。ノードのカーネルが混在しているクラスタで便利です
+- Topology-aware routing に `PreferSameZone` と `PreferSameNode` が加わり、ゾーン間転送のコスト削減に使えます
+- Maglev の backend に重みを付けられるようになりました
+- ENI IPAM で IPv6 が Beta 対応しました
+
+## webhani の推奨
+
+Cilium 1.20 は、Gateway API を「HTTP の Ingress の後継」から「クラスタのトラフィック全体を扱う共通モデル」へ広げるリリースです。
+
+アップグレードは次の順で進めることを推奨します。
+
+1. Gateway API CRD のバージョンと TLSRoute の利用状況を確認し、バックアップを取る
+2. CRD を v1.6.1 以上に上げてから、ステージングで preflight を含む Cilium の更新を行う
+3. `cilium connectivity test` が通ることを確認してから本番に適用する
+4. ListenerSet や TCPRoute の導入は、アップグレードとは別の変更として計画する
+
+アップグレードと新機能の導入を同じ変更にまとめないことが、切り戻しを容易にする一番の方法です。

@@ -1,0 +1,139 @@
+---
+title: "TypeScript 7.1 Beta: The API Returns, and Vue and Svelte Tooling Can Catch Up. What to Test Before the RC"
+description: "TypeScript 7.1 Beta brings a preview API and content mappers to the Go-based compiler, plus import attributes in ambient modules and a stable es2026 target. Here is what to verify before the RC lands."
+date: "2026-11-03"
+status: "published"
+tags: ["TypeScript", "Frontend", "Vue", "Tooling", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-7-1-beta-api-content-mappers-es2026-2026-11"
+---
+
+TypeScript 7.1 Beta shipped on October 20. The reported plan puts the RC on November 10 and the stable release on November 24, though the beta itself slipped about two weeks, so treat those dates as tentative. Either way, the coming week is the last good window to try it on real projects and report problems.
+
+The headline is not a language feature. 7.1 is about **giving the ecosystem a way onto TypeScript 7**. The Go rewrite made type checking dramatically faster, but tools built on the old JavaScript API, including typescript-eslint and the Vue, Svelte, and Angular language tools, could not follow right away. 7.1 is the release that starts closing that gap.
+
+## What changed
+
+### 1. A preview API, split by purpose
+
+Rather than one module exposing everything, the 7.1 API is divided into entry points. The announcement and follow-up coverage list:
+
+- `typescript/sync`: a synchronous compiler client (compiler options, type checker, and program APIs)
+- `typescript/async`: the asynchronous counterpart
+- `typescript/fs`: file system concerns
+- `typescript/ast`, `typescript/ast/is`, `typescript/ast/factory`: AST types, type guards, and node factories
+
+The design centers on **snapshots**: read-only, point-in-time views of compiler state. You create a fresh snapshot or derive an updated one from an existing snapshot. That fits editor-style workloads where state changes constantly but each query needs a consistent view.
+
+The API is explicitly a **preview**. Breaking changes are possible between beta and stable, and full documentation is planned for 7.1 stable. If you maintain internal tooling on the TypeScript API, this is the time to experiment, not to migrate.
+
+### 2. Content mappers for embedded code
+
+Content mappers are a plugin point for formats that embed TypeScript inside something else: Vue SFCs, Svelte components, Angular templates. A tool can expose the TypeScript portions of such a file to the language service.
+
+Until now, each of these tools built its own workaround, usually generating virtual files to feed TypeScript. With a supported mechanism in place, Vue and Svelte projects have a realistic path to TypeScript 7's speed.
+
+### 3. Import attributes in ambient modules
+
+Bundlers that load CSS or raw text through import attributes have been awkward to type. In 7.1 you can scope an ambient module declaration to a specific attribute:
+
+```ts
+// src/types/assets.d.ts
+declare module "*" with { type: "css" } {
+  const sheet: CSSStyleSheet;
+  export default sheet;
+}
+
+declare module "*" with { type: "text" } {
+  const content: string;
+  export default content;
+}
+```
+
+```ts
+import sheet from "./theme.css" with { type: "css" };   // CSSStyleSheet
+import readme from "./README.md" with { type: "text" }; // string
+```
+
+According to follow-up coverage, an import matches when its attributes are assignable to the declared attributes type, the most specific declaration wins when several match, and attribute values must be string literal types. TypeScript does not ship these declarations, so either you write them or your framework or bundler provides them. A useful side effect is that an import missing its required attribute now produces an error.
+
+### 4. es2026 as a stable target and lib
+
+`--target es2026` and `--lib es2026` are now first-class options:
+
+```json
+{
+  "compilerOptions": {
+    "target": "es2026",
+    "lib": ["es2026", "dom", "dom.iterable"],
+    "module": "esnext",
+    "moduleResolution": "bundler"
+  }
+}
+```
+
+A higher target means less downleveling and cleaner output. Whether your runtime supports it (browser matrix, Node.js version) is a separate question. In bundler-driven setups like Next.js, where the bundler handles final transforms, `target` mostly affects type checking anyway.
+
+The beta also adds support for source phase imports.
+
+## Before the RC
+
+### Find out which tools depend on the TypeScript API
+
+How much 7.1 helps you depends on which of your tools talk to the TypeScript API.
+
+```bash
+# Packages that depend on typescript
+npm ls typescript --all 2>/dev/null | grep -v "deduped" | head -50
+
+# The usual suspects
+npm ls typescript-eslint vue-tsc @angular/compiler-cli svelte-check 2>/dev/null
+```
+
+Until those tools ship 7.1-compatible releases, keeping the editor and linter on 5.x while CI type checks with 7.x is a reasonable split.
+
+### Add a non-blocking beta job to CI
+
+It surfaces issues early without affecting your main pipeline.
+
+```yaml
+# .github/workflows/typecheck-ts-next.yml
+name: typecheck (typescript@beta)
+on:
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1"
+
+jobs:
+  typecheck-beta:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm install --no-save typescript@beta
+      - run: npx tsc --noEmit --extendedDiagnostics
+```
+
+Keep the `--extendedDiagnostics` output so you can compare check time and memory across versions.
+
+### Audit your import attributes
+
+If you already use `with { type: ... }` imports, check whether 7.1 declarations can replace the `any` or catch-all declarations you used to paper over them. Once the declarations are in place, imports missing the attribute become errors, which catches omissions for free.
+
+## Our take
+
+TypeScript 7's speed is compelling, but on the projects we support, the blocker has never been the type checker itself. It has been **the state of the surrounding tools**. 7.1 tackles that directly, and for Vue and Angular teams in particular it looks like the practical starting point for a TypeScript 7 migration.
+
+Our recommendations:
+
+1. Add a non-blocking beta CI job this week and record type error diffs and build times.
+2. List your toolchain's 7.1 support status and use it to plan the migration.
+3. Do not rush internal code that uses the TypeScript API (codegen, custom lint rules) until the API stabilizes.
+
+Assume the preview API will change, verify early, and send feedback while it can still shape the stable release.
