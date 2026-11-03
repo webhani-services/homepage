@@ -1,0 +1,110 @@
+---
+title: "Helm 3 Security Support Ends Next Week: Where Helm 4 Breaks Your Pipeline"
+description: "Helm 3 security fixes are scheduled to end on November 11, 2026. Your charts will keep working; your CI flags, --wait permissions, post-renderers, and SDK callers might not. A practical migration plan."
+date: "2026-11-04"
+status: "published"
+tags: ["Kubernetes", "Helm", "CI/CD", "DevOps", "Security"]
+thumbnail: ""
+author: "webhani"
+slug: "helm-3-eol-helm-4-migration-2026-11"
+---
+
+HIP-0012 committed the Helm project to retiring Helm 3 six to eight months after Helm 4 shipped. Most migration guides give these dates:
+
+- **July 8, 2026**: Helm 3 bug fixes ended.
+- **November 11, 2026**: Helm 3 security fixes end.
+
+One article cites a later security cutoff in February 2027. Check the official announcement on helm.sh before you plan around either date. Both are close enough that the work should already be on someone's board.
+
+## Charts are the easy part
+
+Chart API v2 is unchanged in Helm 4. A chart that deploys with Helm 3 should deploy with Helm 4, so for most teams this is not a template rewrite.
+
+The breakage lives in the tooling around the charts: CI images that pin a `helm` binary, scripts that pass renamed flags, plugins, and Go code that imports the Helm SDK.
+
+## Server-side apply, but only for new releases
+
+Helm 4 defaults to server-side apply (SSA) on a fresh install. Upgrades and rollbacks keep whatever apply method the release already used. A release created by Helm 3 therefore stays on client-side apply after you upgrade it with Helm 4.
+
+The consequence is that one chart can behave differently depending on whether the release is new. SSA records field ownership, so a field also touched by `kubectl edit` or another controller can now surface as a conflict. If your preview environments are created from scratch on every pull request, they will hit SSA behavior long before production does. During the transition, passing `--server-side` explicitly keeps environments consistent.
+
+## Renamed flags
+
+```text
+--atomic  ->  --rollback-on-failure
+--force   ->  --force-replace
+```
+
+The old names still work with a warning and are expected to become errors in a later minor release. The new names do not exist in Helm 3, so find the call sites now and switch them in the same pull request that moves CI to Helm 4.
+
+```bash
+grep -rnE "helm .*(--atomic|--force)( |$)" \
+  .github/ scripts/ Makefile* helmfile* 2>/dev/null
+```
+
+Review the matches by hand. `--force` also prefixes unrelated flags such as `--force-update` on `helm repo add`.
+
+## `--wait` needs `watch`
+
+Reports indicate that `--wait` in Helm 4 is kstatus-based and needs the `watch` verb. If your CI service account was trimmed to `get` and `list`, you get the most confusing failure mode: the apply succeeds, then the wait step fails.
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ci-deployer
+  namespace: app
+rules:
+  - apiGroups: ["", "apps", "batch"]
+    resources: ["deployments", "statefulsets", "jobs", "pods", "services"]
+    verbs: ["get", "list", "watch"]
+  # create/update/patch/delete for the install itself are granted separately
+```
+
+The exact resource list depends on the chart. Run Helm 4 against staging and add resources as `Forbidden` errors appear. Adding `watch` is harmless under Helm 3, so this change can land early.
+
+## Post-renderers and plugins
+
+Helm 3 accepted a path to an executable: `--post-renderer ./kustomize-wrapper.sh`. Helm 4 expects post-renderers to be registered as plugins. Kustomize-as-post-renderer is common enough that it deserves its own test case. Helm 4 also introduces a WebAssembly-based plugin model, so verify each existing plugin individually rather than assuming compatibility.
+
+## SDK callers carry the most risk
+
+Internal tools and operators that import Helm as a Go library face a new import path and breaking API changes. One community write-up describes `Wait bool` becoming a `WaitStrategy`, with Helm refusing to build a waiter when it is left empty. That is a runtime failure, not a compile error, which is why integration tests matter more than a green build here.
+
+## A side-by-side migration
+
+Helm 3 and Helm 4 can coexist, so do not flip everything at once.
+
+```bash
+# Install Helm 4 under a different name; pin the exact version from the official release
+curl -fsSL -o helm4.tar.gz \
+  "https://get.helm.sh/helm-v4.x.y-linux-amd64.tar.gz"
+tar -xzf helm4.tar.gz && sudo mv linux-amd64/helm /usr/local/bin/helm4
+
+# Compare rendered manifests with identical values
+helm  template app ./chart -f values-staging.yaml > /tmp/h3.yaml
+helm4 template app ./chart -f values-staging.yaml > /tmp/h4.yaml
+diff -u /tmp/h3.yaml /tmp/h4.yaml
+```
+
+If rendering matches, run a real `upgrade` against staging and exercise `--wait` and any post-renderers. Then switch the CI image, pinned:
+
+```yaml
+- uses: azure/setup-helm@<full-commit-sha>
+  with:
+    version: "v4.x.y"   # pin; do not track latest
+```
+
+## Our take
+
+This is a "charts work, pipelines break" migration, which makes it easy for application teams to miss and easy for platform teams to postpone. But a deploy tool holds write access to your clusters. Running an unpatched one in CI after security support ends is not a neutral choice.
+
+The order we recommend to clients:
+
+1. **Inventory** every caller of `helm`: CI jobs, scripts, operators, internal tools.
+2. **Fix RBAC** by adding `watch` for the CI service account.
+3. **Validate on staging**: post-renderers, `--wait`, SSA on new releases.
+4. **Switch CI and rename flags together**, with the version pinned.
+5. **Automate updates** with Renovate or Dependabot so the next upgrade is a reviewed PR, not a project.
+
+Helm 3 will not stop working on November 12. It just will not get a fix the next time it needs one.

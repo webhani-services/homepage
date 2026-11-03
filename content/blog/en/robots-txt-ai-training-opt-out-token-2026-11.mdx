@@ -1,0 +1,116 @@
+---
+title: "Opting Out of AI Training with One robots.txt Group: The __usage_ai-training Token"
+description: "A new IETF draft published on October 30 defines a single robots.txt token for AI training opt-out, and the major AI labs are reported to back it. Here is how the token works, what it does not cover, and how to ship it in a Next.js app."
+date: "2026-11-04"
+status: "published"
+tags: ["AI", "LLM", "SEO", "Next.js", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "robots-txt-ai-training-opt-out-token-2026-11"
+---
+
+"Keep us out of AI training, but keep us in search results." Until now, the answer to that request was a growing list of per-crawler blocks: `GPTBot`, `ClaudeBot`, `Google-Extended`, `CCBot`, and whatever shipped last month. It works, but it is a maintenance treadmill, and it expresses the wrong thing. You are not objecting to a crawler. You are objecting to a use.
+
+On October 30, an individual IETF Internet-Draft, `draft-kelley-aipref-training-preference-signal-00`, authored by Kevin Kelley of Anthropic, proposed a fix. Coverage over the following days reports that Google, Microsoft, OpenAI, and Anthropic have committed to honoring it. We could not find a primary statement from every company, so treat the backing as reported, not confirmed.
+
+## The mechanism
+
+The draft deliberately adds no new directives and no new grammar. Groups, path matching, and longest-match precedence from RFC 9309 are untouched. Instead, it defines a policy token, `__usage_ai-training`, that you place in a `User-agent` line. Any crawler collecting content for training is expected to obey that group.
+
+"AI training" comes from the AIPREF working group's vocabulary draft: using an asset to modify the learned parameters of a generative AI model. Search indexing and retrieval at answer time are not in scope.
+
+```text
+User-agent: *
+Allow: /
+
+User-agent: __usage_ai-training
+Disallow: /
+```
+
+Path-level rules work the way you would expect:
+
+```text
+User-agent: __usage_ai-training
+Disallow: /blog/
+Disallow: /docs/
+Allow: /press/
+```
+
+## The trap: a blanket Disallow is not an opt-out
+
+The detail most teams will miss: under the draft, `User-agent: *` with `Disallow: /` says nothing about AI training. Blocking all crawling and refusing training are separate statements. If a staging site or an internal docs portal is publicly reachable and you have relied on a blanket disallow, add the token explicitly.
+
+## Shipping it in Next.js
+
+With the App Router, `app/robots.ts` generates the file, and `rules` accepts an array. Add one group and keep the legacy crawler blocks during the transition.
+
+```ts
+// app/robots.ts
+import type { MetadataRoute } from "next";
+
+const AI_TRAINING_TOKEN = "__usage_ai-training";
+const LEGACY_AI_CRAWLERS = ["GPTBot", "ClaudeBot", "Google-Extended", "CCBot"];
+
+export default function robots(): MetadataRoute.Robots {
+  return {
+    rules: [
+      { userAgent: "*", allow: "/" },
+      { userAgent: AI_TRAINING_TOKEN, disallow: "/" },
+      { userAgent: LEGACY_AI_CRAWLERS, disallow: "/" },
+    ],
+    sitemap: "https://example.com/sitemap.xml",
+  };
+}
+```
+
+The double underscore prefix is easy to mistype and impossible to notice in review. Pin it with a test:
+
+```ts
+// app/robots.test.ts
+import { expect, test } from "vitest";
+import robots from "./robots";
+
+test("emits the AI training opt-out group", () => {
+  const { rules } = robots();
+  const list = Array.isArray(rules) ? rules : [rules];
+  expect(
+    list.some((r) => r.userAgent === "__usage_ai-training" && r.disallow === "/"),
+  ).toBe(true);
+});
+```
+
+Then check the real output after a build with `curl -s http://localhost:3000/robots.txt`.
+
+## Page-level signals
+
+Secondary reports say Microsoft will also accept a page-level version via a `meta` tag or `X-Robots-Tag` header, which the IETF draft does not include. We could not confirm the exact value format from a primary source, so we would hold off until Bing documents it. robots.txt is the portable baseline.
+
+## Reported timelines
+
+| Company | Reported support |
+| --- | --- |
+| Anthropic | Already honoring |
+| OpenAI | "In the coming months" |
+| Microsoft | From February 1, 2027 |
+| Google | During 2027 |
+
+Adding the token today will not change behavior everywhere tomorrow. It costs nothing, though, and it starts working the day each crawler adopts it.
+
+## Our take
+
+What we like is that this rides on infrastructure every site already has. Moving from "list every crawler" to "state the purpose you object to" removes a recurring chore and makes intent auditable.
+
+The limits are worth stating plainly:
+
+1. **It is voluntary.** robots.txt has never been an access control. It binds those who agree to honor it. If you need enforcement against scrapers that ignore it, that is a WAF and bot-management problem.
+2. **It is an individual draft.** The token name or semantics could still change before anything is standardized.
+3. **Training is not retrieval.** Opting out of training does not opt you out of being quoted in AI search answers, and for many publishers and e-commerce sites, that traffic matters. Decide those two questions separately, and write the decision down.
+
+## Checklist for this week
+
+1. Audit your robots.txt (or `app/robots.ts`) for an explicit training preference.
+2. If you opt out, add a `__usage_ai-training` group and keep existing crawler blocks for now.
+3. Lock the token with a unit test so it survives refactors.
+4. Record the policy, for example "no training, citation in AI search allowed", where both engineering and the business side can find it.
+
+It is a small file, but it is where your content policy actually becomes enforceable by the people willing to listen.
