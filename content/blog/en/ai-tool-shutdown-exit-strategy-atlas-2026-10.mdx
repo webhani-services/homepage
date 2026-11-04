@@ -1,0 +1,84 @@
+---
+title: "When an AI Product Gets Shut Down: Designing an Exit Strategy After Atlas"
+description: "OpenAI retired its Atlas browser less than a year after launch. What that teaches teams about depending on fast-moving AI products, and a practical way to keep switching costs low."
+date: "2026-10-26"
+status: "published"
+tags: ["AI", "LLM", "Architecture", "Risk Management", "Vendor Management"]
+thumbnail: ""
+author: "webhani"
+slug: "ai-tool-shutdown-exit-strategy-atlas-2026-10"
+---
+
+In July 2026 OpenAI announced that it would retire its ChatGPT Atlas browser, with the shutdown reported for August 9, less than a year after launch. Its features are moving into the ChatGPT desktop app, and affected users were told to migrate their data. Coverage also linked the decision to a wider consolidation of OpenAI's product line.
+
+This is not a story about one company. AI products are being launched, merged, and retired on a cycle of months. If your team has built habits, scripts, or customer-facing features on top of one, the question is not whether something you use will change, but how much it will cost you when it does.
+
+## Where the real dependency is
+
+Teams usually think of lock-in as the model API. In our client work, the painful dependencies sit elsewhere:
+
+- **Workflow dependency.** Staff rely on a specific tool's UI or shortcuts, and there is no written procedure for the task itself.
+- **Data dependency.** Conversation history, saved prompts, memory, and custom instructions live only inside the product.
+- **Integration dependency.** Internal scripts call an undocumented or beta endpoint.
+- **Knowledge dependency.** Nobody can say what "good output" looked like before the tool existed.
+
+A model swap is usually the easy case. A product shutdown hits the other four.
+
+## Keep a dependency register
+
+We ask clients to maintain a short register of every AI product in use. A plain YAML file in the repository is enough:
+
+```yaml
+- name: browser-agent-tool
+  owner: platform-team
+  used_for: "competitor price checks, weekly"
+  maturity: beta            # ga | beta | preview
+  data_held: [history, saved-tasks]
+  export_path: "manual copy only"
+  replacement: "playwright script + any LLM API"
+  last_reviewed: 2026-10-26
+```
+
+The fields that matter are `maturity`, `export_path`, and `replacement`. If `export_path` says "manual copy only" and `maturity` says beta, you have a risk you can see and rank. If you cannot fill in `replacement`, that is the first thing to work on.
+
+## Put an interface between your code and the tool
+
+For anything that runs in code, wrap the vendor behind your own interface. The point is not abstraction for its own sake; it is that the day a vendor retires a feature, the change is one file.
+
+```ts
+export interface PageReader {
+  fetchText(url: string, signal?: AbortSignal): Promise<string>;
+}
+
+export class PlaywrightReader implements PageReader {
+  async fetchText(url: string, signal?: AbortSignal) {
+    // launch browser, navigate, return visible text
+    throw new Error("implement with your browser automation of choice");
+  }
+}
+
+// Callers depend only on PageReader, never on a vendor SDK.
+export async function priceSnapshot(reader: PageReader, url: string) {
+  const text = await reader.fetchText(url);
+  return { url, length: text.length, capturedAt: new Date().toISOString() };
+}
+```
+
+Callers see `PageReader`. Whether it is backed by a vendor agent, a headless browser, or a fixture in tests is an implementation detail.
+
+## Write down the task, not the tool
+
+The most useful artifact is a plain-language procedure: what input, what steps, what a correct result looks like, and three examples. With that, switching tools becomes a configuration change plus a re-run of the examples. Without it, you are reverse-engineering your own process during an outage.
+
+## A short review routine
+
+Once a quarter, for each entry in the register:
+
+1. Is the product still on the vendor's roadmap? Check announcements, not rumors.
+2. Can you export your data today? Actually try it.
+3. Does the replacement still work? Run the saved examples.
+4. Is anything beta that has become critical? Either move it to a supported path or accept the risk in writing.
+
+## What we recommend
+
+Use new AI products freely for exploration. Be stricter once something becomes part of a weekly process or a customer-facing flow: put an interface in front of it, keep an export path, and keep the task written down. The cost is a few hours up front. The benefit is that a shutdown notice becomes a ticket rather than an incident.
