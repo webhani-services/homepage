@@ -1,0 +1,116 @@
+---
+title: "Amazon ECS Gateway: ALB 공유를 Managed로 제공하는 새 Ingress와 도입 전 확인할 제약"
+description: "AWS가 ECS Service용 Managed Ingress인 ECS Gateway를 공개했습니다. 최대 25개 Service가 하나의 ALB를 추가 요금 없이 공유할 수 있지만, Custom Domain 처리와 ALB 증가 방식은 주의가 필요합니다. 동작 방식과 평가 관점을 정리합니다."
+date: "2026-11-05"
+status: "published"
+tags: ["AWS", "Amazon ECS", "Load Balancer", "Platform Engineering", "Container"]
+thumbnail: ""
+author: "webhani"
+slug: "amazon-ecs-gateway-managed-ingress-2026"
+---
+
+AWS는 10월 20일 ECS Service용 Managed Ingress인 **Amazon ECS Gateway**를 발표했습니다. ECS에서 여러 Service를 운영하는 팀은 대개 "Service마다 ALB를 만든다"와 "하나의 ALB를 Terraform Listener Rule로 직접 공유한다" 중 하나를 골라 왔습니다. ECS Gateway는 그 중간 지점을 AWS가 대신 맡아 주는 선택지입니다.
+
+이 글은 AWS 발표, ECS Developer Guide, InfoQ 기사, 그리고 몇 가지 검증 리포트를 바탕으로 정리했습니다. Quota와 사양은 바뀔 수 있으므로 도입 시점에 공식 문서를 확인하십시오.
+
+## 동작 방식
+
+ECS Gateway는 **Account 수준의 Ingress Resource**입니다. 역할 분담은 다음과 같습니다.
+
+- **Platform 팀**: Gateway를 만들고 Network 설정을 한 번만 정의합니다.
+- **Application 팀**: Service를 생성하거나 업데이트할 때 Gateway Connector를 설정해 참여합니다.
+
+연결된 Service마다 고유한 DNS Hostname이 할당되고, Host 기반 Routing으로 트래픽이 분배됩니다. 주요 사양은 다음과 같습니다.
+
+| 항목 | 내용 |
+| --- | --- |
+| ALB 공유 | ALB 하나당 최대 25개 Service (변경 불가로 알려짐) |
+| Gateway당 ALB 수 | 기본 Quota 10, 최대 200까지 상향 가능 |
+| Network Mode | `awsvpc`만 지원. bridge / host / none은 연결 불가 |
+| Launch Type | EC2, Fargate, ECS Managed Instances |
+| Connector | Service당 1개 |
+| 요금 | Gateway 자체는 무료. 생성되는 ALB 등 Resource 비용만 과금 |
+| 미지원 | Express Mode Service |
+
+검증 리포트에 따르면 Gateway를 만드는 것만으로는 아무것도 Provisioning되지 않고, Connector가 있는 Service가 Deploy될 때 비로소 ALB가 생성됩니다. Connector는 Task Definition의 이름 있는 Port(`portName`)를 참조하므로, 기존 Port Mapping에 이름이 없다면 먼저 추가해야 합니다.
+
+```json
+{
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/api:1.4.2",
+      "portMappings": [
+        { "name": "http", "containerPort": 8080, "protocol": "tcp" }
+      ]
+    }
+  ],
+  "networkMode": "awsvpc"
+}
+```
+
+## 무엇이 편해지는가
+
+지금 ALB를 직접 공유하고 있다면 아마 이런 Terraform 코드가 있을 것입니다.
+
+```hcl
+resource "aws_lb_listener_rule" "orders" {
+  listener_arn = aws_lb_listener.https.arn
+  priority     = 120
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.orders.arn
+  }
+
+  condition {
+    host_header {
+      values = ["orders.internal.example.com"]
+    }
+  }
+}
+```
+
+Rule 하나하나는 단순합니다. 문제는 Service가 늘어날수록 Priority 충돌, 팀 간 Rule 소유권, ALB당 Rule 한도, Certificate 할당 같은 운영상의 조율 비용이 쌓인다는 점입니다. ECS Gateway는 이 조율을 Platform 쪽으로 옮기고, Application 팀은 Connector만 붙이면 되도록 정리합니다.
+
+Service마다 ALB를 유지해 온 소규모 팀이라면, 놀고 있는 Load Balancer의 고정비를 줄인다는 비용 측면의 이점도 있습니다.
+
+## 도입 전에 확인할 제약
+
+### Custom Domain
+
+InfoQ는 문서에 Custom Domain, Route 53, CNAME 처리가 언급되어 있지 않다고 지적했습니다. 생성된 Hostname은 내부 Service 간 통신이나 검증 환경에는 충분합니다. 하지만 고객용 Domain으로 공개하는 Service라면 앞단에 CloudFront나 별도 Proxy를 두는 구성이 될 수 있습니다. Production 외부 공개에 쓰기 전에 Domain과 Certificate 처리를 PoC로 확인하십시오.
+
+### ALB는 줄어들지만 하나로 합쳐지지는 않습니다
+
+25개 Service마다 ALB가 하나씩 추가되므로, ALB 수는 Service 수에 비례해 계속 늘어납니다. InfoQ도 여러 ALB를 관리하긴 하지만 촘촘히 채워 배치하지는 않는다고 지적했습니다. Service가 100개를 넘는 환경이라면 실제 절감 효과를 미리 계산해 보아야 합니다.
+
+### 기존 Ingress와의 공존
+
+이미 Terraform으로 ALB를 공유하고 있다면 한 번에 전부 옮길 필요는 없습니다. 신규 Service부터 Gateway에 올리고, 기존 수작업 Rule은 단계적으로 이전하는 것이 현실적입니다. 그동안 어떤 Service가 어느 경로로 공개되어 있는지 목록으로 관리해 두면 장애 시 원인 파악이 수월해집니다.
+
+우선 현재 운영 중인 ALB 수를 파악하는 것부터 시작하면 좋습니다.
+
+```bash
+# Account 내 Application Load Balancer 목록 조회
+aws elbv2 describe-load-balancers \
+  --query "LoadBalancers[?Type=='application'].[LoadBalancerName,LoadBalancerArn]" \
+  --output table
+```
+
+## webhani의 시각
+
+ECS Gateway는 Kubernetes의 Ingress Controller나 Gateway API에 해당하는 역할을 ECS의 Managed 기능으로 제공하는 것이라고 보면 이해하기 쉽습니다. "Kubernetes를 들일 정도는 아니지만 Service 수는 꽤 늘었다"는 규모의 팀에게 잘 맞는 선택지입니다.
+
+다만 막 출시된 기능이라 Custom Domain처럼 실제 운영에서 반드시 묻게 되는 부분의 정보가 아직 부족합니다. 저희가 고객에게 제안한다면 다음 순서를 염두에 두고 있습니다.
+
+1. 생성된 Hostname으로도 문제없는 내부 API나 검증 환경에서 먼저 시험합니다.
+2. 1~2개월 동안 ALB 수와 비용 변화를 측정합니다.
+3. Domain, Certificate, WAF 처리를 확인한 뒤 외부 공개 Service 적용 여부를 판단합니다.
+
+## 정리
+
+- ECS Gateway는 Platform 팀이 ALB 공유를 한 번 정의하고, Application 팀은 Connector로 참여하는 Model입니다.
+- `awsvpc` Service만 연결할 수 있고, Task Definition의 Port에 이름이 있어야 합니다.
+- ALB 하나가 감당하는 Service는 최대 25개이므로, Service 수에 따라 ALB는 계속 늘어납니다.
+- Custom Domain 처리는 PoC로 확인하고, 내부용 Service부터 도입하는 것이 안전합니다.

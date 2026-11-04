@@ -1,0 +1,123 @@
+---
+title: "GitHub Universe 2026：Copilot Projects と Agent Merge で変わる「マージまでの責任分界」"
+description: "GitHub Universe 2026 で Copilot は補完ツールから、Issue からマージまでを担う agent 基盤へと位置づけが変わりました。Copilot Projects、Agent Merge、code review Max、Connectors の要点と、導入前に整えておきたいリポジトリ側のガードレールを整理します。"
+date: "2026-11-05"
+status: "published"
+tags: ["GitHub Copilot", "AI Agent", "Code Review", "DevOps", "MCP"]
+thumbnail: ""
+author: "webhani"
+slug: "github-universe-2026-copilot-projects-agent-merge"
+---
+
+10月28〜29日にサンフランシスコで開催された GitHub Universe 2026 では、Copilot の発表が中心でした。個々の機能よりも重要なのは方向性です。Copilot は「エディタで提案するもの」から「Issue を受け取り、複数の agent を動かし、Pull Request をマージ可能な状態まで持っていくもの」へと再定義されました。
+
+本記事は GitHub 公式ブログと複数のイベントレポートをもとにまとめています。プレビュー/GA の区分や料金体系はレポートごとに記述が揺れているため、導入判断の前に github.blog/changelog で最新情報を確認してください。
+
+## 発表の要点
+
+**Copilot app**
+agent を使ったソフトウェアデリバリーのために設計された新しいアプリです。複数のプロジェクトにまたがる agent やツールをつなぎ、開発者は一つひとつの受け渡しを手で管理せず、作業の方向づけに集中できる、というのが GitHub の説明です。
+
+**Copilot Projects（パブリックプレビュー）**
+複数のリポジトリ、デザインモック、Slack の議論、議事録などを一つの「Project」にまとめ、Copilot が必要な数の agent を並列に動かして Pull Request などの成果物を返します。単一モデルが一つのタスクを最後まで抱えるのではなく、複数の agent が分担する構成です。
+
+**Copilot Fusion**
+以前 HydraFusion としてプレビューされていたモデルルーティングと協調の仕組みです。GA と報じるメディアもあれば、プレビューとする記事もあります。
+
+**Agent Merge と共有 Automations**
+Pull Request のマージボックスに Agent Merge が加わり、失敗している CI やマージコンフリクトを agent が修正できるようになりました。Copilot Automations はチームで共有でき、Issue のトリアージやコードレビューといった定型作業に agent を割り当てられます。
+
+**Copilot code review Max（パブリックプレビュー）と Connectors**
+code review Max は、異なるモデルプロバイダーの複数のレビュー agent にレビューを依頼し、結果を一つのレビューに統合します。Connectors は GitHub が検証した MCP サーバーで、Slack や Sentry などのツールを各 Copilot クライアントから利用できます。
+
+あわせて、GitHub は Pull Request の 40% 以上が agent によって起票されていると述べています。
+
+## 「40%」が意味すること
+
+Pull Request の起票が agent 側に寄ると、ボトルネックは書く工程からレビューとマージの判断に移ります。私たちが10月に書いた [AI agent でコード量は増えたが成果は横ばい](/blog/ai-agents-more-code-same-output-review-bottleneck-2026-10) という記事でも触れましたが、レビューの体制を変えずに生成量だけを増やすと、レビュー待ちの PR が積み上がるか、確認が甘いままマージされるかのどちらかになりがちです。
+
+Agent Merge はこの流れをさらに一歩進めます。CI を直してコンフリクトを解消するところまで agent が担うなら、「マージボタンを押す直前の状態」を誰が保証するのかを、あらかじめ決めておく必要があります。
+
+## 導入前に整えるリポジトリ側のガードレール
+
+agent 機能は GitHub の設定画面から有効にできますが、守りの設定はリポジトリ側の責任です。私たちが社内やお客様の案件で最初に確認している項目は次のとおりです。
+
+### 1. Ruleset で必須チェックと人間のレビューを固定する
+
+Agent Merge が CI を「通る状態」にしても、その修正自体が妥当かは別問題です。Branch ruleset で、必須ステータスチェックと最低1名の承認を強制しておきます。「最後の push 以降の承認」を必須にしておくと、agent が承認後に追加 commit を入れたケースも検出できます。
+
+### 2. CODEOWNERS で agent に触らせたくない領域を明示する
+
+```text
+# .github/CODEOWNERS
+# 認証・課金・インフラは必ず担当チームのレビューを通す
+/src/auth/            @your-org/security-team
+/src/billing/         @your-org/payments-team
+/infra/               @your-org/platform-team
+/.github/workflows/   @your-org/platform-team
+```
+
+特に `.github/workflows/` は重要です。agent が CI を「直す」過程でワークフロー自体を書き換えると、チェックの意味が失われます。
+
+### 3. agent が作成した PR を見分けるラベルを付ける
+
+レビュー時に「これは agent が書いたものだ」と分かるだけで、確認の観点が変わります。PR の作成者が bot アカウントの場合にラベルを付ける、シンプルなワークフローの例です。対象の bot 名は利用環境に合わせて設定してください。
+
+```yaml
+# .github/workflows/label-agent-pr.yml
+name: Label agent-authored PRs
+on:
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@<full-commit-sha> # v7.x
+        env:
+          AGENT_LOGINS: ${{ vars.AGENT_LOGINS }} # 例: "copilot[bot],other-agent[bot]"
+        with:
+          script: |
+            const agents = (process.env.AGENT_LOGINS || "").split(",").map(s => s.trim());
+            const author = context.payload.pull_request.user.login;
+            if (agents.includes(author)) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ["agent-authored"],
+              });
+            }
+```
+
+`pull_request_target` は PR のコードを checkout しない限り安全に使えます。このワークフローではコードを実行しないため、ラベル付与だけに用途を限定しています。
+
+### 4. Connectors（MCP）は最小権限から始める
+
+Slack や Sentry を agent に接続すると、コンテキストの質は上がります。一方で、外部のテキストが agent への指示として読み込まれる経路も増えます。まずは読み取り専用のスコープで始め、どの Connector がどのリポジトリで使われているかを棚卸しできる状態にしておくのが無難です。
+
+## code review Max の位置づけ
+
+複数モデルによるレビューは、単一モデルの見落としを減らす方法として理にかなっています。ただし、私たちは「人間のレビューの代わり」ではなく「人間が読む前の一次フィルター」として扱うことを勧めます。モデルが指摘しやすいのは局所的なバグやスタイルの問題で、仕様の妥当性やドメイン上の判断は依然として人間の担当です。
+
+運用面では、agent レビューの指摘を必須の解消対象にするかどうかを決めておくと、PR ごとに議論が起きずに済みます。
+
+## webhani の見方
+
+今回の発表で、GitHub は「agent がコードを書く」段階から「agent がデリバリーの流れを回す」段階へ進みました。ツールの選択肢としては魅力的ですが、効果を出せるかどうかはリポジトリの規律に左右されます。
+
+- 必須チェック、承認ルール、CODEOWNERS が整っているチームほど、agent に任せられる範囲を広げやすい
+- テストが薄いリポジトリでは、Agent Merge は「CI を緑にする」ことを最適化してしまう
+- ライセンスや AI クレジットの課金体系は変わりつつあるため、PoC の段階から利用量を計測しておく
+
+## まとめ
+
+- Copilot Projects、Agent Merge、code review Max、Connectors の多くはプレビュー段階です。本番リポジトリでの全面導入は、changelog で正式な提供状況を確認してからにしましょう。
+- 導入前に Ruleset（必須チェック、最後の push 以降の承認）と CODEOWNERS を見直してください。
+- agent が作成した PR を可視化し、レビューの観点を切り替えられるようにしておきましょう。
+- MCP の Connectors は読み取り専用から始め、接続先を棚卸しできる状態を保ちましょう。
+
+agent が起票する PR が全体の半分に近づく前に、マージまでの責任分界を言語化しておくことが、いま取り組むべき一番の準備です。

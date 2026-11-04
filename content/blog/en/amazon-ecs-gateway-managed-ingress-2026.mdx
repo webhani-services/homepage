@@ -1,0 +1,116 @@
+---
+title: "Amazon ECS Gateway: Managed ALB Sharing for ECS, and the Limits to Check First"
+description: "AWS launched ECS Gateway, a managed ingress layer that lets up to 25 ECS services share one ALB at no extra charge. Custom domains and ALB growth still need attention. How it works and how we would evaluate it."
+date: "2026-11-05"
+status: "published"
+tags: ["AWS", "Amazon ECS", "Load Balancing", "Platform Engineering", "Containers"]
+thumbnail: ""
+author: "webhani"
+slug: "amazon-ecs-gateway-managed-ingress-2026"
+---
+
+On October 20, AWS announced **Amazon ECS Gateway**, a managed ingress layer for ECS services. Most teams running several ECS services have chosen between two options: one ALB per service, or a shared ALB managed by hand with listener rules in Terraform. ECS Gateway is AWS taking over the middle ground.
+
+This post draws on the AWS announcement, the ECS developer guide, InfoQ's coverage, and a few hands-on write-ups. Quotas and behavior can change, so check the official docs before adopting it.
+
+## How it works
+
+ECS Gateway is an **account-level ingress resource**. Responsibilities split cleanly:
+
+- **Platform team:** creates the gateway and defines networking once.
+- **Application teams:** add a gateway connector when they create or update a service.
+
+Each connected service gets its own DNS hostname, and traffic is routed by host. The key facts:
+
+| Item | Detail |
+| --- | --- |
+| ALB sharing | Up to 25 services per ALB (reported as not configurable) |
+| ALBs per gateway | Default quota of 10, adjustable up to 200 |
+| Network mode | `awsvpc` only; bridge, host, and none cannot connect |
+| Launch types | EC2, Fargate, ECS Managed Instances |
+| Connectors | One per service |
+| Pricing | No charge for the gateway; you pay for the ALBs and other resources it creates |
+| Not supported | Express Mode services |
+
+According to hands-on reports, creating a gateway provisions nothing. ALBs appear only when a service with a connector deploys. The connector references a named port (`portName`) in the task definition, so if your port mappings have no names, fix that first.
+
+```json
+{
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/api:1.4.2",
+      "portMappings": [
+        { "name": "http", "containerPort": 8080, "protocol": "tcp" }
+      ]
+    }
+  ],
+  "networkMode": "awsvpc"
+}
+```
+
+## What it replaces
+
+If you share an ALB yourself today, you probably have Terraform like this:
+
+```hcl
+resource "aws_lb_listener_rule" "orders" {
+  listener_arn = aws_lb_listener.https.arn
+  priority     = 120
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.orders.arn
+  }
+
+  condition {
+    host_header {
+      values = ["orders.internal.example.com"]
+    }
+  }
+}
+```
+
+Each rule is simple. The overhead grows with service count: priority collisions, unclear ownership of rules across teams, per-ALB rule limits, and certificate assignment. ECS Gateway moves that coordination to the platform side and reduces the application team's job to attaching a connector.
+
+There is also a cost angle for smaller teams that kept one ALB per service and now pay a noticeable fixed cost for idle load balancers.
+
+## Limits to check before adopting
+
+### Custom domains
+
+InfoQ pointed out that the documentation does not mention custom domain names, Route 53, or CNAME records. Generated hostnames are fine for internal service-to-service traffic and test environments. For services exposed on a customer-facing domain, you may end up putting CloudFront or another proxy in front. Confirm how domains and certificates work in a PoC before using it for public production traffic.
+
+### Fewer ALBs, not one ALB
+
+Every 25 services adds another ALB, so the count still grows linearly with services. InfoQ noted that the gateway manages multiple load balancers but does not pack them. If you run more than a hundred services, estimate the actual savings before committing.
+
+### Coexisting with your current ingress
+
+If Terraform already manages a shared ALB, you do not need to move everything at once. Put new services on the gateway and migrate the hand-written rules gradually. In the meantime, keep a list of which services are exposed through which path. It saves time during incidents.
+
+A good first step is to see how many ALBs you run today:
+
+```bash
+# List application load balancers in the account
+aws elbv2 describe-load-balancers \
+  --query "LoadBalancers[?Type=='application'].[LoadBalancerName,LoadBalancerArn]" \
+  --output table
+```
+
+## Our take
+
+It helps to think of ECS Gateway as ECS's managed answer to a Kubernetes Ingress controller or the Gateway API. It fits teams that have outgrown hand-managed ALBs but do not want to adopt Kubernetes.
+
+It is also a brand-new feature, and details that every production setup needs, such as custom domains, are still thin. When we propose it to clients, the order we have in mind is:
+
+1. Start with internal APIs or test environments where a generated hostname is acceptable.
+2. Measure ALB count and cost for one to two months.
+3. Decide on public-facing services after confirming how domains, certificates, and WAF fit in.
+
+## Takeaways
+
+- ECS Gateway lets a platform team define ALB sharing once while application teams opt in with a connector.
+- Only `awsvpc` services can connect, and the task definition port must be named.
+- One ALB serves at most 25 services, so ALB count still grows with your service count.
+- Verify custom domain handling in a PoC, and start with internal services.
