@@ -1,0 +1,104 @@
+---
+title: "Amazon ECS Gateway: Managed, Shared Ingress for ECS — and Where We'd Wait"
+description: "ECS Gateway lets up to 25 ECS services share one AWS-managed Application Load Balancer, with platform teams owning the gateway and app teams opting in through a service connector. How it works, what it saves, and the constraints to check before moving production traffic."
+date: "2026-11-06"
+status: "published"
+tags: ["AWS", "ECS", "Cloud", "Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "amazon-ecs-gateway-shared-alb-ingress-2026-11"
+---
+
+Ingress has long been the most repetitive part of running services on Amazon ECS. Each new service needs a target group, listener rules, a certificate, security group rules, and often its own Application Load Balancer. Teams either copy-paste that Terraform for every service or build an internal module that slowly turns into a platform of its own.
+
+Amazon ECS Gateway, launched on October 20, 2026, is AWS's answer. It is an account-level resource that provisions and manages ALBs, certificates, and security groups on your behalf, lets up to 25 services share a single ALB, and gives each service its own DNS hostname. The gateway itself has no charge; you pay for the underlying load balancers and related resources it creates in your account.
+
+## The ownership model
+
+The design is explicitly split between two roles:
+
+- **Platform team**: creates a gateway, decides whether it's public or private and which VPC and subnets it uses, then associates it with one or more ECS clusters.
+- **Application team**: opts a service in by adding a *gateway connector* that names the container port that should receive traffic.
+
+This mirrors how Kubernetes separates `GatewayClass`/`Gateway` from `HTTPRoute`, and it's the most interesting part of the launch. Application teams no longer touch load balancer resources at all.
+
+## What the setup looks like
+
+The flow below follows the AWS developer guide. The API is new, so check the current CLI reference for exact flag names before scripting it.
+
+First, the task definition needs a **named** port mapping. This field already exists and is also used by Service Connect:
+
+```json
+{
+  "containerDefinitions": [
+    {
+      "name": "web",
+      "image": "123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/web:1.4.2",
+      "portMappings": [
+        { "name": "http", "containerPort": 3000, "protocol": "tcp" }
+      ]
+    }
+  ],
+  "networkMode": "awsvpc"
+}
+```
+
+The platform team creates a gateway with a shared-ALB configuration and associates it with the cluster:
+
+```bash
+aws ecs create-gateway \
+  --name public-web \
+  --configuration '{"hostSharedAlb": {}}'
+  # plus the infrastructure role ARN that lets ECS manage ALBs for you
+
+aws ecs associate-gateway-with-cluster \
+  --gateway public-web \
+  --cluster prod-apps
+```
+
+Then an application team connects its service:
+
+```bash
+aws ecs update-service \
+  --cluster prod-apps \
+  --service pricing-web \
+  --gateway-connectors '[{"portName": "http", "filters": {"accessTypes": ["PUBLIC"]}}]'
+```
+
+`portName` must match a named port in the task definition, or the call fails. A service can have at most one connector.
+
+## What it saves
+
+The obvious win is cost. An ALB has a fixed hourly charge regardless of traffic, so a cluster with 20 small internal services each on its own ALB pays for 20 idle load balancers. Packing them onto one or two shared ALBs removes most of that baseline.
+
+The less obvious win is consistency. When every service builds its own ingress, you get 20 slightly different TLS policies, health check settings, and security group rules. A gateway gives you one place to set them.
+
+## Constraints to check before you migrate
+
+Several behaviours are worth understanding up front. Some come from the AWS documentation and some from early hands-on reports.
+
+**Services connect to every compatible gateway on the cluster.** The connector doesn't name a gateway. If a cluster has both a public and a private gateway, a connector without an access-type filter can attach to both. Always set `filters.accessTypes` explicitly. Early testers confirmed that a `PRIVATE` filter attached the service only to the private gateway.
+
+**Some settings are fixed at creation.** The scheme (internet-facing or internal), VPC, and subnets cannot be changed later. Treat gateway creation like VPC design: decide it once, in code, with review.
+
+**Load balancers appear lazily.** `create-gateway` returns `ACTIVE` immediately, but no ALB exists until the first service connects. The first connection takes noticeably longer than later ones; don't mistake it for a hang in your deploy pipeline.
+
+**Capacity is governed by quotas.** By default a gateway can use up to 10 ALBs, with a service quota that allows more. At 25 services per ALB that's plenty for most teams, but large monorepo-style clusters should check it.
+
+**Domain and tooling support is still catching up.** Early coverage noted that custom domains weren't supported at launch, which limits production use for public-facing services. CloudFormation's `AWS::ECS::Service` lists `GatewayConnectors`, while CDK L2 support was still an open issue at the time of writing. Tools like ecspresso have already added support. Check the state of your own IaC tool before planning around it.
+
+**awsvpc only.** Services must use `awsvpc` networking. That covers Fargate, EC2, and ECS Managed Instances, but older bridge-mode services need to migrate first.
+
+## Where we'd use it now
+
+Based on the current feature set, our recommendation is staged:
+
+1. **Internal tools, staging, and preview environments first.** These are where per-service ALBs waste the most money and where AWS-generated hostnames are acceptable.
+2. **Internal service-to-service HTTP endpoints next**, using a private gateway, if you don't already use Service Connect for that traffic.
+3. **Public production traffic last**, once custom domain support and your IaC tooling are where you need them. Keep existing ALBs for these services until then.
+
+If you already maintain a well-tested in-house Terraform module for ECS ingress, there is no urgency. If you're about to build one, it's worth evaluating ECS Gateway first.
+
+## Takeaway
+
+ECS Gateway removes a lot of repetitive infrastructure and introduces a clean split between platform and application responsibilities. It's also new, and a few of its defaults, especially automatic attachment to every compatible gateway, can surprise you. Start with non-production workloads, always set access-type filters, and keep gateway creation under the same review process as your networking code.

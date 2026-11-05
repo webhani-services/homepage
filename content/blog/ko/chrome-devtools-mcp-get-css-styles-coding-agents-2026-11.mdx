@@ -1,0 +1,89 @@
+---
+title: "Chrome DevTools MCP에 get_css_styles 추가 — Coding Agent가 드디어 Cascade를 볼 수 있게 되었습니다"
+description: "Chrome DevTools for agents에 매칭된 Rule, 상속된 Style, Override된 선언, at-rule을 반환하는 get_css_styles Tool이 추가되었습니다. AI 기반 CSS 수정에서 자주 생기는 실패를 왜 막을 수 있는지, Claude Code에 연결하는 방법, 그리고 출력 결과를 그대로 믿으면 안 되는 지점을 정리합니다."
+date: "2026-11-06"
+status: "published"
+tags: ["AI", "Chrome DevTools", "MCP", "CSS", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "chrome-devtools-mcp-get-css-styles-coding-agents-2026-11"
+---
+
+Coding Agent에게 "버튼 여백 좀 고쳐줘"라고 요청해 본 분이라면 익숙한 장면이 있을 겁니다. Agent는 그럴듯한 Rule을 수정하고 "수정했습니다"라고 보고하지만 화면은 그대로입니다. 다른 파일에 있는 더 구체적인 Selector가 Cascade에서 이기고 있기 때문입니다. Agent가 읽은 것은 Source Code이지, Browser가 실제로 적용한 Style이 아닙니다.
+
+Chrome DevTools 팀의 2026년 11월 업데이트는 바로 이 간극을 겨냥합니다. Agent가 실제 Chrome을 조작할 수 있게 해주는 DevTools MCP Server에 `get_css_styles` Tool이 추가되었습니다. 선택한 요소에 대해 매칭된 Rule, 상속된 Rule, Override된 선언, Pseudo-element, `@keyframes` 및 기타 at-rule을 반환하며, 결과가 클 때를 위한 Pagination도 지원합니다. 한마디로 Agent가 추측 대신 Styles 패널을 직접 보게 된 것입니다.
+
+## Source만으로 CSS를 판단할 수 없는 이유
+
+CSS는 코드를 읽는 것만으로는 결과를 알 수 없는 몇 안 되는 영역입니다. Property의 최종 값은 다음 요소들로 결정됩니다.
+
+- 로드된 모든 Stylesheet에 걸친 Selector 명시도(Specificity)와 Source 순서
+- Cascade Layer(`@layer`)와 그 선언 순서
+- `!important`, 상속, Runtime에 해석되는 Custom Property
+- 현재 Viewport 기준으로 평가되는 Media Query / Container Query
+- Third-party Script나 Component Library가 주입하는 Style
+
+Component 파일 하나만 보는 Model은 이 중 극히 일부만 볼 수 있습니다. 흔한 함정을 예로 들어 보겠습니다.
+
+```css
+/* components/button.css */
+.btn-primary {
+  padding: 12px 24px;
+}
+
+/* vendor/theme.css (나중에 로드됨) */
+.card .actions button {
+  padding: 4px 8px;
+}
+```
+
+Agent는 `.btn-primary`를 수정하지만, Theme 쪽 자손 Selector의 명시도가 더 높아서(0,2,1 대 0,1,0) 그쪽이 이깁니다. `get_css_styles`를 사용하면 `.btn-primary` 선언이 Override된 것으로 표시되고, 이기고 있는 Rule과 그 파일 위치까지 확인할 수 있습니다. Layer를 조정할지, Theme의 Scope를 좁힐지, 의도적으로 명시도를 올릴지 같은 올바른 수정 방향을 Agent가 근거를 갖고 판단할 수 있게 됩니다.
+
+## Claude Code에서 설정하기
+
+DevTools MCP Server는 `npx`로 실행합니다. Claude Code에는 한 줄로 추가할 수 있습니다.
+
+```bash
+claude mcp add chrome-devtools -- npx chrome-devtools-mcp@latest --isolated
+```
+
+`--isolated` Flag를 주면 종료 시 폐기되는 임시 Profile로 Chrome이 실행됩니다. 이를 기본값으로 쓰기를 권장합니다. 평소 쓰는 Browser Profile을 Agent가 조작하면 로그인되어 있는 모든 Session에 접근할 수 있기 때문입니다.
+
+새 Tool을 잘 활용하는 Prompt는 대상 요소와 기대 결과를 구체적으로 지정합니다.
+
+```text
+http://localhost:3000/pricing 을 열어 주세요.
+Snapshot을 찍고 Pro 카드의 "Start trial" 버튼을 찾아 주세요.
+그 버튼에 get_css_styles를 사용해서 padding을 결정하는 Rule,
+Override된 Rule, 그리고 각각이 정의된 파일을 알려 주세요.
+아직 파일은 수정하지 마세요.
+```
+
+수정 전에 진단부터 시키는 것이 핵심입니다. Agent는 바로 CSS를 작성하려는 경향이 있는데, 먼저 Cascade 결과를 읽게 하면 Diff가 작고 정확해집니다.
+
+## Frontend Workflow에서의 활용
+
+실무에서 효과가 큰 활용처는 세 가지로 봅니다.
+
+**1. "수정했는데 아무것도 안 바뀌어요" Debugging.** 가장 가치가 큰 경우입니다. 자신의 Rule이 적용되었는지, Override되었는지, 아예 매칭되지 않았는지는 완전히 다른 문제인데, Agent가 이를 구분할 수 있게 됩니다.
+
+**2. Design System Migration.** Legacy Stylesheet에서 Tailwind나 Token 기반 체계로 옮길 때, 기존 페이지의 Component를 검사해 실제 적용 값을 목록화하고 새 구현이 같은 값을 내는지 검증할 수 있습니다. Screenshot을 눈으로 비교하는 것보다 훨씬 정밀한 Loop입니다.
+
+**3. Agent가 만든 UI Review.** Agent가 Component를 만든 뒤 `get_css_styles`로 한 번 더 확인하면, Token으로 바꿔야 할 Hardcoded 값이나 항상 다른 Rule에 밀려 사실상 죽어 있는 Rule을 찾아낼 수 있습니다.
+
+## 염두에 둘 한계
+
+Tool의 Skill 문서는 Agent에게 출력을 "권위 있고 완전한 정보"로 다루라고 안내합니다. 그 순간의 요소와 페이지 상태에 대해서는 타당합니다. 다만 "그 순간"에는 많은 전제가 깔려 있습니다.
+
+- **Viewport와 상태.** 결과는 현재 창 크기, Color Scheme, Interaction 상태를 반영합니다. 375px 폭이나 Dark Mode, `:hover` 상태에서만 생기는 Bug는 Agent가 그 상태를 먼저 만들지 않으면 드러나지 않습니다. 명시적으로 요청하십시오.
+- **동적 Style.** Interaction 이후 JavaScript로 전환되는 Style은 해당 동작을 실행한 뒤에 검사해야 합니다.
+- **Browser 기준으로는 정확하지만 의도까지 알려주지는 않습니다.** Tool이 알려주는 것은 "무엇이 이기고 있는가"이지 "무엇이 이겨야 하는가"가 아닙니다. Theme를 고칠지 Component를 고칠지는 여전히 설계 판단입니다.
+- **큰 페이지.** Pagination이 있는 것은 결과가 커질 수 있기 때문입니다. 무거운 페이지에서는 Token 소모도 늘어나므로, 페이지 전체가 아니라 특정 요소로 범위를 좁히는 것이 현실적입니다.
+
+보안 측면도 있습니다. Browser를 조작하는 Agent는 그 Browser가 닿을 수 있는 모든 것을 읽을 수 있습니다. 대상은 Local이나 Staging 환경으로 한정하고, Isolated Profile을 사용하며, 운영 Admin 도구의 Session은 넘기지 마십시오.
+
+## webhani의 관점
+
+많은 AI Coding 도구는 Logic에는 강하지만 Layout에는 약했습니다. Layout의 정확성이 Repository가 아니라 Browser 안에 있다는 점이 그 이유 중 하나입니다. Cascade에 대한 구조화된 Access를 Agent에게 주는 것은 이 간극을 좁히는 의미 있는 진전이며, 이미 MCP를 쓰는 팀이라면 도입 비용도 거의 들지 않습니다.
+
+저희가 지원하는 팀에는 간단한 규칙을 제안합니다. CSS Bug라면 수정 전에 반드시 해당 요소에 `get_css_styles`를 호출할 것. 작업당 몇 초가 늘어날 뿐이지만, "고쳤는데 그대로예요"라는 반복을 통째로 없앨 수 있습니다.

@@ -1,0 +1,104 @@
+---
+title: "Amazon ECS Gateway — ECS를 위한 Managed 공유 Ingress, 그리고 아직 기다려야 할 부분"
+description: "ECS Gateway를 사용하면 최대 25개의 ECS Service가 AWS가 관리하는 Application Load Balancer 하나를 공유할 수 있습니다. Platform 팀이 Gateway를 소유하고 Application 팀은 Service의 Connector로 Opt-in하는 구조입니다. 동작 방식, 절감 효과, 운영 Traffic을 옮기기 전에 확인할 제약 사항을 정리합니다."
+date: "2026-11-06"
+status: "published"
+tags: ["AWS", "ECS", "Cloud", "Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "amazon-ecs-gateway-shared-alb-ingress-2026-11"
+---
+
+Amazon ECS에서 Service를 운영할 때 Ingress는 오랫동안 가장 반복적인 작업이었습니다. 새 Service마다 Target Group, Listener Rule, 인증서, Security Group Rule, 경우에 따라서는 전용 Application Load Balancer(ALB)가 필요합니다. 그래서 대부분의 팀은 Service마다 Terraform을 복사하거나, 사내 Module을 만들다가 그것이 점점 하나의 Platform으로 커지는 길을 걸어 왔습니다.
+
+2026년 10월 20일 출시된 Amazon ECS Gateway는 이 문제에 대한 AWS의 답입니다. Account 단위 Resource로서 ALB, 인증서, Security Group을 대신 Provisioning하고 관리하며, 최대 25개 Service가 ALB 하나를 공유할 수 있고, Service마다 고유한 DNS Hostname이 부여됩니다. Gateway 자체는 무료이고, Account에 생성되는 Load Balancer 등 기반 Resource 비용만 청구됩니다.
+
+## 책임 분담 Model
+
+설계는 두 역할로 명확히 나뉩니다.
+
+- **Platform 팀**: Gateway를 생성하고, Public/Private 여부와 사용할 VPC, Subnet을 정한 뒤 하나 이상의 ECS Cluster에 연결합니다.
+- **Application 팀**: Traffic을 받을 Container Port를 지정한 *Gateway Connector*를 Service에 추가해 Opt-in합니다.
+
+Kubernetes가 `GatewayClass`/`Gateway`와 `HTTPRoute`를 분리하는 방식과 닮았는데, 저희는 이 부분이 이번 출시에서 가장 흥미로운 점이라고 봅니다. Application 팀은 Load Balancer Resource를 전혀 건드리지 않아도 됩니다.
+
+## Setup 흐름
+
+아래 흐름은 AWS Developer Guide를 기준으로 했습니다. 새로 나온 API이므로 Script로 만들기 전에 최신 CLI Reference에서 Flag 이름을 꼭 확인하십시오.
+
+먼저 Task Definition에 **이름이 붙은** Port Mapping이 필요합니다. 기존에 있던 Field이며 Service Connect에서도 사용합니다.
+
+```json
+{
+  "containerDefinitions": [
+    {
+      "name": "web",
+      "image": "123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/web:1.4.2",
+      "portMappings": [
+        { "name": "http", "containerPort": 3000, "protocol": "tcp" }
+      ]
+    }
+  ],
+  "networkMode": "awsvpc"
+}
+```
+
+Platform 팀은 공유 ALB 구성으로 Gateway를 만들고 Cluster에 연결합니다.
+
+```bash
+aws ecs create-gateway \
+  --name public-web \
+  --configuration '{"hostSharedAlb": {}}'
+  # 그 밖에 ECS가 ALB를 관리할 수 있도록 Infrastructure Role ARN을 지정합니다
+
+aws ecs associate-gateway-with-cluster \
+  --gateway public-web \
+  --cluster prod-apps
+```
+
+이후 Application 팀이 Service를 연결합니다.
+
+```bash
+aws ecs update-service \
+  --cluster prod-apps \
+  --service pricing-web \
+  --gateway-connectors '[{"portName": "http", "filters": {"accessTypes": ["PUBLIC"]}}]'
+```
+
+`portName`이 Task Definition의 이름 붙은 Port와 일치하지 않으면 호출이 실패합니다. Service 하나에는 Connector를 최대 하나만 설정할 수 있습니다.
+
+## 무엇을 절감할 수 있나
+
+가장 눈에 띄는 것은 비용입니다. ALB는 Traffic과 무관하게 시간당 고정 요금이 붙기 때문에, 작은 사내 Service 20개가 각자 ALB를 가진 Cluster라면 사실상 놀고 있는 Load Balancer 20대 값을 내고 있는 셈입니다. 이를 공유 ALB 한두 대로 모으면 기본 비용의 대부분이 사라집니다.
+
+덜 눈에 띄지만 중요한 것은 일관성입니다. Service마다 Ingress를 따로 만들면 TLS Policy, Health Check 설정, Security Group Rule이 20가지로 조금씩 달라지기 쉽습니다. Gateway가 있으면 이를 한곳에서 정할 수 있습니다.
+
+## Migration 전에 확인할 제약 사항
+
+미리 이해해 둘 동작이 몇 가지 있습니다. 일부는 AWS 문서에서, 일부는 초기 실사용 Report에서 확인된 내용입니다.
+
+**Service는 Cluster의 호환되는 모든 Gateway에 연결됩니다.** Connector에서 Gateway를 이름으로 지정하지 않습니다. Cluster에 Public과 Private Gateway가 모두 있다면, Access Type Filter가 없는 Connector는 양쪽에 붙을 수 있습니다. `filters.accessTypes`는 항상 명시하십시오. 초기 검증에서는 `PRIVATE`를 지정한 Service가 Private Gateway에만 연결된 것으로 확인되었습니다.
+
+**생성 시 고정되는 설정이 있습니다.** Scheme(internet-facing/internal), VPC, Subnet은 나중에 바꿀 수 없습니다. Gateway 생성은 VPC 설계처럼 Code로 한 번 정하고 Review를 거치는 대상으로 다뤄야 합니다.
+
+**Load Balancer는 지연 생성됩니다.** `create-gateway`는 즉시 `ACTIVE`를 반환하지만, 첫 Service가 연결될 때까지 ALB는 존재하지 않습니다. 첫 연결은 이후 연결보다 눈에 띄게 오래 걸리므로 Deploy Pipeline이 멈춘 것으로 오해하지 않도록 주의하십시오.
+
+**용량은 Quota로 관리됩니다.** 기본적으로 Gateway 하나가 사용할 수 있는 ALB는 최대 10대이며, Service Quota로 더 늘릴 수 있습니다. ALB당 25개 Service라면 대부분의 팀에는 충분하지만, 대규모 Cluster라면 확인해 두는 것이 좋습니다.
+
+**Domain과 Tool 지원은 아직 따라오는 중입니다.** 초기 보도에서는 출시 시점에 Custom Domain이 지원되지 않아 외부 공개 Service의 운영 사용에 제약이 있다고 지적했습니다. CloudFormation의 `AWS::ECS::Service`에는 `GatewayConnectors`가 명시되어 있지만, CDK L2 지원은 작성 시점 기준으로 Issue가 열려 있는 상태였습니다. ecspresso처럼 이미 지원을 추가한 Tool도 있습니다. 사용하는 IaC Tool의 지원 상황을 먼저 확인하십시오.
+
+**awsvpc만 지원합니다.** Service는 `awsvpc` Network Mode여야 합니다. Fargate, EC2, ECS Managed Instances는 모두 해당되지만, Bridge Mode의 오래된 Service는 먼저 전환이 필요합니다.
+
+## 지금 어디에 쓸 것인가
+
+현재 기능을 기준으로 webhani는 단계적 도입을 권장합니다.
+
+1. **사내 Tool, Staging, Preview 환경부터.** Service별 ALB 낭비가 가장 크고, AWS가 생성한 Hostname이어도 문제가 되지 않는 영역입니다.
+2. **다음은 사내 Service 간 HTTP Endpoint.** 해당 Traffic에 Service Connect를 아직 쓰지 않는다면 Private Gateway로 처리합니다.
+3. **외부 공개 운영 Traffic은 마지막.** Custom Domain 지원과 IaC Tool 대응이 갖춰질 때까지는 기존 ALB를 유지합니다.
+
+이미 잘 Test된 사내 Terraform Module로 ECS Ingress를 관리하고 있다면 서두를 필요는 없습니다. 이제 막 만들려는 참이라면 ECS Gateway를 먼저 검토해 볼 가치가 있습니다.
+
+## 정리
+
+ECS Gateway는 반복적인 Infrastructure 작업을 크게 줄이고 Platform과 Application의 책임을 깔끔하게 나눠 줍니다. 동시에 새로운 Service이기도 해서, 특히 "호환되는 모든 Gateway에 자동 연결"되는 기본 동작은 예상치 못한 결과를 낳을 수 있습니다. 비운영 Workload부터 시작하고, Access Type Filter를 항상 설정하며, Gateway 생성은 Network Code와 같은 Review 절차에 두십시오.
