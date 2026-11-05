@@ -1,0 +1,104 @@
+---
+title: "Amazon ECS Gateway — ECS 向けマネージド共有 Ingress と、まだ待つべき場面"
+description: "ECS Gateway を使うと、最大 25 の ECS サービスが AWS 管理の Application Load Balancer を 1 台共有できます。Platform チームが Gateway を持ち、アプリチームはサービスの Connector でオプトインする構成です。仕組み、削減できるもの、本番トラフィックを移す前に確認すべき制約を整理します。"
+date: "2026-11-06"
+status: "published"
+tags: ["AWS", "ECS", "Cloud", "Infrastructure", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "amazon-ecs-gateway-shared-alb-ingress-2026-11"
+---
+
+Amazon ECS でサービスを運用するうえで、Ingress は長らく最も繰り返しの多い作業でした。新しいサービスを作るたびに、ターゲットグループ、リスナールール、証明書、セキュリティグループのルール、場合によっては専用の Application Load Balancer (ALB) が必要になります。サービスごとに Terraform をコピーするか、社内モジュールを作り、それが少しずつ独自のプラットフォームに育っていく。多くのチームがどちらかの道をたどってきました。
+
+2026 年 10 月 20 日にリリースされた Amazon ECS Gateway は、この課題に対する AWS の回答です。アカウント単位のリソースで、ALB・証明書・セキュリティグループを代わりにプロビジョニング・管理し、最大 25 のサービスで 1 台の ALB を共有でき、サービスごとに固有の DNS ホスト名が割り当てられます。Gateway 自体は無料で、アカウント内に作成される Load Balancer などの基盤リソース分だけ課金されます。
+
+## 責任分担のモデル
+
+設計は明確に 2 つの役割に分かれています。
+
+- **Platform チーム**: Gateway を作成し、public / private の別、使用する VPC とサブネットを決め、1 つ以上の ECS クラスタに関連付けます。
+- **アプリケーションチーム**: トラフィックを受けるコンテナポートを指定した *Gateway Connector* をサービスに追加して、オプトインします。
+
+Kubernetes が `GatewayClass` / `Gateway` と `HTTPRoute` を分けているのとよく似た構造で、今回のリリースで最も興味深い点だと考えています。アプリチームは Load Balancer のリソースに一切触れなくて済みます。
+
+## セットアップの流れ
+
+以下は AWS の開発者ガイドに沿った流れです。API が新しいため、スクリプト化する前に最新の CLI リファレンスでフラグ名を確認してください。
+
+まず、タスク定義に **名前付き** のポートマッピングが必要です。このフィールドは既存のもので、Service Connect でも使われています。
+
+```json
+{
+  "containerDefinitions": [
+    {
+      "name": "web",
+      "image": "123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/web:1.4.2",
+      "portMappings": [
+        { "name": "http", "containerPort": 3000, "protocol": "tcp" }
+      ]
+    }
+  ],
+  "networkMode": "awsvpc"
+}
+```
+
+Platform チームは共有 ALB 構成の Gateway を作成し、クラスタに関連付けます。
+
+```bash
+aws ecs create-gateway \
+  --name public-web \
+  --configuration '{"hostSharedAlb": {}}'
+  # ほかに、ECS が ALB を管理するための Infrastructure Role の ARN を指定します
+
+aws ecs associate-gateway-with-cluster \
+  --gateway public-web \
+  --cluster prod-apps
+```
+
+その後、アプリチームがサービスを接続します。
+
+```bash
+aws ecs update-service \
+  --cluster prod-apps \
+  --service pricing-web \
+  --gateway-connectors '[{"portName": "http", "filters": {"accessTypes": ["PUBLIC"]}}]'
+```
+
+`portName` はタスク定義の名前付きポートと一致していなければ失敗します。1 つのサービスに設定できる Connector は最大 1 つです。
+
+## 何が削減できるのか
+
+わかりやすいのはコストです。ALB にはトラフィック量に関係なく時間単位の固定料金がかかるため、小さな社内サービス 20 個がそれぞれ ALB を持つクラスタでは、ほぼ遊んでいる Load Balancer 20 台分を払っていることになります。1〜2 台の共有 ALB にまとめれば、そのベースコストの大半がなくなります。
+
+もう一つは一貫性です。サービスごとに Ingress を作ると、TLS ポリシー、ヘルスチェック設定、セキュリティグループのルールが 20 通り微妙に異なる状態になりがちです。Gateway があれば、それらを 1 か所で決められます。
+
+## 移行前に確認すべき制約
+
+最初に理解しておきたい挙動がいくつかあります。AWS のドキュメントによるものと、初期の検証レポートによるものがあります。
+
+**サービスはクラスタ上の互換性のあるすべての Gateway に接続される。** Connector では Gateway を名前で指定しません。クラスタに public と private の Gateway が両方あると、アクセスタイプのフィルタを付けていない Connector は両方に接続されることがあります。`filters.accessTypes` は必ず明示しましょう。初期の検証では、`PRIVATE` を指定したサービスは private Gateway にだけ接続されたと報告されています。
+
+**作成時に固定される設定がある。** スキーム (internet-facing / internal)、VPC、サブネットは後から変更できません。Gateway の作成は VPC 設計と同じように、コードで一度だけ決め、レビューを通す対象として扱うべきです。
+
+**Load Balancer は遅延作成される。** `create-gateway` はすぐに `ACTIVE` を返しますが、最初のサービスが接続するまで ALB は存在しません。最初の接続は以降の接続より明らかに時間がかかるため、Deploy パイプラインのハングと勘違いしないよう注意が必要です。
+
+**キャパシティはクォータで管理される。** デフォルトでは 1 つの Gateway が使える ALB は最大 10 台で、サービスクォータでさらに増やせます。ALB あたり 25 サービスなら大半のチームには十分ですが、大規模なクラスタでは確認しておきましょう。
+
+**ドメインとツールのサポートはまだ追いついていない。** 初期の報道では、リリース時点ではカスタムドメインが未対応で、公開サービスの本番利用には制約があると指摘されています。CloudFormation の `AWS::ECS::Service` には `GatewayConnectors` が記載されていますが、CDK の L2 サポートは執筆時点では Issue が開いたままでした。ecspresso のようにすでに対応したツールもあります。自社の IaC ツールの対応状況を確認してから計画してください。
+
+**awsvpc のみ対応。** サービスは `awsvpc` ネットワークモードである必要があります。Fargate、EC2、ECS Managed Instances はカバーされますが、bridge モードの古いサービスは先に移行が必要です。
+
+## 今どこで使うか
+
+現在の機能セットを踏まえ、webhani としては段階的な導入をおすすめします。
+
+1. **まず社内ツール、ステージング、プレビュー環境。** サービスごとの ALB が最も無駄になりやすく、AWS が生成するホスト名でも問題になりにくい領域です。
+2. **次に社内のサービス間 HTTP エンドポイント。** そのトラフィックにまだ Service Connect を使っていなければ、private Gateway で対応します。
+3. **公開向けの本番トラフィックは最後に。** カスタムドメインのサポートや IaC ツールの対応が整うまでは、既存の ALB を維持します。
+
+よくテストされた社内 Terraform モジュールで ECS の Ingress をすでに管理しているなら、急ぐ必要はありません。これから作ろうとしているなら、先に ECS Gateway を評価する価値があります。
+
+## まとめ
+
+ECS Gateway は繰り返しの多いインフラ作業を大きく減らし、Platform とアプリケーションの責任をきれいに分けてくれます。一方で新しいサービスでもあり、特に「互換性のあるすべての Gateway に自動接続される」といったデフォルトの挙動には驚かされる可能性があります。非本番ワークロードから始め、アクセスタイプのフィルタを必ず設定し、Gateway の作成はネットワークのコードと同じレビュー体制に置く。この 3 点を押さえておけば、安全に試せるはずです。
