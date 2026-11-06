@@ -1,0 +1,118 @@
+---
+title: "The eMudhra Certificate Compromise: Why Patching the OS Isn't Enough for JetBrains IDEs and Your Runtimes"
+description: "JetBrains shipped updates after private keys for eight eMudhra intermediate certificates were compromised, noting that an OS update alone won't protect its tools. The same blind spot exists in JVMs, Node.js, Python, and container images. How to audit bundled trust stores across your stack."
+date: "2026-11-07"
+status: "published"
+tags: ["Security", "TLS", "PKI", "DevOps", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "jetbrains-emudhra-bundled-trust-store-audit-2026-11"
+---
+
+At the end of October, JetBrains published a security advisory after the private keys of eight eMudhra intermediate certificates were compromised. Anyone holding those keys could issue TLS certificates that chain to a trusted root for arbitrary domains, which is exactly what you need to impersonate a server. JetBrains released updated builds of its IDEs, ReSharper, .NET tools, Toolbox App, and Gateway, along with a fix for its background service (`jetbrainsd` 0.9.9728 or later). At the time of publishing, JetBrains said it was not aware of any exploitation against its users.
+
+One line in the advisory deserves more attention than the incident itself: **updating your operating system won't fix this**. JetBrains tools run on the bundled JetBrains Runtime, which keeps its own list of trusted certificates.
+
+If that is true for your IDE, it is probably true for several other things in your stack.
+
+## Who actually decides what you trust
+
+Most developers assume "the system" decides which certificate authorities are trusted. In practice, it depends on the runtime:
+
+| Runtime | Default trust source | Updated by OS patching? |
+| --- | --- | --- |
+| JetBrains IDEs (JBR) | Bundled `cacerts` | No |
+| Java / JVM apps | JDK `cacerts` | Only with distro-packaged JDKs that link to the system store |
+| Node.js | Mozilla CA list compiled into the binary | No, unless `--use-system-ca` is enabled |
+| Python `requests` | `certifi` package | No, it updates with `pip` |
+| Go on Linux | System store (`/etc/ssl/certs`) | Yes |
+| Container images | `ca-certificates` package inside the image | Only when you rebuild |
+| Electron apps | Chromium's root store | Updated with app releases |
+
+When a CA incident happens, every row that says "No" is a separate remediation task with a separate owner.
+
+## Auditing each layer
+
+The eMudhra roots in public trust stores are branded **emSign**, so search for both names.
+
+### JVM and JetBrains Runtime
+
+```bash
+# Any JDK on the PATH
+keytool -list -cacerts -storepass changeit 2>/dev/null | grep -iE 'emudhra|emsign'
+
+# The JetBrains Runtime bundled with an IDE (macOS example)
+JBR="/Applications/IntelliJ IDEA.app/Contents/jbr/Contents/Home"
+"$JBR/bin/keytool" -list -keystore "$JBR/lib/security/cacerts" \
+  -storepass changeit | grep -iE 'emudhra|emsign'
+```
+
+A match in the root list doesn't mean you're exploitable. The compromised certificates are intermediates, and JetBrains' fix works by distrusting the affected chain. What the check gives you is a list of every JVM on the machine, each with its own trust store, and that is usually longer than people expect.
+
+### Node.js
+
+Node ships Mozilla's root list inside the binary. You can inspect it directly:
+
+```javascript
+// list-roots.mjs
+import { rootCertificates } from "node:tls";
+import { X509Certificate } from "node:crypto";
+
+const matches = rootCertificates
+  .map((pem) => new X509Certificate(pem))
+  .filter((c) => /emudhra|emsign/i.test(c.subject));
+
+for (const c of matches) {
+  console.log(c.subject.replace(/\n/g, ", "), "| expires", c.validTo);
+}
+console.log(`${matches.length} matching roots in Node ${process.version}`);
+```
+
+Since the bundled list only changes when you upgrade Node, a CA distrust decision reaches your service when you ship a new Node version, not when the OS gets patched. For servers that should follow the organization's trust policy, recent Node releases support `--use-system-ca` (or `NODE_USE_SYSTEM_CA=1`), so a single OS-level change applies everywhere.
+
+### Python
+
+```bash
+python -c "import certifi; print(certifi.where())" \
+  | xargs grep -iE '^# (Issuer|Subject):.*(emudhra|emsign)'
+```
+
+`certifi` updates when you bump the package, which means your lockfile effectively controls your trust store. If your organization manages trust centrally, the `truststore` package (or `SSL_CERT_FILE` pointing at the system bundle) moves Python onto the OS store.
+
+### Container images
+
+```dockerfile
+FROM node:24-bookworm-slim
+# Pull the current CA bundle at build time
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && update-ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+ENV NODE_USE_SYSTEM_CA=1
+```
+
+An image built three months ago carries a three-month-old trust store. The only fix is a rebuild, which is one more reason to rebuild images on a schedule even when application code hasn't changed.
+
+## What to do this week
+
+For JetBrains users specifically:
+
+1. Update IDEs, Toolbox App, Gateway, and ReSharper to the fixed builds listed in JetBrains' advisory.
+2. Confirm the background daemon is at 0.9.9728 or later.
+3. Older IDE versions don't receive the fix. If you are pinned to one, plan the upgrade now.
+4. JetBrains warns that, in rare cases, a server whose certificate chains to a removed root will start failing to connect. If an internal service breaks after the update, the right fix is to reissue that server's certificate, not to add the old root back.
+
+For the broader stack, make one inventory: every runtime that terminates or initiates TLS, where its trust store comes from, and who updates it. In our client work, this exercise usually turns up a handful of forgotten JVMs, a few years-old base images, and at least one service that disables verification "temporarily".
+
+## Our take
+
+Certificate authority incidents are rare, but when one happens the response depends entirely on preparation you did beforehand. The eMudhra case is mild: the vendor is responsive, and no exploitation has been reported. Treat it as a free rehearsal.
+
+Our recommendations:
+
+- Prefer runtimes that follow the OS trust store on servers (`--use-system-ca`, `truststore`, distro-packaged JDKs), so one change covers the fleet.
+- Rebuild container images on a schedule, not only when code changes.
+- Record the trust-store source as part of your SBOM or service catalog.
+- Ban `NODE_TLS_REJECT_UNAUTHORIZED=0`, `verify=False`, and their equivalents in CI with a simple grep rule.
+
+Patching a developer tool takes minutes. Knowing which of your fifty services trusts what is the work that pays off next time.
