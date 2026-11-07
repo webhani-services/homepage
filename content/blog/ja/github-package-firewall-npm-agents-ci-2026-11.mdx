@@ -1,0 +1,99 @@
+---
+title: "GitHub Package Firewall を評価する: npm Install を「設定」ではなく「経路」で守る"
+description: "GitHub が Public Preview として公開した Package Firewall は、npm の Install 時に Policy を強制する Proxy です。Client 側の Cooldown 設定との違い、Coding Agent や CI での位置付け、導入時に塞ぐべき Bypass 経路を整理します。"
+date: "2026-11-08"
+status: "published"
+tags: ["Security", "npm", "Supply Chain", "GitHub", "AI Agent"]
+thumbnail: ""
+author: "webhani"
+slug: "github-package-firewall-npm-agents-ci-2026-11"
+---
+
+npm の Supply Chain 攻撃への対策として、ここ 1 年ほどで Lockfile の徹底、Install Script の制限、新しい Version を一定期間入れない Cooldown が定着してきました。ただ、これらの多くは **各 Client の設定** に依存しています。開発者の Laptop、CI Runner、そして最近では Coding Agent が、それぞれ正しく設定されていることを前提にしているわけです。
+
+GitHub は 2026年10月20日、この前提を変える **Package Firewall** を Public Preview として公開しました。本記事では、GitHub の Changelog と各種報道で確認できた範囲で機能を整理し、webhani として導入を検討する際の観点をまとめます。
+
+## 何をするものか
+
+Package Firewall は、開発者の Endpoint(または社内 Registry)と Upstream の npm Registry の間に入る Proxy です。Metadata の Request と Package の Download の両方を検査し、Enterprise 単位で設定した Policy に従って Install を許可または Block します。
+
+報道されている主な Policy は次のとおりです。
+
+- GitHub Advisory Database の Malware Advisory に該当する Package の Block
+- 指定した Severity 以上の脆弱性 Advisory がある Version の Block(Default は Critical のみとの報道)
+- 公開されたばかりの Version を一定期間入れない Cooldown
+- Attestation の Downgrade など、Supply Chain の整合性に関する Check
+
+誤検知で正規の Package が Block された場合は、利用者が例外を申請できる Workflow が用意されています。
+
+提供条件は以下のとおりです。
+
+- 対象は GitHub Enterprise Cloud(Data Residency 環境を含む)
+- 現時点では npm のみ対応
+- Preview 期間中は無料、GA 時に従量課金を予定
+
+## Client 設定との違い
+
+npm 自体にも、`.npmrc` で設定できる Release Age の制限など、Client 側の防御策が増えています。
+
+```ini
+# .npmrc(Client 側の Cooldown の例。対応 Version と単位は npm の公式 Docs で確認してください)
+min-release-age=7
+```
+
+こうした設定は有効ですが、次のような弱点があります。
+
+- 設定されていない Machine や Container では効かない
+- `npm` 以外の Client や、独自の Script で直接 Tarball を取得する処理には効かない
+- Coding Agent が新しい環境を立ち上げたとき、設定が引き継がれるとは限らない
+- 組織として「本当に全員に適用されているか」を確認する手段がない
+
+Package Firewall は、検査を **通信経路** に置くことでこの問題に対処します。Client がどう設定されていても、Firewall を通る Request には同じ Policy が適用されます。Client 設定と Firewall は置き換えではなく、多層防御として組み合わせるものだと考えています。
+
+## Coding Agent と CI での意味
+
+この機能が今のタイミングで出てきた背景には、Coding Agent の普及があると見ています。Agent は Task を進める中で `npm install` を自律的に実行します。Prompt Injection によって、あるいは単純な Typo によって、意図しない Package を入れてしまう可能性もあります。
+
+Agent の実行環境ごとに防御設定を揃えるよりも、「Agent の Sandbox から出ていく npm の通信はすべて Firewall を通る」という構成にする方が、確認も監査も容易です。CI Runner についても同じことが言えます。
+
+## 導入時に塞ぐべき Bypass 経路
+
+Proxy 型の防御は、それを迂回できると意味がなくなります。導入時には次の点を確認してください。
+
+1. **Endpoint の Registry 設定**: Firewall の Endpoint を Registry として `.npmrc` に設定し、Token で認証する構成になると報じられています。正確な URL 形式と認証方法は GitHub の公式 Docs で確認してください
+2. **社内 Registry の Remote 設定**: Artifactory などが Public npm を直接 Upstream にしている場合、そこが抜け道になります。Remote の Upstream を Firewall 経由に切り替えるか、直接取得を止める必要があります
+3. **Egress の制御**: CI Runner や Agent Sandbox から `registry.npmjs.org` へ直接通信できる状態のままだと、`.npmrc` を書き換えるだけで迂回できます。Network 側で直接通信を制限して初めて「経路で守る」状態になります
+4. **Lockfile 内の URL**: `package-lock.json` の `resolved` には取得元の URL が記録されます。Registry を切り替えた際に Lockfile をどう扱うか、事前に Team で決めておくと混乱を避けられます
+
+CI での Registry 設定は、たとえば次のようになります。
+
+```yaml
+# GitHub Actions の例(Registry URL は Placeholder)
+- name: Configure npm registry
+  run: |
+    npm config set registry "$PACKAGE_FIREWALL_URL"
+    npm config set "//${PACKAGE_FIREWALL_HOST}/:_authToken" "$FIREWALL_TOKEN"
+  env:
+    PACKAGE_FIREWALL_URL: ${{ vars.PACKAGE_FIREWALL_URL }}
+    PACKAGE_FIREWALL_HOST: ${{ vars.PACKAGE_FIREWALL_HOST }}
+    FIREWALL_TOKEN: ${{ secrets.FIREWALL_TOKEN }}
+
+- run: npm ci
+```
+
+## 評価の進め方
+
+Preview 段階の機能なので、いきなり全社展開するのではなく、次の順序で進めることをおすすめします。
+
+1. **観測から始める**: 可能であれば、まず Block ではなく記録に近い緩い Policy で運用し、どの Package がどの Rule に該当するかを把握する
+2. **Cooldown の値を決める**: 緊急の Security Patch を入れたいときに Cooldown が邪魔になるケースがあります。例外申請の流れを事前に確認しておきます
+3. **CI を先に、Laptop を後に**: CI と Agent の環境は構成管理しやすいので先に適用し、開発者の Local 環境は後から広げる
+4. **対象外の Ecosystem を洗い出す**: 現時点では npm のみ対応です。PyPI や Container Image など、同じ組織で使っている他の Ecosystem には別の対策が引き続き必要です
+
+## webhani の見解
+
+Supply Chain 対策は「正しい設定を全員に守ってもらう」ことに頼る限り、どこかに必ず漏れが出ます。Package Firewall は、その責任を個々の Client から経路へ移すという意味で、方向性として妥当だと考えています。
+
+一方で、対象が GitHub Enterprise Cloud に限られること、npm のみであること、GA 後に課金が始まることを考えると、すべての組織にとって最適な選択とは限りません。小規模な Team では、Lockfile、`npm ci`、Install Script の制限、Client 側の Cooldown を確実に運用するだけでも、多くのリスクは下げられます。
+
+重要なのは、どの方法を選ぶ場合でも「迂回できない形で適用されているか」を確認することです。設定 File があることと、それが実際に強制されていることは別の話です。
