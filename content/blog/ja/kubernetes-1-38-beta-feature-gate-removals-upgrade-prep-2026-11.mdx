@@ -1,0 +1,133 @@
+---
+title: "Kubernetes 1.38 ベータ公開：12月の GA までに Feature Gate を棚卸しする"
+description: "Kubernetes v1.38.0-beta.0 が11月4日に公開され、GA は12月16日の予定です。アップグレードで最も壊れやすいのは新機能ではなく、削除された Feature Gate と kubelet フラグです。確認手順をまとめます。"
+date: "2026-11-09"
+status: "published"
+tags: ["Kubernetes", "DevOps", "クラウド", "アップグレード", "インフラ"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-38-beta-feature-gate-removals-upgrade-prep-2026-11"
+---
+
+2026年11月4日、Kubernetes v1.38.0-beta.0 がリリースされました。公式のリリーススケジュールでは、非推奨・削除に関するブログ記事が11月23日、GA が12月16日に予定されています。今週は KubeCon + CloudNativeCon North America が開催されているため、1.38 の話題は増えるはずですが、その多くは新機能の話でしょう。
+
+運用の立場から見ると、アップグレードを壊すのは新機能ではありません。もう存在しないものを参照している設定です。1.38 でいえば、主に**削除された Feature Gate** と、**削除が延期されていた kubelet フラグ**がそれにあたります。これらを見つけるにはベータ期間がちょうどよいタイミングです。
+
+## 現時点で分かっていること
+
+最終的なリストはまだ確定しておらず、公開情報の多くはアルファ版の Changelog やベータ前のプレビュー記事に基づいています。その前提で、アップグレード計画に関係する項目を整理します。
+
+**削除・固定されるもの**
+
+- `KubeletTracing` が削除されました。v1.34 から GA で有効に固定されていた Gate です。
+- `DRADeviceTaints` と `DRADeviceTaintRules` は GA に固定され、無効化できなくなります。
+- Sidero Labs の `go-kubernetes` ライブラリの PR では、1.38.0-beta.0 時点で削除された19個の Feature Gate をアップグレードチェックに追加しています。なお `WinDSR` と `WinOverlay` は kube-proxy の Gate で、このチェッカーの対象外とされています。
+- kubelet のコンテナランタイム関連の設定フラグの一部は、本来 1.37 で削除予定でしたが、containerd v1.7 の互換性維持のため 1.38 に延期されていました。
+
+**注目すべき昇格**
+
+- `ShardedListAndWatch` がベータに昇格
+- Windows の CPU / メモリ affinity がベータになり、デフォルトで有効
+- `KubeProxyNFTablesLocalhostNodePorts` がベータになり、デフォルトで有効
+- emptyDir のモード制御、ボリューム単位のデフォルト所有者設定、bind mount オプションといったストレージ系機能や、DRA の属性関連機能がベータを目指しています
+
+第三者のプレビューでは追跡中の Enhancement は86〜87件程度とされていますが、ソースによって数字が異なります。件数はあくまで目安として見てください。
+
+## 削除された Gate がなぜ問題になるのか
+
+機能が GA になると、その Gate は数リリースの間 `true` に固定され、その後削除されます。設定ファイルでその Gate を明示的に指定したままだと（たとえ `true` であっても）、Gate が存在しなくなった時点でコンポーネントは「unrecognized feature gate」のようなエラーで起動を拒否します。
+
+こうした設定は、動いている構成に誰も触らないため何年も残りがちです。kubeadm の設定、kubelet の設定ファイル、Helm の values、マネージドクラスタ用の Terraform モジュール、CI で使う `kind` の設定などに潜んでいます。
+
+## Step 1：明示的な Feature Gate を洗い出す
+
+まずはインフラ系リポジトリから探します。
+
+```bash
+# IaC とマニフェスト内の明示的な Feature Gate 設定をすべて検索
+grep -rnE --include='*.yaml' --include='*.yml' --include='*.tf' \
+  --include='*.json' --include='*.toml' \
+  'feature-gates|featureGates|feature_gates' .
+```
+
+次に、稼働中のクラスタで実際に何が有効になっているかを確認します。API Server と kubelet は `kubernetes_feature_enabled` メトリクスを公開しています。
+
+```bash
+# API Server から見た状態
+kubectl get --raw /metrics | grep '^kubernetes_feature_enabled' \
+  | grep -E 'KubeletTracing|DRADeviceTaint|WinDSR|WinOverlay'
+
+# 特定ノードの kubelet から見た状態
+NODE=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+kubectl get --raw "/api/v1/nodes/${NODE}/proxy/metrics" \
+  | grep '^kubernetes_feature_enabled'
+```
+
+このメトリクスが示すのは「有効かどうか」であって、「明示的に設定されているかどうか」ではありません。grep の結果と組み合わせて、削除すべき明示的な参照を特定してください。
+
+## Step 2：削除リストと突き合わせる
+
+公式の 1.38 Changelog と11月23日のブログ記事が出たら、削除された Gate のリストを CI で実行できるチェックに落とし込みます。
+
+```bash
+#!/usr/bin/env bash
+# check-removed-gates.sh — 1.38 で削除された Gate を参照していたら失敗させる
+set -euo pipefail
+
+# 公式の CHANGELOG-1.38 公開後に埋める
+REMOVED_GATES=(
+  KubeletTracing
+  # ...
+)
+
+status=0
+for gate in "${REMOVED_GATES[@]}"; do
+  if grep -rnw --include='*.yaml' --include='*.yml' --include='*.tf' \
+       --include='*.json' --include='*.toml' "${gate}" infra/; then
+    echo "::error::Removed feature gate referenced: ${gate}"
+    status=1
+  fi
+done
+exit $status
+```
+
+あえてシンプルにしています。目的はチェックを再現可能にすることで、次のマイナーアップグレードではリストを差し替えるだけで再利用できます。
+
+## Step 3：kubelet のランタイムフラグと containerd のバージョンを確認する
+
+延期されていた kubelet フラグの削除が最も影響するのは、まだ containerd 1.7 を使っているクラスタです。各ノードが報告している値を確認します。
+
+```bash
+kubectl get nodes \
+  -o custom-columns='NODE:.metadata.name,RUNTIME:.status.nodeInfo.containerRuntimeVersion,KUBELET:.status.nodeInfo.kubeletVersion'
+```
+
+`containerd://1.7.x` が残っている場合は、1.38 へのアップグレードとは別の変更として、先に containerd 2.x への移行を計画してください。ランタイムのメジャーバージョンアップと Kubernetes のマイナーアップグレードを同じメンテナンス枠にまとめると、障害時の切り分けが格段に難しくなります。
+
+## Step 4：ベータ上でワークロードを動かす
+
+ベータ版はまさにこのためにあります。1.38 ベータで使い捨てのクラスタを用意し（kind、またはプロバイダがプレビューチャネルを提供していれば非本番クラスタ）、マニフェストや Helm Chart を適用して、既存のスモークテストを流します。
+
+並行して、非推奨 API の利用状況も確認しておきます。
+
+```bash
+kubectl get --raw /metrics | grep '^apiserver_requested_deprecated_apis'
+```
+
+ここに出てくるものは、将来のリリースで削除されることが決まっているものです。
+
+## マネージド Kubernetes のタイムライン
+
+EKS、GKE、AKS を使っている場合、12月16日に 1.38 が使えるわけではありません。マネージドサービスは通常、upstream から数週間〜数か月遅れて追随します。それでもベータを確認する意味はあります。削除される Gate やフラグは同じなので、今のうちに設定を直しておけば、マネージド側のアップグレードが来たときに何も起きずに済みます。
+
+## webhani の見解
+
+Kubernetes のアップグレード案件では、ほぼ毎回同じパターンを目にします。クラスタ自体は問題なく上がり、古い Feature Gate、昔のランタイムフラグ、忘れられた Helm Chart 内の非推奨 API といった小さなものが障害の原因になります。どれも直すのに深い Kubernetes の知識は要りません。必要なのは、アップグレードの後ではなく前に誰かが確認することです。
+
+今後6週間で取り組むことをお勧めします。
+
+- IaC の grep とライブのメトリクスの両方で、明示的な Feature Gate を今のうちに洗い出す
+- 11月23日の削除に関する記事を待ち、CI チェックに変換する
+- containerd 1.7 から 2.x への移行は Kubernetes のアップグレードと分ける
+- hello-world の Pod ではなく、実際のワークロードをベータで動かす
+- スクリプトは残しておく。次のアップグレードでもまた使います

@@ -1,0 +1,143 @@
+---
+title: "Claude Enterprise の Project Tags：有効化する前にコストコード設計を固める"
+description: "Claude Enterprise で、プロジェクトに部門コードや案件番号をタグ付けし、タグ単位で利用額を確認できるようになりました。機能自体はシンプルですが、成否を分けるのはタグ体系の設計です。"
+date: "2026-11-09"
+status: "published"
+tags: ["Claude", "AI", "LLM", "FinOps", "ガバナンス"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-enterprise-project-tags-ai-spend-cost-codes-2026-11"
+---
+
+2026年11月6日、Anthropic のリリースノートで Claude Enterprise の Project Tags がベータとして発表されました（対象となる組織のみ）。管理者は、社内で既に使っているコード——部門のチャージコード、WBS、案件番号など——を Claude のプロジェクトに付与し、タグごとの利用額を確認できます。その前日には、セキュリティセンター、inference hooks、一元管理機能などを含む Enterprise 向けのセキュリティ・管理機能も公開されており、その一部もベータです。
+
+AI を使った作業を顧客に請求したり、案件ごとに原価管理したりしている組織にとって、これは長年の空白を埋める機能です。これまで「A社案件で Claude の利用料はいくらかかったか」という問いには、スプレッドシートと推測で答えるしかありませんでした。Project Tags があれば、少なくとも公式の数字を起点にできます。
+
+機能自体は複雑ではありません。役に立つかどうかを決めるのは、展開前に用意するタグ設計です。
+
+## 機能でできること・できないこと
+
+Anthropic の consumption guide とリリースノートから読み取れる仕様は次のとおりです。
+
+- タグは**プロジェクト**に付与します。利用額はプロジェクトに紐づき、タグ単位で集計されます。
+- 利用額は **Organization settings > Usage > Spend by project** で確認できます。
+- Admin API で、タグ一覧の取得、タグへの許可値の追加、プロジェクトへのタグ設定が可能です（ベータ）。
+- すべての Claude 製品が対象というわけではなく、表示される金額は**請求書と完全には一致しない場合があります**。
+- プロジェクト外で発生した利用は別枠でまとめられます。第三者の解説によると、プロジェクトが設定されていない Claude Code のセッションもここに含まれます。
+- **タグ名と値は組織内の全メンバーに見えます。**
+
+最後の点は見た目以上に重要です。案件番号やプロジェクトのコードネーム自体が機密であれば、そのままタグにすると組織全員に公開されることになります。
+
+## タグからではなく、必要なレポートから考える
+
+タグを定義する前に、実際に必要なレポートを書き出してください。私たちのコンサルティング案件では、問いはほぼ次の3種類に分かれます。
+
+1. **請求** — 顧客案件ごとに、どれだけの AI 利用料を転嫁、または原価計上すべきか
+2. **予算管理** — どの社内チームの利用が伸びていて、計画の範囲内か
+3. **投資の把握** — R&D や社内ツールへの支出と、デリバリーへの支出の比率はどうか
+
+それぞれの問いがタグキー1つに対応します。「念のため」のタグは追加しないでください。軸が1つ増えるたびに、入力のばらつきも1つ増えます。
+
+3つの問いをカバーする最小構成の例です。
+
+```yaml
+# claude-project-tags.yaml — 正とする定義。変更は PR でレビューする
+tags:
+  cost-center:
+    description: "利用額を負担する経理上のコストセンター"
+    values: ["CC-1100-eng", "CC-1200-consulting", "CC-1300-education"]
+  engagement:
+    description: "請求システム上の不透明な案件 ID（顧客名は使わない）"
+    pattern: "^ENG-[0-9]{5}$"
+  purpose:
+    description: "支出の目的"
+    values: ["delivery", "presales", "internal-tooling", "research"]
+```
+
+意図的に決めているポイントは2つです。
+
+- `engagement` には顧客名ではなく**不透明な ID** を使います。ID と顧客の対応表は、すでにアクセス制御されている請求システム側に置きます。これで「組織全員に見える」問題に対処できます。
+- 定義はリポジトリで管理し、タグの変更も他の設定と同じくレビューを通します。
+
+## 適用前にバリデーションする
+
+管理画面から設定する場合も Admin API から設定する場合も、簡単なバリデーションを挟むだけでミスの大半は防げます。上の定義を読み込み、プロジェクトに付けようとしているタグを検証する TypeScript の例です。
+
+```ts
+// validate-tags.ts
+import { readFileSync } from "node:fs";
+import { parse } from "yaml";
+
+type TagRule = { values?: string[]; pattern?: string };
+type Scheme = { tags: Record<string, TagRule> };
+
+const scheme: Scheme = parse(readFileSync("claude-project-tags.yaml", "utf8"));
+
+export function validateProjectTags(tags: Record<string, string>): string[] {
+  const errors: string[] = [];
+
+  for (const key of Object.keys(scheme.tags)) {
+    if (!(key in tags)) errors.push(`missing required tag: ${key}`);
+  }
+
+  for (const [key, value] of Object.entries(tags)) {
+    const rule = scheme.tags[key];
+    if (!rule) {
+      errors.push(`unknown tag key: ${key}`);
+      continue;
+    }
+    if (rule.values && !rule.values.includes(value)) {
+      errors.push(`${key}="${value}" is not an allowed value`);
+    }
+    if (rule.pattern && !new RegExp(rule.pattern).test(value)) {
+      errors.push(`${key}="${value}" does not match ${rule.pattern}`);
+    }
+  }
+  return errors;
+}
+
+// 例
+console.log(
+  validateProjectTags({
+    "cost-center": "CC-1200-consulting",
+    engagement: "Acme Corp", // 検出される：ID ではなく顧客名
+    purpose: "delivery",
+  }),
+);
+```
+
+Admin API でタグ付けを自動化するなら、API を呼ぶ同じ Job の中でこのチェックを先に実行します。Project Tags 関連の Endpoint はベータで変更の可能性があるため、正確な名前とスコープは最新の Admin API リファレンスで確認してください。
+
+## 「プロジェクト外」の利用を減らす
+
+タグなしの利用額が最も多く発生しそうなのは Claude Code です。開発者はプロジェクトに紐づけずにセッションを始めることが多く、その分は未割り当ての枠に入ります。
+
+実務的な対策は3つです。
+
+1. **見える化する** — 未割り当ての比率を毎月レポートします。全体の15〜20%程度を超えるようなら、請求に使える精度ではありません。
+2. **デフォルトを正しくする** — チームの Claude Code オンボーディングやリポジトリテンプレートにプロジェクト設定を含め、新しい作業が最初から正しいプロジェクトに紐づくようにします。
+3. **作り込みすぎない** — 社内ツール用途なら、`purpose: internal-tooling` を付けた包括的なプロジェクト1つで十分です。精度が必要なのは請求対象の作業であって、すべてではありません。
+
+## 金額は「請求額」ではなく「配賦の根拠」として扱う
+
+Anthropic は、タグ別の金額が請求書と異なる可能性を明記しています。タグのデータは請求額の代わりではなく、請求総額を**配賦**するための比率として使うのが安全です。
+
+```text
+配賦額(tag) = 請求総額 × (tag の利用額 / 未割り当てを含む全利用額)
+```
+
+こうしておけば、経理上の数字は実際の支払額と一致したまま、案件ごとのコストも説明できます。
+
+## 新しいセキュリティ機能との関係
+
+11月5日のアップデート（セキュリティセンター、inference hooks、一元管理）と Project Tags は、同じ方向を向いています。Claude Enterprise は、生産性だけでなく監査上の問いにも答える必要がある組織向けに整えられつつあります。セキュリティセンターについては公開情報がまだ限られているため、現時点でそれを前提に設計することはお勧めしません。一方、Project Tags は今すぐ使えて、効果も分かりやすい機能です。
+
+## webhani からの提案
+
+- タグキーは必要なレポートから逆算し、3つ以内に抑える
+- タグは組織全体に見えるため、顧客名ではなく不透明な ID を使う
+- 定義はバージョン管理し、適用前にバリデーションする
+- 特に Claude Code 由来の未割り当て比率を追跡する
+- タグのデータは単独の請求根拠ではなく、請求総額の配賦に使う
+
+ここでの小さな準備は、顧客や経理から「このプロジェクトの AI 部分は実際いくらかかったのか」と聞かれた最初の場面で十分に元が取れます。
