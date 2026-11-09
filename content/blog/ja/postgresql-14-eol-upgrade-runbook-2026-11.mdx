@@ -1,0 +1,113 @@
+---
+title: "PostgreSQL 14は11月12日でサポート終了: 今週から始めるアップグレードRunbook"
+description: "PostgreSQL 14のコミュニティサポートは2026年11月12日に終了し、以降はセキュリティ修正が提供されません。棚卸し、移行先の選び方、pg_upgradeと論理レプリケーションの使い分け、マネージドサービスの延長サポートまで整理します。"
+date: "2026-11-10"
+status: "published"
+tags: ["PostgreSQL", "データベース", "セキュリティ", "AWS", "運用"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-14-eol-upgrade-runbook-2026-11"
+---
+
+PostgreSQL 14のサポートは、11月12日に予定されている最終マイナーリリースをもって終了します。PostgreSQLプロジェクトは5年間のサポートポリシーを採っており、5月のアップデート告知でもこの日付が明記されていました。12日以降に見つかった脆弱性は、14系ではコミュニティから修正されません。
+
+延長サポートを提供する HeroDevs の集計では、PostgreSQL全体で今年すでに44件のCVEが公表されています。数字の数え方には幅がありますが、「EOL後も問題なく動くから当面そのまま」という判断が以前より危うくなっているのは確かです。この記事では、残り数日でやるべきことと、その後の移行の進め方を整理します。
+
+## まず棚卸しをする
+
+最初の作業は「どこに14が残っているか」の把握です。本番だけでなく、ステージング、分析用レプリカ、CIのサービスコンテナ、開発者のdocker-composeも対象に含めます。
+
+```sql
+-- 各インスタンスで実行
+SELECT version();
+
+-- 移行に影響する拡張機能を確認
+SELECT extname, extversion FROM pg_extension ORDER BY extname;
+
+-- データベースごとのサイズ(移行方式の判断材料)
+SELECT datname, pg_size_pretty(pg_database_size(datname))
+FROM pg_database
+WHERE datistemplate = false
+ORDER BY pg_database_size(datname) DESC;
+```
+
+リポジトリ側では、イメージタグの固定箇所を検索すると見落としを減らせます。
+
+```bash
+grep -rnE "postgres(ql)?:14|POSTGRES_VERSION=14|engine_version.*\"14" \
+  --include="*.yml" --include="*.yaml" --include="*.tf" --include="Dockerfile*" .
+```
+
+## 移行先は18を基本にする
+
+移行先の候補は18と19です。私たちは多くのケースで **18** を推奨しています。リリースから1年が経ち、主要な拡張機能やマネージドサービスの対応が揃っているためです。19は新規プロジェクトや、使っている拡張機能の対応を確認できた環境で検討するとよいでしょう。
+
+14から18へ移るときに注意すべき変更をいくつか挙げます。
+
+- **データチェックサムがinitdbのデフォルトで有効。** 14のクラスタがチェックサム無効で作られている場合、そのままでは `pg_upgrade` が失敗します。新クラスタを `--no-data-checksums` で作るか、事前に旧クラスタで有効化します。
+- **MD5パスワード認証の非推奨化。** 18ではMD5の利用に警告が出ます。移行と同時に `scram-sha-256` へ切り替えておくのが効率的です。
+- **pg_upgradeが統計情報を引き継ぐ。** 18から、アップグレード後もプランナの統計情報が保持されるようになり、移行直後の性能劣化が起きにくくなっています。
+
+## 移行方式の選び方
+
+| 方式 | ダウンタイム | 向いているケース |
+| --- | --- | --- |
+| `pg_dump` / `pg_restore` | 大きい | 数十GB程度まで、メンテナンス時間を取れる |
+| `pg_upgrade --link` | 数分程度 | 同一ホストでのインプレース移行 |
+| 論理レプリケーション | 切り替え時のみ | 大規模DB、ダウンタイムをほぼ取れない |
+
+`pg_upgrade` を使う場合は、必ず `--check` から始めます。
+
+```bash
+/usr/lib/postgresql/18/bin/pg_upgrade \
+  --old-bindir=/usr/lib/postgresql/14/bin \
+  --new-bindir=/usr/lib/postgresql/18/bin \
+  --old-datadir=/var/lib/postgresql/14/main \
+  --new-datadir=/var/lib/postgresql/18/main \
+  --link --check
+```
+
+ダウンタイムを最小にしたい場合は論理レプリケーションを使います。14側でパブリケーションを作り、18側で購読します。
+
+```sql
+-- 旧クラスタ(14)
+CREATE PUBLICATION upgrade_pub FOR ALL TABLES;
+
+-- 新クラスタ(18): 事前に pg_dump --schema-only でスキーマを作成しておく
+CREATE SUBSCRIPTION upgrade_sub
+  CONNECTION 'host=old-db port=5432 dbname=app user=replicator'
+  PUBLICATION upgrade_pub;
+```
+
+論理レプリケーションではシーケンスの値が複製されない点に注意してください。切り替え直前に、旧クラスタの値を新クラスタへ反映する手順をRunbookに入れておきます。
+
+```sql
+-- 旧クラスタで、新クラスタ用の setval 文を生成する
+SELECT format('SELECT setval(%L, %s, true);',
+              schemaname || '.' || sequencename, last_value)
+FROM pg_sequences
+WHERE last_value IS NOT NULL;
+```
+
+切り替え後は `vacuumdb --all --analyze-in-stages` を実行し、主要なクエリの実行計画を移行前と比較します。
+
+## マネージドサービスの場合
+
+Amazon RDS / Aurora、Cloud SQL、Azure Database for PostgreSQL では、EOLを迎えたメジャーバージョンを有償の延長サポートに自動登録する仕組みがあります。動き続けはしますが、vCPU単位の追加料金が発生し、移行を先送りにするほど費用がかさみます。
+
+AWSは11月3日付で、コミュニティのCVE修正をバックポートしたAuroraの新しいマイナーバージョンを公開しています。14系を使い続ける期間があるなら、少なくともマイナーバージョンは最新に保ってください。
+
+マネージドサービスでのメジャーアップグレードは、ブルー/グリーンデプロイメントの機能を使うと切り戻しが容易になります。いきなり本番で実行せず、スナップショットから復元した環境でリハーサルするのが基本です。
+
+## webhaniの見解
+
+データベースのメジャーアップグレードは、アプリケーションのライブラリ更新と違い、後回しにしやすい作業です。しかしEOL後のデータベースは、新しい脆弱性が見つかっても自分たちでは直せない状態になります。
+
+これから1か月で進めたい手順をまとめます。
+
+1. **今週:** 14が動いている環境をすべて洗い出し、最新マイナーへ更新する
+2. **今月中:** 拡張機能の対応状況と移行方式を決め、ステージングでリハーサルする
+3. **年内:** 本番の移行を完了し、マネージドサービスの延長サポート課金を止める
+4. **継続:** 次のEOL(15系は2027年11月)をカレンダーに入れ、1年前から計画する
+
+EOLは毎年同じ時期に来ます。今回の移行で作ったRunbookを残しておけば、来年の15系の移行はずっと楽になります。

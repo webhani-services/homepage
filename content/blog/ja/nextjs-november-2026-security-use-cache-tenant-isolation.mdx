@@ -1,0 +1,160 @@
+---
+title: "Next.js 2026年11月セキュリティリリース: `use cache` とマルチテナントの境界を見直す"
+description: "Next.js 16.4.5 / 15.5.29 で修正された7件の脆弱性のうち、多くはCache Componentsのキャッシュ識別子に関するものでした。マルチテナントSaaSでのキャッシュ設計と、パッチ後に確認すべきポイントを整理します。"
+date: "2026-11-10"
+status: "published"
+tags: ["Next.js", "セキュリティ", "キャッシュ", "マルチテナント", "React"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-november-2026-security-use-cache-tenant-isolation"
+---
+
+11月3日、Next.jsの定例セキュリティリリースとして v16.4.5(Active LTS)と v15.5.29(Maintenance LTS)が公開されました。公式ブログによると修正は7件で、High が1件、残りは Medium です。件数そのものより注目したいのは、7件のうち4件が **Cache Components と `use cache` のキャッシュ識別子** に関係している点です。
+
+`use cache` は便利な仕組みですが、「何をキーとしてキャッシュするか」をフレームワークに任せる設計でもあります。マルチテナントのアプリケーションでは、その前提が崩れると他テナントのデータが見えてしまいます。今回はアップデート手順に加えて、キャッシュ設計そのものを見直すきっかけとして整理します。
+
+## まずはバージョンを上げる
+
+```bash
+# 16.x 系
+npm install next@16.4.5
+
+# 15.5 系
+npm install next@15.5.29
+```
+
+先週 16.4.4 に上げたばかりのプロジェクトも、16.4.5 への更新が必要です。CIで最低バージョンを強制しておくと、ブランチ間で古いバージョンが紛れ込むのを防げます。
+
+```js
+// scripts/check-next-version.mjs
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const { version } = require("next/package.json");
+
+const [major, minor, patch] = version.split(".").map(Number);
+const ok =
+  (major === 16 && (minor > 4 || (minor === 4 && patch >= 5))) ||
+  (major === 15 && minor === 5 && patch >= 29) ||
+  major > 16;
+
+if (!ok) {
+  console.error(`next@${version} は 2026年11月のセキュリティ修正を含みません`);
+  process.exit(1);
+}
+```
+
+## 修正内容の整理
+
+公式アドバイザリをもとに、影響を受ける構成ごとに分類すると次のようになります。
+
+| 分類 | 内容 | 影響する構成 |
+| --- | --- | --- |
+| キャッシュ識別子 | `unstable_cache` と `use cache` の併用でテナント間の結果が混ざる(High) | Cache Components 有効 + root parameter を読む関数 |
+| キャッシュ識別子 | ネストした `use cache` で root parameter の依存関係が記録される前に外側が保存される | 内側関数が早い値と遅い値を返すケース |
+| キャッシュ識別子 | 異なるバイナリ引数が同じキャッシュ識別子になる | バイナリ引数でユーザーを区別している場合 |
+| キャッシュ汚染 | セルフホストでの共有シェルの汚染 | `next start` + Partial Prefetching 無効 |
+| HTTP | 圧縮レスポンスのフレーミング不整合による応答の取り違え | fetch した `Response` をそのまま返す + HTTP/1.1 プロキシ |
+| Cookie | Edge Route で `HttpOnly` Cookie が内部ヘッダー経由で読める | `NextResponse.cookies.set()` を Edge で使用 |
+| 画像 | `dangerouslyAllowSVG: false` の回避 | SVG をデコードできるネイティブバックエンド |
+
+Vercel上でも self-hosted でも、まず影響しやすいのは上3件です。Cache Components を有効にしているマルチテナントSaaSであれば、優先度は高いと考えてください。
+
+## 「暗黙のキー」に依存しない書き方
+
+High の脆弱性は、キャッシュ関数が root parameter(例えば `[tenant]` セグメント)を内部で読み、その値が暗黙的にキャッシュキーに含まれるという前提の上で起きていました。パッチで修正はされていますが、私たちは設計として **テナントIDを明示的な引数にする** ことを推奨しています。
+
+```ts
+// lib/dashboard.ts
+import { cacheTag, cacheLife } from "next/cache";
+
+export async function getTenantDashboard(tenantId: string) {
+  "use cache";
+  cacheTag(`tenant:${tenantId}:dashboard`);
+  cacheLife("minutes");
+
+  return db.dashboardWidget.findMany({
+    where: { tenantId },
+    orderBy: { position: "asc" },
+  });
+}
+```
+
+```tsx
+// app/[tenant]/dashboard/page.tsx
+export default async function Page({
+  params,
+}: {
+  params: Promise<{ tenant: string }>;
+}) {
+  const { tenant } = await params;
+  const tenantId = await resolveTenantId(tenant); // 認可チェックを含む
+  const widgets = await getTenantDashboard(tenantId);
+  return <Dashboard widgets={widgets} />;
+}
+```
+
+引数に含めておけば、キャッシュキーにテナントIDが入ることがコードから読み取れます。レビュー時に「この関数はテナントごとに分離されているか」を目で確認できる点も大きいです。
+
+あわせて次の点も確認しておくとよいでしょう。
+
+- **`unstable_cache` から `use cache` を呼ばない。** 新規コードは `use cache` に寄せ、残っている `unstable_cache` は段階的に置き換えます。
+- **バイナリをキーにしない。** `Uint8Array` などを引数で渡している場合は、ユーザーIDのような文字列に置き換えます。
+- **ネストした `use cache` の中で、遅い値を await せずに返していないか。** ストリーミング用途で Promise を含むオブジェクトを返している箇所は要注意です。
+
+## 外部APIのレスポンスをそのまま返さない
+
+self-hosted 環境で外部APIをプロキシする Route Handler を持っている場合、fetch した `Response` をそのまま `return` するのは避けたほうが安全です。ヘッダーを作り直すだけで、今回のようなフレーミングの不整合を防げます。
+
+```ts
+// app/api/upstream/route.ts
+const HOP_BY_HOP = ["content-encoding", "content-length", "transfer-encoding", "connection"];
+
+export async function GET() {
+  const upstream = await fetch("https://api.example.com/data");
+  const headers = new Headers(upstream.headers);
+  for (const h of HOP_BY_HOP) headers.delete(h);
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers,
+  });
+}
+```
+
+Edge Route で Cookie を設定している箇所も見直し対象です。Edge runtime は Vercel 上で非推奨になっているので、Node.js runtime へ移し、`cookies().set()` を使う形に寄せるのが素直な対応です。
+
+## テナント分離をテストで担保する
+
+パッチを当てて終わりにせず、テナント分離を回帰テストとして残しておくことをおすすめします。コールドキャッシュの状態で、異なるテナントへのリクエストを同時に投げて結果が混ざらないかを確認するだけでも効果があります。
+
+```ts
+// e2e/tenant-isolation.spec.ts
+import { test, expect } from "@playwright/test";
+
+test("同時リクエストでテナントのデータが混ざらない", async ({ request }) => {
+  const tenants = ["acme", "globex", "initech"];
+  const results = await Promise.all(
+    tenants.map((t) => request.get(`/${t}/api/dashboard`)),
+  );
+
+  for (const [i, res] of results.entries()) {
+    const body = await res.json();
+    expect(body.tenant).toBe(tenants[i]);
+  }
+});
+```
+
+デプロイ直後やキャッシュ削除後に実行すると、コールドフィル時の挙動を確認できます。
+
+## webhaniの見解
+
+`use cache` はキャッシュの記述量を大きく減らしてくれますが、その分「キャッシュキーに何が含まれているか」が見えにくくなります。今回の修正の多くはフレームワーク側のバグですが、アプリケーション側でもテナントIDを明示的に扱っていれば、影響範囲の調査はずっと楽になります。
+
+対応の優先順位は次のとおりです。
+
+1. 16.4.5 / 15.5.29 へ更新し、CIで最低バージョンを強制する
+2. root parameter を内部で読んでいる `use cache` 関数を洗い出し、テナントIDを引数にする
+3. `unstable_cache` と `use cache` の併用箇所を解消する
+4. テナント分離の E2E テストを追加する
+
+Next.jsのセキュリティリリースは毎月のように続いています。そのたびに慌てないよう、更新手順と確認項目をチームの Runbook として定着させておくと運用が安定します。

@@ -1,0 +1,160 @@
+---
+title: "Next.js November 2026 Security Release: Rethinking `use cache` Tenant Boundaries"
+description: "Next.js 16.4.5 and 15.5.29 fix seven vulnerabilities, and four of them involve Cache Components cache identity. Here is what to patch, how to design cache functions for multi-tenant apps, and how to test isolation."
+date: "2026-11-10"
+status: "published"
+tags: ["Next.js", "Security", "Caching", "Multi-tenancy", "React"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-november-2026-security-use-cache-tenant-isolation"
+---
+
+Next.js shipped its scheduled security release on November 3: v16.4.5 (Active LTS) and v15.5.29 (Maintenance LTS). The official post lists seven fixes, one High and six Medium. The count matters less than the pattern: four of the seven are about how **Cache Components and `use cache` compute cache identity**.
+
+`use cache` lets the framework decide what goes into a cache key. That is convenient until the framework gets it wrong, and in a multi-tenant app "wrong" means one tenant sees another tenant's data. So treat this release as two jobs: patch now, then review how your cache functions are keyed.
+
+## Patch first
+
+```bash
+# 16.x
+npm install next@16.4.5
+
+# 15.5.x
+npm install next@15.5.29
+```
+
+If you moved to 16.4.4 last week, you still need 16.4.5. A small CI guard keeps older versions from creeping back in through long-lived branches:
+
+```js
+// scripts/check-next-version.mjs
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const { version } = require("next/package.json");
+
+const [major, minor, patch] = version.split(".").map(Number);
+const ok =
+  (major === 16 && (minor > 4 || (minor === 4 && patch >= 5))) ||
+  (major === 15 && minor === 5 && patch >= 29) ||
+  major > 16;
+
+if (!ok) {
+  console.error(`next@${version} is missing the November 2026 security fixes`);
+  process.exit(1);
+}
+```
+
+## What was fixed, grouped by exposure
+
+Based on the official advisories:
+
+| Area | Issue | You are exposed if |
+| --- | --- | --- |
+| Cache identity | Mixing `unstable_cache` and `use cache` can serve one tenant's result to another (High) | Cache Components on, and the cached function reads a root parameter |
+| Cache identity | Nested `use cache` can store the outer entry before inner root-param dependencies are recorded | Inner function returns an early value plus a slower async value |
+| Cache identity | Distinct binary arguments can collapse to the same cache identity | You distinguish users with binary arguments |
+| Cache poisoning | Shared page shell poisoning | Self-hosted `next start`, Partial Prefetching off or unset |
+| HTTP | Stale compressed framing headers can misroute responses | Returning a fetched `Response` unchanged behind an HTTP/1.1 pipelining proxy |
+| Cookies | `HttpOnly` cookie values readable via an internal header | `NextResponse.cookies.set()` in Edge routes |
+| Images | `dangerouslyAllowSVG: false` bypass | Native image backend that can decode SVG |
+
+The first three apply whether you deploy on Vercel or self-host. If you run a multi-tenant SaaS with Cache Components enabled, treat this as urgent.
+
+## Stop relying on implicit keys
+
+The High-severity bug depended on a cached function reading a root parameter (such as a `[tenant]` segment) internally and trusting that value to be part of the key. The patch fixes the framework, but we recommend a design change anyway: **pass the tenant ID as an explicit argument**.
+
+```ts
+// lib/dashboard.ts
+import { cacheTag, cacheLife } from "next/cache";
+
+export async function getTenantDashboard(tenantId: string) {
+  "use cache";
+  cacheTag(`tenant:${tenantId}:dashboard`);
+  cacheLife("minutes");
+
+  return db.dashboardWidget.findMany({
+    where: { tenantId },
+    orderBy: { position: "asc" },
+  });
+}
+```
+
+```tsx
+// app/[tenant]/dashboard/page.tsx
+export default async function Page({
+  params,
+}: {
+  params: Promise<{ tenant: string }>;
+}) {
+  const { tenant } = await params;
+  const tenantId = await resolveTenantId(tenant); // includes authorization
+  const widgets = await getTenantDashboard(tenantId);
+  return <Dashboard widgets={widgets} />;
+}
+```
+
+With the ID in the signature, anyone reviewing the code can see that the cache entry is partitioned by tenant. Nothing hides in framework internals.
+
+While you are in there:
+
+- **Don't call `use cache` functions from inside `unstable_cache`.** Write new code with `use cache` and migrate the remaining `unstable_cache` calls.
+- **Don't key on binary data.** Replace `Uint8Array` arguments with string identifiers.
+- **Check nested cached functions** that return objects containing un-awaited promises. That is the shape the second advisory describes.
+
+## Don't proxy upstream responses as-is
+
+On self-hosted deployments, a Route Handler that returns a fetched `Response` directly passes through framing headers that may no longer match the body. Rebuilding the headers is cheap:
+
+```ts
+// app/api/upstream/route.ts
+const HOP_BY_HOP = ["content-encoding", "content-length", "transfer-encoding", "connection"];
+
+export async function GET() {
+  const upstream = await fetch("https://api.example.com/data");
+  const headers = new Headers(upstream.headers);
+  for (const h of HOP_BY_HOP) headers.delete(h);
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers,
+  });
+}
+```
+
+If you set cookies in Edge routes, this is also a good time to move them to the Node.js runtime and use `cookies().set()`. The Edge runtime is deprecated on Vercel anyway.
+
+## Keep isolation under test
+
+A patch fixes today's bug; a test catches the next one. Firing concurrent requests for different tenants against a cold cache is a simple, useful check:
+
+```ts
+// e2e/tenant-isolation.spec.ts
+import { test, expect } from "@playwright/test";
+
+test("concurrent requests never mix tenant data", async ({ request }) => {
+  const tenants = ["acme", "globex", "initech"];
+  const results = await Promise.all(
+    tenants.map((t) => request.get(`/${t}/api/dashboard`)),
+  );
+
+  for (const [i, res] of results.entries()) {
+    const body = await res.json();
+    expect(body.tenant).toBe(tenants[i]);
+  }
+});
+```
+
+Run it right after deploys or cache purges, when entries are being filled for the first time.
+
+## Our take
+
+`use cache` removes a lot of boilerplate, and it also makes the contents of a cache key less visible. Most of this month's fixes are framework bugs, but teams that pass tenant IDs explicitly will scope their exposure in minutes instead of hours.
+
+Suggested order of work:
+
+1. Upgrade to 16.4.5 or 15.5.29 and enforce the minimum in CI.
+2. Find `use cache` functions that read root parameters internally and move the tenant ID into the arguments.
+3. Remove any `unstable_cache` wrapping of `use cache` functions.
+4. Add a tenant-isolation E2E test.
+
+Next.js security releases now arrive roughly monthly. A short, written runbook for "patch, verify, test" keeps each one routine.

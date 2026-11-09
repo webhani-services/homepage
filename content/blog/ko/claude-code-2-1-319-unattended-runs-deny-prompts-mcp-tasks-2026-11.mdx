@@ -1,0 +1,114 @@
+---
+title: "Claude Code 2.1.319: 무인 실행이 멈추지도, 조용히 성공하지도 않도록 설정하기"
+description: "11월 6일 Release된 Claude Code 2.1.319에는 MCP Task Background 실행, 권한 Prompt를 거부로 처리하는 설정, LLM Gateway 환경의 auto mode 동작 변경, `claude -p` 종료 Code 변경이 포함된 것으로 알려져 있습니다. CI와 Batch 운영 관점에서 정리합니다."
+date: "2026-11-10"
+status: "published"
+tags: ["Claude Code", "AI", "CI/CD", "MCP", "개발 도구"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-2-1-319-unattended-runs-deny-prompts-mcp-tasks-2026-11"
+---
+
+Claude Code를 CI나 정기 Batch로 돌리다 보면 두 가지 문제를 자주 만납니다. 아무도 응답하지 않는 권한 Prompt에서 Job이 계속 멈춰 있는 경우, 그리고 Agent가 실제로는 거부당해 아무것도 하지 않았는데 Job이 "성공"으로 끝나는 경우입니다.
+
+11월 6일에 나온 v2.1.319는 이 두 문제 모두와 관련된 변경을 담고 있습니다. 아래 내용은 Anthropic 공식 Changelog가 아니라 classmethod, DEV Community 등 여러 Third-party 해설을 바탕으로 정리한 것입니다. 설정 이름과 세부 동작은 적용 전에 공식 문서에서 꼭 확인하시기 바랍니다.
+
+## 알려진 주요 변경 사항
+
+- **MCP Task의 Background 실행.** MCP Server가 Tool 호출을 Task로 실행하면 Claude Code는 이를 바로 Background로 넘기고, 완료되면 결과를 Claude에게 전달합니다. 대기하도록 하거나 MCP Task를 끄는 환경 변수도 있습니다. Subagent의 MCP 호출은 Task가 되지 않습니다.
+- **Prompt 대신 거부.** `permissions.denyInsteadOfPrompting` 설정이 추가되어, 권한 Prompt를 기다리는 대신 해당 호출을 거부하고 Turn을 계속 진행할 수 있습니다.
+- **Gateway 환경의 auto mode.** Telemetry나 Feature Flag가 꺼진 환경(LLM Gateway 경유 포함)에서는 Server가 판단할 수 없는 호출이 확인 요청 또는 거부로 처리되며, 더 이상 Local 분류기로 Fallback하지 않습니다. `CLAUDE_CODE_AUTO_MODE_SERVER=0`으로 이전 동작을 되돌릴 수 있습니다. Bedrock, Vertex, Foundry는 영향이 없습니다.
+- **`claude -p` 종료 Code.** auto mode가 Action을 거부하면 이제 0이 아니라 1로 종료합니다.
+
+하나하나는 작은 변경이지만, 합쳐 보면 무인 실행의 전제가 꽤 달라집니다.
+
+## "멈추는" 문제: Prompt를 거부로 바꾸기
+
+Headless 실행에서 가장 곤란한 상황은 허용되지 않은 작업에서 Prompt가 뜬 채 Timeout까지 아무 일도 일어나지 않는 것입니다. 거부로 처리되면 Agent는 다른 방법을 찾거나, 하지 못한 일을 보고하고 종료합니다.
+
+CI 설정은 허용 목록을 명시하고 나머지는 거부하는 형태가 기본입니다.
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Bash(npm run lint)",
+      "Bash(npm run test:*)",
+      "Bash(git diff:*)"
+    ],
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(curl:*)",
+      "Read(./.env*)"
+    ],
+    "denyInsteadOfPrompting": true
+  }
+}
+```
+
+이 파일은 CI 전용으로 분리하고, 개발자의 Local 설정과 섞지 않는 것을 권장합니다. Local에서는 확인을 받고 싶은 작업이라도 CI에서는 거부해도 괜찮은 경우가 대부분입니다.
+
+## "조용히 성공하는" 문제: 종료 Code 활용하기
+
+`claude -p`가 auto mode 거부 시 1을 반환하게 되면서, CI Step은 Agent가 작업을 끝내지 못했다는 사실을 감지할 수 있습니다. 다만 바로 실패 처리하기보다 이유를 먼저 남기도록 구성하는 편이 운영에 유리합니다.
+
+```yaml
+# .github/workflows/claude-maintenance.yml (발췌)
+- name: Run Claude Code
+  id: claude
+  run: |
+    set +e
+    claude -p "의존 Package의 lint 경고를 수정하고 Test가 통과하는지 확인해 주세요" \
+      --output-format json > claude-result.json
+    echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+- name: Report refusal or failure
+  if: steps.claude.outputs.exit_code != '0'
+  run: |
+    echo "::warning::Claude Code exited with ${{ steps.claude.outputs.exit_code }}"
+    jq -r '.result // "no result"' claude-result.json | head -50
+    exit 1
+
+- name: Upload transcript
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: claude-result
+    path: claude-result.json
+```
+
+"종료 Code가 0이면 성공"으로 작성한 Pipeline은 이번 Update 이후 처음으로 실패할 수 있습니다. 이는 회귀가 아니라 그동안 보이지 않던 거부가 드러난 것이므로, 허용 목록을 다시 점검하는 계기로 삼으면 됩니다.
+
+## Gateway를 쓰는 Team은 Update 전에 확인하기
+
+사내 LLM Gateway를 거쳐 Claude Code를 사용하는 조직이 이번 변경의 영향을 가장 크게 받습니다. Local 분류기 Fallback이 없어지면서, 지금까지 자동으로 통과하던 작업이 확인 요청이나 거부로 바뀔 수 있습니다.
+
+선택지는 두 가지입니다.
+
+1. **허용 목록을 넓힙니다.** 자주 쓰는 Command를 `allow`에 명시합니다. 무엇이 허용되는지가 설정 파일에 남기 때문에 감사 관점에서 더 바람직합니다.
+2. **`CLAUDE_CODE_AUTO_MODE_SERVER=0`으로 이전 동작을 유지합니다.** 전환 기간의 임시 수단으로만 쓰고, 종료 시점을 정해 둡니다.
+
+저희는 기본적으로 1번을 권장합니다. 자동 판정에 맡기는 범위가 넓을수록, 어떤 작업이 왜 허용되었는지 나중에 설명하기 어려워지기 때문입니다.
+
+## MCP Task Background 실행 시 주의할 점
+
+오래 걸리는 MCP Tool(Build, Data 수집, 외부 API Polling 등)이 Background로 돌면 Agent는 기다리는 동안 다른 작업을 진행할 수 있습니다. 대신 설계에서 신경 쓸 부분이 늘어납니다.
+
+- **멱등성.** 결과가 늦게 도착하고 재실행될 수도 있으므로, 같은 Task를 두 번 실행해도 안전하게 만듭니다.
+- **stdio Server의 수명.** stdio로 동작하는 MCP Server는 Claude Code가 종료되면 Process도 함께 멈추므로 Memory 상의 Task 상태가 사라질 수 있습니다. 긴 Task의 상태는 File이나 Database에 저장합니다.
+- **CI에서의 완료 처리.** Background Task가 끝나기 전에 Job이 종료되면 결과를 놓칩니다. CI에서는 대기하도록 설정하거나, 종료 전에 Task 완료를 확인하도록 Prompt를 구성하는 것이 안전합니다.
+
+## webhani의 견해
+
+이번 변경은 Claude Code가 "사람이 옆에서 보는 대화형 Tool"을 넘어 "무인으로 동작하는 Worker"로서의 용도를 더 의식하고 있음을 보여 줍니다. 무인 실행에서 중요한 것은 멈추지 않는 것, 그리고 실패를 실패로 정확히 보고하는 것입니다. 2.1.319는 두 가지 모두를 다루고 있습니다.
+
+Team 차원에서 해 둘 일을 정리합니다.
+
+1. CI 전용 권한 설정 파일을 만들고 허용 목록과 거부 설정을 명시합니다.
+2. `claude -p`의 종료 Code와 출력을 CI에 기록해 거부 이유를 추적할 수 있게 합니다.
+3. Gateway 환경에서는 허용 목록을 먼저 정비한 뒤 Update합니다.
+4. 오래 걸리는 MCP Tool은 멱등하게 만들고 상태를 외부에 저장합니다.
+
+Claude Code는 Update가 잦습니다. 이런 변경을 개인 설정으로 흡수하기보다 Team 공통 설정으로 관리하는 것이 안정적인 운영의 전제입니다.
