@@ -1,0 +1,133 @@
+---
+title: "Claude Fable 5.2 Is Out: A Playbook for Switching Models Without Surprises"
+description: "Anthropic released Claude Fable 5.2 on November 9 with lower pricing and a new default in Claude Code. Here is how we evaluate, pin, and roll out a new model version in production systems."
+date: "2026-11-11"
+status: "published"
+tags: ["Claude", "LLM", "AI", "Claude Code", "MLOps"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-fable-5-2-model-upgrade-playbook-2026-11"
+---
+
+Anthropic released Claude Fable 5.2 and Claude Mythos 5.2 on November 9, 2026. The two share an underlying model; Fable is the generally available variant, while Mythos access is limited to vetted organizations. For most teams, Fable 5.2 is the one that matters.
+
+The headline numbers are easy to find, so we will keep them short and spend most of this post on what actually takes effort: moving a production workload from one model version to the next without regressions.
+
+## What changed, in facts
+
+- **Model ID:** `claude-fable-5-2`, with a 1M-token context window.
+- **Pricing:** $8 per million input tokens and $40 per million output tokens, with cache reads at $0.20 per million (per the Claude Code changelog). Fable 5.1 was $10 / $50, as reported by InfoWorld.
+- **Speed:** Anthropic says output is up to 30% faster than the 5.1 generation.
+- **Coding:** Anthropic reports 69.9% on FrontierSWE v2, ahead of Claude Opus 5.5 at 62.3%. That is a vendor-reported benchmark; treat it as a reason to test, not as a result for your codebase.
+- **Claude Code:** Version 2.1.321 makes Fable 5.2 the default Fable model. Saved Fable 5.1 selections move to the `fable` alias automatically on Pro and Max plans, and on Team and Enterprise plans once the organization allows it. `/model claude-fable-5-1` switches back.
+
+That last point is the one most teams will feel first. If your developers use Claude Code, many of them are already on 5.2 whether they decided to be or not.
+
+## Aliases versus pinned IDs
+
+The Claude Code behavior is a good illustration of a general rule: an alias like `fable` is a moving target. That is fine for interactive use, where a person sees every output. It is not fine for a backend service that classifies tickets or generates SQL, where a quiet shift in output format can break a parser downstream.
+
+Our rule of thumb:
+
+| Context | Recommendation |
+| --- | --- |
+| Interactive tools (IDE, Claude Code, chat) | Alias is fine; announce the change to the team |
+| Batch jobs and backend APIs | Pin the full model ID in configuration |
+| Evaluation harness | Always explicit IDs on both sides of the comparison |
+
+Keep the model ID in configuration, not in code, so that a rollout is a config change you can revert in seconds:
+
+```ts
+// config/llm.ts
+export const llmConfig = {
+  primaryModel: process.env.LLM_PRIMARY_MODEL ?? "claude-fable-5-1",
+  candidateModel: process.env.LLM_CANDIDATE_MODEL ?? "claude-fable-5-2",
+  // Percentage of traffic routed to the candidate during rollout
+  candidateRatio: Number(process.env.LLM_CANDIDATE_RATIO ?? "0"),
+};
+
+export function pickModel(requestId: string): string {
+  // Deterministic split so a retried request hits the same model
+  const bucket = [...requestId].reduce((a, c) => (a + c.charCodeAt(0)) % 100, 0);
+  return bucket < llmConfig.candidateRatio
+    ? llmConfig.candidateModel
+    : llmConfig.primaryModel;
+}
+```
+
+## Run your own evaluation first
+
+Public benchmarks measure someone else's tasks. Before changing anything in production, we replay a fixed set of real (anonymized) inputs against both models and compare on the checks that matter for that workload.
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+type Case = { id: string; prompt: string; check: (out: string) => boolean };
+
+async function runCase(model: string, c: Case) {
+  const started = Date.now();
+  const res = await client.messages.create({
+    model,
+    max_tokens: 2048,
+    messages: [{ role: "user", content: c.prompt }],
+  });
+  const text = res.content
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("");
+  return {
+    id: c.id,
+    model,
+    passed: c.check(text),
+    ms: Date.now() - started,
+    inputTokens: res.usage.input_tokens,
+    outputTokens: res.usage.output_tokens,
+  };
+}
+
+export async function compare(cases: Case[], a: string, b: string) {
+  const results = [];
+  for (const c of cases) {
+    results.push(await runCase(a, c), await runCase(b, c));
+  }
+  return results;
+}
+```
+
+The `check` functions are where the value is. For a JSON-producing endpoint, check that the output parses and matches your schema. For code generation, run the generated code against tests. For summaries, a rubric graded by a second model is acceptable, but keep a human spot-check on a sample.
+
+Three things we look at besides the pass rate:
+
+1. **Output length.** Newer models often write more. Since output tokens cost five times input tokens here, a 20% longer answer can cancel a price cut.
+2. **Format drift.** Markdown where there used to be plain text, extra preamble before JSON, different heading levels.
+3. **Refusal and over-caution changes.** Anthropic reports fewer blocks than 5.1; confirm that in your own domain, in both directions.
+
+## Re-check the cost math
+
+The list-price drop is real, but the bill depends on your token mix. A quick worked example for a workload of 1M input tokens and 200K output tokens per day:
+
+- Fable 5.1: 1 × $10 + 0.2 × $50 = **$20/day**
+- Fable 5.2: 1 × $8 + 0.2 × $40 = **$16/day**
+
+That is 20% lower, assuming the output length stays the same. If your evaluation shows 5.2 writing 25% more output, the daily cost becomes $18, and the saving shrinks to 10%. If you use prompt caching heavily, the $0.20/Mtok cache-read rate dominates the input side and the comparison changes again. Plug your own numbers in from the `usage` fields you logged during evaluation.
+
+## Rolling it out
+
+Once evaluation looks good, we roll out in stages using the config shown earlier:
+
+1. **5%** of traffic for a day, watching error rate, latency, and downstream parse failures.
+2. **50%** for a few days, comparing cost per request and any user-facing quality signals.
+3. **100%**, keeping the previous model ID in config for at least a couple of weeks as the rollback target.
+
+For Claude Code users on a team, the equivalent is simply communication: tell people the default changed, mention how to switch back, and ask them to report regressions in shared prompts, custom commands, or CLAUDE.md-driven workflows.
+
+## Takeaways
+
+- Fable 5.2 is cheaper per token and reportedly stronger at coding, which makes it worth evaluating promptly.
+- Aliases move. Pin full model IDs anywhere a machine consumes the output.
+- Your own evaluation set beats any leaderboard. Build it once and reuse it for every model release.
+- Recompute cost with real output lengths before claiming the savings.
+
+At webhani we help teams put this kind of evaluation and rollout process around their LLM features, so that each new model release becomes a routine change rather than a risk.

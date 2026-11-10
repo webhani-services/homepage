@@ -1,0 +1,133 @@
+---
+title: "Claude Fable 5.2リリース: 本番環境でモデルを安全に切り替えるための実践ガイド"
+description: "11月9日にClaude Fable 5.2がリリースされ、価格が下がりClaude Codeのデフォルトも切り替わりました。新しいモデルバージョンを評価・固定・段階展開する手順を、webhaniの運用経験をもとに解説します。"
+date: "2026-11-11"
+status: "published"
+tags: ["Claude", "LLM", "AI", "Claude Code", "MLOps"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-fable-5-2-model-upgrade-playbook-2026-11"
+---
+
+2026年11月9日、AnthropicがClaude Fable 5.2とClaude Mythos 5.2をリリースしました。2つは同じ基盤モデルで、Fableが一般提供版、Mythosは審査を通過した組織向けに利用が限定されています。多くのチームにとって関係するのはFable 5.2です。
+
+スペックの数字はすでに多くの記事で紹介されているので、ここでは手短にまとめます。本記事の主眼は、手間がかかる部分、つまり本番のワークロードをあるモデルバージョンから次のバージョンへ、品質を落とさずに移行する方法です。
+
+## 変更点の整理
+
+- **モデルID:** `claude-fable-5-2`。コンテキストウィンドウは1Mトークンです。
+- **価格:** 入力100万トークンあたり8ドル、出力40ドル。キャッシュ読み取りは0.20ドルです(Claude Codeのchangelogより)。InfoWorldの報道によると、Fable 5.1は10ドル/50ドルでした。
+- **速度:** Anthropicによれば、出力は5.1世代より最大30%高速です。
+- **コーディング:** AnthropicはFrontierSWE v2で69.9%(Claude Opus 5.5は62.3%)と発表しています。ベンダー発表のベンチマークなので、「自社のコードでも良くなる」根拠ではなく「試す価値がある」根拠として扱うべきです。
+- **Claude Code:** v2.1.321でFable 5.2がデフォルトのFableモデルになりました。保存済みのFable 5.1の選択は `fable` エイリアスへ自動的に移行します。Pro/Maxプランでは即時、Team/Enterpriseプランでは組織が許可した時点です。元に戻すには `/model claude-fable-5-1` を使います。
+
+最初に影響を感じるのはおそらく最後の点です。チームでClaude Codeを使っているなら、本人が意識しないうちに多くのメンバーがすでに5.2で作業しています。
+
+## エイリアスとモデルIDの固定
+
+Claude Codeの挙動は、一般的な原則をよく表しています。`fable` のようなエイリアスは指す先が変わります。人が毎回出力を確認するインタラクティブな用途なら問題ありません。しかし、チケット分類やSQL生成を行うバックエンドサービスでは、出力フォーマットのわずかな変化が後段のパーサーを壊すことがあります。
+
+webhaniでは次のように使い分けています。
+
+| 用途 | 推奨 |
+| --- | --- |
+| インタラクティブなツール(IDE、Claude Code、チャット) | エイリアスで可。変更はチームに周知する |
+| バッチ処理・バックエンドAPI | 設定ファイルでモデルIDを完全に固定する |
+| 評価ハーネス | 比較対象の両方を必ず明示的なIDで指定する |
+
+モデルIDはコードではなく設定に置き、ロールアウトもロールバックも設定変更だけで済むようにしておきます。
+
+```ts
+// config/llm.ts
+export const llmConfig = {
+  primaryModel: process.env.LLM_PRIMARY_MODEL ?? "claude-fable-5-1",
+  candidateModel: process.env.LLM_CANDIDATE_MODEL ?? "claude-fable-5-2",
+  // ロールアウト中に候補モデルへ振り分ける割合(%)
+  candidateRatio: Number(process.env.LLM_CANDIDATE_RATIO ?? "0"),
+};
+
+export function pickModel(requestId: string): string {
+  // リトライ時も同じモデルに当たるよう決定的に振り分ける
+  const bucket = [...requestId].reduce((a, c) => (a + c.charCodeAt(0)) % 100, 0);
+  return bucket < llmConfig.candidateRatio
+    ? llmConfig.candidateModel
+    : llmConfig.primaryModel;
+}
+```
+
+## まず自前の評価を回す
+
+公開ベンチマークが測っているのは他人のタスクです。本番に手を入れる前に、匿名化した実データの入力セットを両モデルに流し、そのワークロードで重要な観点で比較します。
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+type Case = { id: string; prompt: string; check: (out: string) => boolean };
+
+async function runCase(model: string, c: Case) {
+  const started = Date.now();
+  const res = await client.messages.create({
+    model,
+    max_tokens: 2048,
+    messages: [{ role: "user", content: c.prompt }],
+  });
+  const text = res.content
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("");
+  return {
+    id: c.id,
+    model,
+    passed: c.check(text),
+    ms: Date.now() - started,
+    inputTokens: res.usage.input_tokens,
+    outputTokens: res.usage.output_tokens,
+  };
+}
+
+export async function compare(cases: Case[], a: string, b: string) {
+  const results = [];
+  for (const c of cases) {
+    results.push(await runCase(a, c), await runCase(b, c));
+  }
+  return results;
+}
+```
+
+価値があるのは `check` 関数の中身です。JSONを返すエンドポイントなら、パースできるかとスキーマに合っているかを確認します。コード生成なら、生成されたコードをテストで実行します。要約系なら別モデルによるルーブリック採点でも構いませんが、一部は人の目でスポットチェックします。
+
+合格率以外に見ているポイントは3つです。
+
+1. **出力の長さ:** 新しいモデルは出力が長くなる傾向があります。今回は出力単価が入力の5倍なので、回答が2割長くなれば値下げ分が相殺されかねません。
+2. **フォーマットの変化:** プレーンテキストだった箇所がMarkdownになる、JSONの前に前置きが付く、見出しレベルが変わる、などです。
+3. **拒否・過剰な慎重さの変化:** Anthropicは5.1よりブロックが減ったと発表しています。自社のドメインで、増減の両方向を確認してください。
+
+## コスト試算をやり直す
+
+定価の値下げは事実ですが、請求額はトークンの構成次第です。1日あたり入力100万トークン、出力20万トークンのワークロードで計算してみます。
+
+- Fable 5.1: 1 × 10ドル + 0.2 × 50ドル = **1日20ドル**
+- Fable 5.2: 1 × 8ドル + 0.2 × 40ドル = **1日16ドル**
+
+出力の長さが変わらなければ20%の削減です。ただし評価で5.2の出力が25%長いと分かった場合、1日18ドルとなり、削減幅は10%に縮みます。プロンプトキャッシュを多用しているなら、入力側は0.20ドルのキャッシュ読み取り単価が支配的になり、比較結果はまた変わります。評価時に記録した `usage` の値で、自社の数字を当てはめてください。
+
+## 段階的なロールアウト
+
+評価結果に問題がなければ、前述の設定を使って段階的に切り替えます。
+
+1. **5%** のトラフィックで1日。エラー率、レイテンシ、後段のパース失敗を監視します。
+2. **50%** で数日。リクエストあたりのコストと、ユーザーから見た品質シグナルを比較します。
+3. **100%** に切り替え。少なくとも2週間は旧モデルIDをロールバック先として設定に残しておきます。
+
+チームでClaude Codeを使っている場合、これに相当するのは周知です。デフォルトが変わったこと、戻し方、共有プロンプトやカスタムコマンド、CLAUDE.mdを前提にしたワークフローで違和感があれば報告してほしいことを伝えておきます。
+
+## まとめ
+
+- Fable 5.2はトークン単価が下がり、コーディング性能も向上したと発表されています。早めに評価する価値があります。
+- エイリアスは指す先が変わります。機械が出力を消費する箇所では、モデルIDを完全に固定してください。
+- どのリーダーボードよりも自社の評価セットが役に立ちます。一度作れば、以降のモデルリリースのたびに使い回せます。
+- 削減効果を報告する前に、実際の出力長でコストを再計算してください。
+
+webhaniでは、LLM機能にこうした評価とロールアウトの仕組みを組み込む支援を行っています。新しいモデルのリリースを、リスクではなく定例の変更として扱えるようにするためです。

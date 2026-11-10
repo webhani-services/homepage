@@ -1,0 +1,122 @@
+---
+title: "PostgreSQL 14 Reaches End of Life on November 12: An Upgrade Runbook"
+description: "PostgreSQL 14 gets its final community release on November 12, 2026. Here is how we inventory remaining 14.x clusters, choose a target version, and upgrade with pg_upgrade or logical replication."
+date: "2026-11-11"
+status: "published"
+tags: ["PostgreSQL", "Database", "DevOps", "Migration", "AWS"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-14-eol-upgrade-runbook-2026-11"
+---
+
+According to the PostgreSQL versioning policy page, PostgreSQL 14 receives its final release on **November 12, 2026**. After that, the community ships no more bug or security fixes for the 14 line. The current minor is 14.24, and the version was first released in September 2021, so five years of support is ending on schedule.
+
+If you still run 14 anywhere, this is not an emergency on November 13, but every future CVE becomes something you cannot patch. This post is the runbook we use for these upgrades.
+
+## Step 1: Find every 14.x instance
+
+The obvious production database is rarely the only one. Check containers, CI, and local tooling too.
+
+```bash
+# Container images and compose files
+grep -RnE "postgres(ql)?:14|postgres:14" --include="*.yml" --include="*.yaml" --include="Dockerfile*" .
+
+# CI service containers
+grep -RnE "image:\s*postgres" .github/workflows/ 2>/dev/null
+
+# Terraform / IaC
+grep -RnE "engine_version\s*=\s*\"14" --include="*.tf" .
+```
+
+On each live server, confirm the real version, not the one in a README:
+
+```sql
+SELECT version();
+SHOW server_version_num;  -- 14xxxx means 14.x
+```
+
+Managed services such as Amazon RDS and Aurora typically offer paid extended support after community EOL. That buys time, but it is a cost line, not a plan. Check your provider's dates and pricing and treat them as a deadline.
+
+## Step 2: Choose the target version
+
+The supported lines right now are 15 through 18. We recommend going straight to **18** (currently 18.6, supported until November 2030) unless an extension or a managed-service constraint holds you back. Going from 14 to 15 only gives you one more year.
+
+PostgreSQL 19 is in the release-candidate stage. We would not put a production upgrade on 19.0; let it settle for a few minor releases.
+
+Things to know about 18 specifically when coming from 14:
+
+- **Data checksums are on by default** in `initdb` for 18. `pg_upgrade` requires the old and new clusters to match. If your 14 cluster was created without checksums, either initialize the new cluster with `--no-data-checksums` or enable checksums on the old cluster first with `pg_checksums` (offline).
+- **MD5 password authentication is deprecated** and emits warnings. Move to SCRAM-SHA-256 as part of the project.
+- **`pg_upgrade` now carries over planner statistics** (not extended statistics), which shortens the slow period right after an upgrade.
+
+Read the release notes for 15, 16, 17, and 18. Each major release has an "incompatibilities" section, and skipping four majors means reading four of them.
+
+## Step 3: Check extensions before anything else
+
+Extensions are where most upgrades actually fail.
+
+```sql
+SELECT extname, extversion FROM pg_extension ORDER BY extname;
+```
+
+For each one, confirm a build exists for your target version. PostGIS, pgvector, TimescaleDB, and `pg_partman` all need a matching package installed in the new cluster before `pg_upgrade` will succeed.
+
+## Step 4a: In-place with pg_upgrade
+
+For most self-managed servers, `pg_upgrade` is the simplest path. Always run the check mode first.
+
+```bash
+# New cluster initialized with matching settings
+/usr/lib/postgresql/18/bin/initdb -D /var/lib/postgresql/18/main \
+  --no-data-checksums --encoding=UTF8 --locale=C.UTF-8
+
+# Dry run: reports incompatibilities without changing anything
+/usr/lib/postgresql/18/bin/pg_upgrade \
+  --old-bindir=/usr/lib/postgresql/14/bin \
+  --new-bindir=/usr/lib/postgresql/18/bin \
+  --old-datadir=/var/lib/postgresql/14/main \
+  --new-datadir=/var/lib/postgresql/18/main \
+  --check
+```
+
+Once `--check` is clean, take a backup, stop the old server, and run the same command without `--check`. Adding `--link` uses hard links instead of copying, which makes the upgrade fast on large databases, but the old cluster cannot be safely started after the new one has run. Have a tested backup before using it.
+
+After the upgrade:
+
+```bash
+# Fill in any statistics that were not carried over
+vacuumdb --all --analyze-in-stages --missing-stats-only
+```
+
+## Step 4b: Near-zero downtime with logical replication
+
+When downtime has to be measured in seconds, set up the new version as a logical replication subscriber, let it catch up, and switch application traffic.
+
+```sql
+-- On the 14.x publisher
+CREATE PUBLICATION upgrade_pub FOR ALL TABLES;
+
+-- On the 18.x subscriber (schema loaded first with pg_dump --schema-only)
+CREATE SUBSCRIPTION upgrade_sub
+  CONNECTION 'host=old-db dbname=app user=replicator'
+  PUBLICATION upgrade_pub;
+```
+
+Know the limits: logical replication does not carry sequences or DDL. Before cutover, stop writes, sync sequence values with `setval`, and freeze schema changes for the duration of the migration. Tables without a primary key need a `REPLICA IDENTITY` setting to replicate updates and deletes.
+
+## Step 5: Containers and CI
+
+Changing `postgres:14` to `postgres:18` in a compose file does not upgrade data. A new major version cannot start on the old data directory. For local development, recreating the volume and reseeding is usually simplest. Also note that the official Docker image changed its default data directory layout starting with 18, so check the image documentation before reusing an existing volume mount path.
+
+Update CI service containers at the same time so tests run against the version production will use.
+
+## Takeaways
+
+- PostgreSQL 14 gets its last community fix on November 12, 2026.
+- Inventory every 14.x instance, including Docker, CI, and IaC.
+- Target 18 unless something specific blocks it, and read each skipped major's incompatibilities.
+- Verify extensions first, run `pg_upgrade --check`, and keep a tested backup.
+- Use logical replication when downtime must be minimal, and remember sequences.
+- Treat managed-service extended support as a paid grace period, not a solution.
+
+webhani supports database upgrades for both self-managed PostgreSQL and AWS RDS/Aurora, including rehearsal runs on production-sized copies before the real cutover.

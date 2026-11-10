@@ -1,0 +1,142 @@
+---
+title: "Next.js 2026年11月セキュリティリリース: 本質はキャッシュの分離にある"
+description: "Next.js 16.4.5と15.5.29で7件の脆弱性が修正されました。うち4件はキャッシュがテナントやユーザーの境界を越える問題です。影響の有無の確認方法と、バージョンアップ以外に見直すべき設計を解説します。"
+date: "2026-11-11"
+status: "published"
+tags: ["Next.js", "セキュリティ", "キャッシュ", "マルチテナント", "React"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-november-2026-security-release-cache-isolation"
+---
+
+2026年11月3日、Next.jsチームが11月のセキュリティリリースを公開しました。修正は **v16.4.5**(Active LTS)と **v15.5.29**(Maintenance LTS)に含まれています。どちらかのラインを使っているなら、まずアップグレードを済ませてから、この記事の続きを読んでください。
+
+```bash
+npm install next@16.4.5   # 16.x
+npm install next@15.5.29  # 15.5.x
+```
+
+今回のアドバイザリは7件です。並べて読むと共通点が見えてきます。4件が「キャッシュされたコンテンツが別のテナントやユーザーに返される」問題です。ここはどのバージョンを入れるかだけでなく、マルチテナントのNext.jsアプリでキャッシュをどう設計するかに関わる部分なので、しっかり理解しておく価値があります。
+
+## アドバイザリの整理
+
+**キャッシュの分離(Cache Components / `use cache`)**
+
+- **High:** 同じpublicな `use cache` 関数を、直接呼ぶ経路と `unstable_cache` の内側から呼ぶ経路の両方で使い、その関数がテナントIDなどのroot parameterを読んでいる場合に、テナントをまたいだ情報漏洩が起こり得ます。キャッシュが空の状態で並行に呼ばれると、別リクエストの結果を受け取ることがあります。
+- **Medium:** ネストした `use cache` 関数で、内側がroot parameterを読み、早く返る値と遅い非同期の値を同時に返すケース。内側の依存関係が記録される前に外側のエントリが保存されることがあります。
+- **Medium:** `use cache` 関数に渡した異なるバイナリ引数が、同じキャッシュキーになることがあります。その引数でユーザーを区別していると、他人の結果を受け取る可能性があります。
+- **Medium(セルフホスト):** `next start` でCache Componentsを有効にし、Partial Prefetchingを無効にしている場合、特定の動的ルート構成で共有シェルのキャッシュが汚染される問題です。
+
+**その他**
+
+- **Medium(セルフホスト):** 攻撃者が制御できる `fetch` の `Response` をそのまま返すと、展開済みのボディが圧縮時のフレーミングヘッダー付きで転送されます。共有のバックエンド接続でリクエストをパイプライン処理するHTTP/1.1リバースプロキシの背後では、レスポンスが別のクライアントに割り当てられることがあります。
+- **Medium:** `NextResponse.cookies.set()` でCookieを設定するEdgeのRoute Handlerで、内部ヘッダー `x-middleware-set-cookie` に値が露出し、`HttpOnly` のCookieでも同一オリジンのJavaScriptから読めてしまう問題です。
+- **Medium:** 許可されたソースの画像がAVIFと誤判定され、`images.dangerouslyAllowSVG: false` をすり抜ける問題です。
+
+## 影響有無の簡易チェック
+
+キャッシュ関連の問題の多くはCache Componentsが有効であることが前提です。まずそこから確認します。
+
+```bash
+# 1. 実際にインストールされているNext.jsのバージョン(宣言ではなく実体)
+npm ls next
+
+# 2. Cache Componentsが有効か
+grep -nE "cacheComponents|dynamicIO" next.config.* 2>/dev/null
+
+# 3. "use cache" の利用箇所と、unstable_cache で包んでいる箇所
+grep -RnE "[\"']use cache[\"']" src app 2>/dev/null
+grep -Rn "unstable_cache" src app 2>/dev/null
+
+# 4. Cookieを設定しているEdgeルート
+grep -RlE "runtime\s*=\s*[\"']edge[\"']" src app 2>/dev/null \
+  | xargs grep -ln "cookies.set" 2>/dev/null
+```
+
+2で何も出なければ、キャッシュ関連の4件はほぼ該当しません(それでもアップグレードはすべきです)。同じコードパスで `unstable_cache` と `use cache` が混在しているなら、それがまさにHigh評価の問題の条件です。
+
+## バージョンに関係なく見直したい設計
+
+パッチはフレームワークのバグを直します。一方で、今回のアドバイザリはキャッシュ事故を起こしやすい書き方も浮き彫りにしています。webhaniでは、バージョンに関係なく次の対応を推奨しています。
+
+### 1. テナントは明示的な引数にする
+
+root parameterは便利ですが、ルーティングのコンテキストから暗黙にテナントを読むキャッシュ関数は挙動を追いにくくなります。テナントIDを文字列の引数として渡せば、レビューで誰が見てもキャッシュキーの一部だと分かります。
+
+```ts
+import { cacheTag } from "next/cache";
+
+// テナントIDを明示的な文字列引数として受け取る
+export async function getTenantSettings(tenantId: string) {
+  "use cache";
+  cacheTag(`tenant:${tenantId}:settings`);
+
+  const row = await db.tenantSettings.findUnique({ where: { tenantId } });
+  return row ?? defaultSettings;
+}
+```
+
+### 2. バイナリをキャッシュキーにしない
+
+ユーザーを識別する `Uint8Array` や `ArrayBuffer`(トークンのハッシュなど)をキャッシュ関数に渡している場合は、正規化した文字列に変換するか、より良いのはそれが表すユーザーIDを渡すことです。
+
+```ts
+// Before: バイナリの識別子をキャッシュ関数に渡している
+// await getProfile(sessionHashBytes);
+
+// After: 識別子の解決はキャッシュの外で行い、安定した文字列を渡す
+const userId = await resolveUserId(sessionHashBytes);
+await getProfile(userId);
+```
+
+### 3. 1つのコードパスでキャッシュAPIを混在させない
+
+最も深刻な問題のきっかけは、同じ関数の周りで `unstable_cache` と `use cache` が混在していたことでした。Cache Componentsへ移行中であれば、データ取得関数ごとに移行を完了させ、新方式のキャッシュを旧方式で包む状態を残さないようにします。
+
+### 4. Cookieを設定するルートはEdgeから移す
+
+VercelではEdgeランタイムは非推奨になっており、アドバイザリにもNode.jsのRoute Handlerと `cookies().set()` は影響を受けないと書かれています。セッションCookieを扱うルートをデフォルトのNode.jsランタイムに移せば、この種の問題自体がなくなります。
+
+### 5. セルフホストならプロキシ設定を確認する
+
+レスポンスのフレーミングの問題は、共有のupstream接続でパイプライン処理を行うHTTP/1.1プロキシが前提です。自社プロキシのupstream接続の扱いを確認し、外部APIの `Response` をそのまま返すのはやめましょう。通したいヘッダーだけで組み立て直すのは、そもそも良い習慣です。
+
+```ts
+export async function GET() {
+  const upstream = await fetch("https://api.example.com/data");
+  const body = await upstream.arrayBuffer();
+  return new Response(body, {
+    status: upstream.status,
+    headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
+  });
+}
+```
+
+## 分離を確認するリグレッションテストを追加する
+
+バージョンアップで直るのは今日のバグです。同じキャッシュ対象のページを2つのテナントで取得して比較するテストがあれば、将来のバグも捕まえられます。Playwrightでの最小例です。
+
+```ts
+import { test, expect } from "@playwright/test";
+
+test("tenant settings never leak across tenants", async ({ request }) => {
+  const [a, b] = await Promise.all([
+    request.get("/acme/settings"),
+    request.get("/globex/settings"),
+  ]);
+  expect(await a.text()).toContain("acme");
+  expect(await b.text()).not.toContain("acme");
+});
+```
+
+High評価の問題はキャッシュが空の状態で発生していたため、キャッシュをクリアした状態から並行リクエストで実行するのがポイントです。
+
+## まとめ
+
+- 16.4.5または15.5.29へすぐにアップグレードしてください。
+- Cache Componentsを有効にしているなら、テナントやユーザーに依存する `use cache` 関数をすべて点検してください。
+- 識別子は明示的な文字列引数で渡し、1つの経路で `unstable_cache` と `use cache` を混在させないようにします。
+- Cookieを設定するルートはNode.jsランタイムに置き、プロキシするレスポンスは組み立て直します。
+- テナント間のテストをCIに追加し、キャッシュの分離を「前提」ではなく「検証済み」にします。
+
+webhaniではマルチテナントのNext.jsアプリケーションの開発・保守を行っており、キャッシュ分離のレビューをアップグレード時の標準チェック項目に加えています。

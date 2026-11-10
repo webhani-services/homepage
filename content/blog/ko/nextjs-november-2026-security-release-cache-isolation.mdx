@@ -1,0 +1,142 @@
+---
+title: "Next.js 2026년 11월 Security Release: 핵심은 Cache 격리입니다"
+description: "Next.js 16.4.5와 15.5.29에서 7건의 취약점이 수정되었고, 그중 4건은 Cache된 데이터가 Tenant나 사용자 경계를 넘는 문제입니다. 영향 여부를 확인하는 방법과 버전 업그레이드 외에 바꿔야 할 설계를 정리합니다."
+date: "2026-11-11"
+status: "published"
+tags: ["Next.js", "Security", "Caching", "Multi-tenant", "React"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-november-2026-security-release-cache-isolation"
+---
+
+2026년 11월 3일, Next.js 팀이 11월 Security Release를 공개했습니다. 수정 사항은 **v16.4.5**(Active LTS)와 **v15.5.29**(Maintenance LTS)에 포함되어 있습니다. 두 라인 중 하나를 쓰고 있다면 먼저 업그레이드부터 하고 이 글을 읽으셔도 됩니다.
+
+```bash
+npm install next@16.4.5   # 16.x
+npm install next@15.5.29  # 15.5.x
+```
+
+이번 Advisory는 7건입니다. 함께 놓고 보면 공통점이 드러납니다. 4건이 "Cache된 Content가 다른 Tenant나 사용자에게 전달되는" 문제입니다. 이 부분은 단순히 어떤 버전을 설치하느냐가 아니라, Multi-tenant Next.js 앱에서 Cache를 어떻게 설계해야 하는지와 직결되므로 제대로 이해해 둘 필요가 있습니다.
+
+## Advisory 정리
+
+**Cache 격리(Cache Components / `use cache`)**
+
+- **High:** 같은 public `use cache` 함수를 직접 호출하는 경로와 `unstable_cache` 내부에서 호출하는 경로가 공존하고, 그 함수가 Tenant ID 같은 root parameter를 읽는 경우 Tenant 간 정보 노출이 발생할 수 있습니다. Cache가 비어 있을 때 동시 호출이 들어오면 다른 Request의 결과를 받을 수 있습니다.
+- **Medium:** 중첩된 `use cache` 함수에서 내부 함수가 root parameter를 읽고, 빠른 값과 느린 비동기 값을 함께 반환하는 경우입니다. 내부 의존성이 기록되기 전에 외부 Entry가 저장될 수 있습니다.
+- **Medium:** `use cache` 함수에 전달한 서로 다른 Binary 인자가 같은 Cache Key를 만들 수 있습니다. 그 인자로 사용자를 구분하고 있다면 다른 사용자의 결과를 받을 수 있습니다.
+- **Medium(Self-hosted):** `next start`에서 Cache Components를 켜고 Partial Prefetching을 끈 상태에서, 특정 동적 Route 구조일 때 공유 Shell Cache가 오염되는 문제입니다.
+
+**그 밖의 항목**
+
+- **Medium(Self-hosted):** 공격자가 제어할 수 있는 `fetch` `Response`를 그대로 반환하면, 압축 해제된 Body가 원래의 압축 Framing Header와 함께 전달됩니다. 공유 Backend 연결에서 Request를 Pipelining하는 HTTP/1.1 Reverse Proxy 뒤에서는 Response가 다른 Client에게 할당될 수 있습니다.
+- **Medium:** `NextResponse.cookies.set()`으로 Cookie를 설정하는 Edge Route Handler에서 내부 Header `x-middleware-set-cookie`에 값이 노출되어, `HttpOnly` Cookie라도 같은 Origin의 JavaScript가 읽을 수 있는 문제입니다.
+- **Medium:** 허용된 출처의 이미지가 AVIF로 잘못 판정되어 `images.dangerouslyAllowSVG: false`를 우회하는 문제입니다.
+
+## 영향 여부 빠르게 확인하기
+
+Cache 관련 문제 대부분은 Cache Components가 켜져 있어야 성립합니다. 거기서부터 확인합니다.
+
+```bash
+# 1. 실제로 설치된 Next.js 버전(선언이 아닌 실체)
+npm ls next
+
+# 2. Cache Components 활성화 여부
+grep -nE "cacheComponents|dynamicIO" next.config.* 2>/dev/null
+
+# 3. "use cache" 사용 위치와 unstable_cache로 감싼 위치
+grep -RnE "[\"']use cache[\"']" src app 2>/dev/null
+grep -Rn "unstable_cache" src app 2>/dev/null
+
+# 4. Cookie를 설정하는 Edge Route
+grep -RlE "runtime\s*=\s*[\"']edge[\"']" src app 2>/dev/null \
+  | xargs grep -ln "cookies.set" 2>/dev/null
+```
+
+2번에서 아무것도 나오지 않으면 Cache 관련 4건은 대부분 해당되지 않습니다(그래도 업그레이드는 해야 합니다). 같은 Code Path에 `unstable_cache`와 `use cache`가 섞여 있다면, 그것이 바로 High 등급 문제의 조건입니다.
+
+## 버전과 무관하게 바꿔 둘 설계
+
+Patch는 Framework의 Bug를 고칩니다. 하지만 이번 Advisory는 Cache 사고를 일으키기 쉬운 작성 습관도 드러냈습니다. webhani는 버전과 관계없이 다음을 권장합니다.
+
+### 1. Tenant는 명시적인 인자로 전달한다
+
+root parameter는 편리하지만, Routing Context에서 암묵적으로 Tenant를 읽는 Cache 함수는 동작을 추적하기 어렵습니다. Tenant ID를 문자열 인자로 넘기면 Review 시 누구나 Cache Key의 일부라는 것을 알 수 있습니다.
+
+```ts
+import { cacheTag } from "next/cache";
+
+// Tenant ID를 명시적인 문자열 인자로 받음
+export async function getTenantSettings(tenantId: string) {
+  "use cache";
+  cacheTag(`tenant:${tenantId}:settings`);
+
+  const row = await db.tenantSettings.findUnique({ where: { tenantId } });
+  return row ?? defaultSettings;
+}
+```
+
+### 2. Binary를 Cache Key로 쓰지 않는다
+
+사용자를 식별하는 `Uint8Array`나 `ArrayBuffer`(Token Hash 등)를 Cache 함수에 넘기고 있다면, 정규화된 문자열로 변환하거나, 더 좋게는 그것이 가리키는 User ID를 넘깁니다.
+
+```ts
+// Before: Binary 식별자를 Cache 함수에 직접 전달
+// await getProfile(sessionHashBytes);
+
+// After: 식별자 해석은 Cache 밖에서 하고, 안정적인 문자열을 전달
+const userId = await resolveUserId(sessionHashBytes);
+await getProfile(userId);
+```
+
+### 3. 한 Code Path에서 Cache API를 섞지 않는다
+
+가장 심각한 문제의 계기는 같은 함수 주변에서 `unstable_cache`와 `use cache`가 섞여 있던 것이었습니다. Cache Components로 Migration 중이라면 데이터 함수 단위로 Migration을 끝내고, 새 방식의 Cache를 구 방식으로 감싸는 상태를 남기지 않습니다.
+
+### 4. Cookie를 설정하는 Route는 Edge에서 옮긴다
+
+Vercel에서 Edge Runtime은 Deprecated 상태이고, Advisory에도 Node.js Route Handler와 `cookies().set()`은 영향을 받지 않았다고 나와 있습니다. Session Cookie를 다루는 Route를 기본 Node.js Runtime으로 옮기면 이 유형의 문제가 아예 사라집니다.
+
+### 5. Self-hosted라면 Proxy 설정을 확인한다
+
+Response Framing 문제는 공유 Upstream 연결에서 Pipelining을 하는 HTTP/1.1 Proxy가 전제입니다. 사용 중인 Proxy가 Upstream 연결을 어떻게 다루는지 확인하고, 외부 API의 `Response`를 그대로 반환하지 않도록 합니다. 전달할 Header만 골라 Response를 다시 구성하는 것은 원래 좋은 습관입니다.
+
+```ts
+export async function GET() {
+  const upstream = await fetch("https://api.example.com/data");
+  const body = await upstream.arrayBuffer();
+  return new Response(body, {
+    status: upstream.status,
+    headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
+  });
+}
+```
+
+## 격리를 검증하는 Regression Test 추가
+
+버전 업그레이드가 고치는 것은 오늘의 Bug입니다. 같은 Cache 대상 페이지를 두 Tenant로 요청해 비교하는 Test가 있으면 앞으로의 Bug도 잡을 수 있습니다. Playwright 최소 예시입니다.
+
+```ts
+import { test, expect } from "@playwright/test";
+
+test("tenant settings never leak across tenants", async ({ request }) => {
+  const [a, b] = await Promise.all([
+    request.get("/acme/settings"),
+    request.get("/globex/settings"),
+  ]);
+  expect(await a.text()).toContain("acme");
+  expect(await b.text()).not.toContain("acme");
+});
+```
+
+High 등급 문제는 Cache가 빈 상태에서 발생했으므로, Cache를 비운 뒤 동시 Request로 실행하는 것이 포인트입니다.
+
+## 정리
+
+- 지금 바로 16.4.5 또는 15.5.29로 업그레이드합니다.
+- Cache Components를 쓰고 있다면 Tenant나 사용자에 의존하는 `use cache` 함수를 모두 점검합니다.
+- 식별자는 명시적인 문자열 인자로 전달하고, 한 경로에서 `unstable_cache`와 `use cache`를 섞지 않습니다.
+- Cookie를 설정하는 Route는 Node.js Runtime에 두고, Proxy하는 Response는 다시 구성합니다.
+- Tenant 간 Test를 CI에 추가해 Cache 격리를 "가정"이 아닌 "검증된 사실"로 만듭니다.
+
+webhani는 Multi-tenant Next.js Application을 개발·운영하고 있으며, Cache 격리 Review를 업그레이드 시 표준 Checklist에 포함하고 있습니다.

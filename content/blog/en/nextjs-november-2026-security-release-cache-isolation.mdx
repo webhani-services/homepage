@@ -1,0 +1,142 @@
+---
+title: "Next.js November 2026 Security Release: Cache Isolation Is the Real Story"
+description: "Next.js 16.4.5 and 15.5.29 fix seven issues, four of them about cached data crossing tenant or user boundaries. Here is how to tell whether your app is exposed and what to change beyond the version bump."
+date: "2026-11-11"
+status: "published"
+tags: ["Next.js", "Security", "Caching", "Multi-tenant", "React"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-november-2026-security-release-cache-isolation"
+---
+
+On November 3, 2026, the Next.js team published its November security release. The fixes ship in **v16.4.5** (Active LTS) and **v15.5.29** (Maintenance LTS). If you run either line, upgrade first and read the rest of this post second.
+
+```bash
+npm install next@16.4.5   # 16.x
+npm install next@15.5.29  # 15.5.x
+```
+
+Seven advisories are included. Read them together and a pattern stands out: four are about cached content being served to the wrong tenant or user. That is the part worth understanding, because it says something about how to design caching in multi-tenant Next.js apps, not just which version to install.
+
+## The advisories, grouped
+
+**Cache isolation (Cache Components / `use cache`)**
+
+- **High:** Cross-tenant disclosure when the same public `use cache` function is called both directly and from inside `unstable_cache`, and that function reads a root parameter such as a tenant ID. During a cold cache fill, a concurrent call can receive another request's result.
+- **Medium:** Nested `use cache` functions where the inner one reads a root parameter and returns an early value alongside a slower async value. The outer entry can be stored before the inner dependency is recorded.
+- **Medium:** Distinct binary arguments passed to a `use cache` function can produce the same cache key. If those arguments distinguish users, one user can get another's result.
+- **Medium (self-hosted):** Shared shell cache poisoning with `next start`, Cache Components enabled, and Partial Prefetching disabled, under a specific dynamic-route shape.
+
+**Other**
+
+- **Medium (self-hosted):** Returning an attacker-controlled fetched `Response` unchanged can forward decompressed bytes with the original compressed framing headers. Behind an HTTP/1.1 proxy that pipelines requests on a shared backend connection, responses can be assigned to the wrong clients.
+- **Medium:** Edge Route Handlers that set cookies via `NextResponse.cookies.set()` could expose the serialized value in the internal `x-middleware-set-cookie` header, readable by same-origin JavaScript even for `HttpOnly` cookies.
+- **Medium:** An image from an allowed source could be misclassified as AVIF and bypass `images.dangerouslyAllowSVG: false`.
+
+## Are you affected? A quick triage
+
+Most of the cache issues need Cache Components enabled. Start there.
+
+```bash
+# 1. Which Next.js version is actually installed (not just declared)?
+npm ls next
+
+# 2. Is Cache Components on?
+grep -nE "cacheComponents|dynamicIO" next.config.* 2>/dev/null
+
+# 3. Where is "use cache" used, and does unstable_cache wrap any of it?
+grep -RnE "[\"']use cache[\"']" src app 2>/dev/null
+grep -Rn "unstable_cache" src app 2>/dev/null
+
+# 4. Edge routes that set cookies
+grep -RlE "runtime\s*=\s*[\"']edge[\"']" src app 2>/dev/null \
+  | xargs grep -ln "cookies.set" 2>/dev/null
+```
+
+If step 2 returns nothing, the four cache advisories largely do not apply, though upgrading is still the right call. If you find `unstable_cache` and `use cache` mixed in the same code path, that combination is exactly what the High-severity issue describes.
+
+## Design changes worth making anyway
+
+The patch fixes the framework bugs. But the advisories also highlight habits that make cache mistakes more likely. We recommend the following regardless of version.
+
+### 1. Make the tenant an explicit argument
+
+Root parameters are convenient, but a cached function that implicitly reads the tenant from routing context is harder to reason about. Passing the tenant ID as a plain string argument makes it part of the cache key in a way anyone can see in review.
+
+```ts
+import { cacheTag } from "next/cache";
+
+// Tenant ID is an explicit, serializable string argument
+export async function getTenantSettings(tenantId: string) {
+  "use cache";
+  cacheTag(`tenant:${tenantId}:settings`);
+
+  const row = await db.tenantSettings.findUnique({ where: { tenantId } });
+  return row ?? defaultSettings;
+}
+```
+
+### 2. Avoid binary data as a cache key
+
+If a cached function receives a `Uint8Array` or `ArrayBuffer` that identifies a user (a hashed token, for example), convert it to a canonical string first, or better, pass the user ID it represents.
+
+```ts
+// Before: binary identity passed into a cached function
+// await getProfile(sessionHashBytes);
+
+// After: resolve identity outside the cache, pass a stable string in
+const userId = await resolveUserId(sessionHashBytes);
+await getProfile(userId);
+```
+
+### 3. Pick one caching API per code path
+
+Mixing `unstable_cache` and `use cache` around the same function was the trigger for the most severe issue. If you are migrating to Cache Components, finish the migration for a given data function rather than wrapping new-style caching inside old-style caching.
+
+### 4. Move cookie-setting routes off Edge
+
+The Edge runtime is deprecated on Vercel, and the advisory notes that Node.js Route Handlers and `cookies().set()` were not affected. Moving session-cookie routes to the default Node.js runtime removes this class of issue entirely.
+
+### 5. Check your proxy if you self-host
+
+The response-framing issue requires an HTTP/1.1 reverse proxy that pipelines requests on a shared upstream connection. Confirm how your proxy handles upstream connections, and avoid returning third-party `Response` objects unchanged. Rebuilding the response with only the headers you intend to pass through is a good habit anyway.
+
+```ts
+export async function GET() {
+  const upstream = await fetch("https://api.example.com/data");
+  const body = await upstream.arrayBuffer();
+  return new Response(body, {
+    status: upstream.status,
+    headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
+  });
+}
+```
+
+## Add a regression test for isolation
+
+Version bumps fix today's bugs. A test that requests the same cached page as two tenants and compares the output catches tomorrow's. A minimal Playwright version:
+
+```ts
+import { test, expect } from "@playwright/test";
+
+test("tenant settings never leak across tenants", async ({ request }) => {
+  const [a, b] = await Promise.all([
+    request.get("/acme/settings"),
+    request.get("/globex/settings"),
+  ]);
+  expect(await a.text()).toContain("acme");
+  expect(await b.text()).not.toContain("acme");
+});
+```
+
+Run it with concurrent requests against a cold cache, since cold fills are where the High-severity issue appeared.
+
+## Takeaways
+
+- Upgrade to 16.4.5 or 15.5.29 now.
+- If Cache Components is enabled, audit every `use cache` function that depends on tenant or user identity.
+- Pass identity as explicit string arguments, and do not mix `unstable_cache` with `use cache` in one path.
+- Keep cookie-setting routes on the Node.js runtime and rebuild proxied responses.
+- Add a cross-tenant test to CI so cache isolation is verified, not assumed.
+
+webhani builds and maintains multi-tenant Next.js applications, and cache isolation reviews are now a standard part of our upgrade checklist.
