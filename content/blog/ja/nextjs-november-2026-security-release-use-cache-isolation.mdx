@@ -1,0 +1,126 @@
+---
+title: "Next.js 2026年11月セキュリティリリース：Cache Components の分離不備と確認すべきポイント"
+description: "Next.js 16.4.5 / 15.5.29 で 7 件の脆弱性が修正されました。うち 4 件は Cache Components と use cache に関するもので、テナント間でキャッシュが混ざる問題です。バージョンアップ以外に確認すべき点を整理します。"
+date: "2026-11-12"
+status: "published"
+tags: ["Next.js", "セキュリティ", "Cache Components", "マルチテナント", "フロントエンド"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-november-2026-security-release-use-cache-isolation"
+---
+
+11月3日、Next.js の 2026年11月セキュリティリリースが公開されました。修正版は **16.4.5**（Active LTS）と **15.5.29**（Maintenance LTS）です。それより新しい 16.4.x を使っていれば修正は含まれています。まだの場合は、先にアップデートしてから続きを読んでください。
+
+今回のリリースは、単にバージョンを上げて終わりにしないほうがよい内容です。7 件中 4 件が **Cache Components と `use cache`** に関するもので、その多くは「あるテナント・サイト・ロケール・ユーザー向けに生成された内容が、別の相手に返される」という同じ種類の問題です。クラッシュではなくデータ分離の問題なので、エラー監視にはまず現れません。
+
+## 影響範囲ごとに整理する
+
+公式の一覧順ではなく、どんなアプリケーションが影響を受けるかで分けてみます。
+
+### Cache Components を使うアプリ（マルチテナント・ユーザー別表示）
+
+- **`unstable_cache` と `use cache` の併用によるテナント間漏えい（High）**：root parameter（テナント ID など）を読む同じ `use cache` 関数を、直接呼び出しつつ `unstable_cache` の内側からも呼んでいる場合、コールドキャッシュ時の並行リクエストで他リクエストの結果を受け取る可能性がありました。
+- **ネストした `use cache` 関数（Medium）**：内側の関数が root parameter を読み、即時の値と遅い非同期の値を返す構成で、依存関係が記録される前に外側のエントリが保存されることがありました。
+- **バイナリ引数（Medium）**：異なるバイナリ引数が同じキャッシュ ID になる場合がありました。
+- **共有シェルの汚染（Medium、セルフホスト）**：`next start` で Cache Components を有効にし、Partial Prefetching が無効または未設定の場合、特定の動的ルート構成で細工した URL によって共有シェルが汚染される可能性がありました。
+
+### セルフホストのリクエスト処理
+
+- **圧縮レスポンスのフレーミング不整合（Medium）**：fetch した外部の `Response` をそのまま返すと、展開済みのボディに元の圧縮時のヘッダーが付いたまま送出されることがありました。共有バックエンド接続でパイプライン処理を行う HTTP/1.1 プロキシの背後では、レスポンスが別のクライアントに届く可能性があります。
+
+### Edge ルート
+
+- **`x-middleware-set-cookie` ヘッダーからの Cookie 露出（Medium）**：Edge の Route Handler や Pages Router の Edge API ルートで `NextResponse.cookies.set()` を使うと、`HttpOnly` を含む Cookie の値が同一オリジンの JavaScript から読める状態になっていました。
+
+### Image Optimization
+
+- **SVG 拒否設定の回避（Medium）**：許可されたソースの画像が AVIF と誤判定され、`dangerouslyAllowSVG: false` をすり抜ける可能性がありました。
+
+## ステップ 1：パッチを当て、実際にデプロイされている版を確認する
+
+lockfile はずれますし、モノレポには `next` が複数存在することもよくあります。私たちは CI に小さなチェックを入れて、古い版のままビルドが通らないようにしています。
+
+```js
+// scripts/assert-next-version.mjs
+import { readFileSync } from "node:fs";
+
+const { version } = JSON.parse(
+  readFileSync("node_modules/next/package.json", "utf8"),
+);
+const [major, minor, patch] = version.split(/[.-]/).map(Number);
+
+const patched =
+  major > 16 ||
+  (major === 16 && (minor > 4 || (minor === 4 && patch >= 5))) ||
+  (major === 15 && minor === 5 && patch >= 29);
+
+if (!patched) {
+  console.error(`next@${version} は 2026年11月のセキュリティリリース以前の版です`);
+  process.exit(1);
+}
+console.log(`next@${version} OK`);
+```
+
+`npm ci` の後に実行します。ワークスペースでは `npm ls next` も確認してください。忘れられた社内向けアプリが残っているケースは少なくありません。
+
+## ステップ 2：Cache Components の使い方を棚卸しする
+
+パッチは個々のバグを塞ぎます。棚卸しは、設計そのものが壊れやすい前提に依存していないかを確認する作業です。私たちは次の 3 点を見ています。
+
+**`unstable_cache` と `use cache` の混在**：同じ関数が `use cache` を持ちつつ、どこかで `unstable_cache` に包まれているなら、どちらかに統一します。Cache Components を採用したコードベースでは、残っている `unstable_cache` を移行するほうが素直です。
+
+**バイナリ値をキャッシュ ID にしていないか**：署名付きトークンやユーザーキーなど、セキュリティ上意味のある値を `Uint8Array` や `ArrayBuffer` で渡しているなら、文字列の ID に置き換えます。挙動を追いやすく、ログにも残しやすくなります。
+
+```ts
+// 変更前：バイナリ引数のシリアライズ方法に依存
+async function getStatement(accountKey: Uint8Array) {
+  "use cache";
+  // ...
+}
+
+// 変更後：明示的な文字列 ID
+async function getStatement(accountId: string) {
+  "use cache";
+  // ...
+}
+```
+
+**テナント情報を root parameter だけに頼っていないか**：ネストした cached 関数の奥で root parameter を読んでテナントを分けている場合、各 cached 関数の境界でテナント ID を明示的な引数にすることを検討します。キャッシュキーがコードレビューで見えるようになります。
+
+マルチテナントのアプリには、簡単な回帰テストもおすすめです。コールドキャッシュの状態で 2 テナント分の同じパスを並行リクエストし、それぞれのレスポンスに自テナントの識別子だけが含まれることを確認します。バグがないことの証明にはなりませんが、今回修正された種類の問題は検出できます。
+
+## ステップ 3：セルフホストと Edge の項目を確認する
+
+**外部レスポンスのプロキシ**：上流の `Response` をそのまま返すのはやめ、許可したヘッダーだけで組み立て直します。
+
+```ts
+export async function GET() {
+  const upstream = await fetch("https://api.example.com/report");
+  const body = await upstream.arrayBuffer();
+
+  const headers = new Headers();
+  for (const name of ["content-type", "cache-control", "etag"]) {
+    const value = upstream.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  return new Response(body, { status: upstream.status, headers });
+}
+```
+
+不要な上流ヘッダーの漏えいも防げるので、今回の件とは関係なくやっておく価値があります。
+
+**Cookie を設定する Edge ルート**：`runtime = "edge"` と `NextResponse.cookies.set()` の組み合わせを検索してください。Vercel では Edge runtime が非推奨となり Node.js が推奨されているため、デフォルトの runtime に移すのが最も簡単で、今後の方向性とも合っています。
+
+**画像**：`dangerouslyAllowSVG` は無効のままにし、`images.remotePatterns` はできるだけ絞ります。今回の件でも画像ソースの許可リストは有効に機能しており、最も効果的な防御策です。
+
+## webhani の見解
+
+Cache Components によって、キャッシュは「ルートごとの設定」から「関数の境界で表現するもの」に変わりました。モデルとしては整理されましたが、キャッシュキーがアプリケーションのセキュリティ設計の一部になったということでもあります。マルチテナントの SaaS では、`use cache` 関数ひとつひとつをアクセス制御の境界とみなし、認可処理と同じ水準でレビューすることをおすすめします。
+
+## まとめ
+
+- 16.4.5 / 15.5.29 以降に上げ、CI で強制する
+- 同じ関数に `unstable_cache` と `use cache` を重ねない
+- テナントやユーザーの ID は cached 関数に文字列で明示的に渡す
+- プロキシするレスポンスはそのまま返さず組み立て直す
+- Cookie を設定する Edge ルートは Node.js runtime に移す

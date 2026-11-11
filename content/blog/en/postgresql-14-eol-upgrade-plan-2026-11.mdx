@@ -1,0 +1,110 @@
+---
+title: "PostgreSQL 14 Reaches End of Life Today: A Practical Upgrade Plan to 18"
+description: "PostgreSQL 14 receives its final minor release on November 12, 2026. Here is how we inventory a 14 cluster, pick a target version, and avoid the upgrade gotchas that show up when jumping straight to 18."
+date: "2026-11-12"
+status: "published"
+tags: ["PostgreSQL", "Database", "Upgrade", "Operations", "Security"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-14-eol-upgrade-plan-2026-11"
+---
+
+PostgreSQL 14 reaches end of life today, November 12, 2026. Under the project's five-year support policy, this is the date of its last scheduled minor release. After it, bug fixes and security patches stop for the 14 branch. Any CVE disclosed next month will not be fixed there.
+
+If you are on a managed service, your provider may keep 14 running longer, sometimes under a paid extended-support program. That buys time, but it does not change the underlying situation: you are on a branch the community no longer maintains. Check your provider's announced timeline and plan accordingly.
+
+This post covers how we approach these upgrades for clients, focusing on the jump from 14 to 18, which skips three major versions.
+
+## Choosing the target: 18, not 15
+
+Upgrading to 15 is the smallest step, but 15 itself reaches end of life in November 2027. That leaves you doing this again in a year.
+
+PostgreSQL 19 is scheduled for general availability later this month. We generally avoid putting production on a brand-new major release before the first couple of minor releases land, so for most teams the right target today is **PostgreSQL 18**. It is mature, supported until 2030, and `pg_upgrade` handles the 14-to-18 jump directly.
+
+## Step 1: Inventory the 14 cluster
+
+Before choosing a method, collect facts. These queries cover most of what matters:
+
+```sql
+-- Exact version and key settings
+SELECT version();
+SHOW data_checksums;
+SHOW password_encryption;
+
+-- Extensions and their versions
+SELECT extname, extversion FROM pg_extension ORDER BY extname;
+
+-- Roles still using MD5 password hashes
+SELECT rolname FROM pg_authid WHERE rolpassword LIKE 'md5%';
+
+-- Database sizes (drives downtime estimates)
+SELECT datname, pg_size_pretty(pg_database_size(datname))
+FROM pg_database ORDER BY pg_database_size(datname) DESC;
+```
+
+For each extension, confirm a build exists for 18. PostGIS, pgvector, and pg_partman are usually fine; small or in-house extensions are where upgrades stall.
+
+## Step 2: Know the changes between 14 and 18
+
+Skipping three majors means accumulating three sets of behavior changes. These are the ones we see cause real trouble.
+
+**`public` schema privileges (since 15).** New databases no longer grant `CREATE` on the `public` schema to all users. `pg_upgrade` keeps your existing grants, but databases created afterward, including test databases built by migration tools, behave differently. If an application role creates tables in `public`, grant that explicitly.
+
+**Data checksums by default (18).** `initdb` in 18 enables data checksums unless you opt out. `pg_upgrade` requires the old and new clusters to match. If your 14 cluster has `data_checksums = off`, initialize the new cluster with `--no-data-checksums`, then decide separately whether to enable checksums later with `pg_checksums` during a maintenance window.
+
+**MD5 passwords deprecated (18).** MD5 authentication still works in 18 but now produces deprecation warnings. Use the upgrade as the point where you move remaining roles to SCRAM-SHA-256:
+
+```sql
+SET password_encryption = 'scram-sha-256';
+ALTER ROLE app_user PASSWORD 'new-secret-from-your-vault';
+```
+
+Update `pg_hba.conf` to `scram-sha-256` once every client library supports it. Very old drivers are the usual blocker.
+
+**Removed or changed features.** Read the "Migration" section of the release notes for 15, 16, 17, and 18 in order. It is tedious but takes less time than debugging a failed cutover.
+
+## Step 3: Pick the upgrade method
+
+| Method | Downtime | Good fit |
+| --- | --- | --- |
+| `pg_upgrade --link` | Minutes | Self-managed, same host, can tolerate a short outage |
+| Logical replication | Seconds at cutover | Large databases, strict SLAs, also changing hosts |
+| Managed blue/green | Short, provider-dependent | RDS, Aurora, Cloud SQL, Azure |
+| `pg_dump` / `pg_restore` | Hours for large DBs | Small databases, or when you also want to clean up |
+
+For self-managed clusters, always run the check mode first:
+
+```bash
+/usr/lib/postgresql/18/bin/pg_upgrade \
+  --old-datadir=/var/lib/postgresql/14/main \
+  --new-datadir=/var/lib/postgresql/18/main \
+  --old-bindir=/usr/lib/postgresql/14/bin \
+  --new-bindir=/usr/lib/postgresql/18/bin \
+  --link --check
+```
+
+`--link` uses hard links instead of copying files, which is fast but means you cannot start the old cluster after the new one has run. Take a verified backup before the real run.
+
+## Step 4: After the upgrade
+
+PostgreSQL 18's `pg_upgrade` carries over most planner statistics, which removes much of the post-upgrade slowdown older versions were known for. Some statistics, such as extended statistics, still need to be rebuilt. Instead of analyzing everything, you can target only what is missing:
+
+```bash
+vacuumdb --all --analyze-in-stages --missing-stats-only
+```
+
+Then compare query plans for your top queries against the baseline you captured before the upgrade. We keep a short list of the ten most expensive queries from `pg_stat_statements` and run `EXPLAIN` on them before and after.
+
+## Our take
+
+End-of-life dates are predictable, yet we regularly see teams discover them only when a scanner or auditor flags the version. The fix is not heroics; it is putting the support window of every database into the same calendar as certificate renewals. For PostgreSQL that is easy, because the policy is fixed: a major version is supported for five years, and the last release lands in November.
+
+If you are still on 14 today, you are not in an emergency, but you are now accepting unpatched risk. Schedule the upgrade this quarter.
+
+## Takeaways
+
+- PostgreSQL 14 receives no further fixes after today's final release.
+- Target 18 rather than 15 to avoid repeating this next year.
+- Inventory extensions, checksums, and MD5 roles before choosing a method.
+- Run `pg_upgrade --check` and match the checksum setting on the new cluster.
+- Use `vacuumdb --missing-stats-only` and compare plans after cutover.

@@ -1,0 +1,107 @@
+---
+title: "정형화된 Agent 작업은 Open-weight Model로: Gartner 전망으로 본 Step 단위 Model Routing 설계"
+description: "Gartner는 2030년까지 기업 Agentic Workflow Step의 90%가 Open-weight Model에서 실행될 것으로 전망했습니다. 실무에서의 의미와, 검증·Escalation을 갖춘 Step 단위 Router 설계를 살펴봅니다."
+date: "2026-11-12"
+status: "published"
+tags: ["AI", "LLM", "AI Agent", "Open-weight Model", "비용 최적화"]
+thumbnail: ""
+author: "webhani"
+slug: "open-weight-models-agentic-workflow-routing-2026-11"
+---
+
+Gartner Analyst Mark Petty와 Raymond Paquet가 "Open-Weight Models Will Run 90% of Enterprise Agentic Workflow Steps"라는 Report를 발표했습니다. 11월 3일 The Register 보도에 따르면 핵심 주장은 이렇습니다. 업무용 Agent Workflow의 Step 대부분은 정형화된 작업이고, Open-weight Model은 가장 저렴한 Closed Model과 같은 품질로 그 약 4분의 1 가격에 처리할 수 있다. 모든 Step을 Frontier Model로 보내는 경우와 비교하면 비용은 약 20분의 1이 된다는 것입니다.
+
+더 참고할 만한 부분은 단서 조항입니다. Analyst들도 Open Model은 출력이 장황해지기 쉽고 Retry가 잦아서, Frontier Model 대비 Task 단위의 실제 절감 폭은 5~6배 정도라고 인정합니다. Gartner는 2030년까지 업무용 Agent Workflow Step의 90%가 Open-weight Model에서 실행되고, Frontier Model은 연구개발과 어려운 추론에 계속 쓰일 것으로 가정하고 있습니다.
+
+저희가 주목하는 것은 숫자 자체보다 이 전망이 전제하는 판단 단위입니다. **"이 App에 어떤 Model을 쓸까"가 아니라 "이 Step에 어떤 Model을 쓸까"** 입니다.
+
+## App이 아니라 Step 단위로 봐야 하는 이유
+
+예를 들어 청구서를 처리하는 업무 Agent는 성격이 다른 작업을 여러 개 수행합니다.
+
+1. PDF에서 항목을 추출합니다.
+2. 거래처와 Cost Center를 분류합니다.
+3. 날짜와 통화를 정규화합니다.
+4. 발주서와의 차이가 타당한지 판단합니다.
+5. 담당자에게 보여줄 설명문을 작성합니다.
+
+1~3은 범위가 좁고, 검증 가능하며, 반복적입니다. 4는 판단이 필요합니다. 5는 글솜씨가 중요하지만 위험도는 낮습니다. Pipeline 전체를 Frontier Model로 돌리면 필요 없는 Step에도 비싼 값을 치르게 됩니다. 반대로 전부 작은 Model로 돌리면 4에서 실패합니다.
+
+## 검증이 포함된 2단 구조 Router
+
+저희가 쓰는 패턴은 단순합니다. Step 종류에 따라 Model을 나누고, 출력을 Schema로 검증하고, 실패하면 상위 Model로 Escalation합니다. TypeScript로 핵심만 적으면 다음과 같습니다.
+
+```ts
+import { z } from "zod";
+
+type Tier = "open" | "frontier";
+
+interface Step<T> {
+  name: string;
+  routine: boolean;
+  schema: z.ZodType<T>;
+  prompt: (input: unknown) => string;
+}
+
+const MODELS: Record<Tier, string> = {
+  open: process.env.OPEN_MODEL_ID!,       // Self-hosted 또는 Hosted Open-weight Model
+  frontier: process.env.FRONTIER_MODEL_ID!,
+};
+
+async function runStep<T>(step: Step<T>, input: unknown): Promise<T> {
+  const tier: Tier = step.routine ? "open" : "frontier";
+  const first = await tryModel(step, input, tier);
+  if (first.ok) return first.value;
+
+  metrics.increment("agent.escalation", { step: step.name });
+  const second = await tryModel(step, input, "frontier");
+  if (second.ok) return second.value;
+
+  throw new Error(`Step ${step.name} failed on both tiers`);
+}
+
+async function tryModel<T>(step: Step<T>, input: unknown, tier: Tier) {
+  const raw = await callModel(MODELS[tier], step.prompt(input));
+  const parsed = step.schema.safeParse(safeJson(raw.text));
+  metrics.record("agent.tokens", raw.usage.totalTokens, { step: step.name, tier });
+  return parsed.success
+    ? { ok: true as const, value: parsed.data }
+    : { ok: false as const };
+}
+```
+
+Production에서 제대로 동작하게 하려면 세 가지가 중요합니다.
+
+- **Schema가 계약입니다**: 정형 Step에는 기계적으로 검사할 수 있는 출력이 있어야 합니다. Schema를 쓸 수 없다면 그 Step은 아마 정형 작업이 아닙니다.
+- **Escalation은 실패가 아니라 Metric입니다**: Step별 Escalation 비율을 기록합니다. 30%씩 Escalation된다면 그 Step에는 Open Model이 맞지 않으며, "절감 효과"는 대부분 착시입니다.
+- **Model ID는 Configuration입니다**: 환경 변수나 Gateway 설정에 두면 Deploy 없이 Model을 교체할 수 있습니다.
+
+## Token 단가가 아니라 Task 단가로 비교
+
+장황함과 Retry에 대한 Gartner의 단서는 저희가 가장 자주 보는 실수를 가리킵니다. 가격표만 비교하는 것입니다. Token 단가가 4분의 1이어도 Token을 두 배 쓰고 다섯 번에 한 번 Retry한다면 네 배 저렴한 것이 아닙니다.
+
+저희는 Workflow마다 세 가지 숫자를 보고합니다.
+
+- **완료 Task당 비용** (Retry와 Escalation 포함)
+- **Step별 Escalation 비율**
+- **고정 평가 Set에서의 품질** (예: 정답이 알려진 실제 청구서 200건)
+
+세 가지가 모두 허용 범위에 들어올 때만 해당 Step을 Open Model 쪽으로 옮깁니다. 평가 Set은 Model Version이 바뀌었을 때의 방어선 역할도 합니다.
+
+## Data 통제라는 관점
+
+Analyst들은 비용보다 통제와 Data 소유권을 더 강조합니다. 정형 작업을 Frontier API로 보내면 Workflow Data의 일부가 자사 경계 밖으로 나간다는 지적입니다. 일본의 고객사에서는 이것이 결정적인 요인이 되는 경우도 많습니다. 자사 VPC나 원하는 Region에서 Open-weight Model을 운영하면, Security 심사나 고객이 "Data가 어디로 가는가"를 물을 때 답하기가 쉬워집니다.
+
+다만 Self-hosting에는 GPU 확보, Model 업데이트, On-call 대응 같은 별도의 비용이 듭니다. 많은 팀에게는 Cloud Provider가 제공하는 Hosted Open-weight Endpoint가 현실적인 절충안입니다.
+
+## webhani의 시각
+
+방향성에는 동의하지만 시간표는 좀 더 신중하게 봅니다. Frontier Model은 빠르게 발전하고 가격도 계속 내려가고 있어서 격차는 줄어들 것입니다. 오래 유효한 교훈은 Architecture 쪽에 있습니다. 각 Step이 명확한 계약을 갖고, 그 뒤의 Model을 교체할 수 있도록 Agent를 설계하는 것입니다. 2028년의 저렴한 Model이 Open-weight이든 아니든 이 설계는 유효합니다.
+
+## 정리
+
+- Model 선택은 App 단위가 아니라 Step 단위로 합니다.
+- 정형 Step에는 Schema를 두고 출력을 검증합니다.
+- 실패 시 Frontier Model로 Escalation하고 그 비율을 추적합니다.
+- Retry를 포함한 완료 Task당 비용으로 비교합니다.
+- 더 저렴한 Model로 옮기기 전에 고정 평가 Set을 준비합니다.

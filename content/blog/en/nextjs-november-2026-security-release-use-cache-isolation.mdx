@@ -1,0 +1,126 @@
+---
+title: "Next.js November 2026 Security Release: Cache Components Isolation Bugs and What to Audit"
+description: "Next.js 16.4.5 and 15.5.29 fix seven issues, four of them around Cache Components and cross-tenant cache reuse. Here is how we triage the advisories and what to check beyond simply bumping the version."
+date: "2026-11-12"
+status: "published"
+tags: ["Next.js", "Security", "Cache Components", "Multi-tenant", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-november-2026-security-release-use-cache-isolation"
+---
+
+The Next.js team published its November 2026 security release on November 3. The fixed versions are **16.4.5** (Active LTS) and **15.5.29** (Maintenance LTS). If you run a newer 16.4.x patch, you already have the fixes; otherwise, upgrade first and read the rest of this post afterward.
+
+What makes this release worth more than a version bump is the theme. Four of the seven issues involve **Cache Components and `use cache`**, and most of them have the same failure mode: content generated for one tenant, site, locale, or user is served to another. That is a data-isolation problem, not a crash, and it rarely shows up in error monitoring.
+
+## The advisories, grouped by what they affect
+
+Rather than going through the list in order, we sort them by the kind of application that is exposed.
+
+### Cache Components (multi-tenant and per-user apps)
+
+- **Cross-tenant disclosure via `unstable_cache` + `use cache` (High).** When the same public `use cache` function that reads a root parameter (for example a tenant ID) is called both directly and from inside `unstable_cache`, a concurrent cold fill could return another request's result without checking its root parameters.
+- **Nested `use cache` functions (Medium).** An inner cached function that reads a root parameter and returns an early value plus a slower async value could let the outer entry be stored before the root-parameter dependency was recorded.
+- **Binary arguments (Medium).** Distinct binary arguments passed to a `use cache` function could collapse to the same cache identity.
+- **Shared shell poisoning (Medium, self-hosted).** With `next start`, Cache Components enabled, and Partial Prefetching off or unset, a crafted URL on a specific dynamic-route shape could poison a shell shared by other URLs.
+
+### Self-hosted request handling
+
+- **Stale compressed framing (Medium).** Returning an attacker-controlled fetched `Response` unchanged could forward decompressed bytes with the original compressed framing headers. Behind an HTTP/1.1 proxy that pipelines requests over a shared backend connection, responses could be assigned to the wrong client.
+
+### Edge routes
+
+- **Cookie values in `x-middleware-set-cookie` (Medium).** Edge Route Handlers and Pages Router Edge API routes using `NextResponse.cookies.set()` could expose the serialized cookie, including `HttpOnly` cookies, to same-origin JavaScript.
+
+### Image Optimization
+
+- **SVG rejection bypass (Medium).** An image from an allowed source could be misclassified as AVIF and slip past `dangerouslyAllowSVG: false` when the native backend can decode SVG.
+
+## Step 1: Patch and verify what is actually deployed
+
+Lockfiles drift, and monorepos often have more than one copy of `next`. We add a small guard to CI so that a stale version fails the build instead of quietly shipping:
+
+```js
+// scripts/assert-next-version.mjs
+import { readFileSync } from "node:fs";
+
+const { version } = JSON.parse(
+  readFileSync("node_modules/next/package.json", "utf8"),
+);
+const [major, minor, patch] = version.split(/[.-]/).map(Number);
+
+const patched =
+  major > 16 ||
+  (major === 16 && (minor > 4 || (minor === 4 && patch >= 5))) ||
+  (major === 15 && minor === 5 && patch >= 29);
+
+if (!patched) {
+  console.error(`next@${version} predates the November 2026 security release`);
+  process.exit(1);
+}
+console.log(`next@${version} OK`);
+```
+
+Run it after `npm ci`. Also check `npm ls next` in workspaces; a forgotten internal app is a common gap.
+
+## Step 2: Audit Cache Components usage
+
+Patching closes the specific bugs. The audit tells you whether your design depends on behavior that is easy to get wrong. We look for three patterns.
+
+**Mixing `unstable_cache` with `use cache`.** If a `use cache` function is also wrapped by `unstable_cache` somewhere, pick one. In a codebase that has adopted Cache Components, we migrate the remaining `unstable_cache` call sites rather than layering them.
+
+**Binary values as cache identity.** If a cached function receives a `Uint8Array` or `ArrayBuffer` that encodes something security-relevant (a signed token, a user key), pass a plain string identifier instead. It is easier to reason about and easier to log.
+
+```ts
+// Before: identity depends on how binary args are serialized
+async function getStatement(accountKey: Uint8Array) {
+  "use cache";
+  // ...
+}
+
+// After: explicit, string-based identity
+async function getStatement(accountId: string) {
+  "use cache";
+  // ...
+}
+```
+
+**Tenant data reached only through root params.** If tenant isolation relies on a root parameter read deep inside nested cached functions, consider whether the tenant ID should be an explicit argument at the boundary of each cached function. Explicit arguments make the cache key visible in code review.
+
+We also recommend a cheap regression test for multi-tenant apps: request the same path for two tenants in parallel on a cold cache and assert that each response contains only its own tenant marker. It will not prove absence of bugs, but it catches the class of issue this release fixed.
+
+## Step 3: Check the self-hosted and Edge items
+
+**Proxying fetched responses.** Avoid returning an upstream `Response` object as-is. Rebuild it with an allowlist of headers:
+
+```ts
+export async function GET() {
+  const upstream = await fetch("https://api.example.com/report");
+  const body = await upstream.arrayBuffer();
+
+  const headers = new Headers();
+  for (const name of ["content-type", "cache-control", "etag"]) {
+    const value = upstream.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  return new Response(body, { status: upstream.status, headers });
+}
+```
+
+This also prevents leaking unrelated upstream headers, which is worth doing regardless of the advisory.
+
+**Edge routes that set cookies.** Search for `runtime = "edge"` combined with `NextResponse.cookies.set()`. The Edge runtime is deprecated on Vercel in favor of Node.js, so moving these routes to the default runtime is the simplest fix and aligns with where the platform is going.
+
+**Images.** Keep `dangerouslyAllowSVG` disabled, and keep `images.remotePatterns` as narrow as possible. The image allowlist still held in this advisory; it is your most effective control.
+
+## Our take
+
+Cache Components shifted caching from "something configured per route" to "something expressed in function boundaries." That is a cleaner model, but it means cache keys are now part of your application's security design. Multi-tenant SaaS teams should treat every `use cache` function as an access-control boundary and review it with the same care as an authorization check.
+
+## Takeaways
+
+- Upgrade to 16.4.5 / 15.5.29 or later, and enforce it in CI.
+- Do not mix `unstable_cache` and `use cache` on the same function.
+- Pass tenant and user identity as explicit string arguments to cached functions.
+- Rebuild proxied responses instead of returning them unchanged.
+- Move cookie-setting Edge routes to the Node.js runtime.
