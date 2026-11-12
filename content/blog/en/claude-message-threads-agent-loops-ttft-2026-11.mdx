@@ -1,0 +1,123 @@
+---
+title: "Claude Message Threads: What to Check Before Putting Them in Your Agent Loop"
+description: "The Claude Messages API added message threads in public beta on November 2. Here is how sending only the delta keeps time to first token steady, and what to design for first: replay, fixed fields, and prompt caching."
+date: "2026-11-08"
+status: "published"
+tags: ["Claude", "LLM", "AI Agents", "API Design", "Anthropic"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-message-threads-agent-loops-ttft-2026-11"
+---
+
+Long agent loops get heavier with every turn. The Messages API is stateless, so each request carries the full conversation plus every tool definition. Prompt caching helps with token cost, but the payload still has to be uploaded, validated, and tokenized each time.
+
+On November 2, 2026, Anthropic added **message threads** to the Messages API as a public beta (beta header `message-threads-2026-08-12`). The server holds the conversation for a short window, and after the first turn you send only the new messages. The stated goal in the docs is a lower, steadier time to first token (TTFT) as conversations grow.
+
+Below is how we think about it when helping clients design agent systems: what the feature actually does, and what you need to decide before relying on it.
+
+## The two request types
+
+You add one field, `thread`, to an ordinary Messages request.
+
+- **create**: send the full conversation, `system`, and `tools` as usual, with `"thread": {"type": "create"}`.
+- **continue**: send only the messages since the last response, plus that response's `id`. Leave `system` and `tools` out — including them returns a 400.
+
+```bash
+curl -sS https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2026-10-21" \
+  -H "anthropic-beta: message-threads-2026-08-12" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "claude-opus-5-5",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Run the next step."}],
+    "thread": {"type": "continue", "previous_message_id": "'"$PREV_ID"'"}
+  }'
+```
+
+The SDKs ship a thread helper (`client.beta.messages.thread(...)`) that adds the beta header and switches between create and continue for you. Note that the SDK's beta tool runner now uses a thread by default, so if you already use it, you may be on threads without having opted in explicitly.
+
+## Treat the thread as a cache, not storage
+
+This is the design point that matters most. Per the documentation:
+
+- A thread expires five minutes after its last request and is deleted within an hour of last use.
+- No response tells you whether the turn was stored. You find out on the next continue.
+- When the API can't continue, you get a `404` with `error.details.error_code` set to `thread_not_found`.
+
+Your application has to remain the source of truth for the conversation, and you need a replay path from day one: on `thread_not_found`, resend everything in a fresh create request. If your agent pauses for human approval longer than five minutes, replay is the normal path, not the exception.
+
+```python
+import anthropic
+
+BETA = "message-threads-2026-08-12"
+
+def send_turn(client, history, new_messages, prev_id):
+    base = dict(model="claude-opus-5-5", max_tokens=2048, betas=[BETA])
+    if prev_id:
+        try:
+            return client.beta.messages.create(
+                **base,
+                messages=new_messages,
+                thread={"type": "continue", "previous_message_id": prev_id},
+            )
+        except anthropic.NotFoundError as e:
+            code = (e.body or {}).get("error", {}).get("details", {}).get("error_code")
+            if code != "thread_not_found":
+                raise  # e.g. a typo in the model name also returns 404
+    # Replay from our own copy of the conversation
+    return client.beta.messages.create(
+        **base,
+        system=SYSTEM_PROMPT,
+        tools=TOOLS,
+        messages=history + new_messages,
+        thread={"type": "create"},
+    )
+```
+
+This is a sketch of the control flow; confirm the exact error shape against your SDK version. In most cases, the SDK helper already does this replay for you and is the better starting point.
+
+## Fixed fields will shape your architecture
+
+Each thread stores a fingerprint of its create request.
+
+| Group | Examples | Rule |
+| --- | --- | --- |
+| Create-only | `system`, `tools` | Sending them on continue returns 400 |
+| Fixed | `model`, `tool_choice`, `thinking`, `output_config`, top-level `cache_control`, the set of beta headers | Must match on every request, otherwise `thread_fingerprint_mismatch` |
+| Free | `max_tokens`, `stop_sequences`, `stream`, `metadata` | Can change per turn |
+
+If your design routes turns between models, or swaps tool sets mid-conversation, threads fight you. Either start a new thread at each switch or skip threads for that flow.
+
+## Caching is still your job
+
+Threads do not turn on prompt caching. You still send a top-level `cache_control` on every request (with the same value — it's a fixed field) or place breakpoints yourself. With a thread, a request can carry at most four breakpoints, and breakpoints on the create request's `system` and `tools` count again on every continue.
+
+Pricing and rate limits are unchanged. Think of threads as a latency and payload optimization, not a cost one.
+
+## What doesn't work with threads
+
+Check these before committing:
+
+- Not available with Message Batches or token counting
+- No compaction (including compaction on demand) and most context editing is unsupported
+- Not available to organizations with HIPAA readiness or inference hooks enabled
+- Not ZDR-eligible. Threads live encrypted in memory only and are deleted within an hour
+- There's no API to list, read, or delete a thread
+
+The ZDR point is the one that tends to come up in security reviews for client projects, so surface it early.
+
+## Our take
+
+Threads pay off for long tool loops — coding agents, research agents, anything that runs dozens of turns with a large tool schema. For short chats or batch jobs, the benefit is close to zero.
+
+The rollout we'd recommend:
+
+1. Measure TTFT and request size per turn first. Confirm they actually grow with conversation length.
+2. Start with the SDK thread helper. Write your own request handling only when you hit a limit.
+3. Persist history and build the replay path before enabling threads. Test `thread_not_found` as a normal case.
+4. Exercise fallbacks, refusals, and dropped streams in staging; each has specific rules in the docs.
+5. Where ZDR or HIPAA applies, plan without threads.
+
+Reducing what you send is an easy win to see on a dashboard. But once state lives on the server, your failure handling determines whether the win holds. Try it small during the beta, and track the replay rate as a metric.

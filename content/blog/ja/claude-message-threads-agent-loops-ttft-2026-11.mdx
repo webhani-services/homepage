@@ -1,0 +1,133 @@
+---
+title: "Claude API の Message Threads を Agent Loop に導入する前に押さえておくこと"
+description: "11月2日に Public Beta となった Claude Messages API の Message Threads。差分だけを送ることで TTFT を安定させる仕組みと、Replay 設計・固定 Field・Prompt Caching の扱いなど、本番投入前に確認すべき点を整理します。"
+date: "2026-11-08"
+status: "published"
+tags: ["Claude", "LLM", "AI Agent", "API設計", "Anthropic"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-message-threads-agent-loops-ttft-2026-11"
+---
+
+Agent Loop を長く回していると、Turn を重ねるごとに Request が重くなっていきます。Messages API は Stateless なので、毎回すべての会話履歴と Tool 定義を送り直す必要があるからです。Prompt Caching で Token コストは抑えられても、Payload の転送と Validation、Tokenize の処理は毎回発生します。
+
+Anthropic は 2026年11月2日、Messages API に **Message Threads** を Public Beta として追加しました(Beta Header: `message-threads-2026-08-12`)。会話を Server 側に短時間保持し、2 Turn 目以降は新しい Message だけを送る仕組みです。公式ドキュメントでは「長い会話でも Time to First Token(TTFT)を低く安定させる」ことが目的として説明されています。
+
+本記事では、webhani が Agent 系 Application の設計支援で重視している観点から、導入時に判断が必要なポイントを整理します。
+
+## 基本の流れ: create と continue
+
+使い方はシンプルで、Request に `thread` Field を 1 つ追加するだけです。
+
+- **create**: 最初の Request で、通常どおり全会話・`system`・`tools` を送り、`"thread": {"type": "create"}` を付けます。
+- **continue**: 以降は直前の Response の `id` を指定し、新しい Message だけを送ります。`system` と `tools` は送りません(送ると 400 Error になります)。
+
+```bash
+# 2 Turn 目: 新しい Message だけを送る
+curl -sS https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2026-10-21" \
+  -H "anthropic-beta: message-threads-2026-08-12" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "claude-opus-5-5",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "次の Step に進んでください"}],
+    "thread": {"type": "continue", "previous_message_id": "'"$PREV_ID"'"}
+  }'
+```
+
+SDK には Thread Helper(`client.beta.messages.thread(...)`)が用意されており、Beta Header の付与や、create/continue の切り替えを自動で行ってくれます。また、SDK の Beta Tool Runner は Default で Thread を使う設定になっている点も覚えておくとよいでしょう。
+
+## 「Thread は Best-effort」という前提で設計する
+
+最も重要なのは、Thread を **Cache のようなもの** として扱うことです。ドキュメントには次のように明記されています。
+
+- 最後の Request から 5 分で失効し、最終利用から最大 1 時間以内に削除される
+- Response を見ても、その Turn が保存されたかどうかは分からない(次の continue で初めて分かる)
+- 継続できない場合は `404` と `error.details.error_code: "thread_not_found"` が返る
+
+つまり、会話の Source of Truth は常に自分の Application 側に置き、404 が返ったら全会話を create で送り直す「Replay Path」を最初から用意しておく必要があります。Human-in-the-loop の承認待ちで 5 分以上止まる Agent では、Replay が日常的に発生すると考えた方が安全です。
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+
+async function sendTurn(
+  client: Anthropic,
+  history: Anthropic.Beta.BetaMessageParam[],
+  newMessages: Anthropic.Beta.BetaMessageParam[],
+  prevId: string | null,
+) {
+  const base = { model: "claude-opus-5-5", max_tokens: 2048 } as const;
+  const betas = ["message-threads-2026-08-12"];
+
+  if (prevId) {
+    try {
+      return await client.beta.messages.create({
+        ...base,
+        betas,
+        messages: newMessages,
+        thread: { type: "continue", previous_message_id: prevId },
+      });
+    } catch (e) {
+      const code = (e as any)?.error?.error?.details?.error_code;
+      if (code !== "thread_not_found") throw e; // それ以外はそのまま上げる
+    }
+  }
+  // Replay: 手元の全履歴で新しい Thread を作る
+  return client.beta.messages.create({
+    ...base,
+    betas,
+    system: SYSTEM_PROMPT,
+    tools: TOOLS,
+    messages: [...history, ...newMessages],
+    thread: { type: "create" },
+  });
+}
+```
+
+上記は考え方を示す簡略版です。実際の Error Object の形は SDK の型定義で確認してください。Model 名の Typo でも 404 が返るため、`error_code` を見てから Replay するのがポイントです。多くのケースでは SDK Helper に任せる方が安全です。
+
+## 固定 Field と変更可能な Field
+
+Thread には「Fingerprint」があり、create 時の値を変えられない Field が決まっています。
+
+| 区分 | 主な Field | 扱い |
+| --- | --- | --- |
+| create 時のみ | `system`, `tools` | continue で送ると 400 |
+| 固定 | `model`, `tool_choice`, `thinking`, `output_config`, Top-level `cache_control`, Beta Header の組み合わせ など | 毎回同じ値を送る。違うと `thread_fingerprint_mismatch` |
+| 自由 | `max_tokens`, `stop_sequences`, `stream`, `metadata` など | Turn ごとに変更可 |
+
+途中で Model を切り替える Router 型の構成や、Turn ごとに Tool セットを差し替える設計とは相性がよくありません。その場合は新しい Thread を作るか、Thread を使わない方がシンプルです。
+
+## Prompt Caching は自動ではない
+
+誤解しやすい点ですが、Thread を使っても Prompt Caching は自動では有効になりません。Top-level の `cache_control` を毎回(同じ値で)送るか、自分で Breakpoint を置く必要があります。また Thread 利用時は Breakpoint が最大 4 つに制限され、create 時の `system`/`tools` に置いた Breakpoint は continue のたびにカウントされます。
+
+料金と Rate Limit は Thread を使っても変わらないため、Thread は「コスト削減」ではなく「Latency と Payload の削減」のための機能と捉えるのが正確です。
+
+## 対応していない機能
+
+導入前に、次の制約に該当しないか確認してください。
+
+- Message Batches、Token Counting では使用不可
+- Compaction(Compaction on demand を含む)と、ほとんどの Context Editing は非対応
+- HIPAA Readiness や Inference Hooks が有効な Organization では使用不可
+- ZDR(Zero Data Retention)の対象外。Thread は暗号化された状態でメモリ上にのみ保持され、最大 1 時間で削除されます
+- Thread を一覧・取得・削除する API はない
+
+特に ZDR の扱いは、顧客データを扱う案件ではセキュリティレビューで必ず確認されるポイントです。
+
+## webhani の見解
+
+Message Threads は、長い Tool Loop を回す Coding Agent や調査系 Agent で効果が出やすい機能です。一方で、短い Chat や Batch 処理では恩恵はほとんどありません。
+
+私たちが推奨する導入手順は次のとおりです。
+
+1. まず TTFT と Request Size を計測し、Turn 数に比例して悪化しているか確認する
+2. SDK の Thread Helper から始め、自前実装は必要になってから検討する
+3. 会話履歴の永続化と Replay Path を先に実装し、404 を正常系として Test する
+4. Fallback、Refusal、Stream 切断時の挙動を Staging で確認する
+5. ZDR や HIPAA の要件がある環境では、適用対象外であることを前提に構成を決める
+
+「送る量を減らす」最適化は効果が見えやすい反面、状態を Server に預ける以上、失敗時の設計が品質を左右します。Beta の段階で小さく試し、Replay の頻度を Metrics として取っておくことをおすすめします。

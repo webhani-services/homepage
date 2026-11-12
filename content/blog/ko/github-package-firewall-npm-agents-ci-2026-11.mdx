@@ -1,0 +1,99 @@
+---
+title: "GitHub Package Firewall 검토: npm Install을 '설정'이 아닌 '경로'에서 통제하기"
+description: "GitHub가 Public Preview로 공개한 Package Firewall은 npm Install 시점에 Policy를 강제하는 Proxy입니다. Client 측 Cooldown과의 차이, Coding Agent와 CI에서의 의미, 도입 시 막아야 할 우회 경로를 정리합니다."
+date: "2026-11-08"
+status: "published"
+tags: ["보안", "npm", "Supply Chain", "GitHub", "AI Agent"]
+thumbnail: ""
+author: "webhani"
+slug: "github-package-firewall-npm-agents-ci-2026-11"
+---
+
+지난 1년 사이 npm Supply Chain 공격 대응책은 어느 정도 정형화되었습니다. Lockfile을 Commit하고, Install Script를 제한하고, 갓 공개된 Version은 일정 기간 받지 않는 Cooldown을 둡니다. 문제는 이 대부분이 **각 Client의 설정**에 의존한다는 점입니다. 개발자 Laptop, CI Runner, 그리고 이제는 Coding Agent 실행 환경까지 모두 올바르게 설정되어 있어야 합니다.
+
+GitHub는 2026년 10월 20일, 이 전제를 바꾸는 **Package Firewall**을 Public Preview로 공개했습니다. GitHub Changelog와 언론 보도로 확인되는 범위에서 기능을 정리하고, webhani가 도입을 검토할 때 보는 관점을 공유합니다.
+
+## 어떤 기능인가
+
+Package Firewall은 개발자 Endpoint(또는 사내 Registry)와 Upstream npm Registry 사이에 위치하는 Proxy입니다. Metadata Request와 Package Download를 모두 검사하고, Enterprise 단위로 설정한 Policy에 따라 Install을 허용하거나 차단합니다.
+
+보도된 주요 Policy는 다음과 같습니다.
+
+- GitHub Advisory Database의 Malware Advisory에 해당하는 Package 차단
+- 지정한 Severity 이상의 취약점 Advisory가 있는 Version 차단(기본값은 Critical만이라고 보도됨)
+- 새로 공개된 Version의 설치를 늦추는 Cooldown
+- Attestation Downgrade 등 Supply Chain 무결성 Check
+
+정상 Package가 오탐으로 차단되면 사용자가 예외를 신청하는 Workflow가 제공됩니다.
+
+제공 조건은 다음과 같습니다.
+
+- GitHub Enterprise Cloud(Data Residency 환경 포함) 대상
+- 현재는 npm만 지원
+- Preview 기간에는 무료이며, GA 시 사용량 기반 과금 예정
+
+## Client 설정과 무엇이 다른가
+
+npm 자체에도 `.npmrc`로 Release Age를 제한하는 등 Client 측 방어 수단이 늘고 있습니다.
+
+```ini
+# Client 측 Cooldown 예시. 지원 Version과 단위는 npm 공식 문서를 확인하십시오.
+min-release-age=7
+```
+
+유용한 설정이지만 한계가 있습니다.
+
+- 설정되지 않은 Machine이나 Container에서는 동작하지 않습니다.
+- npm 이외의 Client나 Tarball을 직접 받는 Script에는 적용되지 않습니다.
+- Coding Agent가 새 환경을 띄울 때 설정이 이어진다는 보장이 없습니다.
+- 조직 전체에 실제로 적용되었는지 확인할 방법이 없습니다.
+
+Package Firewall은 검사를 **Network 경로**에 둠으로써 이 문제를 해결합니다. Client가 어떻게 설정되어 있든, Firewall을 거치는 Request에는 동일한 Policy가 적용됩니다. 저희는 이를 Client 설정의 대체재가 아니라, 그 위에 얹는 추가 방어 계층으로 봅니다.
+
+## Coding Agent와 CI에서의 의미
+
+이 기능이 지금 나온 배경에는 Coding Agent의 확산이 있다고 봅니다. Agent는 작업 중에 스스로 `npm install`을 실행합니다. Prompt Injection이나 단순한 오타 때문에 의도하지 않은 Package를 설치할 수도 있습니다.
+
+Agent 환경마다 방어 설정을 맞추는 것은 검증하기 어렵습니다. 반면 "Agent Sandbox에서 나가는 npm 통신은 모두 Firewall을 거친다"는 규칙 하나는 Audit하기 쉽습니다. CI Runner도 마찬가지입니다.
+
+## 반드시 막아야 할 우회 경로
+
+Proxy 방식의 방어는 우회할 수 있으면 의미가 없습니다. 도입 시 다음을 확인하십시오.
+
+1. **Endpoint의 Registry 설정**: `.npmrc`에 Firewall Endpoint를 Registry로 지정하고 Token으로 인증하는 방식으로 보도되었습니다. 정확한 URL 형식과 인증 방법은 GitHub 공식 문서에서 확인하십시오.
+2. **사내 Registry의 Remote 설정**: Artifactory 등이 Public npm을 직접 Upstream으로 쓰고 있다면 그곳이 구멍이 됩니다. Remote가 Firewall을 거치도록 바꾸거나 직접 조회를 막아야 합니다.
+3. **Egress 통제**: CI Runner나 Agent Sandbox에서 `registry.npmjs.org`에 직접 접근할 수 있다면 `.npmrc`만 바꿔도 우회됩니다. Network에서 직접 경로를 막아야 비로소 "경로에서 통제"하는 상태가 됩니다.
+4. **Lockfile의 URL**: `package-lock.json`의 `resolved`에는 Package를 받은 URL이 기록됩니다. Registry를 바꿀 때 Lockfile을 어떻게 다룰지 Team에서 미리 정해 두면 혼란스러운 Diff를 피할 수 있습니다.
+
+CI에서는 예를 들어 다음과 같이 설정할 수 있습니다.
+
+```yaml
+# GitHub Actions 예시 (Registry 값은 Placeholder)
+- name: Configure npm registry
+  run: |
+    npm config set registry "$PACKAGE_FIREWALL_URL"
+    npm config set "//${PACKAGE_FIREWALL_HOST}/:_authToken" "$FIREWALL_TOKEN"
+  env:
+    PACKAGE_FIREWALL_URL: ${{ vars.PACKAGE_FIREWALL_URL }}
+    PACKAGE_FIREWALL_HOST: ${{ vars.PACKAGE_FIREWALL_HOST }}
+    FIREWALL_TOKEN: ${{ secrets.FIREWALL_TOKEN }}
+
+- run: npm ci
+```
+
+## 현실적인 평가 순서
+
+Preview 단계이므로 처음부터 전사에 적용하기보다는 다음 순서를 권장합니다.
+
+1. **관찰부터 시작합니다**: 가능하다면 처음에는 느슨한 Policy로 운영하며, 어떤 Package가 어떤 Rule에 걸리는지 파악한 뒤 차단을 시작합니다.
+2. **감당할 수 있는 Cooldown 값을 정합니다**: 긴급 Security Patch를 넣어야 할 때 Cooldown이 걸림돌이 될 수 있습니다. 예외 신청 절차를 미리 확인해 둡니다.
+3. **Laptop보다 CI를 먼저 적용합니다**: CI와 Agent 환경은 중앙에서 관리하기 쉽습니다. 개발자 Local 환경은 그 다음입니다.
+4. **대상 외 Ecosystem을 정리합니다**: 현재는 npm만 지원합니다. PyPI, Container Image 등 조직에서 쓰는 다른 Ecosystem에는 별도 대책이 계속 필요합니다.
+
+## webhani의 의견
+
+"모두가 올바른 설정을 지켜 준다"는 전제에 기대는 Supply Chain 방어는 어딘가에서 반드시 빈틈이 생깁니다. 통제 책임을 개별 Client에서 Network 경로로 옮긴다는 점에서 Package Firewall은 올바른 방향이라고 봅니다.
+
+다만 GitHub Enterprise Cloud 전용이고, npm만 지원하며, GA 이후에는 과금된다는 점을 고려하면 모든 조직에 최선은 아닙니다. 작은 Team이라면 Lockfile, `npm ci`, Install Script 제한, Client 측 Cooldown을 꾸준히 운영하는 것만으로도 상당한 위험을 줄일 수 있습니다.
+
+어떤 방법을 택하든 핵심은 "우회할 수 없는 형태로 적용되어 있는가"를 확인하는 것입니다. 설정 File이 존재하는 것과 그것이 실제로 강제되는 것은 별개의 문제입니다.

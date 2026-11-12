@@ -1,0 +1,110 @@
+---
+title: "Claude Message Threads, Agent Loop에 도입하기 전에 확인할 것들"
+description: "11월 2일 Public Beta로 공개된 Claude Messages API의 Message Threads. 변경분만 보내 TTFT를 안정시키는 원리와, Replay 설계·고정 Field·Prompt Caching 등 Production 도입 전 점검 항목을 정리합니다."
+date: "2026-11-08"
+status: "published"
+tags: ["Claude", "LLM", "AI Agent", "API 설계", "Anthropic"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-message-threads-agent-loops-ttft-2026-11"
+---
+
+Agent Loop는 Turn이 쌓일수록 Request가 무거워집니다. Messages API가 Stateless이기 때문에 매번 전체 대화와 Tool 정의를 다시 보내야 합니다. Prompt Caching으로 Token 비용은 줄일 수 있어도, Payload 전송과 Validation, Tokenize는 매 요청마다 반복됩니다.
+
+Anthropic은 2026년 11월 2일 Messages API에 **Message Threads**를 Public Beta로 추가했습니다(Beta Header: `message-threads-2026-08-12`). Server가 대화를 짧은 시간 동안 보관하고, 두 번째 Turn부터는 새 Message만 보내는 방식입니다. 공식 문서는 대화가 길어져도 Time to First Token(TTFT)을 낮고 일정하게 유지하는 것을 목적으로 설명합니다.
+
+webhani가 Agent 시스템 설계를 지원할 때 실제로 따져 보는 관점에서, 도입 전에 결정해야 할 사항을 정리합니다.
+
+## create와 continue
+
+일반 Messages Request에 `thread` Field 하나만 추가하면 됩니다.
+
+- **create**: 평소처럼 전체 대화, `system`, `tools`를 보내고 `"thread": {"type": "create"}`를 붙입니다.
+- **continue**: 직전 Response의 `id`와 그 이후의 새 Message만 보냅니다. `system`과 `tools`를 포함하면 400 Error가 반환됩니다.
+
+```bash
+curl -sS https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2026-10-21" \
+  -H "anthropic-beta: message-threads-2026-08-12" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "claude-opus-5-5",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "다음 단계를 진행해 주세요."}],
+    "thread": {"type": "continue", "previous_message_id": "'"$PREV_ID"'"}
+  }'
+```
+
+SDK에는 Thread Helper(`client.beta.messages.thread(...)`)가 있어 Beta Header 추가와 create/continue 전환을 대신 처리합니다. 참고로 SDK의 Beta Tool Runner는 기본값으로 Thread를 사용하므로, 이미 Tool Runner를 쓰고 있다면 의식하지 않은 채 Thread를 사용하고 있을 수 있습니다.
+
+## Thread는 저장소가 아니라 Cache로 취급합니다
+
+가장 중요한 설계 포인트입니다. 문서에 따르면 다음과 같습니다.
+
+- 마지막 Request로부터 5분이 지나면 만료되고, 마지막 사용 후 최대 1시간 이내에 삭제됩니다.
+- Response만으로는 해당 Turn이 저장되었는지 알 수 없습니다. 다음 continue 요청에서야 알 수 있습니다.
+- 이어갈 수 없으면 `404`와 함께 `error.details.error_code: "thread_not_found"`가 반환됩니다.
+
+따라서 대화의 Source of Truth는 항상 Application 쪽에 두고, `thread_not_found`를 받으면 전체 대화를 create로 다시 보내는 Replay Path를 처음부터 구현해야 합니다. 사람의 승인을 기다리느라 5분 이상 멈추는 Agent라면 Replay는 예외가 아니라 일상적인 경로입니다.
+
+```go
+// 개념을 보여 주는 의사 Code입니다. 실제 Type 이름은 SDK 문서를 확인하십시오.
+resp, err := continueThread(ctx, prevID, newMessages)
+if isThreadNotFound(err) { // error_code == "thread_not_found" 인지 확인
+    // Model 이름 오타 등도 404를 반환하므로 error_code를 반드시 확인합니다
+    resp, err = createThread(ctx, systemPrompt, tools, append(history, newMessages...))
+}
+if err != nil {
+    return err
+}
+history = append(history, newMessages...)
+history = append(history, resp.ToParam())
+prevID = resp.ID
+```
+
+대부분의 경우 이 Replay는 SDK Helper가 이미 처리하므로, Helper부터 시작하는 편이 안전합니다.
+
+## 고정 Field가 Architecture를 제약합니다
+
+Thread는 create Request의 Fingerprint를 저장합니다.
+
+| 구분 | 주요 Field | 규칙 |
+| --- | --- | --- |
+| create 전용 | `system`, `tools` | continue에 포함하면 400 |
+| 고정 | `model`, `tool_choice`, `thinking`, `output_config`, Top-level `cache_control`, Beta Header 조합 등 | 매 요청 동일해야 하며, 다르면 `thread_fingerprint_mismatch` |
+| 자유 | `max_tokens`, `stop_sequences`, `stream`, `metadata` 등 | Turn마다 변경 가능 |
+
+Turn마다 Model을 바꾸는 Router 구조나, 대화 중 Tool 세트를 교체하는 설계와는 잘 맞지 않습니다. 이런 경우에는 전환 시점마다 새 Thread를 만들거나, 해당 Flow에서는 Thread를 쓰지 않는 편이 단순합니다.
+
+## Prompt Caching은 여전히 직접 설정해야 합니다
+
+Thread를 쓴다고 Prompt Caching이 자동으로 켜지지는 않습니다. Top-level `cache_control`을 매 요청 같은 값으로 보내거나, Breakpoint를 직접 지정해야 합니다. Thread 사용 시 Request당 Breakpoint는 최대 4개이며, create 시 `system`/`tools`에 둔 Breakpoint는 continue 때마다 다시 카운트됩니다.
+
+요금과 Rate Limit은 변하지 않습니다. 비용 절감이 아니라 Latency와 Payload를 줄이는 기능으로 이해하는 것이 정확합니다.
+
+## 지원하지 않는 기능
+
+도입 전에 다음 항목에 해당하지 않는지 확인하십시오.
+
+- Message Batches와 Token Counting에서는 사용할 수 없습니다.
+- Compaction(Compaction on demand 포함)과 대부분의 Context Editing을 지원하지 않습니다.
+- HIPAA Readiness나 Inference Hooks가 활성화된 Organization에서는 사용할 수 없습니다.
+- ZDR(Zero Data Retention) 대상이 아닙니다. Thread는 암호화된 상태로 Memory에만 보관되고 최대 1시간 안에 삭제됩니다.
+- Thread를 조회·삭제하는 API는 없습니다.
+
+고객 데이터를 다루는 Project라면 ZDR 여부가 Security Review에서 반드시 질문으로 나오므로, 초기에 공유해 두는 것이 좋습니다.
+
+## webhani의 의견
+
+Message Threads는 수십 Turn에 걸쳐 큰 Tool Schema를 다루는 Coding Agent나 조사형 Agent에서 효과가 큽니다. 반대로 짧은 Chat이나 Batch 작업에서는 이점이 거의 없습니다.
+
+권장하는 도입 순서는 다음과 같습니다.
+
+1. 먼저 Turn별 TTFT와 Request Size를 측정해, 대화 길이에 비례해 나빠지는지 확인합니다.
+2. SDK Thread Helper로 시작하고, 직접 구현은 한계에 부딪혔을 때 검토합니다.
+3. 대화 이력 영속화와 Replay Path를 먼저 구현하고, `thread_not_found`를 정상 Case로 Test합니다.
+4. Fallback, Refusal, Stream 끊김 시 동작을 Staging에서 확인합니다. 각각 문서에 별도 규칙이 있습니다.
+5. ZDR이나 HIPAA 요건이 있는 환경은 Thread 없이 구성하는 것을 전제로 합니다.
+
+보내는 양을 줄이는 최적화는 Dashboard에서 효과가 바로 보입니다. 하지만 상태를 Server에 맡기는 만큼, 실패 처리 설계가 품질을 결정합니다. Beta 기간에는 작게 시험하고, Replay 비율을 Metric으로 수집해 두기를 권장합니다.

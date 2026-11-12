@@ -1,0 +1,99 @@
+---
+title: "Evaluating GitHub Package Firewall: Enforce npm Policy on the Path, Not the Client"
+description: "GitHub's package firewall, now in public preview, is a proxy that enforces policy at npm install time. How it differs from client-side cooldowns, where it fits for coding agents and CI, and the bypass routes you need to close."
+date: "2026-11-08"
+status: "published"
+tags: ["Security", "npm", "Supply Chain", "GitHub", "AI Agents"]
+thumbnail: ""
+author: "webhani"
+slug: "github-package-firewall-npm-agents-ci-2026-11"
+---
+
+Over the past year, the standard npm supply chain playbook has settled: commit lockfiles, restrict install scripts, and hold off on brand-new versions with a cooldown. Most of it depends on **client configuration**. Every laptop, every CI runner, and now every coding agent environment has to be set up correctly.
+
+On October 20, 2026, GitHub released a **package firewall** in public preview that moves the check somewhere else. This post covers what's confirmed in GitHub's changelog and press coverage, and how we'd evaluate it.
+
+## What it is
+
+The package firewall is a proxy between your endpoints (or internal registry) and the upstream npm registry. It inspects both metadata requests and package downloads, then allows or blocks the install based on policies set at the enterprise level.
+
+Reported policy controls include:
+
+- Blocking packages that match malware advisories in the GitHub Advisory Database
+- Blocking versions with vulnerability advisories at or above a chosen severity (reportedly "Critical only" by default)
+- A cooldown that delays newly published versions
+- Supply chain integrity checks such as attestation downgrades
+
+When a legitimate package gets blocked, users can request an exception through a workflow.
+
+Availability:
+
+- GitHub Enterprise Cloud, including data-resident deployments
+- npm only, for now
+- Free during the preview; usage-based billing is planned for GA
+
+## How it differs from client settings
+
+npm itself has picked up client-side defenses, such as a release-age limit in `.npmrc`:
+
+```ini
+# Client-side cooldown. Check npm's docs for the supported version and units.
+min-release-age=7
+```
+
+That's worth having, but it has gaps:
+
+- It does nothing on machines or containers where it isn't configured.
+- It doesn't cover other clients, or scripts that fetch tarballs directly.
+- A coding agent spinning up a fresh environment may not inherit it.
+- There's no organization-wide way to prove it's applied everywhere.
+
+The firewall addresses this by putting the check on the **network path**. However a client is configured, any request that goes through the firewall gets the same policy. We see it as an additional layer on top of client settings, not a replacement.
+
+## Why it matters for agents and CI
+
+We suspect the timing isn't accidental. Coding agents run `npm install` on their own as part of a task. A prompt injection, or just a typo, can pull in a package nobody intended.
+
+Hardening every agent environment individually is hard to verify. "All npm traffic leaving the agent sandbox goes through the firewall" is a single rule you can audit. The same reasoning applies to CI runners.
+
+## Close the bypass routes
+
+A proxy only helps if it can't be routed around. Check these during rollout:
+
+1. **Endpoint registry config.** Reports describe pointing `.npmrc` at a firewall endpoint and authenticating with a token. Confirm the URL format and auth method in GitHub's official docs.
+2. **Internal registry remotes.** If Artifactory or a similar tool uses public npm as a direct upstream, that's a hole. Point the remote through the firewall or stop direct fetches.
+3. **Egress control.** If runners and agent sandboxes can still reach `registry.npmjs.org` directly, editing `.npmrc` is enough to bypass the firewall. You're only enforcing on the path once the network blocks the direct route.
+4. **Lockfile URLs.** `package-lock.json` records each package's `resolved` URL. Agree as a team how you'll handle lockfiles when the registry changes, before it causes confusing diffs.
+
+In CI, the registry setup might look like this:
+
+```yaml
+# GitHub Actions example (registry values are placeholders)
+- name: Configure npm registry
+  run: |
+    npm config set registry "$PACKAGE_FIREWALL_URL"
+    npm config set "//${PACKAGE_FIREWALL_HOST}/:_authToken" "$FIREWALL_TOKEN"
+  env:
+    PACKAGE_FIREWALL_URL: ${{ vars.PACKAGE_FIREWALL_URL }}
+    PACKAGE_FIREWALL_HOST: ${{ vars.PACKAGE_FIREWALL_HOST }}
+    FIREWALL_TOKEN: ${{ secrets.FIREWALL_TOKEN }}
+
+- run: npm ci
+```
+
+## A practical evaluation plan
+
+It's a preview, so don't roll it out company-wide on day one.
+
+1. **Observe first.** If you can, start with permissive policies and learn which packages hit which rules before you start blocking.
+2. **Pick a cooldown you can live with.** Cooldowns get in the way of urgent security patches. Walk through the exception flow before you need it.
+3. **CI before laptops.** CI and agent environments are easier to manage centrally. Developer machines can follow.
+4. **List what's out of scope.** It's npm only. PyPI, container images, and anything else your organization pulls still need their own controls.
+
+## Our take
+
+Supply chain defenses that rely on everyone keeping the right config will always leak somewhere. Moving enforcement from individual clients to the network path is the right direction.
+
+That said, it's limited to GitHub Enterprise Cloud, covers only npm, and will be billed after GA. It won't be the right choice for everyone. For smaller teams, consistently using lockfiles, `npm ci`, install-script restrictions, and a client-side cooldown already removes much of the risk.
+
+Whichever route you take, check that the control can't be bypassed. Having a config file and actually enforcing it are two different things.
