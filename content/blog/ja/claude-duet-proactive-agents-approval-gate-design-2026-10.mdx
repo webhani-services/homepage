@@ -1,0 +1,110 @@
+---
+title: "Claude Duet と Proactive Agent: 自社の自動化に Approval Gate をどう設計するか"
+description: "Anthropic の Duet は、連携アプリをバックグラウンドで確認し、重要な操作の前に承認を求める Research Preview です。現時点では米国限定ですが、Approval Gate のパターンは今日作る Agent にそのまま使えます。"
+date: "2026-10-28"
+status: "published"
+tags: ["Claude", "AI Agents", "Security", "Design Pattern", "LLM"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-duet-proactive-agents-approval-gate-design-2026-10"
+---
+
+10 月 21 日、Anthropic は Claude Duet の Research Preview を開始しました。ユーザーが不在の間も、連携したアプリをまたいで作業を進める Agent です。報道によれば、対象は米国の Pro / Max 契約者向けのウェイトリストで、連携アカウントの確認は常時ではなく数時間おき、メール送信・支払い・署名といった重要な操作の前には承認を求めるとのことです。Anthropic 自身の発表ページは確認できておらず、基盤モデルなどの詳細は二次情報で食い違いがあります。本記事は製品レビューではなく、パターンについての考察として読んでください。
+
+読者の多くはまだ Duet を使えません。それでも、この製品が突き付ける設計上の問いは今日の課題です。**Proactive Agent は起動の瞬間に人間が介在しない。では人間はどこに入るのか。** Duet の答えが Approval Gate であり、これは意図して作り込む価値のあるパターンです。
+
+## Reactive と Proactive ではリスクモデルが変わる
+
+チャットアシスタントは、人が入力したときに動きます。Proactive Agent はスケジュールやイベントで動きます。変わるのは次の 3 点です。
+
+- **入力がもはや自分のものではない。** 入力はメール、カレンダーの招待、チケットなどで、第三者が書いた文章を含み得ます。いわゆる Prompt Injection の典型的な経路で、無人実行ではさらに影響が大きくなります。
+- **誰も見ていない。** 誤った操作は、起きた瞬間ではなく後から発覚します。
+- **操作が外部に影響する。** メッセージの送信や請求書の支払いは、タブを閉じても取り消せません。
+
+Approval Gate は 2 点目と 3 点目に直接効き、1 点目の被害も抑えます。
+
+## ツール単位ではなく、可逆性で操作を分類する
+
+よくある間違いは、ツール名でゲートをかけること（「メールツールを使う前に確認」）です。粒度が粗すぎます。下書きの作成は無害ですが、送信はそうではありません。操作が何をするかで分類します。
+
+```typescript
+type Effect = "read" | "write-internal" | "write-external" | "financial";
+
+interface ActionRequest {
+  tool: string;
+  effect: Effect;
+  summary: string;      // 承認画面に表示する人間向けの説明
+  payload: unknown;
+}
+
+type Decision = "allow" | "require-approval" | "deny";
+
+export function decide(action: ActionRequest, ctx: { unattended: boolean }): Decision {
+  switch (action.effect) {
+    case "read":
+      return "allow";
+    case "write-internal":
+      // 下書き作成、ラベル付与など。元に戻せる
+      return "allow";
+    case "write-external":
+      return ctx.unattended ? "require-approval" : "allow";
+    case "financial":
+      return "require-approval"; // 自動承認はしない
+  }
+}
+```
+
+`unattended` フラグが重要です。ユーザーが画面の前にいるときは問題ない操作でも、スケジュール起動なら承認待ちに回すべきです。
+
+## 承認画面には根拠を載せる
+
+「Agent がメールを送信しようとしています。許可しますか？」だけの承認は、人を「とりあえず許可」に慣らしてしまいます。何が起きるのか、なぜそうなったのかを見せます。
+
+```typescript
+interface ApprovalRequest {
+  id: string;
+  action: ActionRequest;
+  trigger: string;          // 「カレンダー: ベンダーレビュー 10/29」
+  sourceExcerpt: string;    // この操作に至った、信頼できない入力の該当箇所
+  expiresAt: Date;
+}
+```
+
+`sourceExcerpt` を含めるのは意図的です。Agent が文書を転送しようとする理由が受信メール中の一文なら、レビュー担当者にその一文を見せるべきです。注入された指示に気付く最短の方法になります。
+
+## Fail Closed と承認の期限切れ
+
+実装は簡単なのに忘れがちなデフォルトが 2 つあります。
+
+- **期限切れ。** 一定時間内に承認がなければ、その操作は破棄します。古い文脈のまま後から実行してはいけません。
+- **Fail Closed。** ポリシー関数が例外を投げた場合や承認サービスに到達できない場合は `deny` にします。この原則は以前の Claude Code Hooks の記事でも取り上げましたが、ここでも同じです。
+
+```typescript
+export async function execute(action: ActionRequest, ctx: { unattended: boolean }) {
+  let decision: Decision;
+  try {
+    decision = decide(action, ctx);
+  } catch {
+    decision = "deny";
+  }
+  if (decision === "deny") return { status: "blocked" as const };
+  if (decision === "require-approval") {
+    return { status: "pending" as const, approvalId: await queueApproval(action) };
+  }
+  return { status: "done" as const, result: await run(action) };
+}
+```
+
+## 操作だけでなく「判断」を記録する
+
+監査とチューニングのため、判断ごとに入力を記録します。操作内容、Effect の分類、無人実行かどうか、承認者です。数週間分たまると、常に承認されるもの（緩和の候補）と、頻繁に却下されるもの（厳格化、または Agent の指示の修正が必要）が見えてきます。Anthropic も Duet の「緊急度の判断」を調整中だとしています。自社の Agent でも同じ調整が必要になり、そのためのデータが要ります。
+
+## まとめ
+
+- Proactive Agent は、チャットアシスタントとは別のリスククラスとして扱う。無人・外部起因・外部影響という性質を持つ。
+- ツールではなく、操作の効果でゲートをかける。
+- レビュー担当者に、起動要因と信頼できない入力の原文を見せる。
+- 保留中の承認には期限を設け、Fail Closed にする。
+- 判断ログを残し、定期的に見直す。
+
+社内業務にバックグラウンド Agent を導入する場合は、まず読み取り専用と下書き作成から始め、外部への書き込みに承認を付け、判断ログを根拠に権限を広げていく進め方をお勧めします。

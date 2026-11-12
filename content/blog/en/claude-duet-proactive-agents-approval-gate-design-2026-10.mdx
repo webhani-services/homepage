@@ -1,0 +1,110 @@
+---
+title: "Claude Duet and Proactive Agents: Designing Approval Gates for Your Own Automation"
+description: "Anthropic's Duet research preview checks connected apps in the background and asks before consequential actions. The product is US-only for now, but the approval-gate pattern is something you can apply to agents you build today."
+date: "2026-10-28"
+status: "published"
+tags: ["Claude", "AI Agents", "Security", "Design Pattern", "LLM"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-duet-proactive-agents-approval-gate-design-2026-10"
+---
+
+On October 21, Anthropic opened a research preview of Claude Duet, an agent that works across connected apps while you are away. Per the coverage we have seen, it is a waitlist for Pro and Max subscribers in the US, it checks connected accounts every few hours rather than continuously, and it asks for approval before important actions such as sending email, making payments, or signing documents. We could not reach Anthropic's own announcement, and secondary sources disagree on details such as the underlying model, so read this as commentary on the pattern, not a product review.
+
+Most of our readers cannot use Duet yet. The design question it raises is still immediate: **a proactive agent acts without a human in the loop at the moment of triggering, so where does the human go?** The answer in Duet's case is an approval gate. That is a pattern worth building deliberately.
+
+## Reactive versus proactive changes the risk model
+
+A chat assistant acts when you type. A proactive agent acts on a schedule or an event. Three properties change:
+
+- **The prompt is no longer yours.** The input is an email, a calendar invite, or a ticket, any of which can contain text written by someone else. This is the standard prompt-injection exposure, and it is larger when the agent runs unattended.
+- **Nobody is watching.** A wrong action is discovered later, not at the moment it happens.
+- **Actions have external effects.** Sending a message or paying an invoice cannot be undone by closing a tab.
+
+Approval gates address the second and third points directly, and limit the damage from the first.
+
+## Classify actions by reversibility, not by tool
+
+A common mistake is gating by tool name ("ask before using the email tool"). That is too coarse: drafting an email is harmless, sending is not. Classify by what the action does.
+
+```typescript
+type Effect = "read" | "write-internal" | "write-external" | "financial";
+
+interface ActionRequest {
+  tool: string;
+  effect: Effect;
+  summary: string;      // human-readable, shown in the approval prompt
+  payload: unknown;
+}
+
+type Decision = "allow" | "require-approval" | "deny";
+
+export function decide(action: ActionRequest, ctx: { unattended: boolean }): Decision {
+  switch (action.effect) {
+    case "read":
+      return "allow";
+    case "write-internal":
+      // e.g. create a draft, add a label: reversible
+      return "allow";
+    case "write-external":
+      return ctx.unattended ? "require-approval" : "allow";
+    case "financial":
+      return "require-approval"; // never auto-approved
+  }
+}
+```
+
+The `unattended` flag matters. The same action can be fine when a user is present and watching, and should be queued when the agent was triggered by a schedule.
+
+## Make the approval prompt carry the evidence
+
+An approval that says "Agent wants to send an email. Allow?" trains people to click yes. Show what will happen and why:
+
+```typescript
+interface ApprovalRequest {
+  id: string;
+  action: ActionRequest;
+  trigger: string;          // "Calendar event: Vendor review, 10/29"
+  sourceExcerpt: string;    // the untrusted text that led here
+  expiresAt: Date;
+}
+```
+
+Including `sourceExcerpt` is deliberate. If the reason an agent wants to forward a document is a sentence in an incoming email, the reviewer should see that sentence. It is the fastest way to spot an injected instruction.
+
+## Fail closed, and let approvals expire
+
+Two defaults that are cheap to implement and easy to forget:
+
+- **Expiry.** If nobody approves within a window, the action is dropped, not executed later with stale context.
+- **Fail closed.** If the policy function throws or the approval service is unreachable, the result is `deny`. We covered this principle for Claude Code hooks in an earlier post; the same logic applies here.
+
+```typescript
+export async function execute(action: ActionRequest, ctx: { unattended: boolean }) {
+  let decision: Decision;
+  try {
+    decision = decide(action, ctx);
+  } catch {
+    decision = "deny";
+  }
+  if (decision === "deny") return { status: "blocked" as const };
+  if (decision === "require-approval") {
+    return { status: "pending" as const, approvalId: await queueApproval(action) };
+  }
+  return { status: "done" as const, result: await run(action) };
+}
+```
+
+## Log decisions, not just actions
+
+For audit and for tuning, record every decision with its inputs: the action, the effect class, whether the run was unattended, and who approved. After a few weeks the log shows which approvals are always granted (candidates to relax) and which are frequently rejected (candidates to tighten or to fix in the agent's instructions). Anthropic says it is still tuning Duet's judgment about urgency; you will be doing the same tuning for your own agents, and you need data to do it.
+
+## Takeaways
+
+- Treat proactive agents as a different risk class from chat assistants. Unattended, externally triggered, and externally effective.
+- Gate on the effect of an action, not the tool it uses.
+- Show the reviewer the trigger and the untrusted source text.
+- Expire pending approvals and fail closed.
+- Keep a decision log and review it regularly.
+
+If you are evaluating background agents for internal workflows, start with read-only access and drafts, add approvals for external writes, and widen permissions only as the decision log supports it.
