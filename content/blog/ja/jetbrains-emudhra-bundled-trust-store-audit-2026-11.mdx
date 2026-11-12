@@ -1,0 +1,118 @@
+---
+title: "eMudhra 証明書の侵害から学ぶ：OS を更新しても JetBrains IDE やランタイムは守られない理由"
+description: "eMudhra の中間証明書8枚の秘密鍵が漏えいし、JetBrains は「OS の更新だけでは不十分」として各製品のアップデートを公開しました。同じ死角は JVM、Node.js、Python、Container イメージにもあります。スタック全体のトラストストアを点検する方法を整理します。"
+date: "2026-11-07"
+status: "published"
+tags: ["Security", "TLS", "PKI", "DevOps", "開発ツール"]
+thumbnail: ""
+author: "webhani"
+slug: "jetbrains-emudhra-bundled-trust-store-audit-2026-11"
+---
+
+10月末、JetBrains がセキュリティ advisory を公開しました。eMudhra の中間証明書8枚について、秘密鍵が第三者の手に渡ったという内容です。この鍵があれば、信頼されたルートにつながる TLS 証明書を任意のドメイン向けに発行でき、サーバーのなりすましに必要な条件がそろってしまいます。JetBrains は IDE、ReSharper、.NET ツール、Toolbox App、Gateway の修正版と、バックグラウンドサービス（`jetbrainsd` 0.9.9728 以降）の修正をリリースしました。公開時点で、JetBrains ユーザーに対する悪用は確認されていないとしています。
+
+インシデントそのものより注目したいのは、advisory の中の一文です。**OS をアップデートしても、この問題は解決しない。** JetBrains のツールは同梱の JetBrains Runtime 上で動いていて、信頼する証明書のリストを独自に持っているためです。
+
+IDE がそうであるなら、皆さんのスタックの中にも同じ構造のものがいくつかあるはずです。
+
+## 「何を信頼するか」を実際に決めているのは誰か
+
+多くの開発者は「システムが」信頼する認証局を決めていると考えています。実際には、ランタイムごとに異なります。
+
+| ランタイム | デフォルトの信頼元 | OS のパッチで更新されるか |
+| --- | --- | --- |
+| JetBrains IDE（JBR） | 同梱の `cacerts` | されない |
+| Java / JVM アプリ | JDK の `cacerts` | ディストリ提供の JDK でシステムストアにリンクしている場合のみ |
+| Node.js | バイナリに組み込まれた Mozilla の CA リスト | されない（`--use-system-ca` 有効時を除く） |
+| Python `requests` | `certifi` パッケージ | されない（`pip` で更新） |
+| Go（Linux） | システムストア（`/etc/ssl/certs`） | される |
+| Container イメージ | イメージ内の `ca-certificates` | 再ビルドしたときだけ |
+| Electron アプリ | Chromium のルートストア | アプリのリリースで更新 |
+
+CA のインシデントが起きたとき、「されない」の行はそれぞれ別の対応タスクになり、担当者も別々になります。
+
+## レイヤーごとの点検方法
+
+公開トラストストア上の eMudhra のルート証明書は **emSign** というブランド名になっているので、両方の名前で検索します。
+
+### JVM と JetBrains Runtime
+
+```bash
+# PATH 上の JDK
+keytool -list -cacerts -storepass changeit 2>/dev/null | grep -iE 'emudhra|emsign'
+
+# IDE に同梱された JetBrains Runtime（macOS の例）
+JBR="/Applications/IntelliJ IDEA.app/Contents/jbr/Contents/Home"
+"$JBR/bin/keytool" -list -keystore "$JBR/lib/security/cacerts" \
+  -storepass changeit | grep -iE 'emudhra|emsign'
+```
+
+ルート一覧に該当があっても、直ちに危険というわけではありません。侵害されたのは中間証明書で、JetBrains の修正は該当するチェーンを信頼しないようにするものです。この点検で得られるのは、マシン上に JVM がいくつあり、それぞれが別のトラストストアを持っているかという一覧です。たいてい、想定より多く見つかります。
+
+### Node.js
+
+Node は Mozilla のルートリストをバイナリに組み込んでいます。中身は直接確認できます。
+
+```javascript
+// list-roots.mjs
+import { rootCertificates } from "node:tls";
+import { X509Certificate } from "node:crypto";
+
+const matches = rootCertificates
+  .map((pem) => new X509Certificate(pem))
+  .filter((c) => /emudhra|emsign/i.test(c.subject));
+
+for (const c of matches) {
+  console.log(c.subject.replace(/\n/g, ", "), "| expires", c.validTo);
+}
+console.log(`${matches.length} matching roots in Node ${process.version}`);
+```
+
+組み込みリストは Node をアップグレードしたときにしか変わりません。つまり CA の失効判断がサービスに反映されるのは、OS にパッチを当てたときではなく、新しい Node をデプロイしたときです。組織のトラストポリシーに従わせたいサーバーでは、最近の Node が対応している `--use-system-ca`（または `NODE_USE_SYSTEM_CA=1`）を使うと、OS 側の変更1回で全体に反映できます。
+
+### Python
+
+```bash
+python -c "import certifi; print(certifi.where())" \
+  | xargs grep -iE '^# (Issuer|Subject):.*(emudhra|emsign)'
+```
+
+`certifi` はパッケージを更新したときに変わるので、実質的には lockfile がトラストストアを決めています。トラストを一元管理したい場合は、`truststore` パッケージ（あるいはシステムのバンドルを指す `SSL_CERT_FILE`）で Python を OS のストアに寄せられます。
+
+### Container イメージ
+
+```dockerfile
+FROM node:24-bookworm-slim
+# ビルド時点の最新 CA バンドルを取り込む
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && update-ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+ENV NODE_USE_SYSTEM_CA=1
+```
+
+3か月前にビルドしたイメージには、3か月前のトラストストアが入っています。直すには再ビルドするしかありません。アプリのコードに変更がなくても、定期的にイメージを再ビルドすべき理由がここにもあります。
+
+## 今週やること
+
+JetBrains ユーザー向けには次のとおりです。
+
+1. IDE、Toolbox App、Gateway、ReSharper を、advisory に記載された修正版に更新する
+2. バックグラウンドデーモンが 0.9.9728 以降になっていることを確認する
+3. 古いバージョンの IDE には修正が提供されません。旧バージョンに固定している場合は、今のうちにアップグレード計画を立てる
+4. JetBrains によると、まれに、削除されたルートにつながる証明書を使うサーバーへの接続が失敗するようになります。更新後に社内サービスにつながらなくなった場合は、古いルートを戻すのではなく、そのサーバーの証明書を再発行するのが正しい対応です
+
+スタック全体については、一度棚卸しを作ってください。TLS を受ける側・張る側のランタイムすべてについて、トラストストアの出どころと更新の担当者をまとめます。webhani がお客様の環境でこの作業をすると、忘れられていた JVM が数個、何年も前のベースイメージがいくつか、そして「一時的に」証明書検証を無効にしたままのサービスが少なくとも1つは見つかるのが普通です。
+
+## webhani の見解
+
+認証局のインシデントはめったに起きません。しかし起きたときの対応速度は、事前の準備でほぼ決まります。今回の eMudhra の件は比較的穏やかで、ベンダーの対応は早く、悪用も報告されていません。無料の予行演習だと捉えるのがよいと考えています。
+
+私たちの推奨は次のとおりです。
+
+- サーバー上では OS のトラストストアに従うランタイム設定（`--use-system-ca`、`truststore`、ディストリ提供の JDK）を優先し、1回の変更で全体に効くようにする
+- Container イメージはコードの変更時だけでなく、定期的に再ビルドする
+- トラストストアの出どころを SBOM やサービスカタログに記録する
+- `NODE_TLS_REJECT_UNAUTHORIZED=0` や `verify=False` などは、CI の grep ルールで禁止する
+
+開発ツールの更新は数分で終わります。50個のサービスがそれぞれ何を信頼しているかを把握しておくことが、次のインシデントで効いてきます。

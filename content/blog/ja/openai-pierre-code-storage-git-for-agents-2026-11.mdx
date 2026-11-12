@@ -1,0 +1,130 @@
+---
+title: "OpenAI の Pierre 買収から考える、Coding Agent 時代の Git 基盤設計"
+description: "OpenAI が Code Storage と、Codex で使われている Trees・Diffs ライブラリの開発元 Pierre の買収を発表しました。人間向けに設計された Git ホスティングが Agent のワークロードで詰まる理由と、今のチームで取れる設計上の対策を整理します。"
+date: "2026-11-07"
+status: "published"
+tags: ["AI", "Coding Agent", "Git", "アーキテクチャ", "OpenAI"]
+thumbnail: ""
+author: "webhani"
+slug: "openai-pierre-code-storage-git-for-agents-2026-11"
+---
+
+11月4日、OpenAI は Pierre Computer Company の買収計画を発表しました。Pierre は、人間ではなく AI プラットフォーム向けに作られたホスティング型 Git サービス「Code Storage」と、Codex アプリのファイルブラウズや差分レビューに使われている OSS ライブラリ Trees・Diffs の開発元です。買収額は非公開で、規制当局の承認待ちの段階です。Pierre の OSS は引き続きオープンソースとして維持されると OpenAI は説明しています。
+
+報道の多くは「OpenAI が GitHub に挑む」という切り口です。それが意味を持つのは数年先かもしれません。いま Coding Agent を使っているチームにとって重要なのは、もっと手前の問いです。**なぜ AI 企業が自前の Git 基盤を必要とするのか。**
+
+## Agent は人間と違う使い方で Git を叩く
+
+既存の Git ホスティングは、人間の作業リズムを前提に設計されています。1日に数回 push し、Pull Request を作り、レビューを待つ。Coding Agent はこの前提を、かなり予測しやすい形で崩します。
+
+| 観点 | 人間の開発者 | Coding Agent |
+| --- | --- | --- |
+| Branch 数 | タスクごとに1本 | 試行ごとに1本。大半は1時間以内に破棄 |
+| Commit 頻度 | 数時間に1回 | ロールバック用に tool 呼び出しごと |
+| コードの読み方 | clone して IDE で読む | grep・glob・blame が中心 |
+| レイテンシ | 2秒の push は気にならない | 200回 push するループでは致命的 |
+
+Code Storage の公開ドキュメントにも、この傾向が表れています。API 経由の grep、glob 指定のアーカイブ取得、ファイルのストリーミング、Git namespace を使った ephemeral branch、TypeScript・Python・Go の SDK、そして MCP サーバーが並んでいます。買収の行方とは関係なく、この機能一覧は「Agent がリポジトリに求めるもの」の見取り図として参考になります。
+
+## ベンダーを変えなくても同じ発想は使える
+
+私たちが支援しているチームの多くは、GitHub や GitLab の上で Coding Agent を動かしています。今回のニュースでホスティングを乗り換えることはまずないでしょう。ただ、設計の考え方は取り入れられます。
+
+### 試行錯誤はローカルの worktree に閉じ込める
+
+共有リモートに `agent/*` Branch が数百本並ぶと、一覧が見づらくなるうえ、CI や webhook が無駄に走ります。探索はローカルの worktree で行い、採用した結果だけを push します。
+
+```bash
+#!/usr/bin/env bash
+# N 回の Agent 試行を独立した worktree で実行し、採用分だけ push する
+set -euo pipefail
+
+TASK_ID="$1"
+ATTEMPTS="${2:-3}"
+BASE="origin/main"
+
+git fetch --quiet origin main
+
+for i in $(seq 1 "$ATTEMPTS"); do
+  dir=".agent-work/${TASK_ID}-${i}"
+  git worktree add --quiet -b "scratch/${TASK_ID}-${i}" "$dir" "$BASE"
+  # ここで "$dir" を Agent Runner に渡す
+done
+
+echo "評価後に採用した試行だけを push:"
+echo "  git push origin scratch/${TASK_ID}-<n>:agent/${TASK_ID}"
+echo "  git worktree remove .agent-work/${TASK_ID}-<n>"
+```
+
+リモートに届くのは採用した1本だけで、名前は `agent/<task>` に固定されます。Branch 保護や CI のルールもこの名前を対象に書けます。
+
+### clone させず、検索 API を渡す
+
+Agent の仕事がコード検索中心なら、フル checkout ではなく検索用の tool を渡すほうが効率的です。共有の bare mirror に対する `git grep` の薄いラッパーで、多くの場合は十分です。
+
+```typescript
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const run = promisify(execFile);
+
+// cron で git fetch して最新に保つ読み取り専用 mirror
+const MIRROR = "/srv/mirrors/app.git";
+
+export async function grepAtRef(pattern: string, ref = "origin/main") {
+  // execFile で shell injection を避け、-F で固定文字列として検索
+  const { stdout } = await run(
+    "git",
+    ["--git-dir", MIRROR, "grep", "-n", "-F", "-e", pattern, ref, "--"],
+    { maxBuffer: 10 * 1024 * 1024 },
+  ).catch((err) => {
+    // 一致なしのとき git grep は exit 1
+    if (err.code === 1) return { stdout: "" };
+    throw err;
+  });
+
+  return stdout
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      // 形式: <ref>:<path>:<line>:<content>
+      const [, path, lineNo, ...rest] = line.split(":");
+      return { path, line: Number(lineNo), text: rest.join(":") };
+    });
+}
+```
+
+これを MCP などの tool として公開すると、大きなリポジトリでの Agent の起動時間が大きく縮みます。書き込みが必要になるまでは、Agent を読み取り専用に保てるのも利点です。
+
+### ストレージをインターフェースの裏に隠す
+
+今回の買収は、Agent ツールの統合が速く進んでいることの表れでもあります。Agent 基盤のあちこちから Git ホスティングの API を直接呼んでいると、後から乗り換えるのが大変になります。Agent が必要とする操作だけを定義し、実装を差し替えられるようにしておきます。
+
+```typescript
+export interface AgentRepoStore {
+  createEphemeralBranch(task: string, base: string): Promise<string>;
+  commit(branch: string, files: Record<string, string>, message: string): Promise<string>;
+  grep(pattern: string, ref: string): Promise<{ path: string; line: number; text: string }[]>;
+  promote(branch: string, target: string): Promise<void>; // 例: PR を作成
+  discard(branch: string): Promise<void>;
+}
+```
+
+最初の実装はローカル worktree と GitHub API で十分です。将来、専用サービスを採用することになっても、差し替えるのは Adapter 1つで、Agent のロジックはそのまま使えます。
+
+## OSS 依存について
+
+自社プロダクトで Trees や Diffs を使っているチームは、OSS を維持するという OpenAI の説明をそのまま受け取ってよいと思います。そのうえで、通常の衛生管理は続けてください。バージョンを固定する、買収完了後にライセンスやガバナンスの変更がないかリポジトリを見ておく、自分たちが依存している機能を把握しておく。メンテナが変わるライブラリ全般に対して私たちが推奨している確認と同じで、すぐに外す理由にはなりません。
+
+## webhani の見解
+
+このニュースの本質は OpenAI 対 GitHub ではありません。**リポジトリが Agent のインフラになりつつある**ということです。そして Agent にとって重要なアクセスパターン（安価な ephemeral branch、サーバー側検索、低レイテンシの commit）は、人間向けの Git ホスティングが最適化してきたものとは違います。
+
+多くの組織にとって、今やるべきことは控えめなもので十分です。
+
+1. Agent の探索はローカル worktree や namespace で行い、結果だけを push する
+2. Agent に検索 tool を渡し、毎回フル clone させない
+3. Agent のオーケストレーションと Git ホスティングの間にインターフェースを置く
+4. Agent の push・branch・clone の回数を計測する。急増しているなら、ホスティングのレート制限に引っかかる前に手を打つ
+
+どれも買収の完了を待つ必要はありません。Agent を数体以上動かしているチームなら、今のうちに整えておきたい設計です。
