@@ -1,0 +1,84 @@
+---
+title: "AI Product가 종료될 때: Atlas 사례로 보는 Exit Strategy"
+description: "OpenAI가 Atlas Browser를 출시 1년도 되지 않아 종료했습니다. 변화가 빠른 AI Product에 의존할 때 무엇이 문제가 되는지, 전환 비용을 낮게 유지하는 실용적인 방법을 정리합니다."
+date: "2026-10-26"
+status: "published"
+tags: ["AI", "LLM", "Architecture", "리스크 관리", "Vendor 관리"]
+thumbnail: ""
+author: "webhani"
+slug: "ai-tool-shutdown-exit-strategy-atlas-2026-10"
+---
+
+2026년 7월 OpenAI는 ChatGPT Atlas Browser를 종료한다고 발표했습니다. 보도에 따르면 서비스 종료일은 8월 9일로, 출시 후 1년이 채 되지 않았습니다. 기능은 ChatGPT Desktop App으로 통합되었고, 사용자에게는 Data 이전 안내가 전달되었습니다. 일부 보도는 이 결정을 OpenAI 제품군 정리라는 맥락에서 설명하기도 합니다.
+
+한 회사만의 이야기가 아닙니다. AI Product는 몇 달 단위로 출시되고, 통합되고, 종료됩니다. 팀의 업무 습관이나 Script, 고객에게 노출되는 기능이 그런 Product 위에 올라가 있다면, 물어야 할 것은 "쓰는 것이 바뀔 것인가"가 아니라 "바뀌었을 때 비용이 얼마인가"입니다.
+
+## 진짜 의존성은 어디에 있는가
+
+Lock-in이라고 하면 보통 Model API를 떠올리지만, 실제 프로젝트에서 문제가 되는 곳은 다릅니다.
+
+- **업무 Workflow 의존.** 담당자가 특정 Tool의 UI나 단축키에 의존하고 있으며, 작업 자체에 대한 절차 문서가 없습니다.
+- **Data 의존.** 대화 이력, 저장한 Prompt, Memory, Custom Instruction이 Product 안에만 있습니다.
+- **연동 의존.** 사내 Script가 문서화되지 않았거나 Beta 상태인 Endpoint를 호출합니다.
+- **지식 의존.** 그 Tool이 없던 시절에 "좋은 결과물"이 무엇이었는지 아무도 설명하지 못합니다.
+
+Model 교체는 대개 가장 쉬운 경우입니다. Product 종료는 나머지 네 가지를 직격합니다.
+
+## 의존성 대장 운영하기
+
+고객사에는 사용 중인 AI Product를 짧은 대장으로 관리하도록 권합니다. Repository 안의 YAML 파일이면 충분합니다.
+
+```yaml
+- name: browser-agent-tool
+  owner: platform-team
+  used_for: "경쟁사 가격 확인 (주간)"
+  maturity: beta            # ga | beta | preview
+  data_held: [history, saved-tasks]
+  export_path: "수동 복사만 가능"
+  replacement: "playwright script + 임의의 LLM API"
+  last_reviewed: 2026-10-26
+```
+
+핵심 항목은 `maturity`, `export_path`, `replacement` 세 가지입니다. `export_path`가 "수동 복사만 가능"이고 `maturity`가 beta라면, 리스크가 눈에 보이는 형태로 우선순위를 매길 수 있습니다. `replacement`를 채울 수 없다면 그것이 가장 먼저 다룰 일입니다.
+
+## 코드와 Tool 사이에 Interface 두기
+
+코드에서 호출하는 대상은 Vendor를 자체 Interface로 감쌉니다. 추상화 자체가 목적이 아니라, Vendor가 기능을 종료하는 날 변경이 파일 하나로 끝나도록 하기 위함입니다.
+
+```ts
+export interface PageReader {
+  fetchText(url: string, signal?: AbortSignal): Promise<string>;
+}
+
+export class PlaywrightReader implements PageReader {
+  async fetchText(url: string, signal?: AbortSignal) {
+    // Browser를 실행하고, 이동한 뒤, 화면에 보이는 Text를 반환
+    throw new Error("implement with your browser automation of choice");
+  }
+}
+
+// 호출하는 쪽은 PageReader에만 의존하고 Vendor SDK에는 의존하지 않음
+export async function priceSnapshot(reader: PageReader, url: string) {
+  const text = await reader.fetchText(url);
+  return { url, length: text.length, capturedAt: new Date().toISOString() };
+}
+```
+
+호출하는 쪽에는 `PageReader`만 보입니다. Vendor Agent로 구현하든, Headless Browser든, 테스트용 Fixture든 구현 세부 사항입니다.
+
+## Tool이 아니라 작업 자체를 문서로 남기기
+
+가장 유용한 산출물은 쉬운 말로 쓴 절차 문서입니다. 입력은 무엇인지, 어떤 단계를 거치는지, 올바른 결과는 어떤 모습인지, 그리고 예시 세 개를 적습니다. 이것이 있으면 Tool 전환은 Configuration 변경과 예시 재실행으로 끝납니다. 없다면 장애 한가운데서 자기 업무를 Reverse Engineering하게 됩니다.
+
+## 분기별 점검 루틴
+
+대장의 각 항목에 대해 분기마다 다음을 확인합니다.
+
+1. 해당 Product가 Vendor의 Roadmap에 남아 있는가. 소문이 아니라 공식 발표로 확인합니다.
+2. 오늘 Data를 Export할 수 있는가. 실제로 해 봅니다.
+3. 대체 수단이 여전히 동작하는가. 저장해 둔 예시로 실행합니다.
+4. Beta인데 핵심이 된 것은 없는가. 지원되는 경로로 옮기거나, 리스크 수용을 문서로 남깁니다.
+
+## webhani의 권장 사항
+
+탐색 목적이라면 새 AI Product를 자유롭게 사용해도 좋습니다. 주간 업무나 고객 대상 Flow의 일부가 된 시점부터는 조금 더 엄격하게 접근합니다. 앞단에 Interface를 두고, Export 경로를 확보하고, 작업을 문서로 남깁니다. 드는 비용은 처음 몇 시간뿐입니다. 그 결과 종료 공지가 "장애"가 아니라 "Ticket"이 됩니다.
