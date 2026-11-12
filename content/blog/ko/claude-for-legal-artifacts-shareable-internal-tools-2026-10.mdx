@@ -1,0 +1,81 @@
+---
+title: "Claude for Legal Artifacts로 보는 공유형 사내 Tool 설계와 운영 Rule"
+description: "Anthropic이 Claude for Legal에 Artifacts Gallery를 추가했습니다. 사내 Tool 개발 관점에서 이 Pattern의 활용처와 도입 전에 정해야 할 Governance를 정리합니다."
+date: "2026-10-31"
+status: "published"
+tags: ["Claude", "AI", "Artifacts", "사내 Tool", "Governance"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-for-legal-artifacts-shareable-internal-tools-2026-10"
+---
+
+2026년 10월 28일, Anthropic은 Claude for Legal에 바로 쓸 수 있는 Artifacts Gallery를 추가했습니다. 보도에 따르면 Artifacts는 Tracker나 Dashboard 같은 Interactive Tool로, 팀이 자신의 문서를 연결해 그대로 공유할 수 있습니다. Anthropic이 제공한 Template은 cite check, jurisdiction matrix, matter board, playbook deviation, regulatory scan, tabular review 여섯 가지이며, 법률 사무소와 Vendor, 비영리 단체가 만든 Tool도 함께 올라와 있습니다.
+
+주제는 법무이지만, 대부분의 Engineering 팀에게 흥미로운 부분은 "전달 방식"입니다. LLM이 Chat에서 답변만 하는 것이 아니라, 동료가 재사용할 수 있는 작은 상태 기반 Interface를 만들어 줍니다. 이 Pattern은 법무 밖에서도 그대로 적용됩니다.
+
+## 작업 단위가 바뀐 지점
+
+지금까지 "LLM을 반복 업무에 쓴다"는 것은 저장된 Prompt나 전용 Assistant를 뜻했고, 결과물은 텍스트였습니다. 항상 정렬된 표, 상태를 추적하는 Board, 매번 같은 Rule로 동작하는 Checker가 필요하면 누군가 실제 Application을 만들어야 했습니다.
+
+Artifacts는 이 경계를 옮깁니다. Interface와 그 뒤의 Logic, 샘플 Data가 함께 제공되고, 팀은 자신의 Data Source를 연결해 조정합니다. Claude for Legal은 5월 출시 이후 60개 이상의 Connector가 추가된 것으로 알려져 있으며, 이것이 "내 문서를 연결한다"는 단계를 현실적으로 만듭니다.
+
+Software 팀의 관점에서는 Spreadsheet와 본격적인 사내 App 사이에 새로운 층이 생긴 셈입니다. 만들기 쉽고 공유하기도 쉽기 때문에, 오히려 Rule이 필요합니다.
+
+## 적합한 경우와 그렇지 않은 경우
+
+공유형 Artifact가 잘 맞는 상황은 다음과 같다고 봅니다.
+
+- **Checklist가 안정적인 Review 업무.** playbook deviation 같은 View는 사실상 "Rule × 문서" 표입니다. 구조는 거의 변하지 않고 내용만 바뀝니다.
+- **소규모 팀의 Status Board.** 다섯 명이 쓰는 Matter Board나 Release Tracker를 위해 별도 Service를 만들 이유는 없습니다.
+- **본 개발 전의 탐색.** 사용자가 정말 원하는 기능을 파악하기 위해 먼저 Artifact로 시험해 보는 것은 빠른 방법입니다.
+
+반대로 감사 수준의 보증, 엄격한 Data 보존 Rule, Transaction 정합성, LLM Session에서 접근하면 안 되는 System과의 연동이 필요하다면 적합하지 않습니다. 이 경우 Artifact는 Prototype으로 보고 교체를 전제로 진행하십시오.
+
+한 가지 더 짚자면, Gallery를 해설한 2차 자료는 Template이 실제 의뢰인 사건에서 테스트되지 않았고 정확도도 측정되지 않았다고 지적합니다. 어느 도메인에나 해당하는 주의점입니다. 잘 다듬어진 Interface는 모델 호출이 실제로 보증하는 수준보다 결과를 더 권위 있게 보이게 합니다.
+
+## 도입 전에 정해 둘 Governance
+
+발표에는 조직 내외부 공유와, Team 간 Ethical Wall을 지원하는 설정이 언급되어 있습니다. 법무가 아니더라도 같은 질문이 생깁니다.
+
+1. **조직 외부 공유는 누가 할 수 있는가.** 기본값은 Off로 두고 Team 단위로 활성화합니다.
+2. **Artifact가 사용할 수 있는 Connector는 무엇인가.** 문서 Store에 연결된 Tracker는 그 Store의 민감도를 그대로 물려받습니다. OAuth Scope를 검토하듯 Connector를 검토하십시오.
+3. **작성자가 떠나면 소유자는 누구인가.** 소유자가 없으면 공유 Tool의 Rule은 갱신되지 않습니다.
+4. **출력이 맞는지 어떻게 확인하는가.** 정답을 아는 작은 Sample을 만들어 두고, Model이나 Artifact가 바뀔 때마다 다시 실행합니다.
+
+4번을 구체화하는 가벼운 방법으로, Artifact 설명 옆에 회귀 Check를 두는 예시입니다.
+
+```ts
+// artifact-checks.ts: 알려진 입력과 기대하는 지적 사항
+type Check = { input: string; mustFlag: string[]; mustNotFlag: string[] };
+
+export const checks: Check[] = [
+  {
+    input: "fixtures/nda-missing-termination.txt",
+    mustFlag: ["termination clause missing"],
+    mustNotFlag: ["governing law missing"],
+  },
+];
+
+export function evaluate(check: Check, findings: string[]) {
+  const missed = check.mustFlag.filter((f) => !findings.includes(f));
+  const spurious = check.mustNotFlag.filter((f) => findings.includes(f));
+  return { ok: missed.length === 0 && spurious.length === 0, missed, spurious };
+}
+```
+
+일부러 단순하게 만들었습니다. 목적은 Model 업데이트 후 "동작이 바뀌었는가"라는 질문에 누군가의 눈썰미가 아니라 실행 가능한 방식으로 답하는 것입니다.
+
+## webhani의 권장 사항
+
+고객에게 이 Pattern을 권한다면 다음 순서를 제안합니다.
+
+1. 반복이 많고 Checklist가 명확한 Review 또는 추적 업무 하나를 고릅니다.
+2. 샘플 Data와 기대 출력 Check를 포함해 Artifact로 만듭니다.
+3. 공유는 Pilot 팀으로 제한하고, 사용하는 Connector를 문서화합니다.
+4. 한 달 뒤 유지, 본격 Application으로 격상, 폐기 중 하나를 결정합니다.
+
+가장 중요한 것은 4번입니다. 가볍게 공유되는 Tool의 위험은 요란하게 망가지는 것이 아니라, 아무도 결정하지 않은 채 조용히 업무의 기반이 되어 버리는 데 있습니다.
+
+법무용 Gallery는 범용 LLM Client가 "질문에 답하는 도구"에서 "작은 공유 Tool을 호스팅하는 도구"로 이동하고 있음을 보여 주는 좋은 예고편입니다. Connector 검토, 소유자 지정, 출력 Test가 습관인 팀은 안전하게 도입할 수 있습니다. 그렇지 않다면 그 습관부터 만드는 것이 먼저입니다.
+
+참고: [Anthropic 발표](https://claude.com/blog/introducing-artifacts-for-legal-work), [Artificial Lawyer 기사](https://artificiallawyer.com/2026/10/28/anthropic-increases-legal-vertical-push-with-artifacts).

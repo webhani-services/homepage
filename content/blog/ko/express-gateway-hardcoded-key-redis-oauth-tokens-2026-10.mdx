@@ -1,0 +1,106 @@
+---
+title: "Express Gateway CVE-2026-107177: 기본 암호화 Key가 Redis 읽기 권한을 계정 탈취로 바꾸는 방식"
+description: "Express Gateway에 하드코딩된 기본 암호화 Key 때문에 Redis를 읽을 수 있는 공격자가 저장된 OAuth Token Secret을 복호화할 수 있습니다. 실패 Pattern과 자사 Stack 점검 방법을 정리합니다."
+date: "2026-10-31"
+status: "published"
+tags: ["Security", "OAuth", "Redis", "Node.js", "API Gateway"]
+thumbnail: ""
+author: "webhani"
+slug: "express-gateway-hardcoded-key-redis-oauth-tokens-2026-10"
+---
+
+CVE-2026-107177은 1.16.11 이하 Express Gateway에 영향을 줍니다. SentinelOne 취약점 Database 항목(NVD 게시일 2026년 10월 7일로 표기)에 따르면 원인은 하드코딩된 기본 암호화 Key입니다. Gateway의 Redis를 읽을 수 있는 공격자는 저장된 OAuth Token Secret을 복호화할 수 있고, Gateway를 통해 인증된 임의의 사용자로 가장할 수 있습니다.
+
+수정 Release나 Vendor Advisory는 확인하지 못했습니다. Version 번호를 근거로 조치하기 전에 Project Repository와 NVD Record를 직접 확인하십시오. 분명하게 말할 수 있는 것은, 이 실패 Pattern이 흔하며 해당 Gateway를 쓰지 않더라도 점검할 가치가 있다는 점입니다.
+
+## 보기보다 심각한 이유
+
+"공격자가 Redis를 읽을 수 있다"는 이미 끝난 상황처럼 들립니다. 하지만 실제로는 생각보다 낮은 문턱에서 성립합니다.
+
+- 인증 없이 내부 Network에 노출된 Redis Instance.
+- RDB 같은 Backup이나 Snapshot이 보호가 약한 위치로 복사된 경우.
+- Debug 중 `KEYS *`나 `MONITOR` 출력이 Ticket에 붙여넣어지는 경우.
+- 공유 Cluster의 인접 Workload나 Sidecar가 침해된 경우.
+
+저장 시 암호화는 이런 사고를 "전면 침해"에서 "암호문 유출"로 낮추기 위한 장치입니다. 하드코딩된 기본 Key는 이 보호를 무력화합니다. 모든 설치에서 Key가 같기 때문에, Source나 Package를 읽은 사람은 Key를 덮어쓰지 않은 모든 환경의 Data를 복호화할 수 있습니다.
+
+## 일반화한 Pattern
+
+이는 Express Gateway에만 해당하는 이야기가 아닙니다. 구조는 다음과 같습니다.
+
+1. Library가 Data 암호화를 위해 Secret Key를 필요로 합니다.
+2. Quick Start가 동작하도록 편의상 기본값을 함께 배포합니다.
+3. 운영 환경이 Quick Start 설정을 그대로 복사하고, 바꾸지 않습니다.
+
+같은 형태가 JWT 기본 서명 Secret, Session Secret, 관리자 기본 Password에도 나타납니다. 대응 원칙은 항상 위험한 상태를 "드물게" 만드는 것이 아니라 "불가능하게" 만드는 것입니다.
+
+## 자사 Stack 점검 방법
+
+### 1. 계속 사용되는 기본값 찾기
+
+Configuration과 환경 변수 파일에서 문서 예시와 일치하는 값을 찾습니다.
+
+```bash
+# Repository 이력이나 샘플 설정에 나타나는 Secret 검색
+git grep -nE "(secret|key|password)\s*[:=]\s*['\"][A-Za-z0-9+/=_-]{8,}['\"]" -- \
+  ':!*.lock' ':!node_modules'
+
+# 배포된 설정과 Package에 포함된 샘플 비교
+diff <(jq -S . config/gateway.config.yml.sample 2>/dev/null) \
+     <(jq -S . deployed/gateway.config.json)
+```
+
+운영 값이 문서나 샘플의 값과 같다면 공개된 값으로 간주합니다.
+
+### 2. 실제 Key가 없으면 기동 실패시키기
+
+Data를 암호화하는 Service를 직접 유지보수한다면 기본값을 배포하지 마십시오. 일찍 실패하게 만듭니다.
+
+```ts
+export function loadEncryptionKey(): Buffer {
+  const raw = process.env.TOKEN_ENCRYPTION_KEY;
+  if (!raw) {
+    throw new Error("TOKEN_ENCRYPTION_KEY is required (32 bytes, base64)");
+  }
+  const key = Buffer.from(raw, "base64");
+  if (key.length !== 32) {
+    throw new Error("TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes");
+  }
+  return key;
+}
+
+// 생성 예: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+
+기동을 거부하는 Service는 5분 동안만 불편합니다. 공개된 Key로 기동하는 Service는 수년간 부채가 됩니다.
+
+### 3. Redis에 두는 정보 줄이기
+
+Protocol이 허용한다면 복호화 가능한 Secret 대신 Token의 Hash를 저장합니다. 복호화 가능한 값을 저장해야 한다면 TTL을 짧게 설정합니다.
+
+### 4. Redis 자체 보호
+
+- 인증을 필수로 하고, ACL로 Application마다 필요한 Command와 Key Prefix만 허용합니다.
+- Host를 넘나드는 연결에는 TLS를 활성화합니다.
+- Redis를 라우팅 가능한 Network에 두지 않고, Backup을 가져갈 수 있는 사람을 제한합니다.
+
+### 5. Rotation 전제하기
+
+Key는 언젠가 유출된다고 가정하십시오. 암호문마다 Key 식별자를 함께 저장하면, 새 Key 도입, 전환 기간의 이전 Key 복호화, 이전 Key 폐기가 가능합니다. Rotation에 Downtime이나 Code 변경이 필요하다면 정작 필요한 순간에는 실행하지 못합니다.
+
+## Express Gateway를 운영 중인 경우
+
+Project에서 수정 Version을 확인하기 전까지는, 기본 Key를 사용한 환경을 노출된 것으로 간주하는 편이 안전합니다.
+
+1. 설정에서 고유하고 무작위인 암호화 Key를 지정합니다.
+2. Gateway가 저장한 OAuth Token과 Client Secret을 폐기하고 재발급합니다. 이전에 저장된 값은 읽혔을 수 있기 때문입니다.
+3. 기본 Key를 사용한 기간의 Redis 접근 Log와 Network 노출 여부를 검토합니다.
+4. 위에서 설명한 대로 Redis 접근을 제한합니다.
+
+팀들이 자주 건너뛰는 단계가 2번입니다. Key를 바꾸면 앞으로의 Data는 보호되지만, 이미 읽을 수 있었던 Secret은 보호되지 않습니다.
+
+## 정리
+
+이 CVE는 시스템의 암호화된 Store마다 다음을 다시 묻는 계기가 됩니다. Key는 어디서 오는가, 환경마다 고유한가, 재작성 없이 Rotation할 수 있는가. 답 중 하나라도 "기본값을 쓴다"라면, 이번 주에 고쳐야 할 항목입니다.
+
+출처: [SentinelOne 취약점 Database CVE-2026-107177](https://www.sentinelone.com/vulnerability-database/cve-2026-107177/).
