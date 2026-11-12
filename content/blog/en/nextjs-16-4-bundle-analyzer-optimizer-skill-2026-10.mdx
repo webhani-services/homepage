@@ -1,0 +1,91 @@
+---
+title: "Finding Hidden JavaScript in Next.js 16.4: Bundle Analyzer Snapshots and the Optimizer Skill"
+description: "Next.js 16.4 adds snapshot diffing, a critical-path view and an agent skill to the Turbopack Bundle Analyzer. A practical look at why lazy imports silently fail and how to catch it."
+date: "2026-10-30"
+status: "published"
+tags: ["Next.js", "Performance", "Turbopack", "AI", "Web Development"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-4-bundle-analyzer-optimizer-skill-2026-10"
+---
+
+Bundle size regressions rarely come from one dramatic change. They come from a shared utility file that gains one import, or a dialog registry that references every dialog. On October 28 the Next.js team published a post on the tooling added in 16.4 for this problem: a better Turbopack Bundle Analyzer and an agent skill, `next-bundle-optimizer`, that uses the analyzer's module graph.
+
+The details are worth reading, but the underlying lesson is more useful than the tools: **a lazy import only defers code if nothing else imports it statically.**
+
+## The failure mode
+
+Consider a heavy editor component that you intend to load on demand.
+
+```tsx
+// HeavyEditorLoader.tsx
+'use client';
+import { lazy } from 'react';
+
+export const HeavyEditorLoader = lazy(() => import('./HeavyEditor'));
+```
+
+This defers `HeavyEditor` only if `HeavyEditorLoader` is the sole importer. If another module in the same bundle does `import { HeavyEditor } from './HeavyEditor'` — perhaps to reuse a type, or a constant exported from the same file — the bundler has to include it in the initial chunk anyway. The `lazy()` call still works, and nothing warns you, but the code now ships upfront.
+
+Typical causes we see in client projects:
+
+- A type or constant exported from the component file and imported elsewhere. Moving shared types to a separate file fixes it.
+- A barrel file (`index.ts`) that re-exports everything, so importing one small helper pulls in the heavy module next to it.
+- A central registry (dialogs, icons, route-to-component maps) that statically references every entry.
+
+None of these show up in code review, because each import looks reasonable on its own.
+
+## What 16.4 adds to the analyzer
+
+Run `next analyze` in your app directory. Per the Next.js announcement, the analyzer now offers:
+
+- **Route summary.** A landing view that lists your largest client routes, so you start from the pages that matter instead of the whole graph.
+- **Table view per route.** Sortable by size, to find the biggest contributors quickly.
+- **Snapshots.** Each analysis is saved automatically, and you can diff two of them. This is the feature we would adopt first: it turns "the bundle got bigger sometime last month" into a comparison between two concrete points.
+- **Critical render path highlighting.** You can filter out async dependencies and see only what loads synchronously for the initial render. The Next.js post notes a caveat: depending on runtime state, RSC renders can include chunks from `next/dynamic` in the initial load, so verify against the running app.
+- **`next analyze export`.** Dumps the module and chunk graph data, so you can query it with your own tooling.
+
+The analyzer relies on Turbopack's module graph, so it requires Turbopack, which has been the default bundler since Next.js 16.
+
+## The optimizer skill
+
+The skill is installed with:
+
+```bash
+npx skills add vercel/next.js --skill next-bundle-optimizer
+```
+
+Then invoke `/next-bundle-optimizer` in your coding agent. By default it reports issues and suggested fixes; `/next-bundle-optimizer fix` applies the changes, reruns the analysis and compares snapshots.
+
+According to the Next.js team, the agent groups connected modules, traces import chains, and uses a minimum-cut approach to find a small set of import boundaries that would defer a large group. It also looks for logic that could move into React Server Components, duplicate versions of large dependencies, and places where tree shaking failed.
+
+The reported results come from Vercel's own apps: nearly two megabytes of compressed JavaScript removed or deferred across v0 and vercel.com. Examples include a code editor loaded on nearly every page (about 150 KB saved on most pages), a dialog registry that eagerly loaded heavy dialogs (40–650 KB depending on the page), and a date-parsing library loaded before users touched the assistant (about 55 KB on average). These are the vendor's numbers on large, long-lived codebases, so expect smaller absolute gains on a typical corporate site — but the categories of mistake are the same ones that appear in most mid-sized apps.
+
+## How we would use it
+
+**Run the analysis before changing anything.** Save the baseline snapshot for your top three or four routes. Without it you cannot show that a change helped.
+
+**Treat the agent's output as a hypothesis list.** Moving an import boundary can change behavior: a component that used to be ready on first paint may now flash a fallback. Review each proposed change against how the component is actually used, and test interactions, not just the build.
+
+**One change per pull request.** The Next.js post describes opening a pull request per change and verifying each on a preview deployment. That is the right granularity — if a regression appears, you know which change caused it.
+
+**Add a budget check in CI.** Snapshots are useful for investigation, but nothing stops regressions on its own. A simple check on first-load JS per route, based on your build output, catches the next accidental static import before it merges.
+
+```yaml
+# .github/workflows/bundle-budget.yml (excerpt)
+- run: npm run build
+- run: node scripts/check-first-load-budget.mjs
+```
+
+The script reads the build output and fails when a route exceeds the budget you set. How you derive the number is up to you; the point is that the threshold lives in the repository.
+
+**Fix the root causes by hand where you can.** Extract shared types into their own files, replace barrel imports with direct imports in client code, and make registries lazy per entry. These are small changes, and they stop the same issue from being reintroduced.
+
+## Takeaways
+
+- A `lazy()` or `next/dynamic` call is not proof that code is deferred. Check the module graph.
+- Snapshot diffing makes bundle growth a measurable event instead of a vague feeling. Start saving baselines now.
+- The optimizer skill is a reasonable first pass, particularly on codebases nobody has audited, but every suggestion needs a human review for behavior changes.
+- Enforce a first-load budget in CI so the improvements stay.
+
+If your site has not been profiled since you migrated to the App Router, an hour with `next analyze` is likely to find something.
