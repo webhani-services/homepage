@@ -1,0 +1,130 @@
+---
+title: "Upgrading to Cilium 1.20: The Gateway API 1.6 Prerequisite, and How TCPRoute and ListenerSets Change Operations"
+description: "Cilium 1.20 moves to Gateway API 1.6 with TCPRoute, UDPRoute, ListenerSets, and ExternalAuth. Here are the CRD prerequisites to check before upgrading, and what the new features change for platform teams."
+date: "2026-11-03"
+status: "published"
+tags: ["Kubernetes", "Cilium", "Gateway API", "eBPF", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "cilium-1-20-gateway-api-1-6-upgrade-checklist-2026-11"
+---
+
+Cilium 1.20 came out in September and is now at patch release 1.20.4. With InfoQ's October coverage and KubeCon + CloudNativeCon North America in Salt Lake City next week, many teams are putting the upgrade on their calendars.
+
+The release touches a lot, but the change with the most operational weight is **the move from Gateway API 1.4 to 1.6**. The new features are useful, but upgrading without meeting the CRD prerequisite can leave TLSRoute broken. This post covers the prerequisite checks first, then looks at how the new features change day-to-day operations.
+
+## Check first: Gateway API CRDs must be v1.6.1 or newer
+
+Cilium's official upgrade guide states that Gateway API support in 1.20 requires **Gateway API CRDs at v1.6.1 or later**. The main reason is TLSRoute: it graduated to v1 in v1.6.1, so the cluster must serve v1 at all times.
+
+If you were already using TLSRoute at v1alpha2, the guide says to install the **Experimental TLSRoute CRD from v1.6.1**, which still carries the v1alpha2 version. It also recommends backing up your TLSRoute resources before you start.
+
+```bash
+# 1. Check the installed Gateway API bundle version
+kubectl get crd gateways.gateway.networking.k8s.io \
+  -o jsonpath='{.metadata.annotations.gateway\.networking\.k8s\.io/bundle-version}{"\n"}'
+
+# 2. If TLSRoute is in use, back it up
+kubectl get tlsroutes.gateway.networking.k8s.io -A 2>/dev/null \
+  && kubectl get tlsroutes.gateway.networking.k8s.io -A -o yaml > tlsroutes-backup.yaml
+
+# 3. See which API versions are currently served
+kubectl api-resources --api-group=gateway.networking.k8s.io
+```
+
+Update the CRDs **before** upgrading Cilium. If you plan to use TCPRoute or UDPRoute, pick the manifest channel that includes them.
+
+```bash
+kubectl apply --server-side \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml
+```
+
+One more change to note: `cec.cilium.io/*` annotations on Gateway or GAMMA infrastructure metadata are no longer copied into the generated CiliumEnvoyConfig. They still appear on the generated Services, where they do nothing. If any configuration relies on them, revisit it before upgrading.
+
+## The upgrade, in outline
+
+Do not skip the preflight check from the official guide.
+
+```bash
+# Preflight: pre-pull images and check compatibility
+helm template cilium cilium/cilium --version 1.20.4 \
+  --namespace kube-system \
+  --set preflight.enabled=true \
+  --set agent=false \
+  --set operator.enabled=false \
+  > cilium-preflight.yaml
+kubectl apply -f cilium-preflight.yaml
+kubectl -n kube-system rollout status ds/cilium-pre-flight-check
+
+# Remove preflight, then upgrade
+kubectl delete -f cilium-preflight.yaml
+helm upgrade cilium cilium/cilium --version 1.20.4 \
+  --namespace kube-system --reuse-values
+
+# Verify
+cilium status --wait
+cilium connectivity test
+```
+
+InfoQ notes that clusters using legacy Mutual Authentication, Kafka-aware network policies, Envoy Go extensions, or custom CNI configurations should check the 1.20 release notes for extra steps. In our experience, custom CNI configuration is the item most likely to have been added years ago and forgotten.
+
+## How the new features change operations
+
+### ListenerSets: split ownership of a shared Gateway
+
+Until now, adding one listener to a shared Gateway meant filing a request with the platform team that owns it. With ListenerSets, **the platform team keeps ownership of the Gateway while application teams attach and manage their own listeners**.
+
+In multi-tenant clusters, this is a good moment to revisit RBAC. A natural split is to let application teams create ListenerSets while keeping write access to the Gateway itself with the platform team.
+
+### TCPRoute and UDPRoute: non-HTTP traffic in the same model
+
+Databases, DNS, and game servers can now be routed through the same Gateway API model as HTTP and gRPC.
+
+```yaml
+# Match the apiVersion to the CRDs you installed
+# (check with: kubectl explain tcproute)
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: postgres
+  namespace: data
+spec:
+  parentRefs:
+    - name: shared-gateway
+      namespace: infra
+      sectionName: postgres-tcp
+  rules:
+    - backendRefs:
+        - name: postgres-primary
+          port: 5432
+```
+
+Setups that created a separate LoadBalancer Service per workload can now consolidate behind a Gateway. The trade-off: concentrating L4 traffic on a Gateway concentrates the blast radius too. Start with stateless TCP services and leave critical databases for later.
+
+### ExternalAuth and CORS: authentication moves to the edge
+
+ExternalAuth lets the Gateway call an external authorization service before traffic reaches your workloads. Teams that duplicated auth middleware across services may be able to consolidate it. CORS filtering can now be configured at the Gateway as well.
+
+### Datapath plugins (beta): proceed carefully
+
+1.20 introduces a beta mechanism that lets third-party code run as a separate process connected to Cilium to extend the eBPF datapath, registered through a CiliumDatapathPlugin custom resource. As InfoQ points out, a faulty plugin can break Cilium or weaken security. In production, we recommend leaving it disabled until vendor support is clearly defined.
+
+### Smaller changes worth knowing
+
+- `bpf.datapathMode=auto` picks netkit when the kernel supports it and falls back to veth otherwise, which helps on clusters with mixed node kernels.
+- Topology-aware routing gains `PreferSameZone` and `PreferSameNode`, useful for cutting cross-zone transfer costs.
+- Maglev backends can now be weighted.
+- ENI IPAM supports IPv6 as a beta feature.
+
+## Our recommendation
+
+Cilium 1.20 widens Gateway API from a successor to HTTP Ingress into a common model for traffic across the whole cluster.
+
+We recommend this order:
+
+1. Check your Gateway API CRD version and TLSRoute usage, and take a backup.
+2. Upgrade the CRDs to v1.6.1 or later, then upgrade Cilium in staging, preflight included.
+3. Apply to production only after `cilium connectivity test` passes.
+4. Plan ListenerSet and TCPRoute adoption as a separate change from the upgrade.
+
+Keeping the version upgrade and new feature adoption in separate changes is the simplest way to keep rollbacks easy.

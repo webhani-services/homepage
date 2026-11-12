@@ -1,0 +1,139 @@
+---
+title: "TypeScript 7.1 Beta：API の復活で Vue・Svelte のツールが TypeScript 7 に追いつく。RC 前に確認すべきこと"
+description: "TypeScript 7.1 Beta では、Go 実装のコンパイラ向けに preview API と content mapper が入り、ambient module での import attributes と es2026 target も加わりました。RC 前にチームで検証しておく項目を整理します。"
+date: "2026-11-03"
+status: "published"
+tags: ["TypeScript", "フロントエンド", "Vue", "ツール", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "typescript-7-1-beta-api-content-mappers-es2026-2026-11"
+---
+
+10月20日に TypeScript 7.1 Beta が公開されました。報じられている予定では RC が11月10日、安定版が11月24日です（Beta が約2週間遅れたため、以降の日程は暫定と考えたほうがよさそうです）。RC までの約1週間は、自分たちのプロジェクトで試して問題を報告できる最後のまとまった期間です。
+
+7.1 の中心は新しい言語機能ではなく、**エコシステムのツールが TypeScript 7 に乗れるようにするための土台**です。Go で書き直された TypeScript 7 は型チェックが大幅に速くなった一方で、TypeScript 5.x までの JavaScript API に依存していたツール、たとえば typescript-eslint や Vue・Svelte・Angular の language tools がすぐには追随できませんでした。7.1 はこの空白を埋めにいくリリースです。
+
+## 主な変更点
+
+### 1. preview API：単一の巨大 API から、用途別の entry point へ
+
+7.1 の API は、従来のように1つの module にすべてを詰め込むのではなく、用途ごとの entry point に分かれています。発表と二次情報で挙げられているものは次のとおりです。
+
+- `typescript/sync`：同期的なコンパイラクライアント（compiler options、type checker、program の API）
+- `typescript/async`：非同期版のクライアント
+- `typescript/fs`：ファイルシステム関連
+- `typescript/ast`、`typescript/ast/is`、`typescript/ast/factory`：AST の型、判定関数、生成関数
+
+設計の軸は **snapshot**、つまりある時点のコンパイラ状態の読み取り専用ビューです。新しい snapshot を作るか、既存の snapshot から差分で更新して使う形になっています。エディタのように状態が頻繁に変わる環境でも、一貫した状態を前提に問い合わせられるようにするためだと読めます。
+
+この API は **preview** であり、Beta から安定版の間でも破壊的変更がありうると明記されています。完全なドキュメントは 7.1 安定版で公開される予定です。自作ツールで今すぐ移行するより、まず触って感触を確かめる段階です。
+
+### 2. content mapper：埋め込みコードを language service に渡す仕組み
+
+Vue の SFC、Svelte、Angular のテンプレートのように、TypeScript を別のファイル形式の中に埋め込むケースに向けた plugin 機構です。ツールはファイル内の TypeScript 部分を language service に「見せる」ことができます。
+
+これまでこうしたツールは、仮想ファイルを生成して TypeScript に渡すなど、各自で工夫していました。仕組みが公式に用意されたことで、TypeScript 7 の速さを Vue や Svelte のプロジェクトでも活かせる見込みが立ちます。
+
+### 3. ambient module で import attributes を宣言できる
+
+バンドラが CSS やテキストを import attributes 付きで読み込む場合、これまでは型を区別しにくい状況でした。7.1 では attribute ごとに ambient module 宣言を書けます。
+
+```ts
+// src/types/assets.d.ts
+declare module "*" with { type: "css" } {
+  const sheet: CSSStyleSheet;
+  export default sheet;
+}
+
+declare module "*" with { type: "text" } {
+  const content: string;
+  export default content;
+}
+```
+
+```ts
+import sheet from "./theme.css" with { type: "css" };   // CSSStyleSheet
+import readme from "./README.md" with { type: "text" }; // string
+```
+
+二次情報によると、import の attributes が宣言側の attributes 型に代入可能であれば一致とみなされ、複数が一致した場合はより具体的な宣言が優先されます。attribute の値は string literal 型である必要があります。これらの宣言は TypeScript の標準 lib には含まれないため、自分で書くか、フレームワークやバンドラが提供するものを使います。
+
+### 4. es2026 が安定した target / lib に
+
+`--target es2026` と `--lib es2026` が正式な選択肢になりました。
+
+```json
+{
+  "compilerOptions": {
+    "target": "es2026",
+    "lib": ["es2026", "dom", "dom.iterable"],
+    "module": "esnext",
+    "moduleResolution": "bundler"
+  }
+}
+```
+
+target を上げると、ダウンレベル変換が減って出力が素直になります。一方で、実行環境（ブラウザのサポート範囲や Node.js のバージョン）が追いついているかは別途確認が必要です。Next.js のようにバンドラが最終的な変換を担う構成なら、`target` は型チェック寄りの設定と割り切ってもよいでしょう。
+
+このほか、source phase imports のサポートも含まれています。
+
+## RC 前にやっておくこと
+
+### 依存ツールが TypeScript API をどう使っているかを把握する
+
+7.1 で恩恵を受けるかどうかは、プロジェクトが依存しているツールが TypeScript の API を使っているかで決まります。
+
+```bash
+# typescript に依存しているパッケージの一覧
+npm ls typescript --all 2>/dev/null | grep -v "deduped" | head -50
+
+# よく問題になる代表的なツール
+npm ls typescript-eslint vue-tsc @angular/compiler-cli svelte-check 2>/dev/null
+```
+
+ここに出てくるツールが 7.1 対応版を出すまでは、エディタやリンターだけ 5.x 系のままにする構成も現実的な選択肢です。
+
+### CI に Beta の非必須ジョブを足す
+
+本線に影響を与えず、問題だけを早めに見つけられます。
+
+```yaml
+# .github/workflows/typecheck-ts-next.yml
+name: typecheck (typescript@beta)
+on:
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1"
+
+jobs:
+  typecheck-beta:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm install --no-save typescript@beta
+      - run: npx tsc --noEmit --extendedDiagnostics
+```
+
+`--extendedDiagnostics` の出力を残しておくと、型チェック時間やメモリの変化も比較できます。
+
+### import attributes を使っている箇所を棚卸しする
+
+`with { type: ... }` を使った import がある場合、これまで `any` や汎用の宣言で逃げていた部分を 7.1 の宣言で置き換えられるか確認します。宣言を加えたあとは attribute のない import がエラーになるため、書き漏れも検出できます。
+
+## webhani の見解
+
+TypeScript 7 の速さは魅力ですが、私たちが支援しているプロジェクトでも、移行の障害は型チェックそのものではなく **周辺ツールの対応状況** でした。7.1 はそこに正面から手を入れるリリースで、Vue や Angular を使うチームにとっては、TypeScript 7 移行の現実的な起点になりそうです。
+
+推奨は次のとおりです。
+
+1. 今週中に Beta の非必須 CI ジョブを追加し、型エラーの差分とビルド時間を記録する
+2. 依存ツールの 7.1 対応状況を一覧化し、移行の判断材料にする
+3. 自作の TypeScript API 利用コード（codegen、カスタム lint など）は、API が安定するまで移行を急がない
+
+preview API は変わる前提で、まずは検証し、得られた知見を早めに報告していくのがよいと考えます。
