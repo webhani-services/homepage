@@ -1,0 +1,110 @@
+---
+title: "PostgreSQL 14 오늘 EOL: 18로 넘어가기 위한 실전 Upgrade 계획"
+description: "PostgreSQL 14는 2026년 11월 12일 마지막 Minor Release를 끝으로 지원이 종료됩니다. 14 Cluster를 점검하고, 대상 Version을 정하고, 18로 한 번에 올릴 때 흔히 걸리는 함정을 피하는 방법을 정리합니다."
+date: "2026-11-12"
+status: "published"
+tags: ["PostgreSQL", "Database", "Upgrade", "운영", "Security"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-14-eol-upgrade-plan-2026-11"
+---
+
+PostgreSQL 14가 오늘, 2026년 11월 12일 End of Life를 맞습니다. PostgreSQL Project의 5년 지원 정책에 따라 오늘이 14 Branch의 마지막 정기 Minor Release 날짜입니다. 이후 14에는 Bug Fix도 Security Patch도 제공되지 않습니다. 다음 달 공개되는 CVE는 14에서 수정되지 않는다는 뜻입니다.
+
+Managed Service를 쓰고 있다면 Provider에 따라 유료 연장 지원 등으로 14를 조금 더 운영할 수 있습니다. 시간을 벌 수는 있지만, Community가 더 이상 유지보수하지 않는 Branch 위에 있다는 사실은 바뀌지 않습니다. 각 Provider가 공지한 일정을 확인하고 계획을 세우시기 바랍니다.
+
+이 글에서는 저희가 고객 환경에서 이런 Upgrade를 진행할 때의 접근 방식을, 14에서 18로 Major Version 세 개를 건너뛰는 경우를 중심으로 정리합니다.
+
+## 대상 Version: 15가 아니라 18
+
+15로 올리는 것이 변경 폭은 가장 작지만, 15 역시 2027년 11월에 EOL이 됩니다. 1년 뒤에 같은 작업을 다시 해야 합니다.
+
+PostgreSQL 19는 이달 하순 GA 예정입니다. 저희는 보통 새 Major Version을 처음 몇 차례 Minor Release가 나오기 전에 Production에 올리지 않습니다. 따라서 대부분의 팀에게 지금 현실적인 대상은 **PostgreSQL 18**입니다. 충분히 안정되었고 2030년까지 지원되며, `pg_upgrade`로 14에서 바로 올릴 수 있습니다.
+
+## 1단계: 14 Cluster 현황 파악
+
+방법을 고르기 전에 사실부터 모읍니다. 중요한 정보는 대부분 다음 Query로 확인할 수 있습니다.
+
+```sql
+-- Version과 주요 설정
+SELECT version();
+SHOW data_checksums;
+SHOW password_encryption;
+
+-- Extension과 Version
+SELECT extname, extversion FROM pg_extension ORDER BY extname;
+
+-- 아직 MD5 Hash를 쓰는 Role
+SELECT rolname FROM pg_authid WHERE rolpassword LIKE 'md5%';
+
+-- Database 크기 (Downtime 산정용)
+SELECT datname, pg_size_pretty(pg_database_size(datname))
+FROM pg_database ORDER BY pg_database_size(datname) DESC;
+```
+
+Extension마다 18용 Build가 있는지 확인합니다. PostGIS, pgvector, pg_partman은 대체로 문제없습니다. 막히는 곳은 보통 작은 Extension이나 사내에서 만든 Extension입니다.
+
+## 2단계: 14와 18 사이의 변경 사항 파악
+
+Major 세 개를 건너뛴다는 것은 세 번 분량의 동작 변경을 한꺼번에 받는다는 의미입니다. 실제로 문제가 자주 되는 항목은 다음과 같습니다.
+
+**`public` Schema 권한 (15부터)**: 새로 만드는 Database에서는 `public` Schema의 `CREATE` 권한이 모든 User에게 부여되지 않습니다. `pg_upgrade`는 기존 권한을 유지하지만, Upgrade 이후 생성되는 Database(Migration Tool이 만드는 Test DB 포함)는 다르게 동작합니다. Application Role이 `public`에 Table을 만든다면 명시적으로 GRANT하십시오.
+
+**Data Checksum 기본 활성화 (18)**: 18의 `initdb`는 따로 끄지 않으면 Data Checksum을 활성화합니다. `pg_upgrade`는 기존 Cluster와 새 Cluster의 설정이 같아야 합니다. 14 쪽이 `data_checksums = off`라면 새 Cluster를 `--no-data-checksums`로 초기화하고, Checksum 활성화는 별도의 Maintenance 시간에 `pg_checksums`로 판단합니다.
+
+**MD5 Password Deprecated (18)**: 18에서도 MD5 인증은 동작하지만 Deprecation 경고가 출력됩니다. Upgrade를 계기로 남은 Role을 SCRAM-SHA-256으로 옮기십시오.
+
+```sql
+SET password_encryption = 'scram-sha-256';
+ALTER ROLE app_user PASSWORD 'new-secret-from-your-vault';
+```
+
+모든 Client Library가 지원하는 것을 확인한 뒤 `pg_hba.conf`도 `scram-sha-256`으로 바꿉니다. 오래된 Driver가 걸림돌이 되는 경우가 많습니다.
+
+**제거·변경된 기능**: 15, 16, 17, 18 Release Note의 "Migration" Section을 순서대로 읽으십시오. 번거롭지만 Cutover 실패 후 Debug하는 것보다 훨씬 짧게 끝납니다.
+
+## 3단계: Upgrade 방법 선택
+
+| 방법 | Downtime | 적합한 경우 |
+| --- | --- | --- |
+| `pg_upgrade --link` | 수 분 | Self-managed, 같은 Host, 짧은 중단 허용 |
+| Logical Replication | Cutover 시 수 초 | 대용량 DB, 엄격한 SLA, Host 이전 병행 |
+| Managed Blue/Green | 짧음 (Service별 상이) | RDS, Aurora, Cloud SQL, Azure |
+| `pg_dump` / `pg_restore` | 대용량은 수 시간 | 소규모 DB, 정리도 함께 하고 싶을 때 |
+
+Self-managed 환경이라면 반드시 Check Mode부터 실행합니다.
+
+```bash
+/usr/lib/postgresql/18/bin/pg_upgrade \
+  --old-datadir=/var/lib/postgresql/14/main \
+  --new-datadir=/var/lib/postgresql/18/main \
+  --old-bindir=/usr/lib/postgresql/14/bin \
+  --new-bindir=/usr/lib/postgresql/18/bin \
+  --link --check
+```
+
+`--link`는 File을 복사하지 않고 Hard Link를 쓰기 때문에 빠르지만, 새 Cluster를 한 번 기동하면 기존 Cluster는 다시 띄울 수 없습니다. 실제 실행 전에 Restore 검증까지 마친 Backup을 확보하십시오.
+
+## 4단계: Upgrade 이후
+
+PostgreSQL 18의 `pg_upgrade`는 Planner 통계 대부분을 그대로 가져오므로, 예전 Version에서 문제였던 Upgrade 직후의 성능 저하가 크게 줄었습니다. 다만 Extended Statistics 등 일부는 다시 만들어야 합니다. 전체를 ANALYZE하는 대신 누락된 부분만 대상으로 할 수 있습니다.
+
+```bash
+vacuumdb --all --analyze-in-stages --missing-stats-only
+```
+
+그다음 주요 Query의 실행 계획을 Upgrade 전에 확보한 Baseline과 비교합니다. 저희는 `pg_stat_statements`에서 비용이 큰 상위 10개 Query를 뽑아 전후로 `EXPLAIN`을 비교합니다.
+
+## webhani의 시각
+
+EOL 날짜는 미리 알 수 있는데도, Scanner나 감사에서 지적받고 나서야 알아차리는 팀을 자주 봅니다. 필요한 것은 특별한 대응이 아니라, 모든 Database의 지원 기한을 인증서 갱신과 같은 Calendar에 넣어 두는 것입니다. PostgreSQL은 정책이 고정되어 있어 어렵지 않습니다. Major Version은 5년간 지원되고, 마지막 Release는 11월에 나옵니다.
+
+오늘 시점에 아직 14를 쓰고 있다고 해서 비상 상황은 아닙니다. 다만 이제부터는 Patch되지 않는 위험을 감수하는 상태입니다. 이번 분기 안에 Upgrade 일정을 잡으십시오.
+
+## 정리
+
+- PostgreSQL 14는 오늘 마지막 Release 이후 더 이상 수정이 제공되지 않습니다.
+- 내년에 같은 작업을 반복하지 않도록 15가 아니라 18을 대상으로 합니다.
+- 방법을 정하기 전에 Extension, Checksum, MD5 Role을 점검합니다.
+- `pg_upgrade --check`를 실행하고 새 Cluster의 Checksum 설정을 기존과 맞춥니다.
+- Cutover 후 `vacuumdb --missing-stats-only`를 실행하고 실행 계획을 비교합니다.

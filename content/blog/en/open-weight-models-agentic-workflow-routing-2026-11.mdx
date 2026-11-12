@@ -1,0 +1,107 @@
+---
+title: "Open-Weight Models for Routine Agent Steps: Designing a Two-Tier Router After Gartner's Forecast"
+description: "Gartner predicts open-weight models will handle 90% of enterprise agentic workflow steps by 2030. We look at what that means in practice and how to build a step-level router with validation and escalation."
+date: "2026-11-12"
+status: "published"
+tags: ["AI", "LLM", "AI Agents", "Open-weight Models", "Cost Optimization"]
+thumbnail: ""
+author: "webhani"
+slug: "open-weight-models-agentic-workflow-routing-2026-11"
+---
+
+Gartner analysts Mark Petty and Raymond Paquet published a note titled "Open-Weight Models Will Run 90% of Enterprise Agentic Workflow Steps." As reported by The Register on November 3, the argument is that most steps in an operational agent workflow are routine, and open-weight models can handle those at parity with the cheapest closed model for roughly a quarter of the price. Compared with sending every step to a frontier model, Gartner puts the cost at around one twentieth.
+
+The more useful part of the coverage is the caveat. The analysts acknowledge that open models tend to be more verbose and retry more often, so the realistic saving per task against a frontier model is closer to five or six times. Gartner's planning assumption is that 90% of operational agent workflow steps will run on open-weight models by 2030, with frontier models remaining the tool for research, development, and hard reasoning.
+
+We think the headline number matters less than the unit of decision it implies: **not "which model for this app," but "which model for this step."**
+
+## Why steps, not applications
+
+A typical business agent, such as one that processes incoming invoices, does several different kinds of work:
+
+1. Extract fields from a PDF.
+2. Classify the vendor and cost center.
+3. Normalize dates and currency.
+4. Decide whether the invoice matches a purchase order with odd discrepancies.
+5. Draft an explanation for a human reviewer.
+
+Steps 1 to 3 are narrow, verifiable, and repetitive. Step 4 needs judgment. Step 5 benefits from good writing but is low-risk. Running the whole pipeline on a frontier model pays frontier prices for steps that do not need them. Running it all on a small model fails at step 4.
+
+## A two-tier router with validation
+
+The pattern we use is simple: route by step type, validate output against a schema, and escalate on failure. Here is a stripped-down TypeScript version:
+
+```ts
+import { z } from "zod";
+
+type Tier = "open" | "frontier";
+
+interface Step<T> {
+  name: string;
+  routine: boolean;
+  schema: z.ZodType<T>;
+  prompt: (input: unknown) => string;
+}
+
+const MODELS: Record<Tier, string> = {
+  open: process.env.OPEN_MODEL_ID!,       // self-hosted or hosted open-weight model
+  frontier: process.env.FRONTIER_MODEL_ID!,
+};
+
+async function runStep<T>(step: Step<T>, input: unknown): Promise<T> {
+  const tier: Tier = step.routine ? "open" : "frontier";
+  const first = await tryModel(step, input, tier);
+  if (first.ok) return first.value;
+
+  metrics.increment("agent.escalation", { step: step.name });
+  const second = await tryModel(step, input, "frontier");
+  if (second.ok) return second.value;
+
+  throw new Error(`Step ${step.name} failed on both tiers`);
+}
+
+async function tryModel<T>(step: Step<T>, input: unknown, tier: Tier) {
+  const raw = await callModel(MODELS[tier], step.prompt(input));
+  const parsed = step.schema.safeParse(safeJson(raw.text));
+  metrics.record("agent.tokens", raw.usage.totalTokens, { step: step.name, tier });
+  return parsed.success
+    ? { ok: true as const, value: parsed.data }
+    : { ok: false as const };
+}
+```
+
+Three things make this work in production:
+
+- **Schemas are the contract.** A routine step must have a machine-checkable output. If you cannot write a schema for it, it is probably not routine.
+- **Escalation is a metric, not a failure.** Track the escalation rate per step. If a step escalates 30% of the time, the open model is not a fit for it, and the "savings" are mostly an illusion.
+- **Model IDs are configuration.** Keep them in environment variables or a gateway config so you can swap models without a deploy.
+
+## Measure cost per task, not per token
+
+Gartner's own caveat about verbosity and retries points to the mistake we see most often: comparing price sheets. A model that costs a quarter per token but uses twice the tokens and retries once in five calls is not four times cheaper.
+
+We report three numbers per workflow:
+
+- **Cost per completed task**, including retries and escalations.
+- **Escalation rate per step.**
+- **Quality on a fixed evaluation set**, for example 200 real invoices with known correct outputs.
+
+Only when all three are acceptable do we move a step to the open tier. The evaluation set also protects you when a model version changes underneath you.
+
+## The data-control argument
+
+The analysts also emphasize control and data ownership over cost: routing routine work through a frontier API sends part of your workflow data outside your perimeter. For our clients in Japan, this is often the deciding factor. An open-weight model running inside your own VPC, or in a region you choose, makes it easier to answer questions from security reviews and customers about where data goes.
+
+That said, self-hosting brings its own costs: GPU capacity, model updates, and on-call. For many teams, a hosted open-weight endpoint from a cloud provider is a reasonable middle ground.
+
+## Our take
+
+We agree with the direction and are more cautious about the timeline. Frontier models are improving quickly, and their prices keep dropping, which narrows the gap. The durable lesson is architectural: design agents so that each step has a clear contract and the model behind it is replaceable. That design pays off whether the cheaper model of 2028 is open-weight or not.
+
+## Takeaways
+
+- Decide model choice per step, not per application.
+- Give every routine step a schema and validate outputs.
+- Escalate to a frontier model on failure, and track the escalation rate.
+- Compare cost per completed task, including retries.
+- Keep a fixed evaluation set before moving any step to a cheaper tier.

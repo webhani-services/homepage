@@ -1,0 +1,126 @@
+---
+title: "Next.js 2026년 11월 Security Release: Cache Components 격리 문제와 점검 포인트"
+description: "Next.js 16.4.5와 15.5.29에서 7건의 취약점이 수정되었습니다. 그중 4건은 Cache Components와 use cache에서 Tenant 간 Cache가 섞이는 문제입니다. Version 업그레이드 외에 무엇을 점검해야 하는지 정리합니다."
+date: "2026-11-12"
+status: "published"
+tags: ["Next.js", "Security", "Cache Components", "Multi-tenant", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-november-2026-security-release-use-cache-isolation"
+---
+
+11월 3일 Next.js 2026년 11월 Security Release가 공개되었습니다. 수정 Version은 **16.4.5**(Active LTS)와 **15.5.29**(Maintenance LTS)입니다. 이보다 새로운 16.4.x Patch를 쓰고 있다면 이미 반영되어 있습니다. 아직이라면 먼저 업그레이드하고 나머지를 읽으시기 바랍니다.
+
+이번 Release는 Version만 올리고 끝내기에는 아까운 내용입니다. 7건 중 4건이 **Cache Components와 `use cache`**에 관한 것이고, 대부분 "특정 Tenant·Site·Locale·User를 위해 생성된 Content가 다른 대상에게 반환된다"는 같은 유형입니다. Crash가 아니라 Data 격리 문제이기 때문에 Error Monitoring에는 거의 잡히지 않습니다.
+
+## 영향 범위별로 다시 묶기
+
+공식 목록 순서 대신, 어떤 Application이 영향을 받는지 기준으로 정리했습니다.
+
+### Cache Components를 쓰는 Application (Multi-tenant, User별 화면)
+
+- **`unstable_cache` + `use cache` 조합의 Tenant 간 노출 (High)**: Root Parameter(예: Tenant ID)를 읽는 동일한 `use cache` 함수를 직접 호출하면서 `unstable_cache` 내부에서도 호출하면, Cold Cache 상태의 동시 요청에서 다른 요청의 결과를 받을 수 있었습니다.
+- **중첩된 `use cache` 함수 (Medium)**: 내부 함수가 Root Parameter를 읽고 즉시 값과 느린 비동기 값을 함께 반환하는 구조에서, 의존성이 기록되기 전에 외부 Entry가 저장될 수 있었습니다.
+- **Binary 인자 (Medium)**: 서로 다른 Binary 인자가 같은 Cache Identity로 처리될 수 있었습니다.
+- **공유 Shell 오염 (Medium, Self-hosted)**: `next start` + Cache Components 활성화 + Partial Prefetching 비활성/미설정 환경에서, 특정 Dynamic Route 구조에 조작된 URL을 보내 공유 Shell을 오염시킬 수 있었습니다.
+
+### Self-hosted Request 처리
+
+- **압축 Response Framing 불일치 (Medium)**: fetch한 외부 `Response`를 그대로 반환하면, 압축 해제된 Body에 원래의 압축 Header가 붙은 채 전달될 수 있었습니다. Backend 연결을 공유하며 Pipelining을 하는 HTTP/1.1 Proxy 뒤에서는 Response가 다른 Client에게 전달될 수 있습니다.
+
+### Edge Route
+
+- **`x-middleware-set-cookie` Header를 통한 Cookie 노출 (Medium)**: Edge Route Handler와 Pages Router Edge API Route에서 `NextResponse.cookies.set()`을 쓰면 `HttpOnly` Cookie 값까지 같은 Origin의 JavaScript에서 읽을 수 있었습니다.
+
+### Image Optimization
+
+- **SVG 차단 우회 (Medium)**: 허용된 Source의 이미지가 AVIF로 잘못 판별되어 `dangerouslyAllowSVG: false`를 우회할 수 있었습니다.
+
+## 1단계: Patch 적용 후 실제 배포 Version 확인
+
+Lockfile은 어긋나기 쉽고, Monorepo에는 `next`가 여러 개 들어 있는 경우가 많습니다. 저희는 CI에 간단한 Check를 넣어 오래된 Version이 조용히 배포되지 않도록 합니다.
+
+```js
+// scripts/assert-next-version.mjs
+import { readFileSync } from "node:fs";
+
+const { version } = JSON.parse(
+  readFileSync("node_modules/next/package.json", "utf8"),
+);
+const [major, minor, patch] = version.split(/[.-]/).map(Number);
+
+const patched =
+  major > 16 ||
+  (major === 16 && (minor > 4 || (minor === 4 && patch >= 5))) ||
+  (major === 15 && minor === 5 && patch >= 29);
+
+if (!patched) {
+  console.error(`next@${version} 는 2026년 11월 Security Release 이전 Version입니다`);
+  process.exit(1);
+}
+console.log(`next@${version} OK`);
+```
+
+`npm ci` 직후에 실행합니다. Workspace 환경이라면 `npm ls next`도 함께 확인하십시오. 잊혀진 내부용 App이 남아 있는 경우가 흔합니다.
+
+## 2단계: Cache Components 사용 현황 점검
+
+Patch는 개별 Bug를 막을 뿐입니다. 점검은 설계 자체가 실수하기 쉬운 동작에 의존하고 있지 않은지 확인하는 과정입니다. 저희가 보는 패턴은 세 가지입니다.
+
+**`unstable_cache`와 `use cache` 혼용**: 같은 함수가 `use cache`를 가지면서 어딘가에서 `unstable_cache`로 감싸져 있다면 하나로 통일합니다. Cache Components를 도입한 Codebase라면 남은 `unstable_cache` 호출을 Migration하는 편이 깔끔합니다.
+
+**Binary 값을 Cache Identity로 사용**: 서명된 Token이나 User Key처럼 Security상 의미 있는 값을 `Uint8Array`나 `ArrayBuffer`로 넘기고 있다면 문자열 ID로 바꿉니다. 동작을 추적하기도, Log로 남기기도 쉬워집니다.
+
+```ts
+// 변경 전: Binary 인자의 Serialize 방식에 의존
+async function getStatement(accountKey: Uint8Array) {
+  "use cache";
+  // ...
+}
+
+// 변경 후: 명시적인 문자열 ID
+async function getStatement(accountId: string) {
+  "use cache";
+  // ...
+}
+```
+
+**Tenant 구분을 Root Parameter에만 의존**: 중첩된 Cached 함수 깊은 곳에서 Root Parameter를 읽어 Tenant를 나누고 있다면, 각 Cached 함수 경계에서 Tenant ID를 명시적 인자로 받도록 하는 것을 검토합니다. Cache Key가 Code Review에서 보이게 됩니다.
+
+Multi-tenant App이라면 간단한 회귀 Test도 권장합니다. Cold Cache 상태에서 두 Tenant의 같은 경로를 병렬로 요청하고, 각 Response에 자기 Tenant 식별자만 포함되는지 확인합니다. Bug가 없다는 증명은 아니지만, 이번에 수정된 유형의 문제는 잡아낼 수 있습니다.
+
+## 3단계: Self-hosted와 Edge 항목 확인
+
+**외부 Response Proxy**: Upstream `Response` 객체를 그대로 반환하지 말고 허용한 Header만으로 다시 구성합니다.
+
+```ts
+export async function GET() {
+  const upstream = await fetch("https://api.example.com/report");
+  const body = await upstream.arrayBuffer();
+
+  const headers = new Headers();
+  for (const name of ["content-type", "cache-control", "etag"]) {
+    const value = upstream.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  return new Response(body, { status: upstream.status, headers });
+}
+```
+
+불필요한 Upstream Header 노출도 막을 수 있으므로 이번 건과 무관하게 해 둘 만합니다.
+
+**Cookie를 설정하는 Edge Route**: `runtime = "edge"`와 `NextResponse.cookies.set()` 조합을 검색합니다. Vercel에서는 Edge Runtime이 Deprecated되고 Node.js가 권장되므로, 기본 Runtime으로 옮기는 것이 가장 간단하고 Platform의 방향과도 맞습니다.
+
+**Image**: `dangerouslyAllowSVG`는 비활성 상태로 두고 `images.remotePatterns`는 최대한 좁힙니다. 이번 건에서도 Image Source 허용 목록은 그대로 유효했으며, 가장 효과적인 통제 수단입니다.
+
+## webhani의 시각
+
+Cache Components로 Cache는 "Route별 설정"에서 "함수 경계로 표현하는 것"으로 바뀌었습니다. 모델은 깔끔해졌지만, Cache Key가 Application Security 설계의 일부가 되었다는 뜻이기도 합니다. Multi-tenant SaaS 팀이라면 모든 `use cache` 함수를 Access Control 경계로 보고, 인가 로직과 같은 수준으로 Review할 것을 권장합니다.
+
+## 정리
+
+- 16.4.5 / 15.5.29 이상으로 올리고 CI에서 강제합니다.
+- 같은 함수에 `unstable_cache`와 `use cache`를 겹치지 않습니다.
+- Tenant·User ID는 Cached 함수에 문자열 인자로 명시적으로 전달합니다.
+- Proxy하는 Response는 그대로 반환하지 않고 재구성합니다.
+- Cookie를 설정하는 Edge Route는 Node.js Runtime으로 옮깁니다.
