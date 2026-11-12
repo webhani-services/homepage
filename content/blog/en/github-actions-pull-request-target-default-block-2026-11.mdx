@@ -1,0 +1,120 @@
+---
+title: "GitHub Actions Blocks `pull_request_target` by Default on December 2: Audit Your Workflows Now"
+description: "From December 2, GitHub blocks `pull_request_target` workflows by default in public repositories without an event policy, with another brownout on November 16. How to find affected workflows, which ones to rewrite, and which ones to explicitly allow."
+date: "2026-11-13"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "Security", "DevOps", "Supply Chain"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-pull-request-target-default-block-2026-11"
+---
+
+GitHub will **block `pull_request_target` workflows by default starting December 2** in public repositories that have no applicable Actions event policy. Scope: public repositories on GitHub Free, Team, and Enterprise Cloud. GitHub Enterprise Server and private or internal repositories are not affected. Blocked runs are marked failed with an error annotation and do not execute.
+
+There are brownouts before enforcement. The first was on November 9; the next is November 16. Secondary sources put the window at 16:00–18:00 UTC. If PR labeling or bot comments stop during that window, you are looking at your repo after December 2.
+
+## Why `pull_request_target` keeps getting abused
+
+`pull_request` runs fork PRs with a read-only token and no secrets. `pull_request_target` runs in the **context of the base repository**: write-scoped token, secrets available. It exists for jobs that write to the repo without running PR code — labeling, commenting, triage.
+
+The trouble starts when a workflow on this trigger checks out the PR head from the fork and runs it. An attacker only needs to change a build script or a `postinstall` hook in their fork to execute arbitrary code in a job that holds your secrets. This "pwn request" pattern has shown up in supply chain incidents repeatedly.
+
+GitHub has been tightening this in stages. In June, `actions/checkout` v7 started refusing fork checkouts under `pull_request_target` by default. In September, workflow execution protections went GA. The December change completes the move: if you want this trigger, opt in explicitly.
+
+## Step 1: Inventory
+
+Find every workflow that uses the trigger.
+
+```bash
+# Current repository
+rg -n "pull_request_target" .github/workflows
+
+# Across an organization, via GitHub CLI code search
+gh search code "pull_request_target" --owner your-org --extension yml \
+  --json repository,path --jq '.[] | "\(.repository.nameWithOwner)\t\(.path)"'
+```
+
+GitHub also exposes policy insights showing which runs the rule would block. Cross-check them against your search results.
+
+Then sort what you found into three buckets:
+
+| Bucket | Examples | Action |
+| --- | --- | --- |
+| A. Never runs PR code | labeler, PR title lint, welcome comment | Allow explicitly via event policy, only what you need |
+| B. Checks out and runs PR code | test fork PRs, then comment results | Split into `pull_request` + `workflow_run` |
+| C. Dead | leftovers from an old bot | Delete |
+
+## Step 2: Split bucket B
+
+Bucket B is the dangerous one, and it should be rewritten regardless of the new default. The standard fix separates **the job that runs untrusted code** from **the job that holds write permissions**.
+
+```yaml
+# .github/workflows/pr-test.yml — run fork code with no privileges
+name: PR Test
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: npm ci && npm test -- --reporter=json > result.json
+      - run: echo "${{ github.event.pull_request.number }}" > pr-number.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-result
+          path: |
+            result.json
+            pr-number.txt
+```
+
+```yaml
+# .github/workflows/pr-comment.yml — read the result, post a comment, nothing else
+name: PR Comment
+on:
+  workflow_run:
+    workflows: ["PR Test"]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-result
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      # Treat the artifact as untrusted input: validate before use
+      - run: |
+          PR=$(cat pr-number.txt)
+          [[ "$PR" =~ ^[0-9]+$ ]] || { echo "invalid PR number"; exit 1; }
+          echo "PR=$PR" >> "$GITHUB_ENV"
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "Tests finished. See the workflow run for details."
+```
+
+One caveat people miss: in the `workflow_run` job, **the artifact contents are attacker-controlled data**. Validate anything you read from it, never execute scripts from it, and never interpolate its contents directly into a shell command.
+
+## Step 3: Explicitly allow bucket A
+
+A `pull_request_target` workflow that never checks out PR code — a labeler, for example — is a legitimate use. Allow those through an Actions event policy at the organization or repository level; policies can also be managed through the Actions policies REST API. If a workflow depends on bot-authored PRs such as Dependabot's, make sure the bot is included in the allowed actors.
+
+Before allowing a workflow, check:
+
+- It does not check out `github.event.pull_request.head.sha` or `head.ref`.
+- It does not interpolate PR-controlled values like `${{ github.event.pull_request.title }}` directly into `run:` — pass them through environment variables instead.
+- Its `permissions:` block is as narrow as possible.
+
+## Our take
+
+In client repositories we review, `pull_request_target` is often there because someone wanted comments on fork PRs and picked the trigger that "just worked." Most of those workflows can move to the split pattern above, or to plain `pull_request`.
+
+The repositories most likely to break silently after December 2 are low-traffic public ones — small OSS libraries, public internal tooling — where nobody opens a PR for weeks. Build the inventory now, and watch what actually stops during the November 16 brownout. The new default costs some cleanup time, but it is also a good forcing function to revisit how permissions flow through your CI.

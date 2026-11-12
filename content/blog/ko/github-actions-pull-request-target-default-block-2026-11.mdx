@@ -1,0 +1,120 @@
+---
+title: "GitHub Actions, 12월 2일부터 Public Repository의 `pull_request_target` 기본 차단: 지금 해야 할 Workflow 점검"
+description: "GitHub이 12월 2일부터 Event Policy가 없는 Public Repository에서 `pull_request_target` Workflow를 기본으로 차단합니다. 11월 16일에도 일시 차단(Brownout)이 예정되어 있습니다. 영향받는 Workflow를 찾는 방법과 안전하게 다시 작성하는 패턴을 정리합니다."
+date: "2026-11-13"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "보안", "DevOps", "Supply Chain"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-pull-request-target-default-block-2026-11"
+---
+
+GitHub은 **12월 2일부터 Public Repository의 `pull_request_target` Workflow를 기본으로 차단**합니다. 대상은 Actions Event Policy가 설정되지 않은 Public Repository(GitHub Free, Team, Enterprise Cloud)이며, GitHub Enterprise Server와 Private/Internal Repository는 해당되지 않습니다. 차단된 실행은 Error Annotation과 함께 실패 처리되고 Job은 실행되지 않습니다.
+
+본격 적용 전에 일시 차단(Brownout)이 진행됩니다. 11월 9일에 이미 한 차례 진행되었고, 다음은 11월 16일입니다. 2차 정보에 따르면 시간대는 16:00~18:00 UTC(한국 시간 17일 01:00~03:00)입니다. 이 시간에 PR Label 지정이나 Bot Comment가 멈춘다면, 그것이 12월 2일 이후의 모습입니다.
+
+## 왜 `pull_request_target`이 표적이 되는가
+
+`pull_request` Event는 Fork에서 온 PR을 읽기 전용 Token으로, Secret 없이 실행합니다. 반면 `pull_request_target`은 **Base Repository의 Context**에서 실행되므로 쓰기 권한 Token과 Secret에 접근할 수 있습니다. PR Code를 실행하지 않고 Repository에 무언가를 쓰는 작업, 즉 Label 지정이나 Comment 작성을 위해 만들어진 Event입니다.
+
+문제는 이 Event 안에서 Fork 쪽 PR Head를 Checkout해 실행하는 경우입니다. 공격자는 Fork에서 Build Script나 `postinstall` Hook만 바꾸면, Secret을 가진 Job 위에서 임의의 Code를 실행할 수 있습니다. 이른바 "pwn request"로, 최근 몇 년간 Supply Chain 공격에 반복적으로 사용되었습니다.
+
+GitHub은 단계적으로 대응해 왔습니다. 6월에는 `actions/checkout` v7이 `pull_request_target`에서 Fork Code Checkout을 기본적으로 거부하도록 바뀌었고, 9월에는 Workflow Execution Protections가 GA되었습니다. 이번 변경은 그 마무리로, "쓰려면 명시적으로 허용하라"는 기본값으로의 전환입니다.
+
+## Step 1: 영향받는 Workflow 찾기
+
+먼저 `pull_request_target`을 사용하는 곳을 모두 파악합니다.
+
+```bash
+# 현재 Repository
+rg -n "pull_request_target" .github/workflows
+
+# Organization 전체 (GitHub CLI Code Search)
+gh search code "pull_request_target" --owner your-org --extension yml \
+  --json repository,path --jq '.[] | "\(.repository.nameWithOwner)\t\(.path)"'
+```
+
+GitHub은 규칙이 적용될 경우 어떤 실행이 차단되는지 보여 주는 Policy Insights도 제공합니다. 검색 결과와 대조해 누락이 없는지 확인하십시오.
+
+찾은 Workflow는 세 가지로 분류합니다.
+
+| 분류 | 예시 | 대응 |
+| --- | --- | --- |
+| A. PR Code를 실행하지 않음 | Labeler, PR 제목 Lint, 환영 Comment | 필요한 것만 Event Policy로 명시적으로 허용 |
+| B. PR Code를 Checkout해 실행 | Fork PR에서 Test 실행 후 결과 Comment | `pull_request` + `workflow_run`으로 분리 |
+| C. 더 이상 사용하지 않음 | 예전 Bot의 흔적 | 삭제 |
+
+## Step 2: B 유형 Workflow 분리하기
+
+가장 위험한 것은 B 유형이며, 이번 차단과 관계없이 다시 작성해야 하는 패턴입니다. 정석은 **신뢰할 수 없는 Code를 실행하는 Job**과 **쓰기 권한을 사용하는 Job**을 분리하는 것입니다.
+
+```yaml
+# .github/workflows/pr-test.yml — Fork Code를 권한 없이 실행
+name: PR Test
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: npm ci && npm test -- --reporter=json > result.json
+      - run: echo "${{ github.event.pull_request.number }}" > pr-number.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-result
+          path: |
+            result.json
+            pr-number.txt
+```
+
+```yaml
+# .github/workflows/pr-comment.yml — 결과를 읽고 Comment만 작성
+name: PR Comment
+on:
+  workflow_run:
+    workflows: ["PR Test"]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-result
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      # Artifact는 신뢰할 수 없는 입력: 사용 전에 검증
+      - run: |
+          PR=$(cat pr-number.txt)
+          [[ "$PR" =~ ^[0-9]+$ ]] || { echo "invalid PR number"; exit 1; }
+          echo "PR=$PR" >> "$GITHUB_ENV"
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "Tests finished. See the workflow run for details."
+```
+
+자주 놓치는 점은 `workflow_run` 쪽에서도 **Artifact 내용은 공격자가 쓸 수 있는 데이터**라는 사실입니다. PR 번호 같은 값은 형식을 검증하고, Artifact 안의 Script를 실행하거나 내용을 Shell 명령에 그대로 펼치지 마십시오.
+
+## Step 3: A 유형은 명시적으로 허용하기
+
+Labeler처럼 PR Code를 Checkout하지 않는 `pull_request_target` Workflow는 정당한 용도입니다. 이런 Workflow는 Organization 또는 Repository 수준의 Actions Event Policy로 명시적으로 허용합니다. Policy는 설정 화면뿐 아니라 Actions Policies REST API로도 관리할 수 있습니다. Dependabot 같은 Bot이 만든 PR에 의존하는 Workflow라면 허용 Actor에 해당 Bot을 포함해야 한다는 점도 주의하십시오.
+
+허용하기 전에 다음 항목을 확인해 두면 안심할 수 있습니다.
+
+- `github.event.pull_request.head.sha`나 `head.ref`를 Checkout하지 않는가
+- `${{ github.event.pull_request.title }}` 같은 PR 유래 값을 `run:`에 직접 넣지 않는가 (환경 변수를 통해 전달)
+- `permissions:`를 최소한으로 제한했는가
+
+## webhani의 관점
+
+저희가 지원하는 프로젝트에서도 `pull_request_target`은 "Fork PR에도 Comment를 달고 싶어서" 별생각 없이 채택된 뒤 그대로 남아 있는 경우가 많습니다. 그런 Workflow 대부분은 위의 분리 패턴이나 단순한 `pull_request`로 충분히 대체할 수 있습니다.
+
+12월 2일 이후 고장 난 채로 아무도 모르고 지나가기 쉬운 곳은 PR이 드문 소규모 OSS나 공개된 사내 Tool Repository입니다. 지금 검색으로 목록을 만들고, 11월 16일 Brownout 시간대에 실제로 무엇이 멈추는지 확인하십시오. 기본 차단은 번거로운 작업을 만들지만, CI 권한 설계를 다시 점검할 좋은 계기이기도 합니다.

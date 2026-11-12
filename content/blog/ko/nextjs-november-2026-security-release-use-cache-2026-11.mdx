@@ -1,0 +1,110 @@
+---
+title: "Next.js 2026년 11월 Security Release: `use cache`를 쓰는 Multi-Tenant 앱부터 업데이트하십시오"
+description: "Next.js 16.4.5와 15.5.29에서 7건의 취약점이 수정되었습니다. 그중 4건이 Cache Components와 `use cache` 관련이며, Tenant 간 데이터 노출로 이어질 수 있습니다. 영향 범위 파악, 업데이트, 그리고 이후 정리해야 할 Code 패턴을 소개합니다."
+date: "2026-11-13"
+status: "published"
+tags: ["Next.js", "보안", "Cache", "React", "Multi-Tenant"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-november-2026-security-release-use-cache-2026-11"
+---
+
+11월 3일 Next.js의 11월 Security Release로 v16.4.5(Active LTS)와 v15.5.29(Maintenance LTS)가 공개되었습니다. 수정된 취약점은 7건으로 High 1건, Medium 6건입니다. 숫자만 보면 평소의 Patch처럼 보이지만, 이번에는 **7건 중 4건이 Cache Components와 `use cache`에 관한 문제**입니다. Root Parameter로 Tenant, Site, Locale을 구분하는 애플리케이션이라면 한 Tenant의 데이터가 다른 Tenant에게 반환될 수 있으므로 우선순위를 높여 대응해야 합니다.
+
+## 7건을 영향 범위별로 나누면
+
+**Cache Components / `use cache` 관련**
+
+- **High**: 같은 public `use cache` 함수를 직접 호출하는 경로와 `unstable_cache` 내부에서 호출하는 경로가 공존하면, Cache가 비어 있는 상태에서 동시 Request가 들어올 때 다른 Root Parameter 값(예: 다른 Tenant ID)의 결과를 받을 수 있습니다 (GHSA-mfr8-8qww-v76h).
+- **Medium**: 중첩된 `use cache`에서 내부 함수가 Root Parameter를 읽고 외부 함수가 느린 비동기 값을 기다리지 않고 끝나면, Root Parameter 의존성이 기록되기 전에 외부 Entry가 저장될 수 있습니다 (GHSA-vc7v-qv4w-wrv8).
+- **Medium**: `use cache` 함수에 서로 다른 Binary 인자를 넘겨도 같은 Cache Key가 생성될 수 있습니다 (GHSA-rhh4-g77r-r9qj).
+- **Medium**: `next start`로 Self-hosting하면서 Cache Components를 켜고 Partial Prefetching을 끄거나 설정하지 않은 경우, 특정 Route 구성에서 공유 Shell이 오염될 수 있습니다.
+
+**기타**
+
+- **Medium**: 공격자가 영향을 줄 수 있는 fetch `Response`를 그대로 반환하는 Self-hosted 구성에서, 공유 Backend 연결에 Request를 Pipelining하는 HTTP/1.1 Proxy와 결합되면 Response가 다른 Client에게 전달될 수 있습니다 (GHSA-pc58-hwjq-p385).
+- **Medium**: Edge Route Handler에서 `NextResponse.cookies.set()`을 사용하면 내부 Header `x-middleware-set-cookie`를 통해 `HttpOnly` Cookie 값이 같은 Origin의 JavaScript에 노출될 수 있습니다 (GHSA-f3mh-rxg3-f5g2).
+- **Medium**: Image Optimization에서 AVIF로 잘못 판별된 이미지가 `dangerouslyAllowSVG: false`를 우회할 수 있습니다 (GHSA-7qx7-33qx-rqx2).
+
+Pantheon의 Release Note에 따르면 15.5.29에는 이 중 3건(Response Injection, Edge Cookie, SVG)만 포함되어 있고, 7건 전부가 포함된 것은 16.4.5입니다. Cache Components는 16.x 기능이므로 15.x에서 Cache 관련 수정이 빠진 것이 곧바로 문제가 되지는 않습니다. 그래도 15.x에 머물 이유가 없다면 16.4.5로의 전환을 계획에 넣어 두시기 바랍니다.
+
+## 업데이트 전에 영향 범위 파악하기
+
+어떤 문제가 해당되는지 먼저 알아 두면 업데이트 후 검증 범위를 정하기 쉽습니다.
+
+```bash
+# 1. 실제로 Resolve된 Next.js 버전
+npm ls next
+
+# 2. Cache Components / use cache 사용 현황
+rg -n "cacheComponents" next.config.*
+rg -n "\"use cache\"|'use cache'" src app
+rg -n "unstable_cache" src app
+
+# 3. Edge Runtime에서 Cookie를 설정하는 곳
+rg -n "runtime\s*=\s*['\"]edge['\"]" src app
+rg -n "NextResponse.*cookies\.set|\.cookies\.set\(" src app
+
+# 4. Image Optimization의 SVG 설정과 원격 이미지 허용 목록
+rg -n "dangerouslyAllowSVG|remotePatterns" next.config.*
+```
+
+가장 먼저 찾아야 할 패턴은 **Tenant 단위 Root Parameter를 읽는 `use cache` 함수가 다른 곳에서 `unstable_cache`로도 감싸져 호출되는 경우**입니다. High 취약점의 발생 조건 그 자체입니다.
+
+## 업데이트
+
+```bash
+# 16.x
+npm install next@16.4.5
+
+# 15.x
+npm install next@15.5.29
+```
+
+공식 Blog의 명령어 예시에는 주석이 "for 16.5"로 되어 있지만, 수정 버전은 16.4.5입니다. Netlify에 배포하는 경우 OpenNext Netlify Adapter도 v5.16.6 이상으로 올려야 한다고 Netlify가 안내하고 있습니다.
+
+## Patch 이후 다시 살펴볼 패턴
+
+Patch는 개별 Bug를 고치지만, 같은 유형의 문제를 만들기 쉬운 Code 형태는 그대로 남습니다. 저희는 고객사에 다음 두 가지를 권장하고 있습니다.
+
+### 1. `unstable_cache`와 `use cache`를 섞어 쓰지 않기
+
+`unstable_cache`는 Cache Components 이전의 API입니다. 하나의 함수를 두 Cache 메커니즘에서 호출하면 Cache 동일성 판단 기준이 두 갈래가 되고, 그 사이에서 경계가 어긋나기 쉽습니다. 새 Code는 `use cache`로 작성하고, 기존 `unstable_cache` 호출부는 단계적으로 교체합니다.
+
+### 2. Tenant 경계는 인자로 명시하기
+
+Cache된 함수 안에서 Root Parameter를 암묵적으로 읽기보다, Cache를 나누는 기준이 되어야 하는 값은 인자로 넘기는 편이 Review에서 경계를 확인하기 쉽습니다.
+
+```tsx
+// 권장: tenantId를 명시적인 인자로 받아 Cache Key에 포함
+async function getTenantDashboard(tenantId: string) {
+  "use cache";
+  return db.dashboard.findMany({ where: { tenantId } });
+}
+
+export default async function Page({
+  params,
+}: {
+  params: Promise<{ tenant: string }>;
+}) {
+  const { tenant } = await params;
+  const data = await getTenantDashboard(tenant);
+  return <Dashboard data={data} />;
+}
+```
+
+Framework는 이제 Root Parameter 의존성을 올바르게 추적합니다. 여기에 더해 Partition Key가 Code에 드러나도록 작성해 두면, 같은 계열의 다음 Bug에 대한 2차 방어선이 됩니다.
+
+`HttpOnly` Cookie를 다루는 처리는 Edge Runtime 대신 Node.js Runtime의 Route Handler와 `cookies().set()`으로 작성하는 것이 안전합니다. Advisory에서도 해당 경로에서는 재현되지 않았다고 밝혔고, Vercel 역시 Edge Runtime에서 Node.js Runtime으로의 전환을 권장하고 있으니 이번 기회에 옮기는 것을 검토해 보십시오.
+
+## webhani의 관점
+
+올해 Next.js는 거의 매달 Security Release를 내고 있으며, 수정의 상당수가 Cache와 Rendering의 경계에 몰려 있습니다. Cache Components는 성능상 이점이 크지만, "무엇이 Cache Key가 되는가"가 Framework 내부에 숨기 쉬운 기능이기도 합니다.
+
+Next.js로 Multi-Tenant SaaS를 운영하고 있다면 다음 세 가지를 정기 운영에 포함하시기를 권장합니다.
+
+1. Dependabot이나 Renovate로 Next.js Patch Release를 1주일 안에 Merge할 수 있는 상태 유지
+2. Tenant A로 로그인했을 때 Tenant B의 데이터가 보이지 않음을 검증하는 E2E Test를 준비하고, Cache가 비어 있을 때뿐 아니라 채워진 상태에서도 실행
+3. `use cache` 함수는 Tenant를 구분하는 값을 인자로 받아야 한다는 규칙을 Code Review 기준에 추가
+
+Patch 적용은 이번 구멍을 막는 일이고, 패턴을 바꾸는 것은 다음 구멍의 영향을 줄이는 일입니다.

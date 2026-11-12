@@ -1,0 +1,105 @@
+---
+title: "Claude Fable 5.2 への移行：effort の既定値、Fast mode、コストをどう見直すか"
+description: "11月9日に Claude Fable 5.2 が公開されました。API はほぼそのまま差し替えられますが、effort の既定値や Fast mode の料金体系など、運用側で確認すべき点があります。本番環境で切り替える前の点検項目をまとめます。"
+date: "2026-11-13"
+status: "published"
+tags: ["Claude", "LLM", "AI", "Anthropic", "コスト管理"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-fable-5-2-migration-effort-fast-mode-2026-11"
+---
+
+Anthropic は11月9日に Claude Fable 5.2 と、利用先を限定した Claude Mythos 5.2 を公開しました。API の model ID は `claude-fable-5-2` です。モデルの差し替え自体は数分で終わりますが、本番の Agent やバッチ処理を切り替えるとなると、品質よりも先に「コストとレイテンシの前提が変わらないか」を確認する必要があります。この記事では、公式ドキュメントと報道から確認できた事実を整理し、私たちが切り替え前に見ている項目を紹介します。
+
+## 何が変わったのか
+
+公式の移行ガイドと各種報道から、運用に関わる点を抜き出すと次のとおりです。
+
+- **料金**：SD Times が Anthropic のブログを引用して報じたところでは、入力 $8 / 出力 $40（いずれも 100 万 token あたり）で、Fable 5.1 より引き下げられています。
+- **速度**：Anthropic によれば、出力生成は Fable 5.1 比で最大 30% 高速です。
+- **Context**：既定で 1M token の context window、1 リクエストあたり最大 128k の出力 token。
+- **Effort**：5 段階すべてに対応し、API の既定値は Fable 5.1 と同じ `high`。一方、Claude アプリと Claude Code では既定値が medium に変わりました。
+- **Thinking**：adaptive thinking は常に有効です。
+- **Fast mode**：Messages API で利用できます。開発者向けの解説記事では `speed: "fast"` を指定し、料金は $16 / $80 と紹介されていますが、これは二次情報なので公式の料金ページで確認してください。
+- **提供先**：Claude の有料プラン、API のほか、Amazon Bedrock、Google Cloud、Microsoft Azure でも利用できます。
+
+移行ガイドは「おおむねそのまま差し替え可能」としていますが、注意すべきなのは effort の既定値です。
+
+## 落とし穴は「既定値の違い」
+
+Claude Code で Fable 5.2 を触ったエンジニアの体感と、API 経由で動く本番システムの挙動は一致しない可能性があります。Claude Code は medium、API は high が既定だからです。
+
+さらに、他のモデルから移ってくる場合は差が大きくなります。たとえば Opus 5.5 の既定値は medium なので、リクエストを変えずに model ID だけ Fable 5.2 に差し替えると、effort が一段上がった状態で動きます。effort が上がれば出力 token、つまりコストとレイテンシも増えます。単価が下がっても、請求額が下がるとは限りません。
+
+私たちが推奨するのは、**effort を既定値に任せず、ワークロードごとに明示する**ことです。
+
+```ts
+// llm-profiles.ts — ワークロードごとにモデル設定を一箇所で管理する
+type Effort = "low" | "medium" | "high";
+
+interface LlmProfile {
+  model: string;
+  effort: Effort;
+  maxTokens: number;
+}
+
+export const profiles = {
+  // ユーザー待ちのチャット応答：レイテンシ優先
+  chat: { model: "claude-fable-5-2", effort: "medium", maxTokens: 4_000 },
+  // 夜間のコードレビュー・バッチ：品質優先
+  review: { model: "claude-fable-5-2", effort: "high", maxTokens: 16_000 },
+  // 分類・抽出：安いモデルで十分
+  classify: { model: "claude-haiku-5-5", effort: "low", maxTokens: 512 },
+} satisfies Record<string, LlmProfile>;
+```
+
+effort をリクエストに渡す具体的なパラメータ名は SDK のバージョンで確認してください。ここでのポイントは、モデル名と effort を同じ場所で管理し、モデルを切り替えるときに effort も意識的に決める状態にしておくことです。
+
+## Fast mode をどこで使うか
+
+Fast mode は出力が速くなる代わりに単価が上がります。上記の二次情報どおりなら通常の2倍です。すべてのトラフィックに適用すると費用が単純に増えるので、私たちは次のように使い分けています。
+
+- **使う**：ユーザーが画面の前で待っている対話型 UI、CI で開発者がブロックされる短いタスク
+- **使わない**：夜間バッチ、非同期のドキュメント生成、Webhook で起動する Agent
+
+判断の基準は「速くなった数秒に、誰かが実際に待たされているか」です。待ち手がいなければ、Fast mode の効果は請求書にしか現れません。
+
+## 切り替え前の点検リスト
+
+本番環境で Fable 5.2 に切り替える前に、次を確認しています。
+
+1. **既存プロンプトで評価を回す**：社内の eval セット（実際の入力 50〜100 件程度）で、旧モデルと出力品質・出力 token 数・所要時間を比較します。
+2. **usage をログに出す**：`input_tokens` / `output_tokens` をリクエスト単位で記録し、切り替え前後の1件あたりコストを比較できるようにします。
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+export async function runWithUsageLog(profileName: string, prompt: string) {
+  const started = Date.now();
+  const res = await client.messages.create({
+    model: "claude-fable-5-2",
+    max_tokens: 4_000,
+    messages: [{ role: "user", content: prompt }],
+  });
+  console.info(JSON.stringify({
+    profile: profileName,
+    model: res.model,
+    inputTokens: res.usage.input_tokens,
+    outputTokens: res.usage.output_tokens,
+    ms: Date.now() - started,
+  }));
+  return res;
+}
+```
+
+3. **データ保持の条件を確認する**：一部の報道では、Claude Platform 上での利用に 30 日間のデータ保持が必要（zero retention の個別許可がある場合を除く）とされています。顧客データを扱う案件では、契約条件と照らし合わせて公式ドキュメントで確認してください。
+4. **フォールバックを残す**：切り替え直後はエラー率やタイムアウトを監視し、旧モデルにすぐ戻せる設定（環境変数や Feature Flag）を残しておきます。
+5. **Claude Code の設定もそろえる**：チームで Claude Code を使っている場合、medium が既定になったことで、以前と比べて「浅い」と感じる場面があるかもしれません。重い設計判断やデバッグでは effort を明示的に上げる運用をチームで共有しておくと混乱が減ります。
+
+## webhani の見解
+
+今回のアップデートは、性能向上よりも「同じ品質をより安く・速く」という性格が強いと私たちは見ています。ただし、単価の引き下げはそのまま節約になるわけではありません。effort の既定値の違いや Fast mode の使い方次第で、請求額は上にも下にも振れます。
+
+model ID を1行変えるだけで済む移行ほど、計測なしで済ませてしまいがちです。まず usage のログを取り、ワークロードごとに effort を明示し、eval で比較してから切り替える。この順番を守れば、新モデルの恩恵を数字で確認しながら取り込めます。

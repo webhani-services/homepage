@@ -1,0 +1,112 @@
+---
+title: "Next.js 2026年11月セキュリティリリース：`use cache` を使うマルチテナント構成は優先して更新を"
+description: "Next.js 16.4.5 と 15.5.29 で7件の脆弱性が修正されました。うち4件は Cache Components と `use cache` に関するもので、テナント間のデータ漏えいにつながり得ます。影響の切り分け方と、修正版へ上げた後に見直したいコードパターンを紹介します。"
+date: "2026-11-13"
+status: "published"
+tags: ["Next.js", "セキュリティ", "キャッシュ", "React", "マルチテナント"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-november-2026-security-release-use-cache-2026-11"
+---
+
+Next.js の11月のセキュリティリリース（11月3日公開）で、v16.4.5（Active LTS）と v15.5.29（Maintenance LTS）が出ました。修正は7件で、High が1件、Medium が6件です。件数だけを見ると「いつものパッチ」に見えますが、今回は **Cache Components と `use cache` に関する問題が4件** を占めています。テナント ID やロケールをルートパラメータで分けているアプリケーションでは、あるテナントのデータが別のテナントに返される可能性があるため、優先度を上げて対応してください。
+
+## 修正された7件の概要
+
+公式ブログの内容を、影響範囲で分類すると次のようになります。
+
+**Cache Components / `use cache` 関連**
+
+- **High**：同じ public な `use cache` 関数を、直接呼び出す経路と `unstable_cache` の内側から呼ぶ経路の両方で使っていると、キャッシュが冷えている状態で並行リクエストが来た際に、別のルートパラメータ（例：テナント ID）の結果を受け取ることがある（GHSA-mfr8-8qww-v76h）
+- **Medium**：ネストした `use cache` で、内側の関数がルートパラメータを読み、外側の関数が遅い非同期値を待たずに完了すると、ルートパラメータの依存が記録される前に外側のエントリが保存される（GHSA-vc7v-qv4w-wrv8）
+- **Medium**：`use cache` 関数に渡したバイナリ引数が異なっていても、同じキャッシュキーになる場合がある（GHSA-rhh4-g77r-r9qj）
+- **Medium**：`next start` でセルフホストし、Cache Components を有効にしていて Partial Prefetching が無効または未設定の場合、特定のルート構成で共有シェルが汚染される
+
+**その他**
+
+- **Medium**：攻撃者が制御できる fetch の `Response` をそのまま返すセルフホスト構成で、HTTP/1.1 のリバースプロキシと組み合わさると、レスポンスが別のクライアントに割り当てられることがある（GHSA-pc58-hwjq-p385）
+- **Medium**：Edge の Route Handler で `NextResponse.cookies.set()` を使うと、内部ヘッダー `x-middleware-set-cookie` から `HttpOnly` の Cookie 値が同一オリジンの JavaScript に読まれ得る（GHSA-f3mh-rxg3-f5g2）
+- **Medium**：Image Optimization で、AVIF と誤判定された画像が `dangerouslyAllowSVG: false` をすり抜ける（GHSA-7qx7-33qx-rqx2）
+
+Pantheon のリリースノートによると、15.5.29 に含まれるのはこのうち3件（レスポンス注入、Edge の Cookie、SVG）のみで、7件すべてを含むのは 16.4.5 です。もっとも Cache Components は 16 系の機能なので、15 系で Cache 関連の修正が無いことは実害に直結しにくいはずです。それでも、15 系に留まる理由がなければ 16.4.5 への移行を計画に入れておくべきです。
+
+## まず影響を切り分ける
+
+いきなりアップデートを進める前に、どの問題が自分のアプリケーションに当てはまるかを把握しておくと、リリース後の検証範囲を決めやすくなります。
+
+```bash
+# 1. 実際に解決されている Next.js のバージョン
+npm ls next
+
+# 2. Cache Components / use cache の利用状況
+rg -n "cacheComponents" next.config.*
+rg -n "\"use cache\"|'use cache'" src app
+rg -n "unstable_cache" src app
+
+# 3. Edge runtime で Cookie を設定している箇所
+rg -n "runtime\s*=\s*['\"]edge['\"]" src app
+rg -n "NextResponse.*cookies\.set|\.cookies\.set\(" src app
+
+# 4. Image Optimization の SVG 設定とリモート画像の許可
+rg -n "dangerouslyAllowSVG|remotePatterns" next.config.*
+```
+
+特に注意すべきは、**`use cache` 関数の中でテナント ID などのルートパラメータを読んでいて、さらに同じ関数を `unstable_cache` からも呼んでいる** ケースです。これは High の問題の発生条件そのものです。
+
+## アップデート
+
+```bash
+# 16 系
+npm install next@16.4.5
+
+# 15 系
+npm install next@15.5.29
+```
+
+公式ブログのコマンド例ではコメントが「for 16.5」となっていますが、修正版は 16.4.5 です。Netlify でホストしている場合は、OpenNext Netlify アダプターも v5.16.6 以上に上げる必要があると Netlify が案内しています。
+
+## 修正版に上げた後に見直したいパターン
+
+パッチは個別の不具合を直しますが、同じ種類の問題を生みやすい書き方は残ります。私たちは今回を機に、次の2点を見直すことを勧めています。
+
+### 1. `unstable_cache` と `use cache` を混在させない
+
+`unstable_cache` は Cache Components 以前の API です。同じ関数を新旧2つのキャッシュ機構から呼ぶと、キャッシュの同一性を判断する仕組みが2系統になり、今回のような境界のずれが起きやすくなります。新規コードは `use cache` に寄せ、既存の `unstable_cache` は段階的に置き換えます。
+
+### 2. テナント境界は引数で明示する
+
+ルートパラメータを関数の中で暗黙的に読むのではなく、キャッシュキーに含めたい値は引数として渡すほうが、レビューで境界を確認しやすくなります。
+
+```tsx
+// 推奨：tenantId を引数として受け取り、キャッシュキーに明示的に含める
+async function getTenantDashboard(tenantId: string) {
+  "use cache";
+  return db.dashboard.findMany({ where: { tenantId } });
+}
+
+export default async function Page({
+  params,
+}: {
+  params: Promise<{ tenant: string }>;
+}) {
+  const { tenant } = await params;
+  const data = await getTenantDashboard(tenant);
+  return <Dashboard data={data} />;
+}
+```
+
+公式の修正でルートパラメータの依存追跡は正しくなっていますが、「どの値でキャッシュが分かれるのか」がコードから読み取れる書き方にしておくと、将来の同種の不具合に対するもう一段の防御になります。
+
+また、`HttpOnly` の Cookie を扱う処理は、Edge runtime ではなく Node.js runtime の Route Handler と `cookies().set()` で書くのが無難です。公式の説明でも、Node.js の Route Handler と `cookies().set()` 経由では再現しなかったとされています。Vercel 自体も Edge runtime から Node.js runtime への移行を推奨しているので、移行のよい機会です。
+
+## webhani の見解
+
+ここ数か月、Next.js のセキュリティリリースは毎月のペースで出ていて、その多くがキャッシュとレンダリングの境界に集中しています。Cache Components は性能面の利点が大きい一方で、「何がキャッシュキーになるか」が実装の内部に隠れやすい機能です。
+
+マルチテナントの SaaS を Next.js で運用している場合は、次の3点を定常的な運用に組み込むことをお勧めします。
+
+1. Next.js のパッチリリースを、Dependabot や Renovate で1週間以内に取り込める状態にしておく
+2. テナント A でログインしてテナント B のデータが見えないことを確かめる E2E テストを用意し、キャッシュを温めた状態でも実行する
+3. `use cache` を使う関数は、テナントを区別する値を引数で受け取るというルールをレビュー観点に加える
+
+パッチを当てるだけで終わらせず、同じ種類の問題を構造的に起こしにくくすることが、今回のリリースから得られる一番の収穫です。
