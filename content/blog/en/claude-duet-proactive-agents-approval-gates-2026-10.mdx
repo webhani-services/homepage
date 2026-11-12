@@ -1,0 +1,126 @@
+---
+title: "Claude Duet and Proactive Agents: Designing Approval Gates for Agents That Act First"
+description: "Anthropic's Claude Duet preview shows where consumer agents are heading: they work while you are away and ask before they send, spend, sign, or delete. How to build the same approval model into your own agents."
+date: "2026-10-29"
+status: "published"
+tags: ["AI", "Claude", "Agents", "Security", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-duet-proactive-agents-approval-gates-2026-10"
+---
+
+On October 21, Anthropic opened a research preview of Claude Duet, a standalone agent app for Pro and Max subscribers on a US waitlist. According to press coverage of the launch, Duet works across connected accounts, checks them every few hours instead of waiting for a prompt, and requires approval before it sends, spends, signs, or deletes anything. Anthropic also says it does not directly see passwords or login tokens.
+
+We have not used Duet, and details are still coming from secondary reporting, so treat the product specifics as provisional. What interests us is the design shape. A proactive agent changes the safety problem: there is no human watching each turn. The control that matters moves from "review the output" to "gate the side effects." If you are building agents for clients, you will need the same structure. This article sketches one.
+
+## Why proactive agents are a different problem
+
+A chat assistant is reactive. The user sends a message, reads the answer, and decides what to do. Every action passes through a person by construction.
+
+A proactive agent inverts this. It wakes on a schedule or an event, reads inboxes and calendars, and decides on its own that something needs doing. Three things follow:
+
+- **Untrusted input arrives unattended.** An email the agent reads at 3 a.m. may contain instructions aimed at the agent. Nobody is there to notice.
+- **Mistakes compound before anyone looks.** A wrong action at 9 a.m. can feed a wrong plan at noon.
+- **Approval fatigue becomes the main risk.** If the agent asks about everything, people click "approve" without reading.
+
+The Duet model, as described, handles this by classifying actions rather than classifying conversations. Reads are free. A narrow set of consequential verbs needs a human.
+
+## A risk-tiered action policy
+
+The simplest useful implementation is a policy table that maps every tool the agent can call to a tier, enforced outside the model.
+
+```ts
+type Tier = "auto" | "approve" | "deny";
+
+interface ToolPolicy {
+  tier: Tier;
+  // Optional guard evaluated at call time, e.g. spend limits
+  guard?: (args: Record<string, unknown>) => boolean;
+}
+
+const policy: Record<string, ToolPolicy> = {
+  "calendar.read":   { tier: "auto" },
+  "mail.search":     { tier: "auto" },
+  "mail.draft":      { tier: "auto" },
+  "mail.send":       { tier: "approve" },
+  "payments.charge": { tier: "approve", guard: (a) => Number(a.amount) <= 50_000 },
+  "docs.sign":       { tier: "approve" },
+  "files.delete":    { tier: "approve" },
+  "shell.exec":      { tier: "deny" },
+};
+```
+
+The important property is that the policy lives in your runtime, not in the system prompt. A prompt can be argued with; a lookup table cannot. Unknown tools default to `deny`.
+
+## The approval queue
+
+When a call lands in the `approve` tier, the agent should not block. It should park the request and move on to other work.
+
+```ts
+interface PendingAction {
+  id: string;            // idempotency key, stable across retries
+  tool: string;
+  args: Record<string, unknown>;
+  reason: string;        // the agent's stated justification
+  sourceRefs: string[];  // message IDs, document URLs that triggered it
+  createdAt: string;
+  expiresAt: string;
+}
+
+async function dispatch(call: ToolCall, ctx: AgentContext) {
+  const rule = policy[call.tool];
+  if (!rule || rule.tier === "deny") throw new PolicyError(call.tool);
+  if (rule.guard && !rule.guard(call.args)) throw new PolicyError(call.tool);
+
+  if (rule.tier === "auto") return execute(call);
+
+  const pending: PendingAction = {
+    id: ctx.idempotencyKey(call),
+    tool: call.tool,
+    args: call.args,
+    reason: call.reason,
+    sourceRefs: ctx.currentSources(),
+    createdAt: new Date().toISOString(),
+    expiresAt: addHours(new Date(), 24).toISOString(),
+  };
+  await approvalQueue.put(pending);
+  return { status: "awaiting_approval", id: pending.id };
+}
+```
+
+Three details matter here.
+
+**Idempotency keys.** An agent that retries after a timeout must not send the same email twice. Derive the key from the intent, not from the attempt.
+
+**Source references.** The approver should see *why* the agent wants to act, including which message triggered it. This is the single best defense against injected instructions: a human looking at "send the invoice to this new address, triggered by an email from an unknown sender" will catch what the model did not.
+
+**Expiry.** Stale approvals are dangerous. If the context changed overnight, an approval granted on yesterday's state should not execute today.
+
+## Credentials: scope them, don't share them
+
+Anthropic states that Duet does not directly view passwords or login tokens. You can aim for the same property: the model never sees secrets, and the tool executor holds narrowly scoped, short-lived credentials. For a mail agent, that means a token that can read and create drafts but whose send scope is only exercised by the approval path. Separating "draft" from "send" at the credential level means a compromised prompt cannot skip the gate.
+
+## Fighting approval fatigue
+
+If every action needs a click, the gate becomes decoration. Some practices that help:
+
+- **Batch by intent.** Show "3 replies to send" with diffs, not three separate prompts.
+- **Show the delta.** For a calendar change, display old and new times side by side.
+- **Allow standing rules after review.** "Always approve replies to this internal distribution list" is reasonable once a human has chosen it, and should be revocable and logged.
+- **Measure rejection rates.** If approvers reject under 1% of requests, either the agent is excellent or nobody is reading. Sample and audit.
+
+## Logging for after the fact
+
+Every proposed action, approval, rejection, and execution should be written to an append-only log with the sources that triggered it. When something goes wrong in a proactive system, the question is always "what did it see, and why did it think that was an instruction?" Without the log you cannot answer.
+
+## What we recommend
+
+If a client asks for an agent that acts on a schedule:
+
+1. Start read-only for two weeks and review what it *would* have done.
+2. Put the tier table in code and default unknown tools to deny.
+3. Make approvals carry their source references and expire.
+4. Keep secrets out of the model's context and scope credentials per action.
+5. Track approval and rejection rates as a health metric.
+
+Duet is a research preview, and Anthropic itself describes limits. But the pattern, free reads and gated side effects, is sound regardless of vendor. Build it into your own agents before the first unattended run, not after the first incident.
