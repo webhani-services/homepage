@@ -1,0 +1,114 @@
+---
+title: "Claude Code 2.1.319: Making Unattended Runs Neither Hang Nor Silently Succeed"
+description: "Claude Code 2.1.319 (November 6) reportedly backgrounds MCP tasks, adds a setting that denies instead of prompting, changes auto mode behind LLM gateways, and makes `claude -p` exit 1 on refusals. Here is what that means for CI and scheduled jobs."
+date: "2026-11-10"
+status: "published"
+tags: ["Claude Code", "AI", "CI/CD", "MCP", "Developer Tools"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-2-1-319-unattended-runs-deny-prompts-mcp-tasks-2026-11"
+---
+
+Teams running Claude Code in CI or on a schedule tend to hit two failure modes. The job hangs on a permission prompt nobody will ever answer. Or the job finishes green even though the agent was refused and did nothing useful.
+
+Version 2.1.319, released November 6, touches both. The details below come from several third-party write-ups (classmethod, DEV Community and others), not from Anthropic's changelog directly, so confirm setting names and exact behavior against the official docs before you roll anything out.
+
+## What reportedly changed
+
+- **MCP tasks run in the background.** When an MCP server executes a tool call as a task, Claude Code backgrounds it immediately and reports the result to Claude when it completes. Environment variables let you make it wait instead, or turn MCP tasks off. MCP calls made by subagents do not become tasks.
+- **Deny instead of prompt.** A new `permissions.denyInsteadOfPrompting` setting denies a call that would otherwise wait on a permission prompt, so the turn continues.
+- **Auto mode behind gateways.** With telemetry or feature flags off, including behind an LLM gateway, calls the server cannot classify are now asked about or denied, instead of falling back to the local classifier. `CLAUDE_CODE_AUTO_MODE_SERVER=0` restores the old behavior. Bedrock, Vertex and Foundry are unaffected.
+- **`claude -p` exit codes.** When auto mode refuses actions, the process now exits 1 instead of 0.
+
+Each change is small. Together they shift the assumptions behind unattended runs.
+
+## Fixing "it hangs": deny instead of prompting
+
+The worst headless failure is a prompt that waits until the job times out. If the call is denied, the agent either finds another route or reports what it could not do and exits.
+
+For CI, keep an explicit allowlist and deny everything else:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Bash(npm run lint)",
+      "Bash(npm run test:*)",
+      "Bash(git diff:*)"
+    ],
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(curl:*)",
+      "Read(./.env*)"
+    ],
+    "denyInsteadOfPrompting": true
+  }
+}
+```
+
+Keep this as a CI-only settings file. Locally you often want to be asked; in CI, denying is the right default.
+
+## Fixing "it silently succeeds": use the exit code
+
+Now that `claude -p` exits 1 on auto mode refusals, a CI step can detect that the agent did not finish its job. Record why before failing; it saves time later:
+
+```yaml
+# .github/workflows/claude-maintenance.yml (excerpt)
+- name: Run Claude Code
+  id: claude
+  run: |
+    set +e
+    claude -p "Fix the lint warnings in dependency code and confirm tests pass" \
+      --output-format json > claude-result.json
+    echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+- name: Report refusal or failure
+  if: steps.claude.outputs.exit_code != '0'
+  run: |
+    echo "::warning::Claude Code exited with ${{ steps.claude.outputs.exit_code }}"
+    jq -r '.result // "no result"' claude-result.json | head -50
+    exit 1
+
+- name: Upload transcript
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: claude-result
+    path: claude-result.json
+```
+
+Pipelines that treated exit 0 as success may start failing after this update. That is not a regression. Refusals that used to be invisible are now visible, and it is a good prompt to revisit your allowlist.
+
+## Teams behind an LLM gateway: check before upgrading
+
+Organizations that route Claude Code through an internal gateway are the most likely to notice. Without the local classifier fallback, actions that used to pass automatically may now be prompted or denied.
+
+You have two options:
+
+1. **Widen the allowlist.** Spell out commonly used commands under `allow`. The permitted surface is then written down in config, which is what an auditor wants to see.
+2. **Set `CLAUDE_CODE_AUTO_MODE_SERVER=0`.** Treat this as a temporary bridge with an end date.
+
+We generally recommend option 1. The more you delegate to automatic classification, the harder it is to explain afterward why a given action was allowed.
+
+## Background MCP tasks: design notes
+
+Backgrounding long-running MCP tools (builds, data pulls, polling external APIs) lets the agent keep working while it waits. It also raises a few design questions:
+
+- **Idempotency.** Results may arrive late, and tasks may be retried. Make the tool safe to run twice.
+- **stdio server lifetime.** A stdio MCP server stops when Claude Code exits, so in-memory task state can be lost. Persist long-running task state to a file or database.
+- **CI completion.** If the job ends while background tasks are still running, you lose their results. In CI, either configure the session to wait or prompt the agent to confirm task completion before exiting.
+
+## Our take
+
+This release reads as Claude Code leaning further into its role as an unattended worker, not just an interactive assistant. Unattended work has two basic requirements: don't stall, and report failure as failure. 2.1.319 addresses both.
+
+What we would put on the team checklist:
+
+1. Maintain a CI-specific permissions file with an explicit allowlist and deny-instead-of-prompt.
+2. Capture `claude -p` exit codes and output in CI so refusals are traceable.
+3. If you are behind a gateway, expand the allowlist before upgrading.
+4. Make long-running MCP tools idempotent and store their state outside the process.
+
+Claude Code ships often. Managing these settings as shared team configuration, rather than in each developer's personal setup, is what keeps unattended runs predictable.

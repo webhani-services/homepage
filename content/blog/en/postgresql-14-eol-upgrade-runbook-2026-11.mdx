@@ -1,0 +1,113 @@
+---
+title: "PostgreSQL 14 Reaches End of Life on November 12: An Upgrade Runbook"
+description: "Community support for PostgreSQL 14 ends on November 12, 2026, and security fixes stop with it. Inventory, choosing a target version, pg_upgrade versus logical replication, and what managed services charge for extended support."
+date: "2026-11-10"
+status: "published"
+tags: ["PostgreSQL", "Database", "Security", "AWS", "Operations"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-14-eol-upgrade-runbook-2026-11"
+---
+
+PostgreSQL 14 gets its final minor release on November 12, and then support ends. The project follows a five-year support policy, and its May update announcement stated the date explicitly. Any vulnerability found after the 12th will not be fixed upstream for the 14 line.
+
+HeroDevs, which sells extended support, counts 44 PostgreSQL CVEs published so far this year. You can argue about how CVEs are counted, but "it still runs, so leave it" is a weaker position than it used to be. Below is what to do in the next few days, and how to run the migration after that.
+
+## Start with an inventory
+
+First, find out where 14 is still running. Production is the obvious one; also check staging, analytics replicas, CI service containers, and developers' docker-compose files.
+
+```sql
+-- Run on each instance
+SELECT version();
+
+-- Extensions that affect the upgrade
+SELECT extname, extversion FROM pg_extension ORDER BY extname;
+
+-- Database sizes, to choose an upgrade method
+SELECT datname, pg_size_pretty(pg_database_size(datname))
+FROM pg_database
+WHERE datistemplate = false
+ORDER BY pg_database_size(datname) DESC;
+```
+
+On the repository side, a search for pinned image tags and engine versions catches what people forget:
+
+```bash
+grep -rnE "postgres(ql)?:14|POSTGRES_VERSION=14|engine_version.*\"14" \
+  --include="*.yml" --include="*.yaml" --include="*.tf" --include="Dockerfile*" .
+```
+
+## Default to 18 as the target
+
+Your options are 18 and 19. In most cases we recommend **18**: it has been out for a year, and major extensions and managed services support it well. Consider 19 for new projects, or where you have confirmed every extension you depend on supports it.
+
+Changes to watch when going from 14 to 18:
+
+- **Data checksums are on by default in initdb.** If your 14 cluster was created without checksums, `pg_upgrade` will refuse to proceed. Either create the new cluster with `--no-data-checksums` or enable checksums on the old cluster first.
+- **MD5 password authentication is deprecated.** 18 emits warnings for MD5. Switch to `scram-sha-256` as part of the migration rather than as a separate project.
+- **pg_upgrade keeps planner statistics.** Since 18, optimizer statistics survive the upgrade, which reduces the usual post-upgrade slowdown.
+
+## Choosing a method
+
+| Method | Downtime | Good fit |
+| --- | --- | --- |
+| `pg_dump` / `pg_restore` | Long | Up to tens of GB, with a maintenance window |
+| `pg_upgrade --link` | Minutes | In-place upgrade on the same host |
+| Logical replication | Cutover only | Large databases, near-zero downtime |
+
+With `pg_upgrade`, always start with `--check`:
+
+```bash
+/usr/lib/postgresql/18/bin/pg_upgrade \
+  --old-bindir=/usr/lib/postgresql/14/bin \
+  --new-bindir=/usr/lib/postgresql/18/bin \
+  --old-datadir=/var/lib/postgresql/14/main \
+  --new-datadir=/var/lib/postgresql/18/main \
+  --link --check
+```
+
+For minimal downtime, replicate logically: publish on 14, subscribe on 18.
+
+```sql
+-- Old cluster (14)
+CREATE PUBLICATION upgrade_pub FOR ALL TABLES;
+
+-- New cluster (18): create the schema first with pg_dump --schema-only
+CREATE SUBSCRIPTION upgrade_sub
+  CONNECTION 'host=old-db port=5432 dbname=app user=replicator'
+  PUBLICATION upgrade_pub;
+```
+
+Logical replication does not copy sequence values. Put a step in the runbook to carry them over right before cutover:
+
+```sql
+-- On the old cluster, generate setval statements for the new one
+SELECT format('SELECT setval(%L, %s, true);',
+              schemaname || '.' || sequencename, last_value)
+FROM pg_sequences
+WHERE last_value IS NOT NULL;
+```
+
+After cutover, run `vacuumdb --all --analyze-in-stages` and compare execution plans for your key queries against the old cluster.
+
+## On managed services
+
+Amazon RDS and Aurora, Cloud SQL, and Azure Database for PostgreSQL automatically enroll end-of-life major versions in paid extended support. Your database keeps running, but you pay a per-vCPU surcharge, and the bill grows the longer you wait.
+
+AWS published new Aurora PostgreSQL minor versions on November 3 that backport community CVE fixes. If you will stay on 14 for a while, at least keep the minor version current.
+
+For the major upgrade itself, managed blue/green deployments make rollback much easier. Rehearse on an environment restored from a snapshot before touching production.
+
+## Our take
+
+Major database upgrades are easy to postpone in a way library updates are not. But once a database is past end of life, newly found vulnerabilities are ones you cannot fix yourself.
+
+A one-month plan:
+
+1. **This week:** Find every environment running 14 and bring it to the latest minor release.
+2. **This month:** Confirm extension support, pick a method, and rehearse on staging.
+3. **By year end:** Finish the production migration and stop paying for extended support.
+4. **Ongoing:** Put the next EOL (PostgreSQL 15, November 2027) on the calendar and start planning a year ahead.
+
+PostgreSQL EOLs land at the same time every year. Keep the runbook from this migration, and next year's move off 15 will be routine.
