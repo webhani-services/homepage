@@ -1,0 +1,116 @@
+---
+title: "Amazon ECS Gateway：ALB の共有をマネージドにする新しい Ingress と、導入前に確認すべき制約"
+description: "AWS が ECS サービス向けのマネージド Ingress「ECS Gateway」を公開しました。最大25サービスで1つの ALB を共有でき、追加料金はありません。一方で、カスタムドメインの扱いや ALB 数の増え方には注意が必要です。仕組みと評価の観点を整理します。"
+date: "2026-11-05"
+status: "published"
+tags: ["AWS", "Amazon ECS", "ロードバランサー", "Platform Engineering", "コンテナ"]
+thumbnail: ""
+author: "webhani"
+slug: "amazon-ecs-gateway-managed-ingress-2026"
+---
+
+AWS は10月20日、ECS サービス向けのマネージド Ingress である **Amazon ECS Gateway** を発表しました。ECS で複数のサービスを運用しているチームの多くは、「サービスごとに ALB を作るか」「1つの ALB を Terraform のリスナールールで手作業で共有するか」のどちらかを選んできました。ECS Gateway は、その中間を AWS が肩代わりする選択肢です。
+
+本記事は AWS の発表、ECS 開発者ガイド、InfoQ の記事、およびいくつかの検証レポートをもとにまとめています。クォータや仕様は今後変わる可能性があるため、導入時には公式ドキュメントを確認してください。
+
+## 仕組み
+
+ECS Gateway は **アカウントレベルの Ingress リソース** です。役割分担は次のように整理できます。
+
+- **プラットフォームチーム**：Gateway を作成し、ネットワークの設定を一度だけ定義する
+- **アプリケーションチーム**：サービスの作成・更新時に「Gateway connector」を設定し、Gateway に参加する
+
+接続されたサービスには、それぞれ固有の DNS ホスト名が割り当てられ、ホストベースのルーティングで振り分けられます。主な仕様は以下のとおりです。
+
+| 項目 | 内容 |
+| --- | --- |
+| ALB の共有 | 1つの ALB を最大25サービスで共有（変更不可とされる） |
+| Gateway あたりの ALB 数 | デフォルト上限10（引き上げ可能なクォータ、最大200） |
+| ネットワークモード | `awsvpc` のみ。bridge / host / none は接続不可 |
+| 起動タイプ | EC2、Fargate、ECS Managed Instances |
+| connector | 1サービスにつき1つ |
+| 料金 | Gateway 自体は無料。作成される ALB などのリソース分のみ課金 |
+| 非対応 | Express Mode のサービス |
+
+検証レポートによれば、Gateway を作っただけでは何もプロビジョニングされず、connector を持つサービスがデプロイされた時点で ALB が作成されます。connector はタスク定義の名前付きポート（`portName`）を参照するため、既存のタスク定義でポートに名前を付けていない場合は先に修正が必要です。
+
+```json
+{
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/api:1.4.2",
+      "portMappings": [
+        { "name": "http", "containerPort": 8080, "protocol": "tcp" }
+      ]
+    }
+  ],
+  "networkMode": "awsvpc"
+}
+```
+
+## 何が楽になるのか
+
+これまで ALB の共有を自前で実装する場合、次のような Terraform を書いてきたはずです。
+
+```hcl
+resource "aws_lb_listener_rule" "orders" {
+  listener_arn = aws_lb_listener.https.arn
+  priority     = 120
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.orders.arn
+  }
+
+  condition {
+    host_header {
+      values = ["orders.internal.example.com"]
+    }
+  }
+}
+```
+
+これ自体は単純ですが、サービスが増えると、ルールの priority の衝突、どのチームがどのルールを所有するか、ALB のルール上限、証明書の割り当てといった運用上の調整事項が積み上がります。ECS Gateway は、この調整をプラットフォーム側で引き受け、アプリケーションチームは connector を付けるだけにする、という整理です。
+
+小規模なチームが「サービスごとに ALB」を続けて ALB の固定費が膨らんでいる場合にも、コスト面のメリットがあります。
+
+## 導入前に確認したい制約
+
+### カスタムドメイン
+
+InfoQ は、ドキュメントにカスタムドメイン名や Route 53、CNAME の扱いが記載されていない点を指摘しています。生成されたホスト名は社内のサービス間通信や検証環境には十分ですが、顧客向けのドメインで公開するサービスでは、前段に CloudFront や別のプロキシを置く構成になるかもしれません。本番の外部公開に使う前に、ドメインと証明書の扱いを PoC で確認してください。
+
+### ALB の数は減るが、なくならない
+
+25サービスごとに ALB が1つ追加されるため、ALB の数はサービス数に比例して増え続けます。InfoQ も「複数の ALB を扱えるが、詰めて配置するわけではない」と指摘しています。サービスが100を超えるような環境では、コスト削減幅を事前に試算しておく必要があります。
+
+### 既存の Ingress との共存
+
+すでに Terraform で ALB を共有している場合、全サービスを一度に移す必要はありません。新規サービスから Gateway に載せ、既存の手書きルールは段階的に移行するのが現実的です。その間は、どのサービスがどちらの経路で公開されているかを一覧で管理しておくと、障害時の切り分けが楽になります。
+
+まずは現在の ALB の数と、それぞれにぶら下がるリスナールール数を把握するところから始めるとよいでしょう。
+
+```bash
+# アカウント内の ALB を一覧表示
+aws elbv2 describe-load-balancers \
+  --query "LoadBalancers[?Type=='application'].[LoadBalancerName,LoadBalancerArn]" \
+  --output table
+```
+
+## webhani の見方
+
+ECS Gateway は、Kubernetes における Ingress Controller や Gateway API に近い役割を、ECS のマネージド機能として提供するものと捉えるとわかりやすいと思います。「Kubernetes を入れるほどではないが、サービス数は増えてきた」という規模のチームには、ちょうどよい選択肢です。
+
+一方で、リリース直後の機能であり、カスタムドメインのような実運用で必ず問われる部分の情報がまだ少ない状態です。私たちがお客様に提案する場合は、次の順序を想定しています。
+
+1. 社内向け API や検証環境など、生成ホスト名で問題ないサービスで試す
+2. ALB 数とコストの変化を1〜2か月計測する
+3. ドメイン・証明書・WAF の扱いを確認した上で、外部公開サービスへの適用を判断する
+
+## まとめ
+
+- ECS Gateway は、ALB の共有をプラットフォームチームが一度定義し、アプリケーションチームは connector で参加するモデルです。
+- 対象は `awsvpc` のサービスのみで、タスク定義のポートに名前が必要です。
+- 1つの ALB を共有できるのは最大25サービスです。サービス数に応じて ALB は増え続けます。
+- カスタムドメインの扱いは PoC で確認し、まずは社内向けのサービスから導入するのが安全です。

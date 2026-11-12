@@ -1,0 +1,112 @@
+---
+title: "Next.js 2026年11月 Security Release：16.4.5 / 15.5.29 と、マルチテナントのキャッシュ設計を見直すべき理由"
+description: "11月3日の Next.js Security Release では、unstable_cache と use cache を併用した際のテナント間キャッシュ漏えい（High）を含む複数の脆弱性が修正されました。影響の見極め方、アップグレード手順、キャッシュキーの設計ルールを整理します。"
+date: "2026-11-05"
+status: "published"
+tags: ["Next.js", "セキュリティ", "キャッシュ", "React", "マルチテナント"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-november-2026-security-release-cache-isolation"
+---
+
+Next.js チームは事前告知どおり、11月3日に Security Release を公開しました。修正版は **16.4.5（Active LTS）** と **15.5.29（Maintenance LTS）** です。大半は Medium 評価ですが、マルチテナントの SaaS を運用しているチームにとっては見過ごせない High の問題が1件含まれています。
+
+以下は Next.js 公式ブログと、検索で確認できた二次情報をもとにした整理です。件数や識別子（CVE / GHSA）はソースによって表記が異なるため、正確な一覧は nextjs.org/blog の公式ポストで確認してください。
+
+## 修正された主な問題
+
+| 深刻度 | 内容 | 影響を受けやすい構成 |
+| --- | --- | --- |
+| High | テナント間のキャッシュ漏えい | `unstable_cache` と `use cache` を併用している |
+| Medium | セルフホスト環境でのキャッシュポイズニング | 特定の動的ルート構成 + blocking fallback |
+| Medium | 古い圧縮レスポンスのフレーミングによるレスポンス注入・漏えい | HTTP/1.1 パイプラインを使うリバースプロキシの背後 |
+| Medium | `x-middleware-set-cookie` ヘッダー経由での Cookie 値の露出 | 同一オリジンで攻撃者の JavaScript が既に動いている場合 |
+| Medium | Image Optimization での SVG 拒否のバイパス | AVIF の誤判定による |
+
+### High：テナント間のキャッシュ漏えい
+
+最も深刻なのは、`unstable_cache` と `use cache` を組み合わせたアプリで、あるテナントのキャッシュデータが別のテナントに返ってしまう問題です。ログイン中のユーザーやテナントごとにデータを出し分けている SaaS では、情報漏えいに直結します。
+
+### Medium：セルフホスト環境のキャッシュポイズニング
+
+公式ポストによれば、成立するにはかなり特定のルート構成が必要です。ビルド時に生成されていない値で prerender 可能な動的パラメータにアクセスし、さらにその下層のパラメータが prerender されておらず、blocking fallback shell があり、レイアウトが Suspense 境界の中で浅い階層のパラメータを読んでいる、という条件です。Vercel 上ではなく、自前の Node.js サーバーや Docker で `next start` を動かしているチームは、自社のルート構成と照らし合わせておくべきです。
+
+### Medium：レスポンスのフレーミング問題
+
+圧縮レスポンスのフレーミングが古いまま残ることで、レスポンスが別のリクエストに混入する可能性があります。HTTP/1.1 のパイプラインを使うリバースプロキシの背後では、レスポンスの取り違えにつながると報告されています。Nginx や社内のロードバランサーの背後でセルフホストしている場合は、優先的に確認したい項目です。
+
+## アップグレード手順
+
+まず、実際に動いているバージョンを確認します。`package.json` の範囲指定ではなく、lockfile で解決されたバージョンを見るのがポイントです。
+
+```bash
+# 解決済みバージョンを確認
+npm ls next
+
+# Active LTS ライン
+npm install next@16.4.5
+
+# Maintenance LTS ライン（15 系を使っている場合）
+npm install next@15.5.29
+```
+
+当社のホームページも Next.js 16 系で動いているため、今回のアップデートの対象です。手順は単純ですが、次の点は省略しないことをおすすめします。
+
+1. lockfile の差分で `next` 以外のパッケージが大きく動いていないか確認する
+2. Docker イメージを再ビルドし、ベースイメージのキャッシュで古いバージョンが残っていないか確認する
+3. デプロイ後に、ランタイムで実際に読み込まれているバージョンを確認する
+
+最後の項目は意外と抜けがちです。CI では新しいバージョンでビルドしていても、本番では古いイメージが動き続けていた、という事例は珍しくありません。
+
+## 本題：キャッシュキーにテナントを「明示」する
+
+パッチを当てれば今回の問題は解消します。しかし、私たちがより重要だと考えているのは設計側の教訓です。キャッシュの分離を、フレームワークがリクエストのコンテキストから自動的に推測してくれることに頼らない、ということです。
+
+`use cache` は、関数の引数とクロージャで参照する値をキャッシュキーに含めます。したがって、テナント ID を関数の外（cookies やヘッダー）から暗黙的に読むのではなく、引数として明示的に渡す形にしておくと、キーが必ずテナントごとに分かれます。
+
+```tsx
+// lib/data.ts
+// NG: テナントを関数内で暗黙的に解決している
+export async function getDashboardImplicit() {
+  "use cache";
+  const tenantId = await resolveTenantFromSomewhere(); // キーに含まれない可能性
+  return db.dashboard.findMany({ where: { tenantId } });
+}
+
+// OK: テナント ID を引数で受け取り、キャッシュキーに確実に含める
+export async function getDashboard(tenantId: string) {
+  "use cache";
+  return db.dashboard.findMany({ where: { tenantId } });
+}
+```
+
+`unstable_cache` を使っている箇所も同様で、keyParts と tags にテナントを入れておきます。
+
+```ts
+import { unstable_cache } from "next/cache";
+
+export function getInvoices(tenantId: string) {
+  return unstable_cache(
+    async () => db.invoice.findMany({ where: { tenantId } }),
+    ["invoices", tenantId],
+    { tags: [`tenant:${tenantId}:invoices`], revalidate: 300 },
+  )();
+}
+```
+
+あわせて、`unstable_cache` から `use cache` への移行が中途半端な状態で、同じデータに2つのキャッシュ機構が混在していないかも確認しておくと安心です。今回の High の問題は、まさにその併用パターンで発生しています。
+
+## その他の対策
+
+- **Image Optimization**：SVG を扱う必要がなければ、`images.dangerouslyAllowSVG` を有効にしないままにしておきます。ユーザーがアップロードした画像を最適化の対象にしている場合は、許可するリモートパターンを最小限に絞りましょう。
+- **リバースプロキシ**：上流への HTTP/1.1 パイプラインを使っているかどうかを確認します。多くの構成では無効ですが、独自のプロキシや古い設定が残っていないか点検しておく価値はあります。
+- **CSP**：Cookie の露出は「同一オリジンで攻撃者の JavaScript が動いている」ことが前提です。逆にいえば、XSS を防ぐ Content Security Policy が、この種の問題の被害を抑える最後の防衛線になります。
+
+同じ11月3日には、認証ライブラリの Better Auth も 1.7.16 で12件のセキュリティ修正を公開しています。Next.js と組み合わせて使っている場合は、まとめて更新するのが効率的です。
+
+## まとめ
+
+- `next` を 16.4.5 または 15.5.29 に上げ、本番で実際に動いているバージョンまで確認してください。
+- マルチテナントのアプリでは、テナント ID を cache 関数の引数や keyParts として明示し、暗黙の分離に頼らないようにしてください。
+- セルフホスト環境では、ルート構成とリバースプロキシの設定を今回の条件と照らし合わせてください。
+- 毎月のように Security Release が出ている現状では、パッチ適用を「イベント」ではなく、定常的なメンテナンスの手順として組み込んでおくことをおすすめします。

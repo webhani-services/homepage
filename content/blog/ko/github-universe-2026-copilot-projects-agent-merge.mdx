@@ -1,0 +1,123 @@
+---
+title: "GitHub Universe 2026: Copilot Projects와 Agent Merge, Merge 버튼의 책임은 누구에게 있는가"
+description: "GitHub Universe 2026에서 Copilot은 Editor 보조 도구에서 Issue부터 Merge까지 처리하는 Agent Platform으로 바뀌었습니다. Copilot Projects, Agent Merge, code review Max, Connectors의 핵심과 도입 전에 갖춰야 할 Repository 측 Guardrail을 정리합니다."
+date: "2026-11-05"
+status: "published"
+tags: ["GitHub Copilot", "AI Agent", "Code Review", "DevOps", "MCP"]
+thumbnail: ""
+author: "webhani"
+slug: "github-universe-2026-copilot-projects-agent-merge"
+---
+
+10월 28~29일 샌프란시스코에서 열린 GitHub Universe 2026의 중심은 Copilot이었습니다. 개별 기능보다 중요한 것은 범위의 변화입니다. Copilot은 이제 Editor에서 코드를 제안하는 도구가 아니라, Issue를 받아 여러 Agent를 조율하고 Pull Request를 Merge 가능한 상태까지 끌고 가는 도구로 자리매김했습니다.
+
+이 글은 GitHub 공식 블로그와 여러 행사 리포트를 바탕으로 정리했습니다. Preview/GA 구분과 요금 체계는 리포트마다 설명이 다르므로, 도입을 결정하기 전에 github.blog/changelog에서 최신 정보를 확인하시기 바랍니다.
+
+## 주요 발표 내용
+
+**Copilot app**
+Agent 기반 Software Delivery를 위해 새로 설계된 Application입니다. GitHub는 여러 Project에 걸친 Agent와 Tool을 연결해, 개발자가 모든 인수인계를 직접 관리하지 않고 작업 방향을 지시하는 데 집중할 수 있게 한다고 설명합니다.
+
+**Copilot Projects (Public Preview)**
+여러 Repository, Design Mock, Slack 논의, 회의록 등을 하나의 Project로 묶으면, Copilot이 필요한 만큼의 Agent를 병렬로 실행해 Pull Request 같은 결과물을 돌려줍니다. 하나의 Model이 작업 전체를 떠안는 대신 여러 Agent가 나누어 처리하는 구조입니다.
+
+**Copilot Fusion**
+이전에 HydraFusion이라는 이름으로 Preview되었던 Model Routing 및 조율 계층입니다. GA라고 보도한 매체도 있고, 여전히 Preview라고 쓴 매체도 있습니다.
+
+**Agent Merge와 공유 Automations**
+Pull Request의 Merge Box에 Agent Merge가 추가되어, 실패한 CI나 Merge Conflict를 Agent가 직접 수정할 수 있게 되었습니다. Copilot Automations는 팀 단위로 공유할 수 있고, Issue Triage나 Code Review 같은 반복 작업에 배정할 수 있습니다.
+
+**Copilot code review Max (Public Preview)와 Connectors**
+code review Max는 서로 다른 Model Provider 기반의 여러 Review Agent에 Review를 요청하고, 결과를 하나의 Review로 통합합니다. Connectors는 GitHub가 검증한 MCP Server로, Slack이나 Sentry 같은 Tool을 각 Copilot Client에서 사용할 수 있게 합니다.
+
+GitHub는 또한 전체 Pull Request의 40% 이상을 Agent가 생성하고 있다고 밝혔습니다.
+
+## 40%라는 숫자가 의미하는 것
+
+Pull Request 생성의 상당 부분을 Agent가 맡게 되면, 병목은 코드 작성에서 Review와 Merge 판단으로 옮겨갑니다. 10월에 쓴 [AI Agent로 코드는 늘었지만 성과는 그대로](/blog/ai-agents-more-code-same-output-review-bottleneck-2026-10)에서도 다룬 내용입니다. Review 체계는 그대로 둔 채 생성량만 늘리면, 대기 중인 PR이 쌓이거나 충분히 확인되지 않은 채 Merge되는 경우가 늘어납니다.
+
+Agent Merge는 여기서 한 걸음 더 나아갑니다. Agent가 CI를 고치고 Conflict까지 해결한다면, Merge 직전 Branch 상태를 누가 보증하는지 기능을 켜기 전에 정해 두어야 합니다.
+
+## 도입 전에 갖춰야 할 Repository 측 Guardrail
+
+Agent 기능은 GitHub 설정 화면에서 켤 수 있지만, 안전하게 운영하는 것은 Repository 쪽의 몫입니다. 사내 및 고객 Project에서 저희가 가장 먼저 확인하는 항목은 다음과 같습니다.
+
+### 1. Ruleset으로 필수 Check와 사람의 Review를 고정합니다
+
+Agent Merge가 CI를 통과시키더라도, 그 수정이 올바른지는 별개의 문제입니다. Branch Ruleset으로 필수 Status Check와 최소 1명의 Approval을 강제합니다. "마지막 Push 이후의 Approval"을 필수로 설정하면, 사람이 승인한 뒤 Agent가 Commit을 추가한 경우도 걸러낼 수 있습니다.
+
+### 2. CODEOWNERS로 Agent가 단독으로 건드리면 안 되는 영역을 지정합니다
+
+```text
+# .github/CODEOWNERS
+# 인증·결제·Infra는 반드시 담당 팀의 Review를 거친다
+/src/auth/            @your-org/security-team
+/src/billing/         @your-org/payments-team
+/infra/               @your-org/platform-team
+/.github/workflows/   @your-org/platform-team
+```
+
+특히 `.github/workflows/`가 중요합니다. Agent가 CI를 "고치는" 과정에서 Workflow 자체를 수정해 버리면 Check는 의미를 잃습니다.
+
+### 3. Agent가 작성한 PR에 Label을 붙입니다
+
+Agent가 쓴 변경이라는 사실을 알기만 해도 Reviewer의 확인 관점이 달라집니다. 아래는 PR 작성자가 설정된 Bot 계정 목록에 있을 때 Label을 붙이는 간단한 Workflow입니다. 목록은 실제로 사용하는 Agent에 맞게 설정하세요.
+
+```yaml
+# .github/workflows/label-agent-pr.yml
+name: Label agent-authored PRs
+on:
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@<full-commit-sha> # v7.x
+        env:
+          AGENT_LOGINS: ${{ vars.AGENT_LOGINS }} # 예: "copilot[bot],other-agent[bot]"
+        with:
+          script: |
+            const agents = (process.env.AGENT_LOGINS || "").split(",").map(s => s.trim());
+            const author = context.payload.pull_request.user.login;
+            if (agents.includes(author)) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ["agent-authored"],
+              });
+            }
+```
+
+이 Job은 PR의 코드를 Checkout하거나 실행하지 않으므로 `pull_request_target`을 써도 안전합니다. 용도는 Label 부여로만 한정하세요.
+
+### 4. Connectors(MCP)는 최소 권한으로 시작합니다
+
+Slack이나 Sentry를 연결하면 Agent가 받는 Context의 질은 좋아집니다. 동시에 외부 텍스트가 Agent에 대한 지시로 읽힐 수 있는 경로도 늘어납니다. 처음에는 읽기 전용 Scope로 시작하고, 어떤 Connector가 어느 Repository에서 켜져 있는지 목록으로 관리하는 것이 안전합니다.
+
+## code review Max는 어디에 두어야 하는가
+
+여러 Model로 Review하는 방식은 단일 Model의 사각지대를 줄이는 합리적인 방법입니다. 다만 저희는 이를 사람의 Review를 대체하는 것이 아니라, 사람이 Diff를 읽기 전의 1차 Filter로 다룰 것을 권합니다. Model은 국소적인 Bug나 Style 문제를 잘 찾지만, Spec과의 정합성이나 Domain 관점의 판단은 여전히 사람의 몫입니다.
+
+Agent Review의 지적을 Merge 전에 반드시 해결해야 하는지도 미리 정해 두십시오. 그렇지 않으면 PR마다 같은 논의가 반복됩니다.
+
+## webhani의 시각
+
+이번 발표로 GitHub는 "Agent가 코드를 쓰는" 단계에서 "Agent가 Delivery 흐름을 돌리는" 단계로 넘어갔습니다. 도구로서는 매력적이지만, 실제 효과는 Repository의 규율에 달려 있습니다.
+
+- 필수 Check, Approval 규칙, CODEOWNERS가 갖춰진 팀일수록 Agent에게 맡길 범위를 넓히기 쉽습니다.
+- Test Coverage가 얕은 Repository에서는 Agent Merge가 올바른 동작보다 "CI를 초록색으로 만드는 것"을 최적화하게 됩니다.
+- License와 AI Credit 과금 체계가 바뀌고 있으므로, PoC 단계부터 사용량을 측정해 두십시오.
+
+## 정리
+
+- Copilot Projects, Agent Merge, code review Max, Connectors의 상당수는 Preview 단계입니다. Production Repository에 전면 도입하기 전에 Changelog에서 제공 상태를 확인하십시오.
+- Ruleset(필수 Check, 마지막 Push 이후 Approval)과 CODEOWNERS를 먼저 점검하십시오.
+- Agent가 작성한 PR을 눈에 보이게 만들어, Reviewer가 확인 관점을 바꿀 수 있게 하십시오.
+- MCP Connector는 읽기 전용으로 시작하고 목록을 관리하십시오.
+
+Agent가 생성하는 PR이 전체의 절반에 가까워지기 전에, Merge 시점의 Branch 상태를 누가 책임지는지 문서로 정해 두는 것이 지금 할 수 있는 가장 유용한 준비입니다.

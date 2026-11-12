@@ -1,0 +1,112 @@
+---
+title: "Next.js 2026년 11월 Security Release: 16.4.5 / 15.5.29 업그레이드와 Multi-tenant Cache Key 설계"
+description: "11월 3일 Next.js Security Release에서 unstable_cache와 use cache를 함께 쓸 때 발생하는 Tenant 간 Cache 유출(High)을 비롯한 여러 취약점이 수정되었습니다. 영향 범위 확인 방법, 업그레이드 절차, Cache Key 설계 원칙을 정리합니다."
+date: "2026-11-05"
+status: "published"
+tags: ["Next.js", "보안", "Cache", "React", "Multi-tenant"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-november-2026-security-release-cache-isolation"
+---
+
+Next.js 팀이 사전 공지대로 11월 3일 Security Release를 공개했습니다. 수정 버전은 **16.4.5**(Active LTS)와 **15.5.29**(Maintenance LTS)입니다. 대부분 Medium 등급이지만, Multi-tenant SaaS를 운영하는 팀이라면 그냥 넘길 수 없는 High 등급 문제가 하나 포함되어 있습니다.
+
+아래 내용은 Next.js 공식 블로그와 검색으로 확인한 2차 자료를 바탕으로 정리했습니다. 취약점 개수와 식별자(CVE / GHSA)는 자료마다 표기가 다르므로, 정확한 목록은 nextjs.org/blog의 공식 Post에서 확인하시기 바랍니다.
+
+## 수정된 주요 문제
+
+| 심각도 | 내용 | 영향받기 쉬운 구성 |
+| --- | --- | --- |
+| High | Tenant 간 Cache 유출 | `unstable_cache`와 `use cache`를 함께 사용 |
+| Medium | Self-hosted 환경의 Cache Poisoning | 특정 Dynamic Route 구조 + Blocking Fallback |
+| Medium | 오래된 압축 Response Framing으로 인한 Response 주입·유출 | HTTP/1.1 Pipelining을 쓰는 Reverse Proxy 뒤 |
+| Medium | `x-middleware-set-cookie` Header를 통한 Cookie 값 노출 | 같은 Origin에서 공격자의 JavaScript가 이미 실행 중인 경우 |
+| Medium | Image Optimization의 SVG 거부 우회 | AVIF 오분류로 인해 발생 |
+
+### High: Tenant 간 Cache 유출
+
+가장 심각한 문제는 `unstable_cache`와 `use cache`를 조합한 Application에서 한 Tenant의 Cache Data가 다른 Tenant에게 반환될 수 있다는 점입니다. 로그인 사용자나 Tenant별로 Data를 달리 보여주는 SaaS라면 곧바로 정보 유출로 이어집니다.
+
+### Medium: Self-hosted 환경의 Cache Poisoning
+
+공식 Post에 따르면 상당히 특정한 Route 구조가 필요합니다. Build 시점에 생성되지 않은 값으로 Prerender 가능한 Dynamic Parameter에 접근하고, 그 하위 Parameter는 Prerender되지 않으며, Blocking Fallback Shell이 있고, Layout이 Suspense 경계 안에서 더 얕은 계층의 Parameter를 읽는 경우입니다. Vercel이 아니라 자체 Node.js Server나 Container에서 `next start`를 운영하고 있다면, 실제 Route 구조와 대조해 보십시오.
+
+### Medium: Response Framing 문제
+
+압축 Response의 Framing이 오래된 상태로 남아, 한 Response가 다른 Request에 섞여 들어갈 수 있습니다. Upstream으로 HTTP/1.1 Pipelining을 하는 Reverse Proxy 뒤에서는 Response가 엉뚱한 Client에게 전달될 수 있다고 보고되었습니다. Nginx나 사내 Load Balancer 뒤에서 Self-hosting하고 있다면 가장 먼저 확인할 항목입니다.
+
+## 업그레이드 절차
+
+먼저 `package.json`의 버전 범위가 아니라, Lockfile에서 실제로 해석된 버전을 확인합니다.
+
+```bash
+# 실제 설치된 버전 확인
+npm ls next
+
+# Active LTS 라인
+npm install next@16.4.5
+
+# Maintenance LTS 라인 (15.x를 쓰는 경우)
+npm install next@15.5.29
+```
+
+저희 홈페이지도 Next.js 16 계열로 운영 중이라 이번 업데이트 대상입니다. 절차 자체는 간단하지만 다음 단계는 생략하지 않을 것을 권합니다.
+
+1. Lockfile Diff를 보고 `next` 외의 Package가 예상치 않게 바뀌지 않았는지 확인합니다.
+2. Container Image를 다시 Build하고, Cache된 Layer 때문에 이전 버전이 설치되어 있지 않은지 확인합니다.
+3. Deploy 후 Production에서 실제로 실행 중인 버전을 확인합니다.
+
+마지막 단계는 의외로 자주 빠집니다. CI는 새 버전으로 Build했는데 Production에서는 지난주 Image가 계속 돌고 있는 경우가 드물지 않습니다.
+
+## 핵심 교훈: Cache Key에 Tenant를 직접 넣으십시오
+
+Patch를 적용하면 이번 Bug는 해결됩니다. 하지만 더 오래 가는 교훈은 설계 원칙입니다. Cache 분리를 Framework가 Request Context에서 알아서 추론해 주리라 기대하지 마십시오.
+
+`use cache`는 함수의 인자와 Closure에서 참조하는 값으로 Cache Key를 만듭니다. Tenant ID를 함수 안에서 Cookie나 Header로부터 암묵적으로 읽지 말고 명시적인 인자로 넘기면, Key가 항상 Tenant별로 분리됩니다.
+
+```tsx
+// lib/data.ts
+// 피해야 할 방식: Cache 함수 안에서 Tenant를 암묵적으로 해석
+export async function getDashboardImplicit() {
+  "use cache";
+  const tenantId = await resolveTenantFromSomewhere(); // Key에 포함되지 않을 수 있음
+  return db.dashboard.findMany({ where: { tenantId } });
+}
+
+// 권장 방식: Tenant ID를 인자로 받아 Key에 반드시 포함
+export async function getDashboard(tenantId: string) {
+  "use cache";
+  return db.dashboard.findMany({ where: { tenantId } });
+}
+```
+
+기존 `unstable_cache` 호출도 마찬가지입니다. keyParts와 tags 양쪽에 Tenant를 넣어 둡니다.
+
+```ts
+import { unstable_cache } from "next/cache";
+
+export function getInvoices(tenantId: string) {
+  return unstable_cache(
+    async () => db.invoice.findMany({ where: { tenantId } }),
+    ["invoices", tenantId],
+    { tags: [`tenant:${tenantId}:invoices`], revalidate: 300 },
+  )();
+}
+```
+
+`unstable_cache`에서 `use cache`로 이전하다 멈춘 상태여서, 같은 Data를 두 Cache 메커니즘이 동시에 다루고 있지 않은지도 확인해 보십시오. 이번 High 등급 Bug가 바로 그 조합에서 발생했고, Bug가 없더라도 Cache 계층이 섞여 있으면 동작을 예측하기 어렵습니다.
+
+## 그 밖의 대책
+
+- **Image Optimization**: SVG가 필요 없다면 `images.dangerouslyAllowSVG`를 켜지 않은 상태로 둡니다. 사용자가 Upload한 Image를 최적화한다면 허용 Remote Pattern을 최소한으로 좁힙니다.
+- **Reverse Proxy**: Next.js Upstream으로 HTTP/1.1 Pipelining을 하는 구성 요소가 있는지 확인합니다. 대부분은 해당하지 않지만, 자체 Proxy나 오래된 설정은 점검할 가치가 있습니다.
+- **CSP**: Cookie 노출은 공격자의 JavaScript가 이미 같은 Origin에서 실행 중이라는 전제가 필요합니다. 결국 XSS를 막는 Content Security Policy가 이런 유형의 문제를 억제하는 마지막 방어선입니다.
+
+같은 11월 3일, Next.js와 자주 함께 쓰이는 인증 Library인 Better Auth도 1.7.16에서 12건의 보안 문제를 수정했습니다. 둘 다 쓰고 있다면 함께 업데이트하는 것이 효율적입니다.
+
+## 정리
+
+- `next`를 16.4.5 또는 15.5.29로 올리고, Production에서 실제로 실행 중인 버전까지 확인하십시오.
+- Multi-tenant Application에서는 Tenant ID를 Cache 함수의 인자나 keyParts로 명시하고, 암묵적인 분리에 의존하지 마십시오.
+- Self-hosting 중이라면 Route 구조와 Proxy 설정을 위 조건과 대조해 보십시오.
+- Security Release가 거의 매달 나오는 지금은, Patch 적용을 일회성 이벤트가 아니라 문서화된 정기 유지보수 절차로 만들어 두는 것이 좋습니다.
