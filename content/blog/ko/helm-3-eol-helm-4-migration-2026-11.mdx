@@ -1,0 +1,110 @@
+---
+title: "Helm 3 보안 지원 종료 일주일 전: Helm 4 전환 시 CI가 깨지는 지점"
+description: "Helm 3 보안 수정은 2026년 11월 11일 종료될 예정입니다. Chart는 대부분 그대로 동작하지만 CI Flag, --wait의 RBAC, Post-renderer, SDK 호출부는 깨질 수 있습니다. 전환 순서와 점검 항목을 정리합니다."
+date: "2026-11-04"
+status: "published"
+tags: ["Kubernetes", "Helm", "CI/CD", "DevOps", "보안"]
+thumbnail: ""
+author: "webhani"
+slug: "helm-3-eol-helm-4-migration-2026-11"
+---
+
+Helm 프로젝트는 HIP-0012에서 "Helm 4 출시 후 6~8개월 뒤 Helm 3를 EOL 처리한다"고 정했습니다. 여러 전환 가이드가 제시하는 일정은 다음과 같습니다.
+
+- **2026년 7월 8일**: Helm 3 Bug 수정 종료
+- **2026년 11월 11일**: Helm 3 보안 수정 종료
+
+일부 글은 보안 수정이 2027년 2월까지 이어진다고 다르게 적고 있으므로, 최종 일정은 helm.sh 공식 공지로 확인하시기 바랍니다. 어느 쪽이든 지금 계획을 세우기에 이른 시점은 아닙니다.
+
+## Chart는 쉬운 부분입니다
+
+Helm 4에서도 Chart API는 v2 그대로입니다. Helm 3로 Deploy되던 Chart는 Helm 4에서도 Deploy되는 것이 원칙이라, 대부분의 팀에게 Template 재작성 작업은 필요 없습니다.
+
+실제 문제는 Chart 주변의 도구에서 생깁니다. 특정 `helm` Binary가 고정된 CI Image, 이름이 바뀐 Flag를 쓰는 Script, Plugin, 그리고 Helm SDK를 import하는 Go Code입니다.
+
+## Server-Side Apply는 신규 Release에만 적용
+
+Helm 4는 새로 install하는 Release에 Server-Side Apply(SSA)를 기본으로 사용합니다. upgrade와 rollback은 해당 Release가 기존에 쓰던 Apply 방식을 따릅니다. 따라서 Helm 3로 만든 Release는 Helm 4로 upgrade해도 Client-Side Apply로 남습니다.
+
+같은 Chart라도 Release가 신규인지 기존인지에 따라 동작이 달라진다는 뜻입니다. SSA는 Field의 소유자를 기록하기 때문에, `kubectl edit`이나 다른 Controller가 같은 Field를 건드리면 Conflict로 드러날 수 있습니다. Pull Request마다 Preview 환경을 새로 만드는 구성이라면 운영 환경보다 훨씬 먼저 SSA 동작을 만나게 됩니다. 전환 기간에는 `--server-side`를 명시해 환경 간 동작을 맞추는 방법도 있습니다.
+
+## 이름이 바뀐 Flag
+
+```text
+--atomic  →  --rollback-on-failure
+--force   →  --force-replace
+```
+
+기존 이름은 경고와 함께 당분간 동작하지만, 향후 Minor Version에서 오류가 될 예정입니다. 새 이름은 Helm 3에 없으므로, 지금은 사용 위치를 파악해 두고 실제 교체는 CI를 Helm 4로 바꾸는 Pull Request에서 함께 진행하는 것이 안전합니다.
+
+```bash
+grep -rnE "helm .*(--atomic|--force)( |$)" \
+  .github/ scripts/ Makefile* helmfile* 2>/dev/null
+```
+
+`--force`는 `helm repo add`의 `--force-update` 같은 무관한 Flag와도 겹치므로 결과는 직접 확인합니다.
+
+## `--wait`에는 `watch` 권한이 필요
+
+보고에 따르면 Helm 4의 `--wait`는 kstatus 기반으로 바뀌었고 `watch` 권한이 필요합니다. CI용 ServiceAccount를 `get`, `list`로만 제한해 두었다면, 적용은 성공했는데 wait 단계에서 실패하는 헷갈리는 현상을 겪게 됩니다.
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ci-deployer
+  namespace: app
+rules:
+  - apiGroups: ["", "apps", "batch"]
+    resources: ["deployments", "statefulsets", "jobs", "pods", "services"]
+    verbs: ["get", "list", "watch"]
+  # install 자체에 필요한 create/update/patch/delete는 별도로 부여
+```
+
+필요한 Resource 종류는 Chart마다 다릅니다. Staging에서 Helm 4를 실행하고 `Forbidden` 오류가 나는 Resource를 하나씩 추가하는 방식이 확실합니다. `watch` 추가는 Helm 3에서도 문제가 없으니 먼저 반영해도 됩니다.
+
+## Post-renderer와 Plugin
+
+Helm 3에서는 `--post-renderer ./kustomize-wrapper.sh`처럼 실행 파일 경로를 바로 넘길 수 있었습니다. Helm 4에서는 Post-renderer를 Plugin으로 등록해야 합니다. Kustomize를 Post-renderer로 쓰는 구성은 흔하므로 별도 Test Case로 검증할 것을 권장합니다. WebAssembly 기반의 새로운 Plugin 방식도 도입되었기 때문에, 기존 Plugin의 호환성은 하나씩 확인해야 합니다.
+
+## 가장 위험한 곳은 SDK 호출부
+
+Helm을 Go Library로 쓰는 사내 도구나 Operator는 Import Path 변경과 API의 Breaking Change를 함께 맞닥뜨립니다. 한 커뮤니티 전환 기록에서는 `Wait bool`이 `WaitStrategy`로 바뀌었고, 값을 비워 두면 Helm이 Waiter 생성을 거부한다고 합니다. Compile 오류가 아닌 Runtime 오류이므로, Build 성공보다 Integration Test 결과가 훨씬 중요합니다.
+
+## 병행 운영으로 전환하기
+
+Helm 3와 Helm 4는 한 머신에서 함께 쓸 수 있습니다. 한 번에 바꾸지 말고 단계적으로 진행합니다.
+
+```bash
+# Helm 4를 다른 이름으로 설치 (버전은 공식 Release에서 확인 후 고정)
+curl -fsSL -o helm4.tar.gz \
+  "https://get.helm.sh/helm-v4.x.y-linux-amd64.tar.gz"
+tar -xzf helm4.tar.gz && sudo mv linux-amd64/helm /usr/local/bin/helm4
+
+# 같은 values로 Rendering 결과 비교
+helm  template app ./chart -f values-staging.yaml > /tmp/h3.yaml
+helm4 template app ./chart -f values-staging.yaml > /tmp/h4.yaml
+diff -u /tmp/h3.yaml /tmp/h4.yaml
+```
+
+Rendering 결과가 같다면 Staging에서 실제 `upgrade`를 실행해 `--wait`와 Post-renderer 동작을 확인합니다. 마지막으로 CI Image를 버전 고정으로 교체합니다.
+
+```yaml
+- uses: azure/setup-helm@<full-commit-sha>
+  with:
+    version: "v4.x.y"   # latest가 아닌 고정 버전
+```
+
+## webhani의 관점
+
+이번 전환은 "Chart는 동작하는데 Pipeline이 깨지는" 유형입니다. 애플리케이션 팀 눈에는 잘 띄지 않고, Platform 팀은 뒤로 미루기 쉽습니다. 하지만 Deploy 도구는 Cluster에 대한 쓰기 권한을 가집니다. 보안 지원이 끝난 도구를 CI에서 계속 쓰는 것은 결코 중립적인 선택이 아닙니다.
+
+고객사에 권장하는 순서는 다음과 같습니다.
+
+1. **현황 파악**: `helm`을 호출하는 CI Job, Script, Operator, 사내 도구를 목록화합니다.
+2. **RBAC 정비**: CI용 ServiceAccount에 `watch`를 추가합니다.
+3. **Staging 검증**: Post-renderer, `--wait`, 신규 Release의 SSA 동작을 확인합니다.
+4. **CI 전환과 Flag 교체를 함께**: 버전을 고정한 채 하나의 Pull Request로 진행합니다.
+5. **업데이트 자동화**: Renovate나 Dependabot으로 다음 버전 업이 Review 가능한 PR로 오도록 합니다.
+
+11월 12일이 되어도 Helm 3가 바로 멈추지는 않습니다. 다만 다음 취약점이 발견되었을 때 수정판이 나오지 않을 뿐입니다.

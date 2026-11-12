@@ -1,0 +1,130 @@
+---
+title: "oauthlib 4.0.0 and Two CVEs: PKCE Timing, JSONP Injection, and No 3.x Backport"
+description: "Python's oauthlib has two new advisories: a timing side channel in PKCE verification (CVE-2026-49265) and JSONP callback injection in the revocation endpoint (CVE-2026-49264). The fix exists only in 4.0.0. How to scope your exposure and what to do when a dependency caps you below 4.0."
+date: "2026-11-04"
+status: "published"
+tags: ["Security", "OAuth", "Python", "Dependency Management", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "oauthlib-4-pkce-timing-jsonp-cves-2026-11"
+---
+
+Few Python teams install `oauthlib` on purpose. It arrives through `requests-oauthlib`, which arrives through the Kubernetes Python client, SaaS SDKs, and the OAuth extensions for Django and Flask. Two advisories against it were published alongside the 4.0.0 release, and they are a good example of why "just upgrade" is not always a one-line answer.
+
+The fixes exist only in 4.0.0, a major release. The maintainers have not backported them to 3.x.
+
+## What the two issues are
+
+### CVE-2026-49265: non-constant-time PKCE comparison
+
+In PKCE, the client sends a `code_challenge` with the authorization request and later proves possession by presenting the original `code_verifier` with the token request. The authorization server checks that they match.
+
+From 3.0.0 up to 4.0.0, oauthlib performed that check with ordinary string comparison, which returns as soon as it finds a mismatched character. In theory, timing differences leak how much of a guess was correct. Version 4.0.0 switches to `hmac.compare_digest`. GitLab's advisory database scores it 6.8 (medium).
+
+In practice, the signal is tiny. The advisory's proof of concept measured roughly 0.037 seconds of difference over ten million iterations, and an attacker would also need to have intercepted a single-use authorization code first. Splunk's analysis frames it as defense in depth for authorization servers. Not urgent, but not a reason to leave it either.
+
+### CVE-2026-49264: JSONP callback injection
+
+From 0.6.1 up to 4.0.0, if a deployment sets `enable_jsonp=True` on the revocation endpoint, the `callback` parameter is reflected into the response body unvalidated, which lets a caller shape a response containing arbitrary JavaScript.
+
+JSONP is off by default. Only deployments that explicitly turned it on are affected, and in 2026 there is almost no legitimate reason to have it on.
+
+## Are you actually exposed?
+
+The first question is which side of OAuth you run oauthlib on.
+
+- **You run an authorization server** with oauthlib's provider classes, directly or through a library such as django-oauth-toolkit. Both CVEs apply. Prioritize this.
+- **You only act as a client**, for example fetching tokens with `requests-oauthlib`. Both bugs live in server-side code paths, so direct impact is limited. Your scanner will still flag it, so you need a documented decision.
+
+Find out who pulls it in:
+
+```bash
+# uv projects
+uv tree --invert --package oauthlib
+
+# plain pip environments
+pip install pipdeptree
+pipdeptree --reverse --packages oauthlib
+```
+
+And confirm JSONP is not enabled anywhere:
+
+```bash
+grep -rn "enable_jsonp" --include="*.py" .
+```
+
+## Upgrading to 4.0.0
+
+The breaking changes in 4.0.0 are reported to be on the provider side; the client interface is unchanged. For client-only use, the upgrade should be low risk.
+
+The catch is resolution. `requests-oauthlib` declares `oauthlib>=3.0.0`, so a resolver can legitimately land on a vulnerable 3.x. The Kubernetes Python client has an open issue and PR to pin `oauthlib>=4.0.0` for exactly this reason. Do the same in your own projects:
+
+```toml
+# pyproject.toml
+[project]
+dependencies = [
+  "requests-oauthlib>=2.0",
+  "oauthlib>=4.0.0",  # CVE-2026-49264 / CVE-2026-49265
+]
+```
+
+## When something caps you below 4.0
+
+The harder case is a dependency that declares `oauthlib<4.0.0`. There is an open request on the oauthlib repository for a 3.x release with the fixes; as of this writing, it has not happened. Options:
+
+1. **Assess and record.** If you are client-only and never enabled JSONP, the practical impact is nil. Suppress the scanner finding with a reason and a review date, not silently.
+2. **Protect your own comparisons.** If you have custom PKCE verification code, make sure it is constant-time regardless of what the library does.
+
+```python
+import base64
+import hashlib
+import hmac
+
+
+def verify_pkce_s256(code_verifier: str, code_challenge: str) -> bool:
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return hmac.compare_digest(expected, code_challenge)  # not ==
+```
+
+3. **Send the upstream PR.** Caps are often just conservative. Relaxing to `<5.0.0` with a passing test suite is a common, quick fix.
+
+## Catch the next one in CI
+
+Transitive CVEs are invisible during code review. `pip-audit` on every pull request makes them visible:
+
+```yaml
+# .github/workflows/audit.yml
+name: dependency-audit
+on: [pull_request]
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@<full-commit-sha>
+      - uses: actions/setup-python@<full-commit-sha>
+        with:
+          python-version: "3.13"
+      - run: pip install pip-audit
+      - run: pip-audit -r requirements.txt
+```
+
+When you accept a finding, pass it with `--ignore-vuln` and leave a comment with the reason and an expiry date, so whoever reads the workflow in six months understands the choice.
+
+## Our take
+
+Neither CVE is severe on its own. We are writing about them because they show a pattern Python teams hit constantly:
+
+- the fix ships only in a major version,
+- the package is transitive, so you never chose its version,
+- an intermediate library caps it, so you cannot upgrade even if you want to.
+
+The right response is neither "bump everything" nor "low severity, ignore." It is to judge the impact against how you actually use the library and write that judgment down. If you implement an OAuth server, move to 4.0.0 first. If you are a client, pinning the floor where you can and documenting exceptions where you cannot is usually enough.
+
+This week:
+
+1. Trace who pulls in oauthlib with `uv tree --invert` or `pipdeptree`.
+2. Determine server versus client use, and check for `enable_jsonp`.
+3. Pin `oauthlib>=4.0.0` where possible; record a reasoned exception where not.
+
+Authentication libraries tend to fall behind precisely because nobody remembers depending on them. That makes them worth a deliberate inventory.

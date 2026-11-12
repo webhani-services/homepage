@@ -1,0 +1,113 @@
+---
+title: "Helm 3 のセキュリティサポート終了まで1週間：Helm 4 移行で CI が壊れるポイント"
+description: "Helm 3 のセキュリティ修正は2026年11月11日で終了する予定です。Chart はそのまま動く一方、CI の Flag、--wait の RBAC、Post-renderer、SDK の API など、壊れるのはツールチェーン側です。移行の手順と点検項目をまとめます。"
+date: "2026-11-04"
+status: "published"
+tags: ["Kubernetes", "Helm", "CI/CD", "DevOps", "セキュリティ"]
+thumbnail: ""
+author: "webhani"
+slug: "helm-3-eol-helm-4-migration-2026-11"
+---
+
+Helm 3 のサポート終了が目前に迫っています。Helm プロジェクトの HIP-0012 では「Helm 4 リリースの6〜8か月後に Helm 3 を EOL にする」と定められ、複数の移行ガイドが次の日程を挙げています。
+
+- **2026年7月8日**：Helm 3 の Bug 修正が終了
+- **2026年11月11日**：Helm 3 のセキュリティ修正が終了
+
+一部の記事では、セキュリティ修正が2027年2月まで続くとする別の日程も見られます。最終的には helm.sh の公式アナウンスで確認してください。ただ、どちらの日付であっても、今から計画を始めて早すぎることはありません。
+
+## 良いニュース：Chart はほぼそのまま動く
+
+Helm 4 でも Chart API は v2 のままです。Helm 3 で Deploy できていた Chart は、基本的に Helm 4 でも Deploy できます。Chart のテンプレートを書き直す大規模な作業は、多くのチームでは不要です。
+
+移行の手間がかかるのは **ツールチェーン側** です。CI の Image に固定された `helm` Binary、Script で使っている Flag、Plugin、そして Go から Helm SDK を呼んでいるコードです。
+
+## 変更点1：新規 Release は Server-Side Apply がデフォルト
+
+Helm 4 では、新しく install する Release に Server-Side Apply（SSA）がデフォルトで使われます。一方、upgrade や rollback は、その Release が以前使っていた Apply 方式を引き継ぎます。つまり Helm 3 で作った既存の Release は、Helm 4 で upgrade しても Client-Side Apply のままです。
+
+ここで注意したいのは、同じ Chart でも「新規環境」と「既存環境」で挙動が分かれることです。SSA では Field の所有者（Field Manager）が記録されるため、`kubectl edit` や別の Controller が同じ Field を変更している場合、Conflict として表面化することがあります。Preview 環境を毎回新規作成している構成では、本番より先に SSA の挙動に出会うことになります。
+
+方式を明示したい場合は `--server-side` Flag で上書きできます。移行期間中は、環境ごとの挙動を揃える目的で明示しておくのも一案です。
+
+## 変更点2：Flag の名前変更
+
+```text
+--atomic  →  --rollback-on-failure
+--force   →  --force-replace
+```
+
+旧名は当面警告付きで動きますが、将来のマイナーバージョンでエラーになるとされています。警告は CI ログに埋もれがちなので、今のうちに使用箇所を洗い出しておきます。新しい名前は Helm 3 には存在しないため、実際の置き換えは CI の Helm 4 切り替えと同じ Pull Request で行うのが安全です。
+
+```bash
+# Repository 内の Helm 呼び出しで旧 Flag を探す
+grep -rnE "helm .*(--atomic|--force)( |$)" \
+  .github/ scripts/ Makefile* helmfile* 2>/dev/null
+```
+
+`--force` は `--force-update`（`helm repo add` の Flag）などにも部分一致するので、検索結果は目で確認してください。
+
+## 変更点3：`--wait` と RBAC
+
+Helm 4 の `--wait` は kstatus ベースになり、Resource の状態を監視するために `watch` 権限が必要になると報告されています。CI 用の ServiceAccount を `get`/`list` だけで絞り込んでいる場合、Deploy 自体は成功するのに `--wait` の段階で失敗する、という分かりにくい壊れ方をします。
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ci-deployer
+  namespace: app
+rules:
+  - apiGroups: ["", "apps", "batch"]
+    resources: ["deployments", "statefulsets", "jobs", "pods", "services"]
+    verbs: ["get", "list", "watch"]
+  # install/upgrade 自体に必要な create/update/patch/delete は別途付与
+```
+
+必要な Resource の種類は Chart によって変わります。Staging で Helm 4 を流し、Forbidden エラーが出た Resource を一つずつ追加していくのが確実です。
+
+## 変更点4：Post-renderer と Plugin
+
+Helm 3 では `--post-renderer ./kustomize-wrapper.sh` のように実行ファイルのパスを直接渡せました。Helm 4 では Post-renderer を Plugin として登録する方式に変わっています。Kustomize を Post-renderer として挟んでいる構成はよくあるので、該当する場合は優先的に検証してください。Plugin については WebAssembly ベースの新しい仕組みも導入されており、既存 Plugin の互換性は個別に確認が必要です。
+
+## 変更点5：Go SDK
+
+Helm を Library として使っている社内ツールや Operator は、もっとも影響が大きい部分です。Import Path が変わり、API にも破壊的変更があります。コミュニティの移行報告では、`Wait bool` が `WaitStrategy` に置き換わり、空の値のままでは Waiter を作れずエラーになるケースが挙げられています。Go のコードは Compile が通っても実行時に挙動が変わる箇所があるため、Integration Test での確認が欠かせません。
+
+## 移行手順
+
+Helm 3 と Helm 4 は同じマシンに共存できます。一気に切り替えるのではなく、段階的に進めます。
+
+```bash
+# 1. Helm 4 を別名で導入（バージョンは公式 Release で確認して固定）
+curl -fsSL -o helm4.tar.gz \
+  "https://get.helm.sh/helm-v4.x.y-linux-amd64.tar.gz"
+tar -xzf helm4.tar.gz && sudo mv linux-amd64/helm /usr/local/bin/helm4
+
+# 2. 同じ values で Rendering 結果を比較
+helm  template app ./chart -f values-staging.yaml > /tmp/h3.yaml
+helm4 template app ./chart -f values-staging.yaml > /tmp/h4.yaml
+diff -u /tmp/h3.yaml /tmp/h4.yaml
+```
+
+Rendering に差分がなければ、次は Staging で実際に `upgrade` を流し、`--wait` と Post-renderer の挙動を確認します。最後に CI の Image を差し替えます。GitHub Actions なら Setup Action でバージョンを明示的に固定しておきます。
+
+```yaml
+- uses: azure/setup-helm@<full-commit-sha>
+  with:
+    version: "v4.x.y"   # latest ではなく固定する
+```
+
+## webhani の見解
+
+今回の移行は「Chart は動くのに Pipeline が壊れる」タイプです。アプリケーション開発者からは見えにくく、Platform チームが気付かないうちに EOL を迎えがちです。セキュリティ修正が止まった Binary を CI で使い続けることは、Kubernetes Cluster への書き込み権限を持つツールを無保守のまま放置することを意味します。
+
+私たちが支援している現場では、次の順で進めることを推奨しています。
+
+1. **棚卸し**：`helm` を呼んでいる CI、Script、Operator、社内ツールを一覧にする
+2. **RBAC の見直し**：CI 用 ServiceAccount に `watch` を追加する（Helm 3 のままでも害はありません）
+3. **Staging で検証**：Post-renderer、`--wait`、新規 Release の SSA 挙動を確認する
+4. **CI Image の切り替えと Flag の置換**：同じ Pull Request で `--atomic` と `--force` を新しい名前に変え、バージョンを固定する
+5. **追従の自動化**：Renovate などで Helm のバージョン更新を Pull Request として受け取る
+
+11月11日を過ぎても Helm 3 がすぐに動かなくなるわけではありません。ただ、次に Helm 3 の脆弱性が見つかったとき、修正版は出ません。その日が来る前に、Pipeline を Helm 4 に載せ替えておくことをおすすめします。

@@ -1,0 +1,133 @@
+---
+title: "robots.txt の1行で AI 学習をオプトアウト：__usage_ai-training Token の仕組みと導入手順"
+description: "AI 学習のオプトアウトを robots.txt で共通化する IETF Draft が10月30日に公開され、主要 AI ラボが支持を表明したと報じられています。Token の書き方、従来の Crawler 別ブロックとの違い、Next.js での実装と運用上の注意点を整理します。"
+date: "2026-11-04"
+status: "published"
+tags: ["AI", "LLM", "SEO", "Next.js", "Web開発"]
+thumbnail: ""
+author: "webhani"
+slug: "robots-txt-ai-training-opt-out-token-2026-11"
+---
+
+「自社サイトのコンテンツを AI の学習に使われたくない。でも検索結果からは消えたくない」。このご相談はここ2年で何度も受けてきました。これまでの答えは、`GPTBot`、`ClaudeBot`、`Google-Extended` など Crawler ごとに `Disallow` を並べることでした。新しい Crawler が出るたびに robots.txt を書き足す、終わりのない作業です。
+
+10月30日、この状況を変えうる IETF の Internet-Draft `draft-kelley-aipref-training-preference-signal-00` が公開されました。著者は Anthropic の Kevin Kelley 氏です。報道によれば、Google、Microsoft、OpenAI、Anthropic の4社が、この Draft の Token を尊重する方針を示しています。ただし、各社の一次発表をすべて確認できたわけではありません。「支持が報じられている」段階と捉えてください。
+
+## 何が新しいのか
+
+Draft の要点は、**新しい Directive も新しい文法も追加しない**ことです。RFC 9309 で定義された robots.txt の Group 構造、Path の書き方、最長一致のルールはそのまま使います。そのうえで、`User-agent` 行に書く特別な Policy Token として `__usage_ai-training` を定義しています。
+
+「AI Training」の定義は、IETF AIPREF Working Group の語彙 Draft（`draft-ietf-aipref-vocab`）から取られており、「生成 AI モデルの学習済み Parameter を変更するために Asset を使うこと」とされています。学習のみが対象で、検索インデックスや、回答生成時の参照（いわゆる RAG や Grounding）は直接の対象ではありません。
+
+最小構成は次のとおりです。
+
+```text
+# 検索 Crawler には通常どおり公開
+User-agent: *
+Allow: /
+
+# AI 学習目的の利用はサイト全体で拒否
+User-agent: __usage_ai-training
+Disallow: /
+```
+
+Path 単位の指定も、通常の robots.txt と同じように書けます。
+
+```text
+User-agent: __usage_ai-training
+Disallow: /blog/
+Disallow: /docs/
+Allow: /press/
+```
+
+## 見落としやすいポイント：`Disallow: /` だけでは学習拒否にならない
+
+Draft で特に重要なのは、`User-agent: *` に `Disallow: /` を書いたサイトであっても、それは「AI 学習について何も表明していない」と扱われる点です。全 Crawler をブロックすることと、学習を拒否することは別の意思表示とみなされます。
+
+実務的には、次のような既存設定を見直す必要があります。
+
+- 開発環境や Staging で `Disallow: /` だけを書いている → 公開されている以上、学習拒否の意図があるなら Token も明記する
+- Crawler 名による個別ブロックだけで済ませている → 当面は残しつつ、Token を追加する
+
+## Next.js App Router での実装
+
+webhani のサイトを含め、Next.js では `app/robots.ts` から robots.txt を生成するのが一般的です。`MetadataRoute.Robots` の `rules` は配列を受け取れるので、Token 用の Group を追加するだけで済みます。
+
+```ts
+// app/robots.ts
+import type { MetadataRoute } from "next";
+
+const AI_TRAINING_TOKEN = "__usage_ai-training";
+
+// 移行期間中は従来の Crawler 別ブロックも残す
+const LEGACY_AI_CRAWLERS = ["GPTBot", "ClaudeBot", "Google-Extended", "CCBot"];
+
+export default function robots(): MetadataRoute.Robots {
+  return {
+    rules: [
+      { userAgent: "*", allow: "/" },
+      { userAgent: AI_TRAINING_TOKEN, disallow: "/" },
+      { userAgent: LEGACY_AI_CRAWLERS, disallow: "/" },
+    ],
+    sitemap: "https://example.com/sitemap.xml",
+  };
+}
+```
+
+Build 後に出力を確認しておくと安心です。
+
+```bash
+curl -s http://localhost:3000/robots.txt
+```
+
+Token 名の先頭が `__`（アンダースコア2つ）である点は typo しやすいので、定数にして Test で固定しておくことをおすすめします。
+
+```ts
+// app/robots.test.ts
+import { expect, test } from "vitest";
+import robots from "./robots";
+
+test("AI 学習の opt-out Token が含まれている", () => {
+  const { rules } = robots();
+  const list = Array.isArray(rules) ? rules : [rules];
+  expect(
+    list.some((r) => r.userAgent === "__usage_ai-training" && r.disallow === "/"),
+  ).toBe(true);
+});
+```
+
+## ページ単位の指定について
+
+二次情報によると、Microsoft は IETF Draft には含まれない、ページ単位の指定（`meta` Tag や `X-Robots-Tag` Header）も追加でサポートするとのことです。正式な値の書式は、私たちの調べた範囲では一次情報で確認できませんでした。Bing の公式ドキュメントが出るまでは、robots.txt 側での指定を基本にするのが安全です。
+
+## 対応時期の目安
+
+報道ベースの情報をまとめると、以下のとおりです。
+
+| 事業者 | 報じられている対応時期 |
+| --- | --- |
+| Anthropic | すでに対応開始 |
+| OpenAI | 「今後数か月以内」 |
+| Microsoft | 2027年2月1日から |
+| Google | 2027年中 |
+
+つまり、今 Token を書いても、すぐに全社で効くわけではありません。それでも今のうちに入れておく価値はあります。robots.txt は一度書けば、対応が始まった時点から効き始めるからです。
+
+## webhani の見解
+
+この Draft で評価しているのは、新しい仕組みを作らず、既存の robots.txt の上に乗せた点です。Crawler 名の一覧を追いかける運用から、「目的」で意思表示する運用へ移れるのは、サイト運営者にとって大きな負担軽減になります。
+
+一方で、限界も理解しておく必要があります。
+
+1. **強制力はありません。** robots.txt は紳士協定です。表明した各社が守ることは期待できますが、それ以外の Scraper への技術的な防御にはなりません。必要なら WAF や Bot 対策を別途組み合わせます。
+2. **個人 Draft の段階です。** 正式な IETF 標準ではなく、Token 名や意味が今後変わる可能性はあります。
+3. **学習と検索・回答生成は別物です。** AI 検索の回答に引用されることまで拒否したいのか、学習だけを拒否したいのかは、事業判断として分けて考える必要があります。メディアや EC では、AI 検索からの流入を失うほうが痛手になることもあります。
+
+## 今週やること
+
+1. 自社の robots.txt と `app/robots.ts` を確認し、AI 学習について明示的な意思表示があるか点検する
+2. 学習を拒否する方針なら `__usage_ai-training` の Group を追加し、既存の Crawler 別ブロックは当面残す
+3. Token 名を Test で固定し、Deploy のたびに検証されるようにする
+4. 「学習は拒否、AI 検索での引用は許可」のように、方針を社内で文書化しておく
+
+robots.txt は小さなファイルですが、コンテンツの扱いに関する会社の方針がそのまま表れる場所です。この機会に、技術担当とビジネス担当が一緒に見直すことをおすすめします。

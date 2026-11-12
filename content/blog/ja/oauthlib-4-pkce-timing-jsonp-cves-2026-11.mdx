@@ -1,0 +1,131 @@
+---
+title: "oauthlib 4.0.0 と2件の CVE：PKCE の Timing Attack と JSONP、3.x に修正が来ない問題への向き合い方"
+description: "Python の OAuth 実装 oauthlib に、PKCE 検証の Timing Attack（CVE-2026-49265）と JSONP Callback Injection（CVE-2026-49264）が報告されました。修正は 4.0.0 のみで 3.x への Backport はありません。影響範囲の見極め方と、依存の上限で 4.0.0 に上げられない場合の対処を整理します。"
+date: "2026-11-04"
+status: "published"
+tags: ["セキュリティ", "OAuth", "Python", "依存関係管理", "CI/CD"]
+thumbnail: ""
+author: "webhani"
+slug: "oauthlib-4-pkce-timing-jsonp-cves-2026-11"
+---
+
+`oauthlib` は、自分で直接 install した覚えがなくても入っていることの多い Library です。`requests-oauthlib` 経由で、Kubernetes の Python Client、各種 SaaS の SDK、Django や Flask の OAuth 拡張などが依存しています。この oauthlib に2件の CVE が公開され、修正版の 4.0.0 がリリースされました。
+
+ただし、今回は「バージョンを上げて終わり」になりにくい事情があります。修正は 4.0.0 のみで、3.x 系への Backport は行われていません。そして 4.0.0 は Major Release です。
+
+## 2件の脆弱性の中身
+
+### CVE-2026-49265：PKCE `code_verifier` 比較の Timing Attack
+
+PKCE では、Client が Authorization Request 時に `code_challenge` を送り、Token Request 時に元の `code_verifier` を提示します。Authorization Server は両者が一致するかを検証します。
+
+oauthlib 3.0.0 以上 4.0.0 未満では、この比較が通常の文字列比較で行われていました。文字列比較は先頭から一致しない文字が見つかった時点で終わるため、処理時間の差から正解に近づける余地が理論上あります。4.0.0 では `hmac.compare_digest` による定数時間比較に置き換えられました。GitLab Advisory Database での評価は CVSS 6.8（Medium）です。
+
+現実的な危険度はどうでしょうか。Advisory の PoC で観測された時間差は、1,000万回の試行で約0.037秒とごくわずかです。さらに攻撃が成立するには、一度しか使えない Authorization Code をあらかじめ傍受しておく必要があります。Splunk の分析も、これは Authorization Server 側の多層防御の問題だと位置付けています。緊急度は高くありませんが、放置してよい理由にもなりません。
+
+### CVE-2026-49264：RevocationEndpoint の JSONP Callback Injection
+
+0.6.1 以上 4.0.0 未満では、Token の Revocation Endpoint で `enable_jsonp=True` を有効にしている場合、Request の `callback` Parameter が検証されずに Response Body に埋め込まれます。結果として、任意の JavaScript を含む Response を返させることができます。
+
+JSONP はデフォルトで無効です。影響を受けるのは、明示的に有効にしている Deployment に限られます。2026年の今、JSONP を使う理由はまずないため、「有効になっていないか確認して、なっていたら止める」で十分なケースがほとんどです。
+
+## 自分たちは影響を受けるのか
+
+最初に整理すべきは、自分たちが oauthlib を **Server（Provider）側** で使っているのか、**Client 側** で使っているのかです。
+
+- **Authorization Server を oauthlib で実装している**（`oauthlib.oauth2.Server` や、それを使う django-oauth-toolkit などの Provider 系 Library）→ 両方の CVE が関係します。優先度は高めです。
+- **外部 API を呼ぶ Client として使っているだけ**（`requests-oauthlib` で Token を取得するなど）→ 2件とも Server 側の処理なので、直接の影響は限定的です。ただし脆弱性 Scanner では検出されるため、対応方針は決めておく必要があります。
+
+依存の経路は次のように確認できます。
+
+```bash
+# uv を使っている場合：oauthlib を誰が引き込んでいるか
+uv tree --invert --package oauthlib
+
+# pip 環境の場合
+pip install pipdeptree
+pipdeptree --reverse --packages oauthlib
+```
+
+JSONP の有効化は Code 検索で確認します。
+
+```bash
+grep -rn "enable_jsonp" --include="*.py" .
+```
+
+## 4.0.0 に上げる
+
+4.0.0 の破壊的変更は主に Provider 側の Interface にあり、Client 側の Interface は変わっていないとされています。Client 用途であれば、上げるリスクは比較的小さいと考えられます。
+
+注意したいのは、`requests-oauthlib` が `oauthlib>=3.0.0` としか宣言していない点です。Resolver の状況によっては、脆弱な 3.x に落ち着くことがあります。Kubernetes Python Client でも、この理由で `oauthlib>=4.0.0` を明示的に固定する Issue と PR が出ています。自分たちの Project でも下限を明示します。
+
+```toml
+# pyproject.toml
+[project]
+dependencies = [
+  "requests-oauthlib>=2.0",
+  "oauthlib>=4.0.0",  # CVE-2026-49264 / CVE-2026-49265
+]
+```
+
+## 4.0.0 に上げられない場合
+
+厄介なのは、依存先の Library が `oauthlib<4.0.0` と上限を設けているケースです。oauthlib の Repository には 3.x への Backport を求める Issue が出ていますが、本稿執筆時点で Maintainer は対応していません。このとき取れる選択肢は次のとおりです。
+
+1. **上流の対応を待つ間、影響の有無を記録する。** Client 用途で JSONP も使っていないなら、実質的な影響はありません。Scanner の検出に対しては、理由と再確認日を添えて例外登録します。
+2. **自前の Server 実装なら、比較部分を自分で守る。** 自前の検証 Code を持っているなら、少なくともそこは定数時間比較にしておきます。
+
+```python
+import base64
+import hashlib
+import hmac
+
+
+def verify_pkce_s256(code_verifier: str, code_challenge: str) -> bool:
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    # == ではなく定数時間比較を使う
+    return hmac.compare_digest(expected, code_challenge)
+```
+
+3. **上流に PR を送る。** 上限が保守的すぎるだけなら、`<5.0.0` への緩和と CI の通過で解決することもよくあります。
+
+## CI で継続的に検出する
+
+今回のように「間接依存に入っている Library の CVE」は、人の目では気付けません。`pip-audit` を CI に組み込んでおくと、Pull Request の段階で検出できます。
+
+```yaml
+# .github/workflows/audit.yml
+name: dependency-audit
+on: [pull_request]
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@<full-commit-sha>
+      - uses: actions/setup-python@<full-commit-sha>
+        with:
+          python-version: "3.13"
+      - run: pip install pip-audit
+      - run: pip-audit -r requirements.txt
+```
+
+例外にした CVE は `--ignore-vuln` で明示し、Comment に理由と期限を残しておくと、半年後の自分たちが判断を追えます。
+
+## webhani の見解
+
+今回の2件は、どちらも単体では深刻度の高い脆弱性ではありません。それでも取り上げたのは、Python の依存管理でよく起きる構図がそのまま表れているからです。
+
+- 修正が Major Release にしかない
+- 間接依存のため、自分たちで直接バージョンを決めていない
+- 中間の Library が上限を設けていて、上げたくても上げられない
+
+この状況で大事なのは、「とりあえず上げる」でも「影響が小さいから無視する」でもなく、**自分たちの使い方に照らして影響を判断し、その判断を記録すること** です。Server 側で OAuth を実装しているなら 4.0.0 への移行を優先し、Client 用途なら下限の固定と例外登録で十分なことが多いはずです。
+
+今週のアクションは次の3つです。
+
+1. `uv tree --invert` や `pipdeptree` で、oauthlib を引き込んでいる経路を確認する
+2. Server 用途か Client 用途か、JSONP を有効にしていないかを確認する
+3. 可能なら `oauthlib>=4.0.0` を明示し、無理なら理由付きで例外登録する
+
+認証まわりの Library は、使っている意識が薄いほど更新が遅れがちです。この機会に、依存ツリーの中の認証関連 Package を一度棚卸ししておくことをおすすめします。
