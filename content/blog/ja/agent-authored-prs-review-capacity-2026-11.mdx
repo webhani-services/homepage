@@ -1,0 +1,126 @@
+---
+title: "Agentが起票するPRが4割に:チームのレビュー容量をどう守るか"
+description: "GitHub Octoverse 2026に関する報道では、AI Agentが起票するPull Requestの割合が大きく伸びているとされています。ボトルネックはコード生成からレビューへ移りました。実践的な運用ルールと GitHub Actions の設定例を紹介します。"
+date: "2026-11-01"
+status: "published"
+tags: ["AI", "GitHub", "Code Review", "CI/CD", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "agent-authored-prs-review-capacity-2026-11"
+---
+
+今週、GitHubのOctoverse 2026に関する報道で、9月時点でAI Agentが起票したPull Requestが全体の4割を超え、3月の約17%から大きく増えたと伝えられました。私たちはレポート本体ではなく二次情報を参照しているため、数字は目安として受け取ってください。ただ、方向性はお客様のリポジトリで見ている状況と一致しています。差分を作るコストは急激に下がりましたが、差分を読むコストは変わっていません。
+
+この非対称性が、開発チームにとっての本題です。以前は人が1本開く間にAgentが10本開けるなら、制約になるのは承認する人間の注意力です。何もしなければ、レビュー待ちの行列が伸びるか、形だけの承認が増えるかのどちらかに傾きます。
+
+## スループットだけを見てはいけない理由
+
+Coding Agentを導入したチームは、PR数とマージまでの時間を指標にしがちです。どちらも改善して見えますが、次の問題が隠れます。
+
+- 待ち行列が長くなるほど、レビューは浅くなります。斜め読みになります。
+- Agent のPRは一本ずつ見ると「問題なさそう」です。その結果、全体としてアーキテクチャに合っているかを誰も問わなくなります。
+- 手で書いた人がいないため、深夜に障害が起きたとき「自分のコード」という感覚が持てません。
+
+見るべき指標は、レビュー待ち時間、実質的なコメントが付いたPRの割合、30日以内のRevert率です。待ち時間とRevert率が同時に上がっているなら、速度を品質で支払っている状態です。
+
+## スケールするルール
+
+Agent起票のPRを人間のPRと同じ扱いにせず、明示的なルールを持つ別カテゴリとして扱うことをお勧めします。最小限の例です。
+
+1. **すべてのAgent PRに人間のオーナーを置く。** タスクを依頼した人が起票者として責任を持ち、最初のレビュアーになります。別の人の承認も必要です。
+2. **サイズ上限を設ける。** 一定の行数を超えたPRは、レビュー前に分割します。1,500行の差分は誰が書いてもレビューできません。
+3. **意図を書く。** 依頼内容、確認したこと、確認していないことをPR説明に書かせます。テンプレートで強制します。
+4. **自動チェックを先に通す。** テスト、型チェック、Lintが通ってから人間にレビューを依頼します。壊れたBuildを最初に見つけるのは人間の役目ではありません。
+5. **WIP制限をかける。** 1人あたりの未完了Agent PR数に上限を設けます。キューが減ってから次を作る仕組みになるため、最も効果の高い施策です。
+
+## Agent PRを自動でラベル付けする
+
+見えないものは管理できません。作成者の種別でラベルを付け、大きすぎる差分を検知する小さなWorkflowが、データとガードレールの両方になります。以下は公式の`pull_request`イベントと、`actions/github-script`経由のREST APIのみを使っています。
+
+```yaml
+name: pr-triage
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const labels = [];
+
+            // Agentの認証方式に合わせて調整してください
+            const agentLogins = ["copilot-swe-agent[bot]", "my-org-agent[bot]"];
+            if (agentLogins.includes(pr.user.login)) labels.push("agent-authored");
+
+            const changed = pr.additions + pr.deletions;
+            if (changed > 600) labels.push("needs-split");
+
+            if (labels.length > 0) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: pr.number,
+                labels,
+              });
+            }
+
+            if (changed > 600) {
+              core.setFailed(
+                `Diff is ${changed} lines. Split it before requesting review.`
+              );
+            }
+```
+
+このチェックをBranch protectionの必須項目にします。意図的に失敗させているのは、Agentに分割を依頼するほうが、大きすぎるPRを人間がレビューするより安いからです。
+
+## 意図を書かせるPRテンプレート
+
+```markdown
+## Task
+Agentに何を依頼したか。Issueへのリンク。
+
+## Verified
+- [ ] テストを追加・更新した
+- [ ] ローカル / Previewで動作確認した
+- [ ] 指定範囲外の変更がないか確認した
+
+## Not verified
+確認していないこと、その理由。
+
+## Human owner
+@username
+```
+
+最も重要なのは「Not verified」です。暗黙のリスクを、レビュアーが反応できる文章に変えてくれます。
+
+## AIレビューはフィルターであり、判定者ではない
+
+Copilot code reviewのようなツールは、スタイル、明らかなバグ、テスト不足といった一次チェックに向いています。人間が見る前のノイズ削減に使い、承認者にはしないでください。コードを書いたAgentとレビューするツールは、似た学習データに基づく言語モデルであり、盲点を共有しがちです。同じ系統のツールによるセカンドオピニオンは、見かけほど独立していません。
+
+役割分担の目安です。
+
+- **自動:** フォーマット、Lint、型エラー、依存関係・Secretのスキャン、テスト結果。
+- **AI支援:** 差分の要約、リスクのある箇所の指摘、不足しているテストケースの提案。
+- **人間:** この変更はここにあるべきか、Moduleの境界を守っているか、失敗時の影響は許容できるか。
+
+## CODEOWNERSは引き続き効く
+
+Agentが多くの領域に触れるなら、`CODEOWNERS`で各領域に詳しい人へレビューを回す仕組みが重要です。認証、課金、インフラ定義、Migrationなど、ミスの代償が大きいパスほど、ルールは緩めるのではなく厳しくします。テストが通っているAgent PRでも、これらのパスではCode Ownerの承認を必須にしてください。
+
+## webhaniの推奨
+
+- 今週中に`agent-authored`ラベルを導入し、1か月はレビュー待ち時間を観察するだけにします。
+- オーナーごとのWIP制限を入れます。最初は未完了Agent PRを3本までとし、運用しながら調整します。
+- 「Not verified」を必須項目にします。
+- マージ時間と並べて、30日Revert率を追跡します。
+- 認証、データ、インフラに触れる変更は、最終承認を必ず人間が行います。
+
+Agent駆動の開発は抵抗すべきものではなく、数字を見る限りすでに日常になりつつあります。成果を出せるのは、レビュー容量を有限なリソースとして扱い、それを前提にプロセスを設計したチームです。制約をインシデントで知ることになる前に、手を打っておきましょう。

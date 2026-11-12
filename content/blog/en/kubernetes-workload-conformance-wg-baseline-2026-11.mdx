@@ -1,0 +1,134 @@
+---
+title: "Kubernetes Workload Conformance WG: A Baseline You Can Self-Check Today"
+description: "The Kubernetes community has formed a Workload Conformance Working Group to define how workloads should behave at runtime. No spec exists yet, but the likely areas are familiar. Here is a manifest baseline and a CI check you can adopt now."
+date: "2026-11-01"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "DevOps", "CI/CD", "AI"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-workload-conformance-wg-baseline-2026-11"
+---
+
+On October 27, the Kubernetes project announced a new Workload Conformance Working Group. Its goal is a shared standard for how a workload behaves at runtime, as opposed to how a cluster behaves. According to the announcement, the group plans three deliverables: a workload-behavior specification for each Kubernetes minor version, a way to test each requirement against a running workload, and upstream tooling that implements those tests. Application logic is explicitly out of scope. SIG Architecture is expected to own the spec through a subproject, with SIG Apps contributing the application perspective.
+
+We could find only the announcement itself. There is no draft specification yet, so anything about the final content is speculation. Still, the announcement is useful for a practical reason: it tells us which questions Kubernetes maintainers consider worth standardizing, and most teams have never written their answers down.
+
+## Where this fits among the existing programs
+
+Two conformance efforts already exist, and the new group sits next to them:
+
+- **Certified Kubernetes** tests the cluster: does the API behave as specified.
+- **Kubernetes AI Conformance** (CNCF, launched November 2025) tests whether a cluster can run AI and ML workloads reliably.
+- **Workload Conformance** would test the other side of the contract: does the workload behave well when a cluster does what clusters do, such as rescheduling, draining, and scaling.
+
+The announcement frames a common workload specification as a shared baseline for the other two programs. For consultancies like us that means a future where "does this service behave correctly on Kubernetes" has a checkable answer rather than a code review opinion.
+
+## What a workload contract probably covers
+
+Without a spec, we use our own experience of what breaks in production. These are the behaviors we check on every engagement, and they are a reasonable bet for what any workload standard has to address:
+
+1. **Graceful termination.** The process handles `SIGTERM`, stops accepting work, finishes in-flight requests, and exits before `terminationGracePeriodSeconds` expires.
+2. **Health signaling.** Readiness reflects the ability to serve traffic; liveness only detects unrecoverable states. Slow starts are handled with a startup probe, not a long liveness delay.
+3. **Resource declarations.** Requests and limits are set, so the scheduler and the autoscaler can make sensible decisions.
+4. **Disruption tolerance.** More than one replica where availability matters, plus a `PodDisruptionBudget` so node drains do not take the service down.
+5. **Least privilege.** Non-root user, no privilege escalation, a read-only root filesystem where the app allows it.
+6. **Statelessness or declared state.** Local disk is treated as ephemeral; anything durable is on a declared volume.
+
+## A baseline manifest
+
+This uses only stable, documented fields. It is a starting point, not a standard.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: api
+          image: registry.example.com/api@sha256:REPLACE_WITH_DIGEST
+          ports:
+            - containerPort: 8080
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          startupProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet: { path: /ready, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: { app: api }
+```
+
+Note that we omit a CPU limit on purpose. CPU limits cause throttling that is hard to diagnose; a memory limit is the safer guard. This is a judgment call, and your workload may differ.
+
+## Testing the shutdown path
+
+The graceful termination item is the one most often skipped, because it only fails during deploys and drains. A cheap check is to start the container, send `SIGTERM`, and assert on exit time and code.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE="$1"
+CID=$(docker run -d "$IMAGE")
+trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+
+sleep 3
+start=$(date +%s)
+docker kill --signal=SIGTERM "$CID" >/dev/null
+code=$(docker wait "$CID")
+elapsed=$(( $(date +%s) - start ))
+
+echo "exit code: $code, shutdown took ${elapsed}s"
+[ "$elapsed" -le 25 ] || { echo "shutdown too slow"; exit 1; }
+[ "$code" -eq 0 ] || { echo "non-zero exit on SIGTERM"; exit 1; }
+```
+
+Run it in CI against the image you are about to deploy. A service that ignores `SIGTERM` gets killed after the grace period, dropping whatever was in flight.
+
+## Validating manifests in CI
+
+For the declarative parts, a server-side dry run against a test cluster catches schema errors, and a policy tool can assert the baseline. If you use Kyverno or OPA Gatekeeper, express each item above as a policy and run it in audit mode first. Audit mode shows how many existing workloads would fail without blocking anyone, which makes the rollout conversation concrete.
+
+```bash
+kubectl apply --dry-run=server -f k8s/
+```
+
+## What we recommend
+
+- Do not wait for the spec. The behaviors above are valuable on their own and unlikely to be contradicted by a reasonable standard.
+- Write your baseline down as a short checklist and enforce it in CI. A checklist that exists only in a wiki is not a standard.
+- Start with the shutdown test and the PodDisruptionBudget. These two prevent most deploy-time incidents.
+- Follow the working group if you run platform infrastructure. It meets every other Wednesday at 15:00 UTC and is reachable on the `#wg-workload-conformance` Slack channel.
+- Treat any claims about the eventual spec, including ours, as provisional until a draft is published.
+
+The useful shift here is conceptual. For years, "works on Kubernetes" meant "someone got it running." A workload standard, even an early one, pushes the industry toward something testable. Getting there ahead of the spec costs a few manifest changes and one CI job.

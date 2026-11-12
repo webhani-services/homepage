@@ -1,0 +1,134 @@
+---
+title: "Kubernetes Workload Conformance WG:今日から自己チェックできるBaseline"
+description: "Kubernetesコミュニティが、Workloadの実行時の振る舞いを定義するWorkload Conformance Working Groupを立ち上げました。仕様はまだありませんが、対象になりそうな領域はおなじみです。今すぐ採用できるManifestのBaselineとCIチェックを紹介します。"
+date: "2026-11-01"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "DevOps", "CI/CD", "AI"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-workload-conformance-wg-baseline-2026-11"
+---
+
+10月27日、Kubernetesプロジェクトは新たにWorkload Conformance Working Groupの発足を発表しました。目的は、Clusterの振る舞いではなく、Workloadが実行時にどう振る舞うべきかについての共通標準を作ることです。発表によると、成果物は3つ予定されています。Kubernetesのマイナーバージョンごとのworkload behavior仕様、各要件を実行中のWorkloadに対してテストする方法、そのテストを実装するupstreamのツールです。アプリケーションロジックは明確にスコープ外です。仕様の管理はSIG Architectureのsubprojectが担い、SIG Appsがアプリケーション側の視点を提供する想定です。
+
+私たちが確認できたのは発表記事のみです。Draft仕様はまだ公開されていないため、最終的な内容についての話はすべて推測になります。それでもこの発表には実用的な価値があります。Kubernetesのメンテナが「標準化に値する」と考える問いが見えてくるからです。そして多くのチームは、その問いへの自分たちの答えをまだ文章にしていません。
+
+## 既存のプログラムとの関係
+
+Conformanceに関する取り組みはすでに2つあり、新しいグループはその隣に位置します。
+
+- **Certified Kubernetes**はClusterをテストします。APIが仕様どおりに動くかどうかです。
+- **Kubernetes AI Conformance**(CNCF、2025年11月開始)は、ClusterがAI/MLのWorkloadを確実に動かせるかをテストします。
+- **Workload Conformance**は契約のもう一方、つまりClusterが通常行う動作(再スケジュール、Drain、スケーリング)に対してWorkloadが適切に振る舞うかをテストする位置づけになります。
+
+発表では、共通のWorkload仕様が他の2つのプログラムの共通Baselineになるとされています。私たちのようなコンサルティング会社にとっては、「このサービスはKubernetes上で正しく動くか」に、Code Reviewでの意見ではなく検証可能な答えが出せる未来を意味します。
+
+## Workload契約が扱いそうな内容
+
+仕様がない以上、本番で実際に壊れる箇所という経験則に頼るしかありません。以下は私たちが案件ごとに確認している項目で、どのようなWorkload標準でも扱うことになる可能性が高いと見ています。
+
+1. **Graceful termination。** プロセスが`SIGTERM`を処理し、新規受付を止め、処理中のRequestを完了させ、`terminationGracePeriodSeconds`が切れる前に終了します。
+2. **Healthの通知。** Readinessは「トラフィックを受けられるか」を表し、Livenessは回復不能な状態だけを検知します。起動が遅い場合は、Livenessの待ち時間を伸ばすのではなくStartup probeを使います。
+3. **Resourceの宣言。** RequestとLimitを設定し、SchedulerとAutoscalerが妥当な判断をできるようにします。
+4. **中断への耐性。** 可用性が必要な箇所ではReplicaを複数にし、`PodDisruptionBudget`でNodeのDrain時にサービスが落ちないようにします。
+5. **最小権限。** 非rootユーザー、権限昇格の禁止、アプリが許す限りRead-onlyのroot filesystem。
+6. **Statelessまたは宣言されたState。** ローカルディスクは一時的なものとして扱い、永続化が必要なものは宣言したVolumeに置きます。
+
+## Baselineとなる Manifest
+
+安定していてドキュメント化されたフィールドだけを使っています。標準ではなく出発点です。
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: api
+          image: registry.example.com/api@sha256:REPLACE_WITH_DIGEST
+          ports:
+            - containerPort: 8080
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          startupProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet: { path: /ready, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: { app: api }
+```
+
+CPU Limitを意図的に省いている点に注意してください。CPU Limitは原因の特定が難しいThrottlingを引き起こすため、Memory Limitのほうが安全なガードだと考えています。これは判断が分かれる部分で、Workloadによって異なる場合があります。
+
+## 終了処理のテスト
+
+Graceful terminationは、デプロイやDrainのときにしか失敗が表面化しないため、最も省略されがちな項目です。簡易的なチェックとして、コンテナを起動して`SIGTERM`を送り、終了までの時間とExit codeを検証する方法があります。
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE="$1"
+CID=$(docker run -d "$IMAGE")
+trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+
+sleep 3
+start=$(date +%s)
+docker kill --signal=SIGTERM "$CID" >/dev/null
+code=$(docker wait "$CID")
+elapsed=$(( $(date +%s) - start ))
+
+echo "exit code: $code, shutdown took ${elapsed}s"
+[ "$elapsed" -le 25 ] || { echo "shutdown too slow"; exit 1; }
+[ "$code" -eq 0 ] || { echo "non-zero exit on SIGTERM"; exit 1; }
+```
+
+デプロイ直前のImageに対して、CIでこれを実行します。`SIGTERM`を無視するサービスは猶予期間の後に強制終了され、処理中だったものが失われます。
+
+## CIでのManifest検証
+
+宣言的な部分については、テスト用Clusterに対するServer-sideのdry runでSchemaの誤りを検出し、Policyツールで Baselineを検証できます。KyvernoやOPA Gatekeeperを使っているなら、上記の各項目をPolicyとして表現し、まずAuditモードで運用してください。誰もブロックせずに、既存のWorkloadのうち何件が違反するかが分かるため、導入の議論が具体的になります。
+
+```bash
+kubectl apply --dry-run=server -f k8s/
+```
+
+## webhaniの推奨
+
+- 仕様を待つ必要はありません。上記の振る舞いはそれ自体に価値があり、妥当な標準と矛盾する可能性は低いと考えます。
+- Baselineを短いチェックリストにまとめ、CIで強制します。Wikiにしか存在しないチェックリストは標準ではありません。
+- 終了処理のテストとPodDisruptionBudgetから始めてください。この2つでデプロイ時のインシデントの多くを防げます。
+- Platform基盤を運用しているなら、Working Groupの動向を追ってください。隔週水曜15:00 UTCに開催され、Slackの`#wg-workload-conformance`チャンネルで連絡が取れます。
+- 最終的な仕様についての主張は、私たちのものも含め、Draftが公開されるまで暫定的なものとして扱ってください。
+
+ここで重要なのは考え方の転換です。長い間、「Kubernetesで動く」とは「誰かが動かすところまでこぎつけた」という意味でした。Workload標準は、たとえ初期段階のものでも、業界を検証可能な方向へ動かします。仕様に先回りするためのコストは、いくつかのManifest修正とCIジョブ1つで済みます。

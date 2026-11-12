@@ -1,0 +1,167 @@
+---
+title: "Go 1.27.3 / 1.26.10: crypto/x509가 차단된 중간 인증서를 걸러냅니다. CI에서 감지하십시오"
+description: "10월 Go 패치 릴리스에서 특정 CA의 중간 인증서가 차단된 경우 crypto/x509가 인증서 체인을 구성하는 방식이 바뀌었습니다. 변경 내용, 영향을 받는 경우, 그리고 TLS 동작과 Go 버전 고정을 CI에서 검증하는 방법을 정리합니다."
+date: "2026-11-01"
+status: "published"
+tags: ["Go", "Security", "TLS", "CI/CD", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "go-1-27-3-x509-intermediate-filtering-tls-ci-2026-11"
+---
+
+Go 1.27.3과 1.26.10은 10월 중순에 배포되었고, 공지된 보안 수정은 `crypto/x509`의 한 건입니다. 10월 20일자 oss-security 목록에 올라온 Go 팀의 공지에 따르면, `Certificate.Verify`는 중간 인증서가 차단되고 있는 특정 인증 기관(CA)에 속한 중간 인증서를 포함하는 체인을 걸러냅니다. CVE-2026-111943으로 관리됩니다. 여기서는 CA 이름을 일부러 적지 않습니다. 공지가 특정 CA에 대한 완화 조치로 설명하고 있고, 세부 내용은 저희의 요약보다 go.dev와 oss-security의 원문에서 확인하는 편이 정확하기 때문입니다.
+
+작은 패치이지만 성격이 독특합니다. Go의 보안 수정은 대개 Bug를 막습니다. 이번 수정은 신뢰 판단 자체를 바꿉니다. 어제까지 검증을 통과하던 체인이 오늘은 통과하지 못할 수 있습니다. 그래서 일상적인 의존성 업데이트가 아니라 의도적인 배포 절차를 밟을 만한 가치가 있습니다.
+
+## 코드에 미치는 영향
+
+해당 중간 인증서를 거치지 않는 Endpoint하고만 통신하는 Service나 Tool에는 아무 일도 일어나지 않습니다. 상위 의존 대상, 사내 PKI, 외부 API 가운데 하나라도 해당 중간 인증서를 거치는 체인을 제시하면 `Verify`가 허용 가능한 경로를 찾지 못하고, `certificate signed by unknown authority` 같은 `x509` 오류와 함께 Handshake가 실패합니다.
+
+놓치기 쉬운 특징이 두 가지 있습니다.
+
+- **환경 단위가 아니라 Binary 단위로 결정됩니다.** 새 Toolchain으로 다시 Build할 때에만 실패가 나타납니다. 지난달 Image로 동작하는 Staging 환경은 계속 동작하고, 새로 Build한 Image만 실패합니다.
+- Go 프로그램은 TLS 로직을 스스로 포함하는 경우가 많습니다. scratch나 distroless Image에서 정적 Binary를 Build한다면, 신뢰 동작은 Base Image의 CA Bundle이 아니라 Binary와 함께 배포됩니다. OS Package를 업데이트해도 도움이 되지 않습니다.
+
+또한 이전 1.27.x Build에서 `http.Get` 같은 단순한 외부 호출에 영향을 주는 TLS 문제가 있었다는 보고도 보았습니다. 저희가 확인할 수 있는 자료로는 원인을 검증하지 못했으므로, 사실이 아니라 Test해 보아야 할 이유로 받아들이시기 바랍니다.
+
+## 먼저 실제로 무엇이 돌고 있는지 파악합니다
+
+첫 번째 작업은 현황 조사입니다. 어떤 Service가 어떤 Go 버전으로 Build되었는지 확인합니다.
+
+```bash
+# Build된 Binary에 내장된 버전
+go version -m ./bin/my-service | head -n 3
+
+# 디렉터리 내 여러 Binary
+for f in ./dist/*; do
+  printf '%s: ' "$f"
+  go version "$f"
+done
+```
+
+Container의 경우에도 Image 안의 Binary에 대해 같은 확인이 가능합니다.
+
+```bash
+docker create --name tmp registry.example.com/my-service:latest
+docker cp tmp:/app/my-service ./my-service
+docker rm tmp
+go version ./my-service
+```
+
+10월 19일 이전에 Build된 Binary에는 새 필터링이 들어 있지 않습니다. 이는 수정의 영향을 받지 않는다는 뜻일 뿐 안전하다는 뜻이 아닙니다. 완화 조치도 들어 있지 않기 때문입니다.
+
+## Toolchain을 고정하고, 의도한 시점에 올립니다
+
+Go 1.21부터 `go.mod`의 `go`와 `toolchain` 지시자가 Module을 Build할 Toolchain을 제어합니다. 고정해 두면 의도하지 않은 시점에 더 새로운 패치 버전으로 바뀌는 일을 막을 수 있습니다.
+
+```text
+module example.com/my-service
+
+go 1.27
+
+toolchain go1.27.3
+```
+
+Docker Build에서는 Builder Image를 특정 패치 버전, 가능하면 Digest로 고정합니다.
+
+```dockerfile
+FROM golang:1.27.3 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/my-service ./cmd/my-service
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /out/my-service /my-service
+ENTRYPOINT ["/my-service"]
+```
+
+고정에는 비용이 따릅니다. 업그레이드의 책임을 직접 지게 됩니다. 해법은 오래된 Toolchain에 머무는 것이 아니라, 업그레이드를 일상적이고 검증된 작업으로 만드는 것입니다.
+
+## 중요한 TLS 경로를 Test합니다
+
+이번 실패의 형태는 "예전에는 되던 외부 연결이 되지 않는다"이므로, 유용한 Test는 중요한 의존 대상마다 실제 Handshake를 수행하는 것입니다. 목록은 짧고 구체적으로 유지합니다. Database Host, 결제 Provider, ID Provider, 사설 CA 뒤에 있는 사내 Service 등입니다.
+
+```go
+package tlscheck_test
+
+import (
+	"crypto/tls"
+	"net"
+	"testing"
+	"time"
+)
+
+var endpoints = []string{
+	"api.example.com:443",
+	"idp.example.com:443",
+}
+
+func TestCriticalEndpointsHandshake(t *testing.T) {
+	if testing.Short() {
+		t.Skip("network test")
+	}
+	for _, addr := range endpoints {
+		addr := addr
+		t.Run(addr, func(t *testing.T) {
+			d := &net.Dialer{Timeout: 5 * time.Second}
+			conn, err := tls.DialWithDialer(d, "tcp", addr, &tls.Config{
+				MinVersion: tls.VersionTLS12,
+			})
+			if err != nil {
+				t.Fatalf("handshake failed: %v", err)
+			}
+			defer conn.Close()
+
+			state := conn.ConnectionState()
+			t.Logf("verified chains: %d", len(state.VerifiedChains))
+		})
+	}
+}
+```
+
+이 Test는 별도의 CI Job으로 두고 Pull Request뿐 아니라 정기 실행으로도 돌리십시오. 저희 쪽 변경이 없어도 상위 쪽에서 인증서를 교체한 경우를 감지할 수 있습니다.
+
+## govulncheck로 스캔합니다
+
+Go는 취약점 Database를 통해 정보를 공개하며, `govulncheck`는 코드에서 도달 가능한 문제만 보고합니다. 어떤 Module에 새 Toolchain이 필요한지 알아내는 가장 손쉬운 방법입니다.
+
+```yaml
+name: govulncheck
+on:
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: govulncheck ./...
+```
+
+`setup-go`가 `go.mod`를 읽으므로 스캔은 고정한 Toolchain으로 수행됩니다. 표준 라이브러리 문제는 Toolchain 버전을 기준으로 보고되므로, 오래된 패치 릴리스에 고정해 두면 올리기 전까지 경고가 계속 나온다는 점에 유의하십시오.
+
+## 배포 순서
+
+1. Binary와 Go 버전의 현황을 조사합니다.
+2. Handshake Test를 추가하고 **현재** Toolchain으로 실행해 기준선을 확보합니다.
+3. 위험이 낮은 Service 하나에서 고정 버전을 1.27.3(이전 계열이라면 1.26.10)으로 올립니다.
+4. Handshake Test와 해당 Service의 Integration Test를 실행하고, 배포 후 외부 호출 오류율을 관찰합니다.
+5. 외부 신뢰 관계가 많은 Service 순으로 하나씩 배포합니다.
+
+## webhani의 권장 사항
+
+- 일반 패치가 아니라 신뢰 정책의 변경으로 취급하고, 승격 전에 다시 Build하고 Test하십시오.
+- 긴급도를 정하기 전에 원문 공지에서 CA 세부 내용과 영향 범위를 확인하십시오.
+- 중요한 TLS Endpoint의 짧은 목록을 두고 CI에서 정기적으로 점검하십시오.
+- `toolchain`과 Base Image를 고정하고, 업그레이드를 정기적이고 작은 작업으로 만드십시오.
+- Go 고유의 검증 결과를 OS의 CA Bundle 업데이트로 해결하려 하지 마십시오.
+
+이런 패치 릴리스는 "패치"가 항상 "동작 변경 없음"을 뜻하지는 않는다는 점을 상기시켜 줍니다. 중요한 의존 대상마다 Handshake Test를 하나씩만 두어도, 운영 환경에서의 불쾌한 놀라움이 실패한 CI Job으로 바뀝니다.
