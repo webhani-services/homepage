@@ -1,0 +1,143 @@
+---
+title: "Claude Enterprise Project Tags: Designing Cost Codes Before You Turn Them On"
+description: "Claude Enterprise now lets admins tag projects with charge codes or client-matter numbers and view spend by tag. The feature is simple; the taxonomy behind it is where teams succeed or fail."
+date: "2026-11-09"
+status: "published"
+tags: ["Claude", "AI", "LLM", "FinOps", "Governance"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-enterprise-project-tags-ai-spend-cost-codes-2026-11"
+---
+
+On November 6, 2026, Anthropic's release notes announced project tags for Claude Enterprise, in beta for eligible organizations. Admins can attach the codes their company already uses — a charge code, a WBS element, a client-matter number — to Claude projects and then see spend broken down by those tags. A day earlier, Anthropic also shipped a set of Enterprise security and admin controls, including a security center, inference hooks, and centralized management, several of them in beta.
+
+For organizations that resell or bill AI-assisted work, this closes a gap. Until now, the usual answer to "how much did Client A's work cost in Claude usage?" was a spreadsheet and a guess. Project tags give you a first-party number to start from.
+
+The feature itself is not complicated. What decides whether it is useful is the tag design you put in place before rolling it out.
+
+## What the feature does (and doesn't)
+
+From Anthropic's consumption guide and release notes:
+
+- Tags are attached to **projects**. Spend is attributed to a project and then rolled up by tag.
+- Spend views live under **Organization settings > Usage > Spend by project**.
+- The Admin API can list tags, add allowed values to a tag, and set a project's tags (beta).
+- Not every Claude product is covered, and the reported amounts **may not match your invoice** exactly.
+- Spend that happens outside any project is grouped separately. Third-party write-ups note this includes Claude Code sessions with no project configured.
+- **Tag names and values are visible to everyone in the organization.**
+
+That last point matters more than it looks. If your client-matter numbers or project codenames are themselves confidential, putting them directly into tags exposes them to every member of the org.
+
+## Start with the questions, not the tags
+
+Before defining any tag, write down the reports you actually need. In our consulting work, the questions almost always fall into three groups:
+
+1. **Billing** — How much AI usage should we pass through, or account for, per client engagement?
+2. **Budgeting** — Which internal teams are growing their usage, and is it within plan?
+3. **Investment tracking** — How much are we spending on R&D or internal tooling versus delivery?
+
+Each question maps to one tag key. Resist adding a tag "just in case." Every extra dimension is something people will fill in inconsistently.
+
+A minimal scheme that covers all three:
+
+```yaml
+# claude-project-tags.yaml — the source of truth, reviewed via PR
+tags:
+  cost-center:
+    description: "Finance cost center that owns the spend"
+    values: ["CC-1100-eng", "CC-1200-consulting", "CC-1300-education"]
+  engagement:
+    description: "Opaque engagement ID from the billing system (never the client name)"
+    pattern: "^ENG-[0-9]{5}$"
+  purpose:
+    description: "Why the spend exists"
+    values: ["delivery", "presales", "internal-tooling", "research"]
+```
+
+Two deliberate choices here:
+
+- `engagement` uses an **opaque ID**, not a client name. The mapping from ID to client lives in your billing system, where access is already controlled. This handles the org-wide visibility issue.
+- The scheme lives in a repository. Tag changes go through review like any other configuration.
+
+## Validate before you apply
+
+Whether you set tags through the admin UI or the Admin API, a small validation step catches most mistakes. Here is a TypeScript checker that reads the scheme above and validates a proposed project tag set:
+
+```ts
+// validate-tags.ts
+import { readFileSync } from "node:fs";
+import { parse } from "yaml";
+
+type TagRule = { values?: string[]; pattern?: string };
+type Scheme = { tags: Record<string, TagRule> };
+
+const scheme: Scheme = parse(readFileSync("claude-project-tags.yaml", "utf8"));
+
+export function validateProjectTags(tags: Record<string, string>): string[] {
+  const errors: string[] = [];
+
+  for (const key of Object.keys(scheme.tags)) {
+    if (!(key in tags)) errors.push(`missing required tag: ${key}`);
+  }
+
+  for (const [key, value] of Object.entries(tags)) {
+    const rule = scheme.tags[key];
+    if (!rule) {
+      errors.push(`unknown tag key: ${key}`);
+      continue;
+    }
+    if (rule.values && !rule.values.includes(value)) {
+      errors.push(`${key}="${value}" is not an allowed value`);
+    }
+    if (rule.pattern && !new RegExp(rule.pattern).test(value)) {
+      errors.push(`${key}="${value}" does not match ${rule.pattern}`);
+    }
+  }
+  return errors;
+}
+
+// Example
+console.log(
+  validateProjectTags({
+    "cost-center": "CC-1200-consulting",
+    engagement: "Acme Corp", // caught: client name instead of ID
+    purpose: "delivery",
+  }),
+);
+```
+
+If you automate tagging through the Admin API, run this check in the same job before making the call. Check the current Admin API reference for exact endpoint names and scopes; the project tag endpoints are in beta and may change.
+
+## Close the "not in a project" gap
+
+The biggest source of untagged spend we expect to see is Claude Code. Developers often start sessions without associating them to a project, and that spend lands in the unassigned bucket.
+
+Three practical steps:
+
+1. **Make it visible.** Report the unassigned share every month. If it is above roughly 15–20% of total spend, the tag numbers are not trustworthy for billing.
+2. **Make the default right.** Include project setup in your team's Claude Code onboarding and in repository templates, so new work starts attached to the correct project.
+3. **Don't over-engineer it.** For internal tooling, a single catch-all project tagged `purpose: internal-tooling` is fine. Precision matters for billable work, not for everything.
+
+## Treat the numbers as allocation, not invoices
+
+Anthropic is explicit that per-tag amounts may differ from the invoice. Use tag data to **allocate** the invoiced total, not to replace it:
+
+```text
+allocated_cost(tag) = invoice_total × (tag_spend / sum_of_all_tag_spend_including_unassigned)
+```
+
+This keeps your finance numbers reconciled with what you actually pay, while still letting you attribute cost to engagements.
+
+## How this fits with the new security controls
+
+The November 5 update — security center, inference hooks, centralized management — and project tags point in the same direction: Claude Enterprise is being shaped for organizations that need to answer audit questions, not just productivity questions. Public detail on the security center is still limited, so we would not design around it yet. Project tags, however, are usable today and directly useful.
+
+## Our recommendation
+
+- Define tag keys from the reports you need, and keep it to three or fewer
+- Use opaque IDs, never client names, because tags are org-wide visible
+- Keep the scheme in version control and validate before applying
+- Track the unassigned share, especially from Claude Code
+- Use tag data to allocate invoice totals rather than as a billing source on its own
+
+Small setup work here pays back the first time a client or your finance team asks what the AI-assisted part of a project actually cost.

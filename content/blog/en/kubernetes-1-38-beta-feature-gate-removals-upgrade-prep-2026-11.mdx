@@ -1,0 +1,133 @@
+---
+title: "Kubernetes 1.38 Beta Is Out: Audit Your Feature Gates Before December"
+description: "Kubernetes v1.38.0-beta.0 shipped on November 4 with GA planned for December 16. The most likely upgrade breakage is not a new feature but removed feature gates and kubelet flags. Here is how to check."
+date: "2026-11-09"
+status: "published"
+tags: ["Kubernetes", "DevOps", "Cloud", "Upgrade", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-38-beta-feature-gate-removals-upgrade-prep-2026-11"
+---
+
+Kubernetes v1.38.0-beta.0 was released on November 4, 2026. According to the official release schedule, a deprecations and removals blog post is planned for November 23, and the GA release is scheduled for December 16. KubeCon + CloudNativeCon North America runs this week, so expect a lot of 1.38 discussion — most of it about new features.
+
+From an operations perspective, the features are rarely what breaks an upgrade. What breaks it is configuration that references something that no longer exists. In 1.38, that mostly means **removed feature gates** and **deferred kubelet flag removals**. The beta is the right time to find those.
+
+## What we know so far
+
+The final list is not frozen, and most public detail comes from alpha changelogs and pre-beta previews. With that caveat, the items relevant to upgrade planning are:
+
+**Removals and lock-ins**
+
+- `KubeletTracing` has been removed. It had been GA and locked on since v1.34.
+- `DRADeviceTaints` and `DRADeviceTaintRules` are locked to GA, so they can no longer be disabled.
+- A tracking PR in the Sidero Labs `go-kubernetes` library adds 19 feature gates removed as of 1.38.0-beta.0 to its upgrade checks. It notes that `WinDSR` and `WinOverlay` are kube-proxy gates, which its checker does not inspect.
+- Some kubelet container-runtime configuration flags were originally due for removal in 1.37 and were deferred to 1.38 to keep containerd v1.7 working.
+
+**Graduations to watch**
+
+- `ShardedListAndWatch` moved to beta.
+- Windows CPU and memory affinity reached beta and is on by default.
+- `KubeProxyNFTablesLocalhostNodePorts` is beta and on by default.
+- Several storage features (emptyDir mode control, per-volume default ownership, bind mount options) and DRA attribute features are targeting beta.
+
+Third-party previews count roughly 86–87 tracked enhancements, but the numbers differ between sources. Treat counts as directional.
+
+## Why a removed gate breaks things
+
+When a feature reaches GA, its gate is locked to `true` for a few releases and then removed. If your component configuration still sets that gate explicitly — even to `true` — the component will refuse to start once the gate no longer exists, with an "unrecognized feature gate" style error.
+
+These settings tend to survive for years because nobody touches a working config. They hide in kubeadm configs, kubelet config files, Helm values, Terraform modules for managed clusters, and `kind` configs used in CI.
+
+## Step 1: inventory explicit feature gates
+
+Start with your infrastructure repositories:
+
+```bash
+# Find every explicit feature gate setting in IaC and manifests
+grep -rnE --include='*.yaml' --include='*.yml' --include='*.tf' \
+  --include='*.json' --include='*.toml' \
+  'feature-gates|featureGates|feature_gates' .
+```
+
+Then check what a running cluster actually has enabled. The API server and kubelet expose a `kubernetes_feature_enabled` metric:
+
+```bash
+# API server view
+kubectl get --raw /metrics | grep '^kubernetes_feature_enabled' \
+  | grep -E 'KubeletTracing|DRADeviceTaint|WinDSR|WinOverlay'
+
+# A specific node's kubelet view
+NODE=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+kubectl get --raw "/api/v1/nodes/${NODE}/proxy/metrics" \
+  | grep '^kubernetes_feature_enabled'
+```
+
+The metric shows what is enabled, not what is set explicitly. Combine it with the grep results to find the explicit references you need to delete.
+
+## Step 2: compare against the removal list
+
+Once the official 1.38 changelog and the November 23 blog post are out, turn the removed-gate list into a check you can run in CI:
+
+```bash
+#!/usr/bin/env bash
+# check-removed-gates.sh — fail if config references gates removed in 1.38
+set -euo pipefail
+
+# Fill from the official CHANGELOG-1.38 once published
+REMOVED_GATES=(
+  KubeletTracing
+  # ...
+)
+
+status=0
+for gate in "${REMOVED_GATES[@]}"; do
+  if grep -rnw --include='*.yaml' --include='*.yml' --include='*.tf' \
+       --include='*.json' --include='*.toml' "${gate}" infra/; then
+    echo "::error::Removed feature gate referenced: ${gate}"
+    status=1
+  fi
+done
+exit $status
+```
+
+It is deliberately simple. The point is to make the check repeatable, so the next minor upgrade reuses it with a new list.
+
+## Step 3: check the kubelet runtime flags and containerd version
+
+The deferred kubelet flag removal matters most for clusters still on containerd 1.7. Check what each node reports:
+
+```bash
+kubectl get nodes \
+  -o custom-columns='NODE:.metadata.name,RUNTIME:.status.nodeInfo.containerRuntimeVersion,KUBELET:.status.nodeInfo.kubeletVersion'
+```
+
+If you still see `containerd://1.7.x`, plan the containerd 2.x move as a separate change before the 1.38 upgrade. Bundling a runtime major version and a Kubernetes minor version into one maintenance window makes failures much harder to diagnose.
+
+## Step 4: run your workloads on the beta
+
+A beta release is meant for exactly this. Spin up a disposable cluster on 1.38 beta (kind, or a non-production cluster from your provider if they offer preview channels), apply your manifests and Helm charts, and run the smoke tests you already have.
+
+While it runs, check for deprecated API usage:
+
+```bash
+kubectl get --raw /metrics | grep '^apiserver_requested_deprecated_apis'
+```
+
+Anything that shows up there is a removal waiting to happen in a future release.
+
+## Managed Kubernetes timelines
+
+If you use EKS, GKE, or AKS, you will not get 1.38 on December 16. Managed providers typically follow upstream by weeks to months. That does not make the beta irrelevant: the removed gates and flags are the same, and fixing your configs now means the managed upgrade is a non-event when it arrives.
+
+## Our take
+
+We see the same pattern on almost every Kubernetes upgrade project: the cluster itself upgrades fine, and something small — a stale feature gate, an old runtime flag, a deprecated API in a forgotten Helm chart — causes the outage. None of these require deep Kubernetes knowledge to fix. They require someone to look before the upgrade, not after.
+
+Our recommendation for the next six weeks:
+
+- Inventory explicit feature gates now, using both IaC grep and the live metric
+- Wait for the November 23 removals post, then convert it into a CI check
+- Separate the containerd 1.7 to 2.x migration from the Kubernetes upgrade
+- Run real workloads against the beta, not just a hello-world pod
+- Keep the scripts; the next upgrade will need them again
