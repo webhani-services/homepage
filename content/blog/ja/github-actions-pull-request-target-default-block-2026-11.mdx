@@ -1,0 +1,120 @@
+---
+title: "GitHub Actions：12月2日から public リポジトリの `pull_request_target` が既定でブロックに。今やるべき棚卸し"
+description: "GitHub は12月2日から、イベントポリシーが未設定の public リポジトリで `pull_request_target` ワークフローを既定でブロックします。11月16日にも一時的なブロック（brownout）が予定されています。影響するワークフローの洗い出し方と、安全な書き換えパターンを紹介します。"
+date: "2026-11-13"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "セキュリティ", "DevOps", "サプライチェーン"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-pull-request-target-default-block-2026-11"
+---
+
+GitHub は、public リポジトリでの `pull_request_target` ワークフローを **12月2日から既定でブロック** すると発表しました。対象は、Actions のイベントポリシーが設定されていない public リポジトリです（GitHub Free / Team / Enterprise Cloud。GitHub Enterprise Server、private / internal リポジトリは対象外）。ブロックされた実行はエラーアノテーション付きで失敗扱いになり、ジョブは動きません。
+
+本番適用の前に一時的なブロック（brownout）が行われます。11月9日はすでに実施済みで、次は11月16日です。二次情報では時間帯は 16:00〜18:00 UTC（日本時間 17 日 1:00〜3:00）とされています。この時間帯に PR のラベル付けや自動コメントが止まったら、それが本番適用後の姿です。
+
+## なぜ `pull_request_target` が狙われるのか
+
+`pull_request` イベントは fork からの PR に対して、読み取り専用の token で、secret なしで動きます。一方 `pull_request_target` は **ベースリポジトリの文脈** で動くので、書き込み権限の token と secret にアクセスできます。ラベル付けや PR へのコメントのように「PR の中身を実行せずに、リポジトリに書き込む」用途のために用意されたイベントです。
+
+問題になるのは、このイベントの中で PR のコード（fork 側の head）を checkout して実行してしまうケースです。攻撃者は fork でビルドスクリプトや `package.json` の `postinstall` を書き換えるだけで、secret を持ったジョブ上で任意のコードを動かせます。いわゆる "pwn request" で、ここ数年のサプライチェーン攻撃で何度も使われてきました。
+
+GitHub は段階的に対策を進めてきました。6月には `actions/checkout` v7 が `pull_request_target` で fork のコードを checkout することを既定で拒否するようになり、9月にはワークフロー実行保護（workflow execution protections）が GA になりました。今回の変更はその仕上げにあたり、「使うなら明示的に許可せよ」という既定値への転換です。
+
+## ステップ 1：影響するワークフローを洗い出す
+
+まずは自分たちのリポジトリで `pull_request_target` を使っている箇所を把握します。
+
+```bash
+# ローカルのリポジトリ
+rg -n "pull_request_target" .github/workflows
+
+# Organization 全体（GitHub CLI のコード検索）
+gh search code "pull_request_target" --owner your-org --extension yml \
+  --json repository,path --jq '.[] | "\(.repository.nameWithOwner)\t\(.path)"'
+```
+
+GitHub は、ルールを有効にした場合にどの実行がブロックされるかを確認できる policy insights を提供しています。検索で見つけたワークフローと突き合わせて、漏れがないか確認してください。
+
+見つかったワークフローは、次の3つに分類します。
+
+| 分類 | 例 | 対応 |
+| --- | --- | --- |
+| A. PR のコードを実行しない | labeler、PR タイトルの lint、歓迎コメント | 必要なものだけイベントポリシーで明示的に許可 |
+| B. PR のコードを checkout して実行する | fork の PR でテストを回し、結果をコメント | `pull_request` + `workflow_run` に分割 |
+| C. もう使っていない | 昔のボットの名残 | 削除 |
+
+## ステップ 2：B のワークフローを分割する
+
+最も危険なのは B です。今回のブロックがなくても書き換えるべきパターンです。定番の書き換えは、**信頼できないコードを動かすジョブ** と **書き込み権限を使うジョブ** を分けることです。
+
+```yaml
+# .github/workflows/pr-test.yml — fork のコードを権限なしで実行
+name: PR Test
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: npm ci && npm test -- --reporter=json > result.json
+      - run: echo "${{ github.event.pull_request.number }}" > pr-number.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-result
+          path: |
+            result.json
+            pr-number.txt
+```
+
+```yaml
+# .github/workflows/pr-comment.yml — 結果を読んでコメントするだけ
+name: PR Comment
+on:
+  workflow_run:
+    workflows: ["PR Test"]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-result
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      # artifact は信頼できない入力として扱う：数値チェックしてから使う
+      - run: |
+          PR=$(cat pr-number.txt)
+          [[ "$PR" =~ ^[0-9]+$ ]] || { echo "invalid PR number"; exit 1; }
+          echo "PR=$PR" >> "$GITHUB_ENV"
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "Tests finished. See the workflow run for details."
+```
+
+注意点は、`workflow_run` 側でも **artifact の中身は攻撃者が書けるデータ** だということです。PR 番号のような値は形式を検証し、artifact 内のスクリプトを実行したり、内容をそのままシェルに展開したりしないでください。
+
+## ステップ 3：A のワークフローは明示的に許可する
+
+ラベル付けのように、PR のコードを checkout しない `pull_request_target` ワークフローは正当な用途です。これらは Actions のイベントポリシーで明示的に許可します。ポリシーは Organization やリポジトリの設定画面のほか、Actions policies の REST API からも管理できます。Dependabot などのボットが PR を作るワークフローに依存している場合は、許可する actor にボットを含める必要がある点にも注意してください。
+
+許可する前に、各ワークフローを次の観点で確認しておくと安心です。
+
+- `actions/checkout` で `github.event.pull_request.head.sha` や `head.ref` を取得していないか
+- `${{ github.event.pull_request.title }}` などの PR 由来の値を `run:` に直接埋め込んでいないか（環境変数経由で渡す）
+- `permissions:` を必要最小限に絞っているか
+
+## webhani の見解
+
+私たちが支援している案件でも、`pull_request_target` は「fork からの PR にもコメントを付けたいから」という理由で何となく採用され、そのまま残っていることがよくあります。そうしたワークフローの多くは、上記の分割パターンか、`pull_request` だけで十分に置き換えられます。
+
+12月2日以降、壊れたまま気づかないのは、普段あまり PR が来ない OSS や社内ツールの public リポジトリです。今のうちに検索で一覧を作り、11月16日の brownout の時間帯に実際に何が止まるかを確認してください。既定でブロックされるようになることは、手間ではありますが、CI の権限設計を見直す良いきっかけでもあります。

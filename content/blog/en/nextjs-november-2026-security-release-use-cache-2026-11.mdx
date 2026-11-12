@@ -1,0 +1,110 @@
+---
+title: "Next.js November 2026 Security Release: Patch Multi-Tenant `use cache` Apps First"
+description: "Next.js 16.4.5 and 15.5.29 fix seven vulnerabilities, four of them in Cache Components and `use cache`, with real potential for cross-tenant data exposure. How to scope your exposure, upgrade, and harden the code patterns behind it."
+date: "2026-11-13"
+status: "published"
+tags: ["Next.js", "Security", "Caching", "React", "Multi-Tenant"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-november-2026-security-release-use-cache-2026-11"
+---
+
+The November Next.js security release landed on November 3 with v16.4.5 (Active LTS) and v15.5.29 (Maintenance LTS). Seven fixes: one High, six Medium. On paper, a routine patch. In practice, **four of the seven involve Cache Components and `use cache`**, and if you separate tenants, sites, or locales by root parameters, some of them can serve one tenant's data to another. That moves this to the top of the queue.
+
+## The seven issues, grouped by blast radius
+
+**Cache Components / `use cache`**
+
+- **High** — If the same public `use cache` function is called both directly and from inside `unstable_cache`, a concurrent request during a cold cache fill can receive a result computed for a different root-parameter value, such as another tenant ID (GHSA-mfr8-8qww-v76h).
+- **Medium** — With nested `use cache` functions, if the inner one reads a root parameter and the outer one completes without awaiting a slower async value, the outer entry can be stored before the root-parameter dependency is recorded (GHSA-vc7v-qv4w-wrv8).
+- **Medium** — Distinct binary arguments passed to a `use cache` function can collapse to the same cache identity (GHSA-rhh4-g77r-r9qj).
+- **Medium** — Self-hosted `next start` with Cache Components enabled and Partial Prefetching off or unset can have a shared page shell poisoned via a specific route shape.
+
+**Everything else**
+
+- **Medium** — Self-hosted apps that return an attacker-influenced fetched `Response` unchanged, behind an HTTP/1.1 proxy that pipelines requests on a shared backend connection, can misroute responses between clients (GHSA-pc58-hwjq-p385).
+- **Medium** — Edge Route Handlers using `NextResponse.cookies.set()` can leak serialized cookies, including `HttpOnly` ones, to same-origin JavaScript through the internal `x-middleware-set-cookie` header (GHSA-f3mh-rxg3-f5g2).
+- **Medium** — An image misclassified as AVIF can bypass `images.dangerouslyAllowSVG: false` in Image Optimization (GHSA-7qx7-33qx-rqx2).
+
+According to Pantheon's release notes, 15.5.29 carries only three of these fixes (response injection, Edge cookies, SVG), while 16.4.5 carries all seven. Cache Components is a 16.x feature, so the missing cache fixes on 15.x matter less there. If nothing is holding you on 15.x, though, put 16.4.5 on the roadmap.
+
+## Scope your exposure before you upgrade
+
+Knowing which issues actually apply tells you what to retest after the upgrade.
+
+```bash
+# 1. Which Next.js version is actually resolved
+npm ls next
+
+# 2. Cache Components / use cache usage
+rg -n "cacheComponents" next.config.*
+rg -n "\"use cache\"|'use cache'" src app
+rg -n "unstable_cache" src app
+
+# 3. Edge runtime routes that set cookies
+rg -n "runtime\s*=\s*['\"]edge['\"]" src app
+rg -n "NextResponse.*cookies\.set|\.cookies\.set\(" src app
+
+# 4. Image Optimization SVG settings and remote sources
+rg -n "dangerouslyAllowSVG|remotePatterns" next.config.*
+```
+
+The pattern to look for first: **a `use cache` function that reads a tenant-scoped root parameter and is also wrapped in `unstable_cache` somewhere else.** That is exactly the High-severity precondition.
+
+## Upgrade
+
+```bash
+# 16.x
+npm install next@16.4.5
+
+# 15.x
+npm install next@15.5.29
+```
+
+The official post labels the 16.x command "for 16.5"; the fixed version is 16.4.5. If you deploy on Netlify, Netlify says the OpenNext Netlify adapter also needs to be at v5.16.6 or later.
+
+## Patterns worth revisiting after the patch
+
+The patch fixes these specific bugs. The code shapes that invite this class of bug are still in your repo. Two things we are recommending to clients:
+
+### 1. Don't mix `unstable_cache` and `use cache`
+
+`unstable_cache` predates Cache Components. Calling one function through both mechanisms gives you two independent notions of cache identity, and boundaries drift between them. Write new code with `use cache` and migrate existing `unstable_cache` call sites incrementally.
+
+### 2. Make tenant boundaries explicit in arguments
+
+Instead of reading a root parameter implicitly inside the cached function, pass anything that should partition the cache as an argument. Reviewers can then see the boundary.
+
+```tsx
+// Preferred: tenantId is an explicit argument, so it is part of the cache key
+async function getTenantDashboard(tenantId: string) {
+  "use cache";
+  return db.dashboard.findMany({ where: { tenantId } });
+}
+
+export default async function Page({
+  params,
+}: {
+  params: Promise<{ tenant: string }>;
+}) {
+  const { tenant } = await params;
+  const data = await getTenantDashboard(tenant);
+  return <Dashboard data={data} />;
+}
+```
+
+The framework now tracks root-parameter dependencies correctly. Making the partition key visible in code is a second layer of defense against the next bug in the same family.
+
+For `HttpOnly` cookies, prefer Node.js runtime Route Handlers with `cookies().set()`. The advisory notes the leak did not reproduce there, and Vercel now recommends moving off the Edge runtime anyway, so this is a good moment to migrate.
+
+## Our take
+
+Next.js has shipped a security release roughly every month this year, and a large share of the fixes sit on the boundary between caching and rendering. Cache Components buys real performance, but it also hides "what is the cache key?" inside the framework.
+
+If you run multi-tenant SaaS on Next.js, we suggest making three things routine:
+
+1. Configure Dependabot or Renovate so Next.js patch releases are merged within a week.
+2. Keep an E2E test that logs in as tenant A and asserts tenant B's data never appears — and run it against a warm cache, not just a cold one.
+3. Add a review rule: any `use cache` function must receive tenant-distinguishing values as arguments.
+
+Applying the patch closes these holes. Changing the patterns makes the next one less likely to matter.

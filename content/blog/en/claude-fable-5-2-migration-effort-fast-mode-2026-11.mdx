@@ -1,0 +1,105 @@
+---
+title: "Moving to Claude Fable 5.2: Effort Defaults, Fast Mode, and What It Does to Your Bill"
+description: "Claude Fable 5.2 shipped on November 9. Swapping the model ID is close to drop-in, but effort defaults differ between the API and Claude Code, and Fast mode has its own pricing. Here is what we check before switching production traffic."
+date: "2026-11-13"
+status: "published"
+tags: ["Claude", "LLM", "AI", "Anthropic", "Cost Management"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-fable-5-2-migration-effort-fast-mode-2026-11"
+---
+
+Anthropic released Claude Fable 5.2 on November 9, alongside Claude Mythos 5.2, a restricted variant for vetted security and life-sciences organizations. The API model ID is `claude-fable-5-2`. Changing the ID takes a minute. Changing it safely for production agents and batch jobs takes a bit more, because the first thing that shifts is usually cost and latency, not quality.
+
+## What changed
+
+From the official migration guide and press coverage:
+
+- **Pricing:** $8 input / $40 output per million tokens, as reported by SD Times citing Anthropic's announcement. That is lower than Fable 5.1.
+- **Speed:** Anthropic says output generation is up to 30% faster than Fable 5.1.
+- **Context:** 1M-token context window by default, up to 128k output tokens per request.
+- **Effort:** All five effort levels are supported. The API default stays at `high`, same as 5.1. Claude apps and Claude Code now default to medium.
+- **Thinking:** Adaptive thinking is always on.
+- **Fast mode:** Available on the Messages API. A developer guide describes it as `speed: "fast"` priced at $16 / $80 per million tokens. That is a secondary source; confirm against the official pricing page.
+- **Availability:** Paid Claude plans, the Claude API, Amazon Bedrock, Google Cloud, and Microsoft Azure.
+
+The migration guide calls the switch mostly drop-in. The part that is not drop-in is the effort default.
+
+## The trap: different defaults in different places
+
+An engineer who tries Fable 5.2 in Claude Code is running at medium effort. The same prompt sent through the API runs at high. Those two experiences will not match, and neither will the token counts.
+
+It gets wider when you come from another model. Opus 5.5 defaults to medium, so swapping only the model ID to Fable 5.2 quietly bumps every request up one effort level. Higher effort means more output tokens, which means more latency and more cost. A lower unit price does not guarantee a lower invoice.
+
+Our recommendation: **never rely on the default. Set effort explicitly per workload.**
+
+```ts
+// llm-profiles.ts — one place that owns model + effort per workload
+type Effort = "low" | "medium" | "high";
+
+interface LlmProfile {
+  model: string;
+  effort: Effort;
+  maxTokens: number;
+}
+
+export const profiles = {
+  // Interactive chat: latency matters most
+  chat: { model: "claude-fable-5-2", effort: "medium", maxTokens: 4_000 },
+  // Nightly code review batch: quality matters most
+  review: { model: "claude-fable-5-2", effort: "high", maxTokens: 16_000 },
+  // Classification / extraction: a small model is enough
+  classify: { model: "claude-haiku-5-5", effort: "low", maxTokens: 512 },
+} satisfies Record<string, LlmProfile>;
+```
+
+Check your SDK version for the exact request field that carries effort. The point is structural: model and effort live together, so changing one forces a conscious decision about the other.
+
+## Where Fast mode earns its price
+
+Fast mode trades a higher per-token price for faster output — roughly double, if the secondary pricing above holds. Turning it on everywhere just doubles a line item. We split it like this:
+
+- **Use it:** interactive UIs where a person is watching a spinner; short CI tasks that block a developer.
+- **Skip it:** nightly batches, async document generation, webhook-triggered agents.
+
+The test is simple: is someone actually waiting for those saved seconds? If not, the only place Fast mode shows up is the bill.
+
+## Pre-switch checklist
+
+Before moving production traffic, we run through the following.
+
+1. **Re-run your evals.** Use 50–100 real inputs and compare the previous model and Fable 5.2 on quality, output token count, and wall-clock time.
+2. **Log usage per request.** Without per-request token data you cannot tell whether the switch saved money.
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+export async function runWithUsageLog(profileName: string, prompt: string) {
+  const started = Date.now();
+  const res = await client.messages.create({
+    model: "claude-fable-5-2",
+    max_tokens: 4_000,
+    messages: [{ role: "user", content: prompt }],
+  });
+  console.info(JSON.stringify({
+    profile: profileName,
+    model: res.model,
+    inputTokens: res.usage.input_tokens,
+    outputTokens: res.usage.output_tokens,
+    ms: Date.now() - started,
+  }));
+  return res;
+}
+```
+
+3. **Check data retention terms.** Some coverage reports that Fable 5.2 on the Claude Platform requires 30-day data retention unless zero retention has been granted. If you process client data, verify this against the official docs and your contracts.
+4. **Keep a fallback.** Put the model ID behind an environment variable or feature flag and watch error rates and timeouts for the first few days.
+5. **Align Claude Code usage.** With medium now the default, some engineers will notice shallower answers on hard problems. Agree as a team on when to raise effort explicitly — architecture decisions and gnarly debugging are the obvious cases.
+
+## Our take
+
+This release reads less like a capability jump and more like "similar quality, cheaper and faster." That is useful, but a cheaper unit price is not automatically a saving. Effort defaults and Fast mode usage can move the bill in either direction.
+
+One-line migrations are exactly the ones that get shipped without measurement. Log usage first, pin effort per workload, compare on evals, then switch. Done in that order, you get the benefit of the new model with numbers to prove it.
