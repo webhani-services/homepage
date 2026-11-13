@@ -1,0 +1,133 @@
+---
+title: "PostgreSQL 19のWAIT FOR LSN: Sticky Routingなしでレプリカからの Read-Your-Writesを実現する"
+description: "PostgreSQL 19のリリースが間近に迫っています。WAIT FOR LSNにより、スタンバイから自分の書き込みを確実に読むパターンが標準機能になります。Node.jsのコード付きで解説します。"
+date: "2026-11-14"
+status: "published"
+tags: ["PostgreSQL", "データベース", "レプリケーション", "アーキテクチャ", "Node.js"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-19-wait-for-lsn-read-your-writes-replicas-2026-11"
+---
+
+PostgreSQL 19はリリース候補の段階にあり、EDBのスケジュール解説によれば、一般提供は今月後半の予定です(最終的な日程はpostgresql.orgで確認してください)。以前の記事では[アップグレード前に確認すべき非互換点](/blog/postgresql-19-rc1-upgrade-incompatibilities-checklist-2026)を取り上げました。今回は読み取りスケーリングの設計を変えうる機能、`WAIT FOR LSN`コマンドを扱います。Beta 1のアナウンスで、レプリカ上のRead-Your-Writesパターンを支える機能として挙げられていたものです。
+
+Betaから RCの間には、機能が差し戻されたケースもあります(SQL/PGQのプロパティグラフクエリが報告されている例です)。この記事のオプション名や挙動を前提に実装を始める前に、最終版のリリースノートで`WAIT FOR LSN`の仕様を確認してください。
+
+## 解決する問題
+
+プライマリの負荷を下げるためにリードレプリカを追加したとします。ユーザーがプロフィールを保存すると、書き込みはプライマリへ、保存後のリダイレクト先の読み取りはレプリカへ向かいます。レプリカは数百ミリ秒遅れているため、ユーザーには古いデータが表示され、「保存されていない」という問い合わせが届きます。
+
+よくある回避策には、それぞれコストがあります。
+
+- **書き込み後しばらくは常にプライマリから読む**: 単純ですが、時間による当て推量であり、プライマリに負荷が戻ります。
+- **プライマリへのSticky Session**: セッションがフェイルオーバーやデプロイをまたぐと破綻します。
+- **全体を同期レプリケーションにする**: 解決しますが、書き込みレイテンシと可用性を犠牲にします。
+
+`WAIT FOR LSN`はもう少し正確な手段を提供します。アプリケーションが自分の書き込みのWAL位置を覚えておき、レプリカに「少なくともこの位置まで適用するまで待て」と依頼する方式です。
+
+## 仕組み
+
+すべての書き込みはWAL上の位置、つまりLSN(Log Sequence Number)を持ちます。流れは次のとおりです。
+
+1. プライマリで書き込み、その直後に現在のWAL位置を取得する。
+2. そのLSNをリクエストとともに持ち回る(Cookie、セッション、レスポンスヘッダーなど)。
+3. レプリカから読む前に`WAIT FOR LSN '<lsn>'`を実行する。スタンバイがその位置まで適用すると復帰し、Timeoutに達すると失敗する。
+4. 読み取りを実行する。
+
+プライマリでコミットした後:
+
+```sql
+SELECT pg_current_wal_insert_lsn();
+-- 例: 0/3A7F2C8
+```
+
+レプリカで読み取りの前に:
+
+```sql
+WAIT FOR LSN '0/3A7F2C8' WITH (TIMEOUT '200ms');
+SELECT * FROM profiles WHERE user_id = 42;
+```
+
+正確なオプション名やTimeout時の挙動は、最終版のドキュメントで確認してください。Beta時点の構文が調整されている可能性があります。
+
+見落としやすい点が1つあります。LSNは、自分のトランザクションが**コミットした後**に、コミットレコード以降の値として取得する必要があります。同じ接続で`COMMIT`の直後に挿入位置を読めば、少なくとも自分のコミットまで進んだ値になるため安全です。
+
+## Node.jsでの実装
+
+薄いラッパーにポリシーを集約します。短時間だけ待ち、レプリカが間に合わなければプライマリにフォールバックします。
+
+```ts
+import { Pool } from "pg";
+
+const primary = new Pool({ connectionString: process.env.PRIMARY_URL });
+const replica = new Pool({ connectionString: process.env.REPLICA_URL });
+
+export async function writeAndGetLsn(
+  fn: (c: import("pg").PoolClient) => Promise<void>,
+): Promise<string> {
+  const client = await primary.connect();
+  try {
+    await client.query("BEGIN");
+    await fn(client);
+    await client.query("COMMIT");
+    const { rows } = await client.query(
+      "SELECT pg_current_wal_insert_lsn() AS lsn",
+    );
+    return rows[0].lsn as string;
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function readAfter<T>(
+  lsn: string | undefined,
+  sql: string,
+  params: unknown[],
+): Promise<T[]> {
+  if (!lsn) {
+    return (await replica.query(sql, params)).rows as T[];
+  }
+  const client = await replica.connect();
+  try {
+    // lsnは自サーバー側の状態から来る値だが、形式は検証しておく。
+    if (!/^[0-9A-F]+\/[0-9A-F]+$/i.test(lsn)) throw new Error("bad lsn");
+    await client.query(`WAIT FOR LSN '${lsn}' WITH (TIMEOUT '200ms')`);
+    return (await client.query(sql, params)).rows as T[];
+  } catch {
+    // レプリカの遅延が大きい(または待機に失敗した)場合はプライマリで読む。
+    return (await primary.query(sql, params)).rows as T[];
+  } finally {
+    client.release();
+  }
+}
+```
+
+正規表現による検証に注目してください。`WAIT FOR LSN`は文字列リテラルを取るため、ドライバーによっては通常のパラメータとしてバインドできません。クライアントから直接受け取った値を埋め込むのは避けてください。LSNはサーバー側のセッションに保存するか、Cookieで運ぶなら署名を付けます。
+
+## 意識して決めるべき設計項目
+
+**Timeout**: 待機は読み取りパスに加わるレイテンシです。許容できるp95に近い値を選び、Timeoutの発生はノイズではなくシグナルとして扱います。フォールバック率が上がっているなら、レプリケーション遅延が実際に問題になっています。
+
+**LSNの置き場所**: サーバー側のセッションストアが最も単純です。Cookieで運ぶ場合は署名し、数秒で失効させます。古いLSNは意味を持たず、空振りの待機が発生するだけです。
+
+**対象とする読み取り**: ほとんどの読み取りには不要です。5秒古いダッシュボードで問題ありません。ユーザー自身の書き込み直後に、その結果を表示する画面にだけ適用します。
+
+**複数レプリカ**: LSNはクラスタ全体で共通なので、どのレプリカに対しても使えますが、待ち時間はレプリカごとに異なります。
+
+## 解決しないこと
+
+- 他のユーザーの書き込みについては、レプリカとの整合性は保証されません。保証されるのは自分の書き込みだけです。
+- レプリケーション遅延そのものはなくなりません。重要な読み取りに限って、ブロックと引き換えに隠すだけです。
+- レプリカが大きく遅れている場合は、Timeoutを待った後にプライマリを読むことになります。遅延は別途監視してください。
+
+## まとめ
+
+- `WAIT FOR LSN`は、時間による当て推量を「自分の書き込みを見るまで返答しない」という明示的な因果依存に置き換えます。
+- プライマリへのフォールバックを持つ小さなポリシー関数として実装し、フォールバックの発生頻度を計測します。
+- 最終的な構文とオプションはPostgreSQL 19のドキュメントで確認し、Betaではなくリリース版で検証します。
+- 特定の書き込みを見る必要がない読み取りは、これまでどおり通常のレプリカ読み取りで構いません。
+
+レプリカ遅延を隠すためだけにSticky Routingやアプリケーション層のCacheを入れていたチームは、19がステージング環境で使えるようになった時点で試作してみる価値があります。

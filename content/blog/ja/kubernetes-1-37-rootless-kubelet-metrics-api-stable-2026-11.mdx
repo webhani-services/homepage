@@ -1,0 +1,108 @@
+---
+title: "Kubernetes 1.37: Metrics APIがStable、Rootless KubeletがBetaに。何を検証すべきか"
+description: "Kubernetes 1.37でMetrics APIがStableに、Rootless KubeletがBetaに進みました。オートスケーリング、ノードのセキュリティ、アップグレード時のチェック項目への影響を実務目線で整理します。"
+date: "2026-11-14"
+status: "published"
+tags: ["Kubernetes", "クラウドインフラ", "セキュリティ", "オートスケーリング", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-37-rootless-kubelet-metrics-api-stable-2026-11"
+---
+
+Kubernetes 1.37(コードネーム「Garhwal」)は8月下旬にリリースされました。InfoQの記事は、日々の運用に関わる2点を取り上げています。Metrics APIのStable化と、kubeletのRootlessモードのBeta移行です。第三者のまとめでは、このリリースの機能強化は67件で、うち16件がStableとされています。SELinuxやkube-proxyの変更など[アップグレード時の注意点](/blog/kubernetes-1-37-upgrade-selinux-kube-proxy-2026)はすでに別記事で扱っているため、今回はこの2点を「実際に何をすべきか」という観点で見ていきます。
+
+情報源について補足します。本記事はリリースに関する報道とプロジェクトのリリースページに基づいており、この記事のために当社でクラスタをアップグレードして検証した内容ではありません。Feature Gateの正確な名称やデフォルト値は、変更前に公式の1.37リリースノートとお使いのディストリビューションのドキュメントで確認してください。
+
+## Metrics APIのStable化
+
+Metrics API(`metrics.k8s.io`)は、`kubectl top`やHorizontal Pod AutoscalerのCPU・メモリベースのスケーリングを支えるAPIです。API Server本体ではなく、通常はmetrics-serverなどのアドオンが提供します。長年Beta版のままでしたが、ほぼすべての本番クラスタが依存してきました。
+
+Stableになっても、APIの機能自体は変わりません。変わるのは約束事です。
+
+- Stable APIは長期的な互換性を示すため、利用側のツールが「Betaなので変わるかもしれない」と身構える必要がなくなる。
+- クライアントライブラリやコントローラーが、Stable版を前提に実装できる。
+- アドオンの実装者にとって、固定されたインターフェースができる。
+
+### 確認すること
+
+まず、現在のクラスタが提供しているバージョンを確認します。
+
+```bash
+kubectl api-versions | grep metrics.k8s.io
+kubectl get apiservices | grep metrics
+kubectl top nodes
+```
+
+metrics-serverを運用している場合は、アップグレードの**後**ではなく**前**に、導入済みのバージョンが1.37のコントロールプレーンで提供されるバージョンに対応しているかを確認してください。不一致があると`kubectl top`がエラーを返し、HPAのメトリクスが`unknown`になります。つまりオートスケーリングが静かに止まります。
+
+アップグレード後のカナリアとして使える最小限のHPAです。
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+本番以外のクラスタをアップグレードしたら、レプリカ数だけでなく`kubectl describe hpa web`の`AbleToScale`と`ScalingActive`の状態を確認します。レプリカ数が正常に見えても、メトリクスのパイプラインが止まってオートスケーラーに値が届いていない場合があるためです。
+
+`/apis/metrics.k8s.io/v1beta1/...`を直接呼ぶ独自ツール(コストダッシュボードやキャパシティ計画のスクリプトなど)がないかも検索しておいてください。将来Beta版が廃止されたときに壊れるのは、そうしたツールです。
+
+## Rootless KubeletのBeta化
+
+kubeletをrootで動かすのは従来からのデフォルトで、権限面の攻撃対象が大きい構成です。kubeletはPodを管理し、ボリュームをマウントし、コンテナランタイムとやり取りします。Rootlessモードは、kubeletを非特権ユーザーで動かすことを目指すものです。User Namespaceを利用し、ノードエージェントが侵害されてもホストのroot権限奪取につながりにくくします。
+
+Betaは、機能が一定の検証を経てFeature Gate経由で有効にできる段階を意味しますが、記事を読んだその日にフリート全体へ展開してよいという意味ではありません。BetaのノードレベルFeatureに対する現実的な想定は次のとおりです。
+
+- 一部のVolumeタイプやCSI Driverでは、挙動が異なる、または未対応の場合がある。
+- ネットワークやDevice Plugin(GPUなど)が摩擦の起きやすい箇所になる。
+- ベースOSにUser Namespaceのサポートと、適切な`subuid`/`subgid`の範囲が必要になる。
+
+### 現実的な評価の進め方
+
+1. **リスクの低いNode Poolを選ぶ**: Statelessなワークロードで、GPUや特殊なストレージを使わないもの。
+2. **前提条件を確認する**: ノードイメージのUser Namespace対応、ランタイムのバージョン、cgroupのバージョン。
+3. **通常のConformanceテストとSmokeテストに加え、自社のテストも実行する**: PersistentVolumeのAttach、DNS、サービス間通信、ログ転送、node-exporterのスクレイプなど。
+4. **通常のPoolと比較する**: リソース使用量とPodの起動レイテンシ。
+5. **失敗した内容を記録する**: Upstreamのissueやディストリビューションのベンダーに共有する。
+
+```bash
+# 候補ノードでの大まかな前提確認
+cat /proc/sys/user/max_user_namespaces
+stat -fc %T /sys/fs/cgroup   # cgroup2fsならcgroup v2
+grep "$USER" /etc/subuid /etc/subgid
+```
+
+これらは出発点であり、完全なチェックリストではありません。実際の要件は、お使いのランタイムの公式ドキュメントで確認してください。
+
+## セキュリティ対策の中での位置づけ
+
+Rootless Kubeletは多層防御の一部であり、基本対策の代わりにはなりません。過剰に広いRBAC、特権Pod、公開されたダッシュボードといった問題には何の効果もありません。優先順位をつけるなら次のとおりです。
+
+1. Pod Security Standardsを`baseline`または`restricted`で強制する。
+2. Network Policyと、最小権限のService Accountを整備する。
+3. ノードOSのハードニングと、迅速なパッチ適用を行う。
+4. そのうえで、被害範囲を狭めるためにRootlessコンポーネントを評価する。
+
+## まとめ
+
+- Metrics APIのStable化は互換性の面では概ね朗報です。実務上のリスクは、metrics-serverのバージョン不一致によってHPAが静かに壊れることです。
+- コントロールプレーンのアップグレードごとに、レプリカ数ではなくHPAの状態を見てオートスケーリングを明示的にテストします。
+- BetaのRootless Kubeletは、フリート全体ではなく、リスクの低いNode Poolで小さく意図的に試します。
+- ここに書いた内容を実行に移す前に、Feature Gateの名称、デフォルト値、要件を公式の1.37ドキュメントで確認してください。
+
+本番クラスタの1.37アップグレードを計画していて、チェックリストを第三者の目で見てほしい場合は、まさにそうしたレビューをお客様向けに提供しています。

@@ -1,0 +1,133 @@
+---
+title: "PostgreSQL 19 WAIT FOR LSN: Read-Your-Writes on Replicas Without Sticky Routing"
+description: "With PostgreSQL 19 expected within days, WAIT FOR LSN gives applications a first-class way to read their own writes from a standby. A practical look at the pattern, with Node.js code."
+date: "2026-11-14"
+status: "published"
+tags: ["PostgreSQL", "Database", "Replication", "Architecture", "Node.js"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-19-wait-for-lsn-read-your-writes-replicas-2026-11"
+---
+
+PostgreSQL 19 is in release-candidate stage, with general availability planned for later this month according to EDB's schedule write-up (check postgresql.org for the final date). Our earlier post covered [the incompatibilities to check before upgrading](/blog/postgresql-19-rc1-upgrade-incompatibilities-checklist-2026). This one covers a feature that changes how you design read scaling: the `WAIT FOR LSN` command, listed in the Beta 1 announcement as support for read-your-writes patterns on replicas.
+
+Features were reverted between beta and RC (SQL/PGQ property graph queries are one reported example), so confirm in the final release notes that `WAIT FOR LSN` and its options look the way they do below before you build on it.
+
+## The problem it solves
+
+You add a read replica to take load off the primary. A user saves a profile; the write goes to the primary; the redirect after save reads from the replica, which is a few hundred milliseconds behind. The user sees their old data and files a bug.
+
+Common workarounds, all with costs:
+
+- **Always read from the primary after a write** for some period. Simple, but it is time-based guessing and it puts load back on the primary.
+- **Sticky sessions** to the primary. Works until the session spans a failover or a deploy.
+- **Synchronous replication** for everything. Fixes it at the cost of write latency and availability.
+
+`WAIT FOR LSN` offers a more precise option: the application remembers the write-ahead log position of its own write, and asks the replica to block until it has replayed at least that position.
+
+## The mechanism
+
+Every write has a position in the WAL, the LSN (log sequence number). The flow is:
+
+1. Write on the primary, then capture the current WAL position.
+2. Pass that LSN along with the request (a cookie, a session field, a response header).
+3. Before reading from a replica, run `WAIT FOR LSN '<lsn>'`. It returns once the standby has replayed that position, or fails if a timeout is hit.
+4. Run the read.
+
+On the primary, after the commit:
+
+```sql
+SELECT pg_current_wal_insert_lsn();
+-- e.g. 0/3A7F2C8
+```
+
+On the replica, before the read:
+
+```sql
+WAIT FOR LSN '0/3A7F2C8' WITH (TIMEOUT '200ms');
+SELECT * FROM profiles WHERE user_id = 42;
+```
+
+Check the final documentation for the exact option names and for what the command reports on timeout, since the syntax shipped in beta may have been adjusted.
+
+One detail that is easy to get wrong: capture the LSN *after* your transaction commits, using a value that is at or beyond your commit record. Reading the insert position right after `COMMIT` on the same connection is safe, because it is at least as far as your commit.
+
+## A Node.js implementation
+
+A thin wrapper keeps the policy in one place: wait briefly, and fall back to the primary if the replica cannot catch up in time.
+
+```ts
+import { Pool } from "pg";
+
+const primary = new Pool({ connectionString: process.env.PRIMARY_URL });
+const replica = new Pool({ connectionString: process.env.REPLICA_URL });
+
+export async function writeAndGetLsn(
+  fn: (c: import("pg").PoolClient) => Promise<void>,
+): Promise<string> {
+  const client = await primary.connect();
+  try {
+    await client.query("BEGIN");
+    await fn(client);
+    await client.query("COMMIT");
+    const { rows } = await client.query(
+      "SELECT pg_current_wal_insert_lsn() AS lsn",
+    );
+    return rows[0].lsn as string;
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function readAfter<T>(
+  lsn: string | undefined,
+  sql: string,
+  params: unknown[],
+): Promise<T[]> {
+  if (!lsn) {
+    return (await replica.query(sql, params)).rows as T[];
+  }
+  const client = await replica.connect();
+  try {
+    // lsn comes from our own server-side state, but still validate its shape.
+    if (!/^[0-9A-F]+\/[0-9A-F]+$/i.test(lsn)) throw new Error("bad lsn");
+    await client.query(`WAIT FOR LSN '${lsn}' WITH (TIMEOUT '200ms')`);
+    return (await client.query(sql, params)).rows as T[];
+  } catch {
+    // Replica too far behind (or wait failed): use the primary for this read.
+    return (await primary.query(sql, params)).rows as T[];
+  } finally {
+    client.release();
+  }
+}
+```
+
+Note the regex check: `WAIT FOR LSN` takes a literal, so you cannot bind it as a normal parameter in every driver. Never interpolate a value that came directly from a client. Store the LSN server-side in the session, or sign it if it must travel in a cookie.
+
+## Design decisions to make deliberately
+
+**Timeout.** The wait is added latency on the read path. Choose a value near your acceptable p95 and treat timeouts as a signal, not noise. A rising fallback rate means replication lag is a real problem.
+
+**Where the LSN lives.** A server-side session store is simplest. If you pass it through a cookie, sign it, and let it expire after a few seconds; an old LSN is useless and just costs a no-op wait.
+
+**Which reads need it.** Most reads do not. A dashboard that is five seconds stale is fine. Apply the wait only after a user's own write, on the page that shows the result.
+
+**Multiple replicas.** The LSN is cluster-wide, so it works with whichever replica you pick, but each replica may wait a different amount.
+
+## What it does not fix
+
+- It does not make replicas consistent with *other* users' writes. Only your own.
+- It does not remove replication lag; it hides it for the reads that matter, at the cost of blocking.
+- If a replica is badly behind, you will pay the timeout and then hit the primary anyway. Monitor lag separately.
+
+## Takeaways
+
+- `WAIT FOR LSN` replaces time-based guessing with an explicit causal dependency: "do not answer until you have seen my write."
+- Implement it as a small policy function with a primary fallback, and track how often the fallback fires.
+- Verify the final syntax and options against the PostgreSQL 19 documentation, and test on the release, not just the beta.
+- Keep using plain replica reads for everything that does not need to observe a specific write.
+
+For teams that previously added sticky routing or an application-level cache just to hide replica lag, this is worth prototyping as soon as 19 is available in your staging environment.

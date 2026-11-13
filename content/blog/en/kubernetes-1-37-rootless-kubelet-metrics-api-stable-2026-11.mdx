@@ -1,0 +1,108 @@
+---
+title: "Kubernetes 1.37: Stable Metrics API and a Rootless Kubelet in Beta, and What to Test"
+description: "Kubernetes 1.37 graduated the Metrics API to stable and moved rootless kubelet to beta. A practical guide to what changes for autoscaling, node security, and your upgrade checklist."
+date: "2026-11-14"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "Security", "Autoscaling", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-37-rootless-kubelet-metrics-api-stable-2026-11"
+---
+
+Kubernetes 1.37 ("Garhwal") shipped in late August. InfoQ's coverage highlights two items that matter for day-to-day operations: the Metrics API reaching stable, and the kubelet's rootless mode moving to beta. Third-party summaries count 67 enhancements in the release, 16 of them stable. We have already written about [upgrade issues such as SELinux and kube-proxy changes](/blog/kubernetes-1-37-upgrade-selinux-kube-proxy-2026); this post looks at the two items above from a "what should we actually do" angle.
+
+A note on sources: we are working from release coverage and the project's release pages, not from a cluster we have upgraded ourselves for this article. Check the official 1.37 release notes and your distribution's documentation for exact feature gate names and defaults before changing anything.
+
+## The Metrics API reaching stable
+
+The Metrics API (`metrics.k8s.io`) is what powers `kubectl top` and the Horizontal Pod Autoscaler's CPU and memory-based scaling. It is served by an add-on, typically metrics-server, not by the core API server itself. For years it has sat at a beta version while being a hard dependency of almost every production cluster.
+
+Stable status does not change what the API does. It changes the contract:
+
+- A stable API signals long-term compatibility, so tools that consume it can stop hedging.
+- Client libraries and controllers can target the stable version without a "beta might change" caveat.
+- Add-on authors have a fixed surface to implement.
+
+### What to check
+
+First, see which versions your cluster currently serves:
+
+```bash
+kubectl api-versions | grep metrics.k8s.io
+kubectl get apiservices | grep metrics
+kubectl top nodes
+```
+
+If you run metrics-server, confirm that your installed version supports the version served by the 1.37 control plane before the upgrade, not after. A mismatch shows up as `kubectl top` returning errors and HPAs reporting `unknown` metrics, which means autoscaling silently stops.
+
+A minimal HPA to use as a canary after the upgrade:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+After upgrading a non-production cluster, check `kubectl describe hpa web` and look for `AbleToScale` and `ScalingActive` conditions rather than just a replica count. A healthy-looking replica count can hide a metrics pipeline that has stopped feeding the autoscaler.
+
+If you have custom tooling that hits `/apis/metrics.k8s.io/v1beta1/...` directly (cost dashboards, capacity scripts), grep for it. Those are the ones that break when a beta version is eventually retired.
+
+## Rootless kubelet in beta
+
+Running the kubelet as root has always been the default, and it is a large privilege surface: the kubelet manages pods, mounts volumes, and talks to the container runtime. Rootless mode aims to let the kubelet run as an unprivileged user, relying on user namespaces so that a compromise of the node agent is less likely to translate into host root.
+
+Beta status means the feature is enabled through a feature gate path that has been exercised, but it is not something to roll out across a fleet on the day you read about it. Reasonable expectations for a beta node feature:
+
+- Some volume types and CSI drivers may behave differently or be unsupported.
+- Networking and device plugins (GPUs, for instance) are common friction points.
+- Your base OS needs user namespace support, with sane `subuid`/`subgid` ranges.
+
+### A pragmatic evaluation plan
+
+1. **Pick a low-risk node pool.** Stateless workloads, no GPU, no exotic storage.
+2. **Verify prerequisites** on the node image: kernel support for user namespaces, runtime version, and cgroup version.
+3. **Run your normal conformance and smoke tests** on that pool, plus your own: persistent volume attach, DNS, service-to-service traffic, log shipping, node-exporter scraping.
+4. **Compare** resource usage and startup latency against a regular pool.
+5. **Document what fails** and feed it back to the upstream issue tracker or your distribution's vendor.
+
+```bash
+# Rough prerequisite checks on a candidate node
+cat /proc/sys/user/max_user_namespaces
+stat -fc %T /sys/fs/cgroup   # cgroup2fs indicates cgroup v2
+grep "$USER" /etc/subuid /etc/subgid
+```
+
+Treat these as starting points, not a complete checklist; the official documentation lists the real requirements for your runtime.
+
+## Where this fits in a security posture
+
+Rootless kubelet is defense in depth, not a replacement for the basics. It does nothing about overly permissive RBAC, privileged pods, or exposed dashboards. If you have to prioritize:
+
+1. Pod Security Standards enforced at `baseline` or `restricted`.
+2. Network policies and least-privilege service accounts.
+3. Node OS hardening and prompt patching.
+4. Then, evaluate rootless components for a reduced blast radius.
+
+## Takeaways
+
+- The stable Metrics API is mostly good news for compatibility; the practical risk is a metrics-server version mismatch that quietly breaks HPA.
+- Test autoscaling explicitly after every control-plane upgrade by inspecting HPA conditions, not just replica counts.
+- Rootless kubelet in beta deserves a small, deliberate pilot on a low-risk node pool, not a fleet-wide rollout.
+- Confirm feature gate names, defaults, and requirements in the official 1.37 documentation before you act on any of this.
+
+If you are planning a 1.37 upgrade for a production cluster and want a second pair of eyes on the checklist, that is the kind of review we do for clients.
