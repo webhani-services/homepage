@@ -1,0 +1,133 @@
+---
+title: "PostgreSQL 19의 WAIT FOR LSN: Sticky Routing 없이 Replica에서 Read-Your-Writes 구현하기"
+description: "PostgreSQL 19 출시가 임박했습니다. WAIT FOR LSN으로 Standby에서 자신의 쓰기를 확실히 읽는 패턴을 표준 기능으로 쓸 수 있습니다. Node.js 코드와 함께 설명합니다."
+date: "2026-11-14"
+status: "published"
+tags: ["PostgreSQL", "Database", "Replication", "아키텍처", "Node.js"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-19-wait-for-lsn-read-your-writes-replicas-2026-11"
+---
+
+PostgreSQL 19는 Release Candidate 단계이며, EDB의 일정 정리에 따르면 정식 출시(GA)는 이달 하순으로 계획되어 있습니다(최종 일정은 postgresql.org에서 확인하시기 바랍니다). 이전 글에서는 [업그레이드 전에 확인할 비호환 사항](/blog/postgresql-19-rc1-upgrade-incompatibilities-checklist-2026)을 다뤘습니다. 이번에는 읽기 확장 설계를 바꿀 수 있는 기능인 `WAIT FOR LSN` 명령을 살펴봅니다. Beta 1 공지에서 Replica의 Read-Your-Writes 패턴을 지원하는 기능으로 소개된 것입니다.
+
+Beta와 RC 사이에 일부 기능이 철회된 사례도 있습니다(SQL/PGQ Property Graph Query가 보고된 예입니다). 아래 옵션과 동작을 전제로 구현을 시작하기 전에, 최종 Release Notes에서 `WAIT FOR LSN`의 사양을 확인하시기 바랍니다.
+
+## 해결하려는 문제
+
+Primary의 부하를 줄이려고 Read Replica를 추가했다고 가정합니다. 사용자가 프로필을 저장하면 쓰기는 Primary로 가고, 저장 후 Redirect된 페이지의 읽기는 Replica로 갑니다. Replica가 수백 밀리초 뒤처져 있으면 사용자에게는 이전 데이터가 보이고, "저장이 안 됐다"는 문의가 들어옵니다.
+
+흔한 우회책에는 저마다 비용이 있습니다.
+
+- **쓰기 직후 일정 시간은 항상 Primary에서 읽기**: 단순하지만 시간에 기댄 추측이며, Primary에 부하가 되돌아갑니다.
+- **Primary로의 Sticky Session**: Session이 Failover나 Deploy를 넘어가면 깨집니다.
+- **전체를 Synchronous Replication으로 전환**: 해결되지만 쓰기 Latency와 가용성을 희생합니다.
+
+`WAIT FOR LSN`은 좀 더 정확한 수단을 제공합니다. 애플리케이션이 자신의 쓰기가 만든 WAL 위치를 기억해 두었다가, Replica에게 "적어도 이 위치까지 적용될 때까지 기다려 달라"고 요청하는 방식입니다.
+
+## 동작 원리
+
+모든 쓰기는 WAL 상의 위치, 즉 LSN(Log Sequence Number)을 가집니다. 흐름은 다음과 같습니다.
+
+1. Primary에 쓰고, 직후에 현재 WAL 위치를 가져옵니다.
+2. 그 LSN을 요청과 함께 전달합니다(Cookie, Session, Response Header 등).
+3. Replica에서 읽기 전에 `WAIT FOR LSN '<lsn>'`을 실행합니다. Standby가 해당 위치까지 적용하면 반환되고, Timeout에 도달하면 실패합니다.
+4. 읽기를 실행합니다.
+
+Primary에서 Commit한 뒤:
+
+```sql
+SELECT pg_current_wal_insert_lsn();
+-- 예: 0/3A7F2C8
+```
+
+Replica에서 읽기 전에:
+
+```sql
+WAIT FOR LSN '0/3A7F2C8' WITH (TIMEOUT '200ms');
+SELECT * FROM profiles WHERE user_id = 42;
+```
+
+정확한 옵션 이름과 Timeout 시의 동작은 최종 Documentation에서 확인하시기 바랍니다. Beta 시점의 문법이 조정되었을 수 있습니다.
+
+놓치기 쉬운 점이 하나 있습니다. LSN은 자신의 Transaction이 **Commit된 이후**에, Commit Record 이상의 값으로 가져와야 합니다. 같은 Connection에서 `COMMIT` 직후에 Insert 위치를 읽으면 최소한 자신의 Commit까지 진행된 값이므로 안전합니다.
+
+## Node.js 구현
+
+얇은 Wrapper에 정책을 모읍니다. 잠깐만 기다리고, Replica가 제때 따라오지 못하면 Primary로 Fallback합니다.
+
+```ts
+import { Pool } from "pg";
+
+const primary = new Pool({ connectionString: process.env.PRIMARY_URL });
+const replica = new Pool({ connectionString: process.env.REPLICA_URL });
+
+export async function writeAndGetLsn(
+  fn: (c: import("pg").PoolClient) => Promise<void>,
+): Promise<string> {
+  const client = await primary.connect();
+  try {
+    await client.query("BEGIN");
+    await fn(client);
+    await client.query("COMMIT");
+    const { rows } = await client.query(
+      "SELECT pg_current_wal_insert_lsn() AS lsn",
+    );
+    return rows[0].lsn as string;
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function readAfter<T>(
+  lsn: string | undefined,
+  sql: string,
+  params: unknown[],
+): Promise<T[]> {
+  if (!lsn) {
+    return (await replica.query(sql, params)).rows as T[];
+  }
+  const client = await replica.connect();
+  try {
+    // lsn은 서버 측 상태에서 온 값이지만, 형식은 반드시 검증합니다.
+    if (!/^[0-9A-F]+\/[0-9A-F]+$/i.test(lsn)) throw new Error("bad lsn");
+    await client.query(`WAIT FOR LSN '${lsn}' WITH (TIMEOUT '200ms')`);
+    return (await client.query(sql, params)).rows as T[];
+  } catch {
+    // Replica 지연이 크거나 대기에 실패하면 Primary에서 읽습니다.
+    return (await primary.query(sql, params)).rows as T[];
+  } finally {
+    client.release();
+  }
+}
+```
+
+정규식 검증에 주목하시기 바랍니다. `WAIT FOR LSN`은 문자열 Literal을 받기 때문에, Driver에 따라서는 일반 Parameter로 Binding할 수 없습니다. Client에서 직접 받은 값을 그대로 끼워 넣어서는 안 됩니다. LSN은 서버 측 Session에 저장하거나, Cookie로 전달해야 한다면 서명을 붙입니다.
+
+## 의식적으로 결정해야 할 설계 항목
+
+**Timeout**: 대기는 읽기 경로에 추가되는 Latency입니다. 허용 가능한 p95에 가까운 값을 고르고, Timeout 발생은 Noise가 아니라 Signal로 다룹니다. Fallback 비율이 오르고 있다면 Replication 지연이 실제 문제라는 뜻입니다.
+
+**LSN을 두는 위치**: 서버 측 Session Store가 가장 단순합니다. Cookie로 전달한다면 서명하고 몇 초 뒤 만료되게 합니다. 오래된 LSN은 의미가 없고 헛된 대기만 발생시킵니다.
+
+**대상이 되는 읽기**: 대부분의 읽기에는 필요하지 않습니다. 5초 늦은 Dashboard는 문제없습니다. 사용자 본인의 쓰기 직후, 그 결과를 보여 주는 화면에만 적용합니다.
+
+**여러 Replica**: LSN은 Cluster 전체에서 공통이므로 어느 Replica에도 쓸 수 있지만, 대기 시간은 Replica마다 다릅니다.
+
+## 해결하지 못하는 것
+
+- 다른 사용자의 쓰기에 대해서는 Replica와의 일관성이 보장되지 않습니다. 보장되는 것은 본인의 쓰기뿐입니다.
+- Replication 지연 자체가 사라지지는 않습니다. 중요한 읽기에 한해 Blocking을 대가로 지연을 감출 뿐입니다.
+- Replica가 크게 뒤처져 있으면 Timeout만큼 기다린 뒤 결국 Primary를 읽게 됩니다. 지연은 별도로 모니터링해야 합니다.
+
+## 정리
+
+- `WAIT FOR LSN`은 시간에 기댄 추측을 "내 쓰기를 볼 때까지 응답하지 말라"는 명시적인 인과 의존으로 바꿔 줍니다.
+- Primary로의 Fallback을 갖춘 작은 정책 함수로 구현하고, Fallback 발생 빈도를 측정합니다.
+- 최종 문법과 옵션은 PostgreSQL 19 Documentation에서 확인하고, Beta가 아닌 정식 Release에서 검증합니다.
+- 특정 쓰기를 볼 필요가 없는 읽기는 지금처럼 일반 Replica 읽기를 그대로 사용합니다.
+
+Replica 지연을 숨기려고 Sticky Routing이나 애플리케이션 계층 Cache를 도입했던 팀이라면, 19를 Staging 환경에서 쓸 수 있게 되는 시점에 Prototype을 만들어 볼 가치가 있습니다.

@@ -1,0 +1,108 @@
+---
+title: "Kubernetes 1.37: Metrics API Stable 승격, Rootless Kubelet Beta 진입. 무엇을 검증해야 할까"
+description: "Kubernetes 1.37에서 Metrics API가 Stable로, Rootless Kubelet이 Beta로 올라섰습니다. Autoscaling, Node 보안, 업그레이드 체크리스트에 미치는 영향을 실무 관점에서 정리합니다."
+date: "2026-11-14"
+status: "published"
+tags: ["Kubernetes", "Cloud Infrastructure", "보안", "Autoscaling", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "kubernetes-1-37-rootless-kubelet-metrics-api-stable-2026-11"
+---
+
+Kubernetes 1.37(코드명 "Garhwal")은 8월 하순에 출시되었습니다. InfoQ 기사는 일상 운영과 관련된 두 가지를 짚습니다. Metrics API의 Stable 승격과 kubelet Rootless Mode의 Beta 진입입니다. 제3자 요약에 따르면 이번 릴리스의 Enhancement는 67건이고 그중 16건이 Stable입니다. SELinux와 kube-proxy 변경 같은 [업그레이드 시 주의점](/blog/kubernetes-1-37-upgrade-selinux-kube-proxy-2026)은 이미 별도 글에서 다뤘으므로, 이번에는 위 두 가지를 "실제로 무엇을 해야 하는가"의 관점에서 살펴봅니다.
+
+자료 출처에 대해 먼저 밝힙니다. 이 글은 릴리스 관련 보도와 프로젝트의 Release 페이지를 바탕으로 작성했으며, 이 글을 위해 당사가 Cluster를 직접 업그레이드해 검증한 내용은 아닙니다. Feature Gate의 정확한 이름과 기본값은 변경 전에 공식 1.37 Release Notes와 사용 중인 배포판의 Documentation에서 확인하시기 바랍니다.
+
+## Metrics API의 Stable 승격
+
+Metrics API(`metrics.k8s.io`)는 `kubectl top`과 Horizontal Pod Autoscaler의 CPU·메모리 기반 Scaling을 뒷받침하는 API입니다. API Server 자체가 아니라 보통 metrics-server 같은 Add-on이 제공합니다. 오랫동안 Beta 버전에 머물러 있었지만, 거의 모든 Production Cluster가 의존해 왔습니다.
+
+Stable이 되어도 API의 기능은 바뀌지 않습니다. 바뀌는 것은 약속입니다.
+
+- Stable API는 장기적인 호환성을 의미하므로, 이를 사용하는 Tool이 "Beta라서 바뀔 수 있다"는 부담을 덜 수 있습니다.
+- Client Library와 Controller가 Stable 버전을 기준으로 구현할 수 있습니다.
+- Add-on 개발자에게는 고정된 Interface가 생깁니다.
+
+### 확인할 사항
+
+먼저 현재 Cluster가 제공하는 버전을 확인합니다.
+
+```bash
+kubectl api-versions | grep metrics.k8s.io
+kubectl get apiservices | grep metrics
+kubectl top nodes
+```
+
+metrics-server를 운영 중이라면, 업그레이드 **후**가 아니라 **전에** 설치된 버전이 1.37 Control Plane이 제공하는 버전을 지원하는지 확인하십시오. 불일치가 있으면 `kubectl top`이 오류를 반환하고 HPA의 Metric이 `unknown`으로 표시됩니다. 즉 Autoscaling이 조용히 멈춥니다.
+
+업그레이드 후 Canary로 쓸 수 있는 최소한의 HPA입니다.
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+Production이 아닌 Cluster를 업그레이드한 뒤에는 Replica 수만 보지 말고 `kubectl describe hpa web`의 `AbleToScale`, `ScalingActive` Condition을 확인합니다. Replica 수가 정상으로 보여도 Metrics Pipeline이 멈춰 Autoscaler에 값이 전달되지 않는 경우가 있기 때문입니다.
+
+`/apis/metrics.k8s.io/v1beta1/...`을 직접 호출하는 자체 Tool(비용 Dashboard, Capacity 계획 Script 등)이 없는지도 검색해 두십시오. 나중에 Beta 버전이 폐기될 때 깨지는 것은 바로 그런 Tool입니다.
+
+## Rootless Kubelet의 Beta 진입
+
+kubelet을 root로 실행하는 것은 오래된 기본값이며, 권한 측면에서 공격 표면이 큰 구성입니다. kubelet은 Pod를 관리하고, Volume을 Mount하며, Container Runtime과 통신합니다. Rootless Mode는 kubelet을 비특권 사용자로 실행하려는 시도입니다. User Namespace를 활용해 Node Agent가 침해되더라도 Host의 root 권한 탈취로 이어지기 어렵게 합니다.
+
+Beta는 기능이 일정한 검증을 거쳐 Feature Gate로 활성화할 수 있는 단계라는 뜻이지, 기사를 읽은 당일 전체 Fleet에 배포해도 된다는 뜻이 아닙니다. Beta 단계의 Node 수준 기능에 대한 현실적인 예상은 다음과 같습니다.
+
+- 일부 Volume 유형이나 CSI Driver는 동작이 다르거나 지원되지 않을 수 있습니다.
+- Networking과 Device Plugin(예: GPU)이 마찰이 자주 생기는 지점입니다.
+- 기반 OS에 User Namespace 지원과 적절한 `subuid`/`subgid` 범위가 필요합니다.
+
+### 현실적인 평가 순서
+
+1. **위험이 낮은 Node Pool을 선택합니다**: Stateless Workload이고 GPU나 특수한 Storage를 쓰지 않는 곳입니다.
+2. **전제 조건을 확인합니다**: Node Image의 User Namespace 지원, Runtime 버전, cgroup 버전.
+3. **일반 Conformance Test와 Smoke Test에 자사 Test를 더해 실행합니다**: PersistentVolume Attach, DNS, Service 간 통신, Log 전송, node-exporter Scrape 등.
+4. **일반 Pool과 비교합니다**: Resource 사용량과 Pod 시작 Latency.
+5. **실패한 내용을 기록합니다**: Upstream Issue Tracker나 배포판 벤더에 공유합니다.
+
+```bash
+# 후보 Node에서의 대략적인 전제 조건 확인
+cat /proc/sys/user/max_user_namespaces
+stat -fc %T /sys/fs/cgroup   # cgroup2fs이면 cgroup v2
+grep "$USER" /etc/subuid /etc/subgid
+```
+
+이는 출발점일 뿐 완전한 체크리스트가 아닙니다. 실제 요구 사항은 사용 중인 Runtime의 공식 Documentation에서 확인하시기 바랍니다.
+
+## 보안 체계 안에서의 위치
+
+Rootless Kubelet은 다층 방어의 일부이며 기본 대책을 대체하지 않습니다. 지나치게 넓은 RBAC, Privileged Pod, 외부에 노출된 Dashboard 같은 문제에는 아무 효과가 없습니다. 우선순위를 정한다면 다음과 같습니다.
+
+1. Pod Security Standards를 `baseline` 또는 `restricted`로 강제합니다.
+2. Network Policy와 최소 권한 Service Account를 갖춥니다.
+3. Node OS Hardening과 신속한 Patch를 적용합니다.
+4. 그런 다음 피해 범위를 줄이기 위해 Rootless Component를 평가합니다.
+
+## 정리
+
+- Metrics API의 Stable 승격은 호환성 측면에서 대체로 좋은 소식입니다. 실무상 위험은 metrics-server 버전 불일치로 HPA가 조용히 망가지는 것입니다.
+- Control Plane을 업그레이드할 때마다 Replica 수가 아니라 HPA 상태를 확인해 Autoscaling을 명시적으로 Test합니다.
+- Beta 단계의 Rootless Kubelet은 전체 Fleet이 아니라, 위험이 낮은 Node Pool에서 작고 의도적으로 시험합니다.
+- 여기에 적은 내용을 실행하기 전에 Feature Gate 이름, 기본값, 요구 사항을 공식 1.37 Documentation에서 확인하시기 바랍니다.
+
+Production Cluster의 1.37 업그레이드를 계획 중이고 체크리스트를 제3자의 시각으로 점검받고 싶다면, 바로 그런 Review를 고객사에 제공하고 있습니다.

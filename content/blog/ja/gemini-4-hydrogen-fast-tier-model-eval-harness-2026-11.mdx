@@ -1,0 +1,147 @@
+---
+title: "Gemini 4 Hydrogen登場: Fast-tierモデルの切り替えにはRegression Harnessが要る"
+description: "GoogleがGemini 4 Hydrogenを11月12日にリリースしました。モデルIDを1行変える前に、自社トラフィックで新しいFast-tierモデルを評価する方法を整理します。"
+date: "2026-11-14"
+status: "published"
+tags: ["AI", "LLM", "Gemini", "評価", "アーキテクチャ"]
+thumbnail: ""
+author: "webhani"
+slug: "gemini-4-hydrogen-fast-tier-model-eval-harness-2026-11"
+---
+
+Googleは11月12日にGemini 4 Hydrogenを発表し、Geminiアプリ、Search、開発者向けに順次提供を始めています。報道では日常利用向けの高速モデルという位置づけで、Googleの総合指標では上位モデルのGemini 4 Argonを上回るとする記事もあります。ただし二次情報ではモデル名や日付に揺れがあるため、正確なラインナップや料金はGoogle公式の発表で確認してください。
+
+この記事では機能紹介はしません。ベンチマークの数字がどうであれ、本番でLLM機能を運用しているチームにとっての実務上の問いは同じです。**「ボリュームが大きくレイテンシに敏感な呼び出しを、品質を落とさずに新モデルへ移せるか」**。これに確実に答えられるのは、自社のトラフィックから作ったRegression Harnessだけです。
+
+## 公開ベンチマークでは答えが出ない理由
+
+Fast-tierモデルは、分類、抽出、短い入力の要約、ルーティング、オートコンプリートなど、最も呼び出し回数の多い機能を支えていることが多いはずです。こうした用途では、出力の形式に下流のコードが依存しているため、小さな挙動の変化が大きく響きます。
+
+モデル切り替え後によくある問題は次のとおりです。
+
+- これまで常に正しかったJSONに、末尾のコメントや余分なキーが混ざる。
+- 分類ラベルの分布が数ポイントずれ、業務指標が動く。
+- 応答の長さが変わり、トークンコストやUIのレイアウトに影響する。
+- 中央値は速くなったが、高負荷時のテールレイテンシが悪化する。
+
+これらは公開ベンチマークには現れませんが、実トラフィックを再生するHarnessなら確実に検出できます。
+
+## Step 1: 本番からReplay Setを作る
+
+実際のリクエストをサンプリングし、個人情報を除去したうえで、入力と**現行モデルの出力**を保存します。数千件は不要で、機能ごとに数百件を選べば多くの回帰は拾えます。
+
+サンプルの選び方には意図を持たせます。
+
+- 通常パスを代表するランダムなケース
+- ユーザーが出力を修正・却下したケース(難しいケースです)
+- 空入力、極端に長い入力、日英韓が混在する入力などのエッジケース
+
+```ts
+// eval/cases.ts
+export type EvalCase = {
+  id: string;
+  feature: "ticket-triage" | "summary" | "extract-invoice";
+  input: string;
+  baseline: string; // 現在本番で動いているモデルの出力
+  tags: string[];
+};
+```
+
+## Step 2: モデルを狭いInterfaceの背後に置く
+
+モデルIDがコードベースに散らばっていると、モデル同士の比較に手間がかかります。小さなInterfaceを1つ用意し、実装は設定で選べるようにします。
+
+```ts
+// llm/client.ts
+export interface Completion {
+  text: string;
+  inputTokens: number;
+  outputTokens: number;
+  latencyMs: number;
+}
+
+export interface LlmClient {
+  complete(args: {
+    system: string;
+    user: string;
+    maxOutputTokens: number;
+  }): Promise<Completion>;
+}
+
+export function createClient(modelId: string): LlmClient {
+  // ここでProvider SDKまたはGatewayに接続します。
+  // モデルIDは設定から渡し、機能側のコードには書きません。
+  throw new Error(`not implemented for ${modelId}`);
+}
+```
+
+AIプロダクトで最も頻繁に変わる部分に、依存性逆転の原則を適用しているわけです。すでにGatewayを経由している場合も考え方は同じで、モデル名はコードではなくデータとして扱います。
+
+## Step 3: 雰囲気ではなく検査でスコアリングする
+
+まず安価で決定的な検査を書き、それでも足りない部分にだけLLM Judgeを足します。
+
+```ts
+// eval/score.ts
+import { z } from "zod";
+
+const Triage = z.object({
+  category: z.enum(["billing", "bug", "feature", "other"]),
+  priority: z.number().int().min(1).max(4),
+});
+
+export function scoreTriage(output: string, baseline: string) {
+  let parsed: z.infer<typeof Triage>;
+  try {
+    parsed = Triage.parse(JSON.parse(output));
+  } catch {
+    return { valid: false, sameCategory: false };
+  }
+  const base = Triage.parse(JSON.parse(baseline));
+  return {
+    valid: true,
+    sameCategory: parsed.category === base.category,
+  };
+}
+```
+
+実行ごとに記録しておきたい指標です。
+
+| 指標 | 重要な理由 |
+| --- | --- |
+| Schema妥当率 | 低下すると下流のコードがすぐに壊れる |
+| Baselineとの一致率 | 正解率ではなくドリフトを測る。不一致は目視で確認する |
+| p50 / p95レイテンシ | ユーザーが体感するのはテール側 |
+| 1呼び出しあたりの出力トークン数 | コストに直結する |
+| 拒否・空出力の率 | バージョンごとに安全性チューニングが異なる |
+
+Baselineとの一致率は精度ではありません。新モデルが食い違うとき、新モデルが誤っている場合もあれば、旧モデルの誤りを正している場合もあります。不一致のサンプルを読む10分が、このプロセスで最も価値のある時間です。
+
+## Step 4: Flagの裏でShadow運用してから展開する
+
+Harnessの結果がきれいでも、実トラフィック特有の影響は拾えません。リスクの低い手順は次のとおりです。
+
+1. **Shadow**: 同じリクエストを両モデルへ送り、返すのは旧モデルの結果だけにして、両方をログに残す。
+2. **Canary**: 少数のトラフィックだけ新モデルで処理する。ユーザーやテナントの安定したハッシュで振り分け、ユーザーごとの挙動を一貫させる。
+3. **Ramp**: Schema妥当率、レイテンシ、その機能が影響する業務指標を見ながら段階的に増やす。
+4. **Rollbackを残す**: 1週間分の問題ないデータが揃うまで、旧モデルIDを設定に残しておく。
+
+```ts
+function pickModel(userId: string, rolloutPercent: number) {
+  const bucket = hash(userId) % 100;
+  return bucket < rolloutPercent ? "candidate" : "stable";
+}
+```
+
+## webhaniの見解
+
+高速なモデルは確かに有用です。レイテンシが下がれば体感品質が上がり、トークン単価が下がれば、以前は成立しなかった機能が成り立つこともあります。ただしモデルIDは他の依存関係と同じ依存関係であり、依存関係を更新するならテストが必要です。
+
+お客様には次の進め方をお勧めしています。
+
+- モデルIDは設定に置き、1つのInterfaceの背後に隠す。
+- 機能ごとにReplay Setを持ち、「軽微な」更新を含むすべてのモデル変更で実行する。
+- 構造化出力の妥当率はHard Gateとし、一致率・レイテンシ・コストはレビュー対象とする。
+- Harnessの結果が良好でも、ShadowとCanaryの段階を省略しない。
+
+Harnessの構築にかかるのは1日程度です。ベンダーが「平均的には良いが、自社の最重要パスでは悪化する」モデルを出したとき、その1回で元が取れます。
