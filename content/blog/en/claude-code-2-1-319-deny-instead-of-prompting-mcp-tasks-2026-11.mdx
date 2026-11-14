@@ -1,0 +1,86 @@
+---
+title: "Claude Code 2.1.319: Deny-Instead-of-Prompting and Backgrounded MCP Tasks for Unattended Runs"
+description: "Claude Code 2.1.319 adds a setting that denies tool calls instead of waiting on a permission prompt, runs MCP tasks in the background, and changes auto mode exit codes. What these mean for CI jobs, scheduled agents, and gateway setups."
+date: "2026-11-15"
+status: "published"
+tags: ["Claude Code", "AI coding", "MCP", "CI/CD", "agent safety"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-2-1-319-deny-instead-of-prompting-mcp-tasks-2026-11"
+---
+
+Most Claude Code release notes are about the interactive experience. Version 2.1.319, published in the first week of November 2026, is more interesting for the opposite case: runs where nobody is watching. According to secondary coverage of the release (dev.classmethod.jp, ai-tldr.dev, and others), it adds a `permissions.denyInsteadOfPrompting` setting, moves MCP tasks into the background in terminal sessions, and changes how auto mode behaves behind LLM gateways and in `claude -p`. Official notes are the authority here, so check the changelog before relying on any detail below.
+
+None of these are flashy. All of them matter if you run Claude Code from CI, cron, or a scheduled agent.
+
+## The problem with permission prompts in headless runs
+
+An interactive session treats a permission prompt as a feature: the agent wants to run a command, you look at it, you approve or refuse. In a headless run the same prompt is a hazard in one of two directions:
+
+- The run **hangs** waiting for an answer nobody will give, burning CI minutes until a timeout kills it.
+- The run is configured with a broad allow-list or a "skip permissions" flag just to avoid hanging, which quietly widens what the agent may do.
+
+Both are common in practice. Teams hit the hang, "fix" it by loosening permissions, and end up with an unattended agent that has more authority than anyone intended.
+
+`denyInsteadOfPrompting` gives a third option: anything not already allowed is refused immediately, and the agent has to find another route or report that it couldn't proceed. The failure becomes visible and cheap instead of hidden or expensive.
+
+## A minimal unattended configuration
+
+The pattern we recommend is an explicit allow-list for what the job needs, plus deny-on-miss for everything else. A project-level settings file might look like this:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Bash(npm run lint)",
+      "Bash(npm run test:unit)",
+      "Bash(git diff:*)"
+    ],
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(curl:*)"
+    ],
+    "denyInsteadOfPrompting": true
+  }
+}
+```
+
+Check the exact key placement against the current settings documentation for your installed version; the point is the shape of the policy, not this snippet's syntax. In a CI workflow, a refusal then shows up in the transcript instead of as a stalled job:
+
+```yaml
+- name: Automated lint triage
+  run: |
+    claude -p "Run the linter, fix trivial violations, summarize anything else." \
+      --output-format json > result.json
+```
+
+Treat a non-zero exit as a signal worth reading, not noise to retry past.
+
+## The exit code change matters more than it looks
+
+The release also changes `claude -p` so that, in auto mode, an action refused because a safety check was unavailable now exits with code 1 rather than 0. If your wrapper scripts only checked for "the process finished," they previously reported success on a run where the agent was blocked.
+
+Audit any script that calls `claude -p` and branches on the exit code. A job that used to go green while silently refusing its main task will now go red, which is the correct behavior but may surprise your on-call rotation the first morning after an upgrade. Pin the version in CI, upgrade deliberately, and expect a few newly failing jobs to be revealing rather than regressions.
+
+## Auto mode behind a gateway
+
+Teams that route model traffic through an internal LLM gateway often disable telemetry and experimental betas. Reportedly, 2.1.319 stops auto mode from falling back to the built-in classifier in those environments, and there are environment variables (`CLAUDE_CODE_AUTO_MODE_SERVER`) to control the server-side check explicitly. If managed settings disable experimental betas, the coverage says they must now also set the server flag deliberately.
+
+The practical advice: if you run behind a gateway, test auto mode in a staging project after upgrading and confirm via `/status` that the behavior is what you configured, rather than assuming the old fallback still applies. Silent behavior changes in a safety-relevant classifier are exactly what you want to catch before production.
+
+## MCP tasks in the background
+
+In terminal sessions, long-running MCP tool calls can now run as background tasks, with the result delivered to Claude when they finish. There are environment variables to turn this off if you prefer the call to block. This pairs with the MCP specification's task primitives, which we covered earlier in our post on async agents.
+
+For server authors, this makes it worthwhile to implement long operations (index rebuilds, report generation, migrations dry-runs) as proper tasks rather than blocking calls with a long timeout. For agent operators, it means a session can keep working while a slow tool runs, but also that **side effects can now complete after the model has moved on**. If a tool mutates state, make sure its result is idempotent to re-read and that your audit logging records the task ID, not just the initial call.
+
+## What we recommend
+
+1. **Adopt deny-on-miss for every unattended job.** Start from an empty allow-list and add only what the job demonstrably needs.
+2. **Audit exit-code handling** in any script wrapping `claude -p`. Treat 1 as "blocked or failed," never as a retry-until-green condition.
+3. **Pin and stage upgrades.** A release with over a hundred changes, mostly fixes including permission and sandbox corrections, is worth reading rather than auto-updating.
+4. **Re-verify gateway deployments** after upgrading: confirm auto mode status and the relevant environment variables explicitly.
+5. **Log MCP task IDs** if you expose tools that mutate state, so background completions are traceable.
+
+The common thread is that agent safety is increasingly configured per run rather than per person. A policy that is correct for an engineer at a keyboard is usually wrong for a cron job, and 2.1.319 gives you a few more levers to express the difference. If you're designing guardrails for AI coding agents in CI or internal platforms, we're happy to talk through the trade-offs.

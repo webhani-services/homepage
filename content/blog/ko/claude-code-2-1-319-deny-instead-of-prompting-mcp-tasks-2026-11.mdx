@@ -1,0 +1,86 @@
+---
+title: "Claude Code 2.1.319: 무인 실행을 위한 denyInsteadOfPrompting과 MCP Task 백그라운드 실행"
+description: "Claude Code 2.1.319는 Permission Prompt 대기 대신 즉시 거부하는 설정, MCP Task의 백그라운드 실행, auto mode 종료 코드 변경을 추가했습니다. CI, 예약 실행 Agent, Gateway 구성에 미치는 영향을 정리합니다."
+date: "2026-11-15"
+status: "published"
+tags: ["Claude Code", "AI 코딩", "MCP", "CI/CD", "Agent 안전성"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-2-1-319-deny-instead-of-prompting-mcp-tasks-2026-11"
+---
+
+Claude Code 릴리스 노트는 대화형 사용 경험 중심인 경우가 많습니다. 11월 첫째 주에 공개된 2.1.319는 오히려 "아무도 화면을 보고 있지 않은 실행"에서 의미가 큰 릴리스입니다. 2차 자료(dev.classmethod.jp, ai-tldr.dev 등)에 따르면 `permissions.denyInsteadOfPrompting` 설정 추가, 터미널 세션에서 MCP Task의 백그라운드 실행, LLM Gateway 환경과 `claude -p`에서의 auto mode 동작 변경이 포함되어 있습니다. 정확한 사양은 공식 changelog가 기준이므로, 아래 세부 사항은 도입 전에 확인하시기 바랍니다.
+
+화려한 변경은 아니지만, CI나 cron, 예약 실행 Agent에서 Claude Code를 사용하는 팀에게는 모두 중요한 내용입니다.
+
+## Headless 실행에서 Permission Prompt가 문제인 이유
+
+대화형 세션에서 Permission Prompt는 기능의 일부입니다. Agent가 명령을 실행하려 하면 사람이 확인하고 승인하거나 거부합니다. 그러나 headless 실행에서는 같은 Prompt가 두 방향의 위험이 됩니다.
+
+- 아무도 응답하지 않는 Prompt에서 **멈춘 채** Timeout까지 CI 시간을 소모합니다.
+- 멈춤을 피하려고 넓은 allow-list나 권한 우회 Flag를 설정해 **Agent의 권한이 의도치 않게 커집니다**.
+
+실무에서는 두 경우가 모두 흔합니다. 멈춤 문제를 겪은 팀이 권한을 느슨하게 풀어 "해결"하고, 결과적으로 아무도 의도하지 않은 권한을 가진 무인 Agent가 만들어집니다.
+
+`denyInsteadOfPrompting`은 세 번째 선택지를 줍니다. 허용되지 않은 동작은 즉시 거부되고, Agent는 다른 방법을 찾거나 진행하지 못했다고 보고합니다. 실패가 숨겨지거나 비싸지 않고, 눈에 보이면서 비용도 작아집니다.
+
+## 무인 실행을 위한 최소 Configuration
+
+권장하는 방식은 Job에 필요한 것만 명시적으로 allow하고, 나머지는 거부하는 구성입니다. Project 설정 파일은 다음과 같은 형태가 됩니다.
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Bash(npm run lint)",
+      "Bash(npm run test:unit)",
+      "Bash(git diff:*)"
+    ],
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(curl:*)"
+    ],
+    "denyInsteadOfPrompting": true
+  }
+}
+```
+
+Key의 정확한 위치는 사용 중인 버전의 설정 문서에서 확인하시기 바랍니다. 여기서 전달하려는 것은 정책의 형태이지 이 Snippet의 문법이 아닙니다. CI Workflow에서는 거부가 "Job 정지"가 아니라 Transcript의 기록으로 남습니다.
+
+```yaml
+- name: Automated lint triage
+  run: |
+    claude -p "Run the linter, fix trivial violations, summarize anything else." \
+      --output-format json > result.json
+```
+
+0이 아닌 종료 코드는 재시도로 덮을 Noise가 아니라 읽어야 할 Signal로 다루십시오.
+
+## 종료 코드 변경은 보기보다 중요합니다
+
+이번 릴리스에서는 `claude -p`의 auto mode에서 "안전 확인을 사용할 수 없어 거부된" 경우 종료 코드가 0이 아닌 1이 되도록 바뀌었다고 보도되었습니다. "Process가 끝났는가"만 확인하던 Wrapper Script는 Agent가 막힌 실행을 성공으로 보고하고 있었던 셈입니다.
+
+`claude -p`를 호출하고 종료 코드로 분기하는 Script는 모두 점검하십시오. 주요 Task를 조용히 거부하고도 green이던 Job이 이제 올바르게 red가 됩니다. 바람직한 동작이지만, 업그레이드 다음 날 아침 당직 담당자는 놀랄 수 있습니다. CI에서는 버전을 고정하고 의도적으로 업그레이드하며, 새로 실패하는 Job은 Regression이 아니라 발견으로 받아들이시기 바랍니다.
+
+## Gateway 환경의 auto mode
+
+사내 LLM Gateway를 통해 Model을 호출하는 팀은 Telemetry나 실험적 beta를 비활성화한 경우가 많습니다. 보도에 따르면 2.1.319에서는 이런 환경에서 auto mode가 내장 Classifier로 Fallback하지 않으며, Server 측 검사를 명시적으로 제어하는 환경 변수(`CLAUDE_CODE_AUTO_MODE_SERVER`)가 제공됩니다. Managed settings에서 실험적 beta를 비활성화하고 있다면 Server 측 Flag도 의도적으로 설정해야 한다고 합니다.
+
+Gateway 구성이라면 업그레이드 후 Staging Project에서 auto mode를 시험하고, `/status`로 설정한 대로 동작하는지 확인하십시오. 기존 Fallback이 여전히 적용될 것이라고 가정하지 않는 것이 중요합니다. 안전과 관련된 Classifier의 동작 변경은 Production 이전에 발견해야 합니다.
+
+## MCP Task의 백그라운드 실행
+
+터미널 세션에서는 오래 걸리는 MCP Tool 호출이 백그라운드 Task로 실행되고, 완료 시 결과가 Claude에게 전달됩니다. 호출이 Block되도록 하려면 이를 끄는 환경 변수도 있습니다. 이는 MCP 사양의 Task 개념과 연결되며, 이전 비동기 Agent 관련 글에서도 다룬 바 있습니다.
+
+MCP Server를 만드는 쪽에서는 Index 재구성, Report 생성, Migration dry-run 같은 긴 작업을 긴 Timeout의 Blocking 호출이 아니라 제대로 된 Task로 구현할 이유가 생깁니다. Agent를 운영하는 쪽에서는 느린 Tool이 실행되는 동안에도 세션이 작업을 이어갈 수 있는 반면, **Model이 다음 단계로 넘어간 뒤에 Side Effect가 완료될 수 있다**는 뜻입니다. 상태를 변경하는 Tool은 결과 재조회가 멱등(idempotent)하도록 만들고, 감사 Log에는 최초 호출뿐 아니라 Task ID도 남기십시오.
+
+## webhani의 권장 사항
+
+1. **모든 무인 Job에 deny-on-miss를 적용합니다.** allow-list는 비어 있는 상태에서 시작하고, Job이 실제로 필요로 하는 것만 추가합니다.
+2. **`claude -p`를 감싸는 Script의 종료 코드 처리를 점검합니다.** 1은 "차단 또는 실패"이며, green이 될 때까지 재시도할 대상이 아닙니다.
+3. **버전을 고정하고 단계적으로 업그레이드합니다.** 100건이 넘는 변경(대부분 권한·Sandbox 관련 수정 포함)이 있는 릴리스는 자동 업데이트보다 읽어 본 뒤 올릴 가치가 있습니다.
+4. **Gateway 구성은 업그레이드 후 다시 검증합니다.** auto mode 상태와 관련 환경 변수를 명시적으로 확인합니다.
+5. **상태를 변경하는 Tool을 노출한다면 MCP Task ID를 Log로 남깁니다.** 백그라운드 완료를 추적할 수 있어야 합니다.
+
+공통된 흐름은 Agent의 안전 설정이 "사람 단위"가 아니라 "실행 단위"로 바뀌고 있다는 점입니다. 키보드 앞의 엔지니어에게 맞는 정책은 cron Job에는 대체로 맞지 않습니다. 2.1.319는 그 차이를 표현할 수단을 조금 더 제공합니다. CI나 사내 Platform에서 AI 코딩 Agent의 Guardrail을 설계하고 계시다면, Trade-off 정리부터 함께 논의해 드리겠습니다.

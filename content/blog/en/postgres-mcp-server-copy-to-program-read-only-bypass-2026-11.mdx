@@ -1,0 +1,86 @@
+---
+title: "Postgres MCP Server's Read-Only Mode Bypass: Why SQL Validators Are Not a Security Boundary"
+description: "AWS Labs' postgres-mcp-server shipped a read-only mode that could be bypassed with COPY ... TO PROGRAM (CVE-2026-87911, fixed in 1.1.7). The real lesson for anyone connecting an LLM to a database: enforce read-only in the database, not in a prompt or a parser."
+date: "2026-11-15"
+status: "published"
+tags: ["MCP", "PostgreSQL", "AI security", "LLM", "least privilege"]
+thumbnail: ""
+author: "webhani"
+slug: "postgres-mcp-server-copy-to-program-read-only-bypass-2026-11"
+---
+
+AWS published security bulletin 2026-104-AWS covering the `awslabs` Postgres MCP server: a read-only enforcement bypass, tracked as CVE-2026-87911 and fixed in version 1.1.7. Per the bulletin, versions before 1.1.7 are affected when the server is used with a self-managed PostgreSQL connection and the database role has superuser or `pg_execute_server_program` privileges. A second, related issue in the same SQL validation component (CVE-2026-85787, an incomplete disallow list that allowed data modification past the read-only scope) is reportedly fixed in the same release. Scores vary by source (one lists CVSS 3.1 at 9.6), and the NVD entry was still being processed when we checked, so confirm details against the bulletin.
+
+Upgrading is the immediate action. This post is about why the bug existed in the first place, because the same design is probably running in your own internal tooling.
+
+## The design: a parser standing in for a permission system
+
+The server offers a "read-only mode" so that an LLM agent can explore a database without changing it. The reported implementation validates the SQL text before execution and rejects statements considered unsafe. The flaw: the validator did not block `COPY ... TO PROGRAM`, which has PostgreSQL run a shell command on the database host and pipe query output into it. A statement that looks like a read can therefore execute operating system commands.
+
+AWS's description of the attack path is the important part. The attacker does not need direct access to the database. Content the authenticated MCP user processes, such as text in a document, ticket, or web page that ends up in the model's context, can steer the agent into issuing the statement. This is prompt injection with a database as the sink.
+
+Two properties made this dangerous:
+
+1. **The enforcement lived in application code.** A string-level allow/deny check must anticipate every dangerous construct in a large, evolving SQL dialect. Disallow lists are always incomplete, which is exactly the second CVE.
+2. **The database role was more powerful than the task.** `COPY ... TO PROGRAM` requires superuser or membership in `pg_execute_server_program`. A role that needs only to read tables had no business holding it.
+
+## Enforce read-only where the data lives
+
+The parser is a convenience layer. The boundary must be the database's own permission model, because that's the one component whose entire job is deciding what a session may do. AWS's own interim workaround points the same way: grant only `CONNECT`, `USAGE`, and `SELECT` on the schemas needed, and force read-only transactions at the role level. A sketch:
+
+```sql
+CREATE ROLE agent_ro LOGIN PASSWORD :'agent_password'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+
+-- Read-only by default for every transaction this role opens
+ALTER ROLE agent_ro SET default_transaction_read_only = on;
+-- Bound runaway queries an agent might generate
+ALTER ROLE agent_ro SET statement_timeout = '15s';
+ALTER ROLE agent_ro SET idle_in_transaction_session_timeout = '30s';
+
+GRANT CONNECT ON DATABASE app TO agent_ro;
+GRANT USAGE ON SCHEMA reporting TO agent_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA reporting TO agent_ro;
+ALTER DEFAULT PRIVILEGES IN SCHEMA reporting
+  GRANT SELECT ON TABLES TO agent_ro;
+```
+
+Note one caveat: `default_transaction_read_only` can be switched off by the session itself with `SET`, so on its own it is a seatbelt, not a wall. The wall is the absence of write grants and of any elevated membership. Combine both: without `INSERT`/`UPDATE`/`DELETE` grants, a role that flips the setting still can't write.
+
+Better still, expose a **reporting schema of views** rather than base tables. Views let you drop sensitive columns, pre-join, and hide tables the agent has no reason to see. If the database is a replica, even a role mistake can't reach the primary.
+
+## Verify, don't assume
+
+Add a test that proves the boundary rather than trusting it. Run it against the same role your agent uses:
+
+```sql
+-- Each of these must fail for agent_ro
+INSERT INTO reporting.some_table DEFAULT VALUES;
+CREATE TABLE reporting.should_fail (id int);
+COPY (SELECT 1) TO PROGRAM 'id';
+SELECT pg_read_file('/etc/passwd');
+```
+
+If any statement succeeds, you've found the problem before an attacker's prompt did. Keep the script in CI against a staging copy, so a future grant change that widens the role fails a build.
+
+Also list who holds the dangerous memberships today:
+
+```sql
+SELECT r.rolname, m.rolname AS member_of
+FROM pg_auth_members am
+JOIN pg_roles r ON r.oid = am.member
+JOIN pg_roles m ON m.oid = am.roleid
+WHERE m.rolname IN ('pg_execute_server_program', 'pg_write_server_files',
+                    'pg_read_server_files');
+```
+
+## What we recommend for LLM-to-database connections
+
+1. **Upgrade postgres-mcp-server to 1.1.7 or later** if you use it, and review the role it connects as.
+2. **Create a dedicated, minimally privileged role per agent use case.** Never reuse the application's or an administrator's credentials.
+3. **Treat any validator in the tool as defense in depth**, never as the enforcement layer. If removing the validator would make the setup unsafe, the setup is unsafe.
+4. **Assume all retrieved content is attacker-influenced.** Anything the model reads, including tickets, emails, and scraped pages, can carry instructions. Design the tool's authority as if the model will occasionally follow them.
+5. **Log every statement the agent issues**, with the role and session, so anomalies like `COPY ... PROGRAM` attempts are visible.
+6. **Prefer managed access paths** such as read replicas and views for exploratory agent use.
+
+The pattern generalizes beyond Postgres. Any MCP server that wraps a powerful system (a shell, a cloud API, a database) with a "safe mode" implemented as text filtering should be reviewed for what happens when the filter has a gap, and the answer should be "the underlying credential still can't do it." If you're putting LLM agents in front of internal data and want an independent review of the permission model, webhani can help.

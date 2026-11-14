@@ -1,0 +1,86 @@
+---
+title: "Postgres MCP Server의 읽기 전용 모드 우회: SQL Validator는 보안 경계가 아닙니다"
+description: "AWS Labs의 postgres-mcp-server에서 읽기 전용 모드를 COPY ... TO PROGRAM으로 우회할 수 있는 문제(CVE-2026-87911, 1.1.7에서 수정)가 보고되었습니다. LLM과 Database를 연결할 때의 핵심 교훈은 읽기 전용을 Prompt나 Parser가 아닌 Database에서 강제하는 것입니다."
+date: "2026-11-15"
+status: "published"
+tags: ["MCP", "PostgreSQL", "AI 보안", "LLM", "최소 권한"]
+thumbnail: ""
+author: "webhani"
+slug: "postgres-mcp-server-copy-to-program-read-only-bypass-2026-11"
+---
+
+AWS는 `awslabs` Postgres MCP Server에 관한 보안 공지 2026-104-AWS를 게시했습니다. 읽기 전용 강제를 우회할 수 있는 문제로, CVE-2026-87911로 추적되며 버전 1.1.7에서 수정되었습니다. 공지에 따르면 Self-managed PostgreSQL에 연결하고 해당 Database Role이 Superuser 또는 `pg_execute_server_program` 권한을 가진 경우 1.1.7 이전 버전이 영향을 받습니다. 같은 SQL 검증 Component의 관련 문제(CVE-2026-85787, 금지 목록이 불완전하여 읽기 전용 범위를 넘어 데이터를 수정할 수 있었음)도 같은 릴리스에서 수정된 것으로 보도되었습니다. 점수는 출처마다 다르고(CVSS 3.1 기준 9.6으로 표기한 곳도 있습니다), 확인 시점에는 NVD 항목도 처리 중이었으므로 세부 사항은 AWS 공지에서 확인하시기 바랍니다.
+
+당장의 조치는 업그레이드입니다. 이 글에서는 애초에 이 버그가 왜 생겼는지를 다룹니다. 같은 설계가 여러분의 사내 Tool에도 쓰이고 있을 가능성이 높기 때문입니다.
+
+## 설계: 권한 시스템을 대신한 Parser
+
+이 Server에는 LLM Agent가 Database를 변경하지 않고 탐색할 수 있도록 "읽기 전용 모드"가 있습니다. 보고된 구현은 실행 전에 SQL 문자열을 검증하여 안전하지 않다고 판단한 문장을 거부하는 방식입니다. 결함은 검증이 `COPY ... TO PROGRAM`을 막지 못했다는 점입니다. 이 구문은 PostgreSQL이 Database Host에서 Shell 명령을 실행하게 하고 쿼리 결과를 그 명령으로 보냅니다. 읽기처럼 보이는 문장이 OS 명령을 실행할 수 있게 됩니다.
+
+중요한 부분은 AWS가 설명한 공격 경로입니다. 공격자가 Database에 직접 접근할 필요가 없습니다. 인증된 MCP 사용자가 처리하는 Content, 예를 들어 Model의 Context에 들어가는 문서, Ticket, Web Page의 텍스트가 Agent로 하여금 해당 문장을 발행하도록 유도할 수 있습니다. Database가 최종 Sink가 되는 Prompt Injection입니다.
+
+위험을 키운 요소는 두 가지입니다.
+
+1. **강제가 Application Code 안에 있었습니다.** 문자열 수준의 허용/거부 검사는 크고 계속 변하는 SQL Dialect의 모든 위험한 구문을 예측해야 합니다. 금지 목록은 항상 불완전하며, 두 번째 CVE가 바로 그 사례입니다.
+2. **Database Role이 작업에 비해 너무 강했습니다.** `COPY ... TO PROGRAM`에는 Superuser 또는 `pg_execute_server_program` 멤버십이 필요합니다. Table을 읽기만 하는 Role이 이를 가질 이유가 없습니다.
+
+## 읽기 전용은 데이터가 있는 곳에서 강제합니다
+
+Parser는 편의를 위한 계층일 뿐입니다. 경계는 Session에 무엇을 허용할지 결정하는 것이 유일한 임무인 Database 자체의 권한 모델이어야 합니다. AWS가 제시한 임시 우회책도 같은 방향입니다. 필요한 Schema에 `CONNECT`, `USAGE`, `SELECT`만 부여하고 Role 수준에서 읽기 전용 Transaction을 강제하는 것입니다. 예시는 다음과 같습니다.
+
+```sql
+CREATE ROLE agent_ro LOGIN PASSWORD :'agent_password'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+
+-- 이 Role이 여는 모든 Transaction을 기본적으로 읽기 전용으로 설정
+ALTER ROLE agent_ro SET default_transaction_read_only = on;
+-- Agent가 생성할 수 있는 폭주 쿼리를 제한
+ALTER ROLE agent_ro SET statement_timeout = '15s';
+ALTER ROLE agent_ro SET idle_in_transaction_session_timeout = '30s';
+
+GRANT CONNECT ON DATABASE app TO agent_ro;
+GRANT USAGE ON SCHEMA reporting TO agent_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA reporting TO agent_ro;
+ALTER DEFAULT PRIVILEGES IN SCHEMA reporting
+  GRANT SELECT ON TABLES TO agent_ro;
+```
+
+한 가지 주의할 점이 있습니다. `default_transaction_read_only`는 Session 자신이 `SET`으로 해제할 수 있으므로, 단독으로는 안전벨트일 뿐 벽이 아닙니다. 벽이 되는 것은 쓰기 권한과 상승된 멤버십이 없다는 사실입니다. 둘을 함께 쓰십시오. `INSERT` / `UPDATE` / `DELETE` 권한이 없다면 설정을 바꾸더라도 쓸 수 없습니다.
+
+더 좋은 방법은 Base Table 대신 **View로 구성한 reporting Schema**를 노출하는 것입니다. View를 쓰면 민감한 Column을 제외하고, 미리 Join하며, Agent가 볼 필요 없는 Table을 숨길 수 있습니다. 접속 대상이 Replica라면 Role 설정 실수가 있어도 Primary에는 닿지 않습니다.
+
+## 믿지 말고 검증합니다
+
+경계를 신뢰하는 대신 증명하는 Test를 추가하십시오. Agent가 쓰는 것과 같은 Role로 실행합니다.
+
+```sql
+-- agent_ro에서는 아래가 모두 실패해야 함
+INSERT INTO reporting.some_table DEFAULT VALUES;
+CREATE TABLE reporting.should_fail (id int);
+COPY (SELECT 1) TO PROGRAM 'id';
+SELECT pg_read_file('/etc/passwd');
+```
+
+하나라도 성공한다면 공격자의 Prompt보다 먼저 문제를 찾은 것입니다. 이 Script를 Staging 복제본 대상 CI에 넣어 두면, 이후 권한 변경으로 Role이 넓어질 때 Build가 실패합니다.
+
+위험한 멤버십을 현재 누가 가지고 있는지도 조회하십시오.
+
+```sql
+SELECT r.rolname, m.rolname AS member_of
+FROM pg_auth_members am
+JOIN pg_roles r ON r.oid = am.member
+JOIN pg_roles m ON m.oid = am.roleid
+WHERE m.rolname IN ('pg_execute_server_program', 'pg_write_server_files',
+                    'pg_read_server_files');
+```
+
+## LLM과 Database를 연결할 때 webhani의 권장 사항
+
+1. **postgres-mcp-server를 사용 중이라면 1.1.7 이상으로 업그레이드**하고, 접속에 쓰는 Role을 검토합니다.
+2. **Agent 용도별로 최소 권한의 전용 Role을 만듭니다.** Application이나 관리자의 Credential을 재사용하지 마십시오.
+3. **Tool 안의 Validator는 다층 방어의 일부로만 취급하고, 강제 계층으로 삼지 않습니다.** Validator를 제거했을 때 안전하지 않은 구성이라면, 그 구성은 이미 안전하지 않습니다.
+4. **가져온 Content는 모두 공격자의 영향을 받을 수 있다고 가정합니다.** Ticket, Email, Scraping한 Page 등 Model이 읽는 모든 것이 지시를 담을 수 있습니다. Model이 가끔 그 지시를 따른다는 전제로 Tool의 권한을 설계하십시오.
+5. **Agent가 발행한 모든 문장을 Role, Session과 함께 Log로 남깁니다.** `COPY ... PROGRAM` 시도 같은 이상 징후가 보이게 됩니다.
+6. **탐색적인 Agent 사용에는 Read Replica와 View 같은 관리된 접근 경로를 우선합니다.**
+
+이 패턴은 Postgres에 국한되지 않습니다. Shell, Cloud API, Database 같은 강력한 시스템을 텍스트 Filter로 구현한 "안전 모드"로 감싼 MCP Server라면, Filter에 구멍이 있을 때 어떤 일이 생기는지 점검해야 합니다. 그때의 답은 "기반 Credential 자체가 그 작업을 할 수 없다"여야 합니다. LLM Agent를 사내 데이터 앞에 두면서 권한 모델에 대한 독립적인 Review가 필요하시다면 webhani가 도와드리겠습니다.
