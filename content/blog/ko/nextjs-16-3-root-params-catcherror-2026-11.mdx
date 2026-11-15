@@ -1,0 +1,138 @@
+---
+title: "Next.js 16.3 Root Params와 catchError: Prop 전달은 줄이고 Error Boundary는 안전하게"
+description: "다국어 사이트에서 체감이 큰 Next.js 16.3의 두 기능을 살펴봅니다. 어떤 Server Component에서든 [lang]을 읽을 수 있는 Root Params와, notFound·redirect를 방해하지 않으면서 Server Component를 다시 가져오는 catchError입니다."
+date: "2026-11-16"
+status: "published"
+tags: ["Next.js", "React", "TypeScript", "i18n", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-3-root-params-catcherror-2026-11"
+---
+
+Next.js 16.3 관련 소식은 Instant Navigations와 dev server 메모리 절감에 집중되는 경향이 있습니다. 하지만 다국어 사이트를 운영하는 팀이라면 Root Params와 catchError라는 두 가지 작은 추가 기능도 눈여겨볼 만합니다. 둘 다 App Router 프로젝트가 거의 반드시 직접 작성해 온 코드를 줄여 줍니다. 아래 예제는 16.3 공식 릴리스 노트를 따랐습니다. Root Params는 현재 Server Component에서만 지원되므로, 사용 중인 버전의 문서도 함께 확인하시기 바랍니다.
+
+## 문제: params가 너무 멀리 전달됩니다
+
+일반적인 i18n 구조에서는 Route가 `app/[lang]/posts/[slug]/page.tsx` 같은 형태입니다. page는 `params`를 받지만, Footer나 날짜 Formatter, 깊이 중첩된 Card에도 Locale이 필요합니다. 흔한 선택지는 모두 조금씩 번거롭습니다.
+
+- `lang`을 여러 단계의 props로 계속 넘깁니다.
+- Middleware가 설정한 Header나 Cookie에서 읽습니다.
+- Context Provider로 감쌉니다(Client Component 쪽으로 기울게 됩니다).
+
+틀린 방법은 아니지만, 사실상 전역인 값 하나를 위해 연결 코드가 늘어납니다.
+
+## Root Params
+
+16.3에서는 `next/root-params`가 추가되었습니다. Root Layout보다 위에 정의된 동적 Segment(여기서는 `[lang]`)를 props 없이 모든 Server Component에서 비동기 함수로 읽을 수 있습니다.
+
+```tsx
+// app/[lang]/posts/[slug]/page.tsx
+import { lang } from 'next/root-params';
+
+export default async function PostPage(
+  props: PageProps<'/[lang]/posts/[slug]'>,
+) {
+  const { slug } = await props.params;
+  const language = await lang();
+
+  return (
+    <article>
+      <p>Language: {language}</p>
+      <p>Post: {slug}</p>
+    </article>
+  );
+}
+```
+
+실제로 유용한 경우는 page에서 멀리 떨어진 Component입니다.
+
+```tsx
+// components/PublishedDate.tsx  (Server Component)
+import { lang } from 'next/root-params';
+
+export async function PublishedDate({ iso }: { iso: string }) {
+  const locale = await lang();
+  const formatted = new Intl.DateTimeFormat(locale, {
+    dateStyle: 'long',
+  }).format(new Date(iso));
+
+  return <time dateTime={iso}>{formatted}</time>;
+}
+```
+
+props도 Context도 필요 없고, Component는 서버에 남습니다. 릴리스 노트에 따르면 Root Params는 `use cache` Scope 안에서도 동작합니다. 캐시된 결과가 Locale별로 올바르게 나뉘어, 한 언어의 Markup이 다른 언어에 섞이는 사고를 막을 수 있다는 점에서 중요합니다.
+
+### 알아 둘 제약
+
+- 현재는 Server Component만 지원합니다. Route Handler와 Server Action은 계획 단계이며 아직 제공되지 않습니다.
+- Route Segment를 읽는 방식이므로 Locale이 URL에 포함된 경우에만 의미가 있습니다. Cookie나 `Accept-Language`로 결정한다면 해당되지 않습니다.
+- `next-intl`을 사용 중이라면 이미 Request 단위의 Locale 확인 수단이 있습니다. Root Params가 이를 대체하는 것은 아닙니다. 원본 Segment 값이 필요한 작은 Utility나 i18n Library를 쓰지 않는 앱에서 더 유용합니다. 잘 동작하는 코드를 옮기기 전에 이점을 먼저 따져 보시기 바랍니다.
+
+## catchError: Next.js와 협력하는 Error Boundary
+
+기존 React Error Boundary는 App Router에서 두 가지 문제가 있었습니다. 하나는 `notFound()`와 `redirect()`가 특수한 Error를 throw하는 방식으로 동작하기 때문에 애플리케이션 코드의 동작을 방해할 수 있다는 점입니다. 다른 하나는 초기화할 수 있는 것이 Client state뿐이어서, 실패한 Server Component를 Fallback에서 재시도할 수 없다는 점입니다.
+
+16.3의 `next/error`가 제공하는 `catchError`는 `notFound`와 `redirect`를 건드리지 않는 Boundary를 만듭니다. Fallback에는 `retry()`가 전달되며, 호출하면 Boundary 아래 자식 요소(Server Component 재렌더링 포함)를 다시 가져옵니다.
+
+```tsx
+'use client';
+
+import { catchError, type ErrorInfo } from 'next/error';
+
+function ReviewsFallback(
+  props: { productName: string },
+  { error, retry }: ErrorInfo,
+) {
+  return (
+    <section role="alert">
+      <h3>{props.productName} 리뷰를 불러오지 못했습니다</h3>
+      <p>{error.message}</p>
+      <button onClick={() => retry()}>다시 시도</button>
+    </section>
+  );
+}
+
+export default catchError(ReviewsFallback);
+```
+
+불안정한 외부 Service에 의존하는 영역을 감쌉니다.
+
+```tsx
+import ReviewsBoundary from './ReviewsBoundary';
+import { Reviews } from './Reviews'; // async Server Component
+
+export function ProductReviews({ name }: { name: string }) {
+  return (
+    <ReviewsBoundary productName={name}>
+      <Reviews />
+    </ReviewsBoundary>
+  );
+}
+```
+
+리뷰 API가 Timeout되어도 상품 페이지의 나머지는 정상 사용할 수 있고, 사용자는 전체 새로고침 없이 해당 영역만 다시 시도할 수 있습니다.
+
+### 적용하기 좋은 곳
+
+- **서드파티 Data Widget**(리뷰, 재고, 환율 등): 실패해도 페이지 전체가 아닌 한 영역만 저하되도록 할 때 적합합니다.
+- 독립된 Panel로 구성된 **Dashboard**.
+- 검증이나 예상 가능한 Error 처리를 **대체하는 용도로는 쓰지 않습니다**. 예상 가능한 Error는 타입이 있는 결과로 반환하고, Boundary는 예상하지 못한 상황에 남겨 두십시오.
+
+한 가지 주의할 점은, 운영 환경에서는 Server Component Error의 `error.message`가 가려질 수 있다는 것입니다. Fallback에는 사람이 작성한 메시지를 보여 주고, 상세 내용은 서버에서 Log로 남기는 편이 안전합니다.
+
+## 업그레이드 메모
+
+두 기능 모두 16.3에 포함되어 있으므로 `npm install next@latest`로 사용할 수 있습니다. 같은 릴리스에서 `typescript`를 `^7`로 올리면 `next build`의 Type Check에 TypeScript 7을 쓸 수 있습니다. 타입 오류와 Framework 회귀가 뒤섞이지 않도록, CI에서의 시도는 Next.js 업그레이드와 분리해서 진행하시길 권합니다.
+
+기존 다국어 앱에서의 진행 순서 예시입니다.
+
+1. Next.js를 올리고 Build와 E2E를 그대로 통과시킵니다.
+2. props로 전달하던 Locale 경로 하나를 `lang()`으로 교체하고, 캐시되는 Component가 Locale별로 나뉘는지 확인합니다.
+3. 불안정한 영역 하나를 `catchError`로 감싸고, `notFound()`가 이전처럼 404를 표시하는지 확인합니다.
+4. 두 가지가 기존 Test에서 문제없음을 확인한 뒤에 범위를 넓힙니다.
+
+둘 다 화려한 기능은 아닙니다. 다만 제거되는 것은 연결용 코드이고, 작은 버그가 숨기 쉬운 곳이 바로 그런 곳입니다.
+
+## 참고
+
+- Next.js 16.3 릴리스 노트(nextjs.org, 2026년 8월)

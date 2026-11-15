@@ -1,0 +1,92 @@
+---
+title: "HalluSquatting: When Your Coding Agent Clones a Repository That Doesn't Exist Yet"
+description: "Researchers showed that AI coding agents can be steered into fetching repositories and skills that were hallucinated, then registered by an attacker. What the attack needs, and the guardrails worth putting in front of agent installs."
+date: "2026-11-16"
+status: "published"
+tags: ["AI Agents", "Security", "Supply Chain", "Claude Code", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "hallusquatting-ai-agents-hallucinated-repos-skills-2026-11"
+---
+
+Typosquatting relies on a human mistyping a name. A newer variant relies on a model inventing one. In July 2026, researchers from Tel Aviv University, Technion, and Intuit published a paper (arXiv, July 8) describing "HalluSquatting": an attacker measures which non-existent repository or skill names an LLM predictably hallucinates, registers those names ahead of time, and waits for an agent to fetch them.
+
+This is relevant to anyone letting a coding agent run `git clone`, `npm install`, or install a skill on its own. The details below come from the paper's coverage in secondary sources, so check the original before quoting numbers.
+
+## How the attack works
+
+The mechanism has three parts:
+
+1. A user asks an agent to set up something new: "clone the official repo for tool X and wire it into our project."
+2. The model produces a plausible but wrong identifier, such as `acme-labs/tool-x` when the real one is `acme/tool-x`.
+3. If an attacker registered that exact name beforehand, the agent fetches attacker-controlled content. Repository contents, README instructions, and skill files are all text the agent tends to trust and act on.
+
+The reported figures: hallucinated resource names in up to 85% of repository-cloning scenarios and 100% of skill-installation scenarios, with end-to-end success of roughly 20–65% in repository cloning depending on the application, model, and payload. The researchers reportedly tested several mainstream agents and ran only harmless placeholder payloads, and they disclosed to vendors before publishing.
+
+Two related findings point the same way. Aikido Security reported a hallucinated npm package name, `react-codeshift`, that had already been copied through AI-written instructions into a few hundred projects. Palo Alto Networks' Unit 42 described "phantom squatting" for hallucinated domains. The common thread is that a name the model made up is as good as a real one to an unattended agent.
+
+One vendor response, as reported, is worth noting: registering a repository under an unused name is normal behavior on a code host. The weakness is the agent trusting what it finds. That puts the burden on the people configuring agents.
+
+## Why this is hard to patch away
+
+Model improvements reduce hallucination but won't remove it, and the attacker's work is cheap: sample a model many times, collect recurring fake names, register them. The names that repeat are the ones worth squatting.
+
+So the defense belongs at the boundary where an identifier turns into a network fetch. That boundary is deterministic code, not model judgment.
+
+## Guardrail 1: Resolve before you fetch
+
+Require every repository an agent wants to clone to pass a lookup first. A small script can check that the repository exists, how old it is, and whether it is on an approved list of owners.
+
+```bash
+#!/usr/bin/env bash
+# check-repo.sh owner/name  -> exit 0 only if the repo looks acceptable
+set -euo pipefail
+
+REPO="$1"
+OWNER="${REPO%%/*}"
+ALLOWED_OWNERS=("vercel" "facebook" "anthropics" "our-org")
+
+if [[ ! " ${ALLOWED_OWNERS[*]} " =~ " ${OWNER} " ]]; then
+  echo "blocked: owner '$OWNER' is not on the allowlist" >&2
+  exit 1
+fi
+
+# GitHub REST API: GET /repos/{owner}/{repo}
+created=$(gh api "repos/$REPO" --jq '.created_at' 2>/dev/null) || {
+  echo "blocked: $REPO does not resolve" >&2
+  exit 1
+}
+echo "ok: $REPO (created $created)"
+```
+
+An allowlist of owners is crude, but it removes the entire class of "plausible name under an unknown account." For unknown owners, send the decision to a human with the lookup result attached: creation date, stars, and whether the owner matches the project's documented organization.
+
+## Guardrail 2: Keep install and clone commands on manual approval
+
+Most agent tools let you pre-approve commands. Be selective. Reading files and running your test suite are fine to allow. `git clone`, `npm install <new-package>`, `pip install`, and skill installation should prompt, because they pull in code you have not reviewed. If you maintain a shared agent configuration, deny these by default and add explicit allow rules for the few registries you trust.
+
+## Guardrail 3: Treat fetched repositories as untrusted input
+
+A cloned repository can contain instructions aimed at the agent: a README telling it to run a setup script, or a skill file with embedded commands. Handle it like a pull request from a stranger.
+
+- Run first-time evaluation in a sandbox or disposable container with no credentials mounted.
+- Keep cloud keys, SSH agents, and `.env` files out of the environment where the agent works on unfamiliar code.
+- Do not let the same session that read the untrusted repository also hold production secrets.
+
+## Guardrail 4: Pin and mirror what you depend on
+
+For dependencies the agent adds, require a lockfile diff in review and prefer an internal mirror or package firewall for registries. A new dependency that appears in a pull request with no prior history in your organization should get a second look, especially if the commit message says only "add helper."
+
+## What we recommend teams do this week
+
+- Audit your agent configuration for pre-approved `clone`, `install`, and skill-add commands, and remove them.
+- Add the lookup script above (or an equivalent hook) so identifiers are verified before any fetch.
+- Move first-run evaluation of third-party repositories into a sandbox without secrets.
+- Add a review rule: any new dependency or skill introduced by an agent needs a human to confirm the source against the project's official documentation.
+
+None of this requires distrusting the tools. It requires accepting that a model's confident output is a suggestion about a name, and a name is not an identity. The check that connects the two should be code you control.
+
+## Sources
+
+- HalluSquatting paper (arXiv, July 2026) and coverage by The Hacker News, DevOps.com, and Cloud Security Alliance Labs
+- Aikido Security's report on `react-codeshift`; Unit 42 on phantom squatting
