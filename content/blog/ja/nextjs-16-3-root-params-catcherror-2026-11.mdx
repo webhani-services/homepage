@@ -1,0 +1,138 @@
+---
+title: "Next.js 16.3のRoot ParamsとcatchError：propsの受け渡しを減らし、Error Boundaryを安全に"
+description: "多言語サイトで効いてくるNext.js 16.3の2つの機能を解説します。任意のServer Componentから[lang]を読めるRoot Paramsと、notFoundやredirectを邪魔せずServer Componentを再取得できるcatchErrorです。"
+date: "2026-11-16"
+status: "published"
+tags: ["Next.js", "React", "TypeScript", "i18n", "Frontend"]
+thumbnail: ""
+author: "webhani"
+slug: "nextjs-16-3-root-params-catcherror-2026-11"
+---
+
+Next.js 16.3の話題は、Instant Navigationsやdev serverのメモリ削減に集まりがちです。ただ、多言語サイトを運用しているチームにとっては、Root ParamsとcatchErrorという2つの小さな追加も見逃せません。どちらも、App Routerのプロジェクトがほぼ必ず手書きしてきたコードを減らしてくれます。以下の例は16.3の公式リリースノートに沿っています。Root Paramsは現時点でServer Componentに限定されるため、お使いのバージョンのドキュメントも確認してください。
+
+## 課題：paramsが遠くまで運ばれる
+
+典型的なi18n構成では、ルートが `app/[lang]/posts/[slug]/page.tsx` のようになります。pageは `params` を受け取れますが、フッターや日付フォーマッタ、深くネストしたカードにもロケールが必要です。よくある選択肢はどれも少し面倒です。
+
+- `lang` を何層ものpropsで渡す。
+- middlewareで設定したheaderやcookieから読む。
+- Context Providerで包む（Client Componentに寄っていく）。
+
+どれも間違いではありませんが、実質グローバルな値のために配線が増えます。
+
+## Root Params
+
+16.3では `next/root-params` が追加されました。root layoutより上に定義された動的セグメント（ここでは `[lang]`）を、任意のServer Componentからpropsなしで非同期関数として取得できます。
+
+```tsx
+// app/[lang]/posts/[slug]/page.tsx
+import { lang } from 'next/root-params';
+
+export default async function PostPage(
+  props: PageProps<'/[lang]/posts/[slug]'>,
+) {
+  const { slug } = await props.params;
+  const language = await lang();
+
+  return (
+    <article>
+      <p>Language: {language}</p>
+      <p>Post: {slug}</p>
+    </article>
+  );
+}
+```
+
+便利なのは、pageから離れたコンポーネントです。
+
+```tsx
+// components/PublishedDate.tsx  (Server Component)
+import { lang } from 'next/root-params';
+
+export async function PublishedDate({ iso }: { iso: string }) {
+  const locale = await lang();
+  const formatted = new Intl.DateTimeFormat(locale, {
+    dateStyle: 'long',
+  }).format(new Date(iso));
+
+  return <time dateTime={iso}>{formatted}</time>;
+}
+```
+
+propsもContextも不要で、コンポーネントはサーバー側に残ります。リリースノートによれば、Root Paramsは `use cache` のスコープ内でも動作します。キャッシュ結果がロケールごとに正しく分かれ、ある言語のマークアップが別の言語に混ざる事故を避けられる点で重要です。
+
+### 注意点
+
+- 現時点ではServer Componentのみ対応です。Route HandlerとServer Actionは今後の予定で、未提供です。
+- ルートセグメントを読む仕組みなので、ロケールがURLに含まれる場合にのみ意味があります。cookieや `Accept-Language` で決めている場合は対象外です。
+- `next-intl` を使っている場合、すでにリクエストスコープのロケール取得手段があります。Root Paramsはそれを置き換えるものではありません。生のセグメント値が欲しい小さなユーティリティや、i18nライブラリを使っていないアプリで活きます。動いているものを移行する前に、メリットを見極めてください。
+
+## catchError：Next.jsと協調するError Boundary
+
+従来のReact Error Boundaryには、App Routerで2つの問題がありました。1つは、`notFound()` や `redirect()` が特殊なエラーをthrowして動く仕組みのため、アプリケーションコードの動作を邪魔しうること。もう1つは、リセットできるのがクライアント側のstateだけで、失敗したServer Componentをfallbackから再試行できないことです。
+
+16.3の `next/error` が提供する `catchError` は、`notFound` と `redirect` を邪魔しないBoundaryを作ります。fallbackには `retry()` が渡され、呼ぶとBoundary配下の子要素（Server Componentの再レンダリング含む）を再取得します。
+
+```tsx
+'use client';
+
+import { catchError, type ErrorInfo } from 'next/error';
+
+function ReviewsFallback(
+  props: { productName: string },
+  { error, retry }: ErrorInfo,
+) {
+  return (
+    <section role="alert">
+      <h3>{props.productName}のレビューを読み込めませんでした</h3>
+      <p>{error.message}</p>
+      <button onClick={() => retry()}>再試行</button>
+    </section>
+  );
+}
+
+export default catchError(ReviewsFallback);
+```
+
+不安定な外部サービスに依存するセクションを包みます。
+
+```tsx
+import ReviewsBoundary from './ReviewsBoundary';
+import { Reviews } from './Reviews'; // async Server Component
+
+export function ProductReviews({ name }: { name: string }) {
+  return (
+    <ReviewsBoundary productName={name}>
+      <Reviews />
+    </ReviewsBoundary>
+  );
+}
+```
+
+レビューAPIがタイムアウトしても、商品ページの他の部分は使え、ユーザーはページ全体をリロードせずにそのセクションだけ再試行できます。
+
+### 使いどころ
+
+- **サードパーティのデータウィジェット**（レビュー、在庫、為替など）。失敗してもページ全体ではなく1セクションの劣化にとどめたい場面です。
+- **独立したパネルを持つダッシュボード**。
+- バリデーションや想定内エラーの処理の代わりには**使いません**。想定できるエラーは型付きの結果で返し、Boundaryは想定外のために残します。
+
+注意点として、Server Componentのエラーの `error.message` は本番環境ではサニタイズされることがあります。fallbackには人が書いたメッセージを表示し、詳細はサーバー側でログに残す方が確実です。
+
+## アップグレードのメモ
+
+どちらの機能も16.3に含まれるため、`npm install next@latest` で利用できます。同じリリースで、`typescript` を `^7` に上げれば `next build` の型チェックにTypeScript 7を使えます。型エラーとフレームワークのリグレッションが混ざらないよう、CIでの試行はNext.jsのアップグレードとは別に行うのがお勧めです。
+
+既存の多言語アプリでの進め方の例です。
+
+1. Next.jsを上げて、ビルドとE2Eをそのまま通す。
+2. propsで運んでいたロケールの経路を1つ `lang()` に置き換え、キャッシュされるコンポーネントがロケールごとに分かれることを確認する。
+3. 不安定なセクションを1つ `catchError` で包み、`notFound()` が従来どおり404を表示することを確認する。
+4. 2つが既存テストで問題ないと確認できてから、範囲を広げる。
+
+どちらも派手な機能ではありません。ただ、取り除かれるのは配線用のコードで、小さなバグが潜みやすい場所です。
+
+## 参考
+
+- Next.js 16.3リリースノート（nextjs.org、2026年8月）
