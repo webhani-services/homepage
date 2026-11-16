@@ -1,0 +1,90 @@
+---
+title: "Vercel AI Gateway Virtual Models: 재배포 없이 LLM 교체하기"
+description: "애플리케이션은 고정된 모델 ID를 호출하고, 실제 모델은 Gateway에서 바꿉니다. Virtual Models의 활용 지점과 위험 요소, 안전한 도입 절차를 정리합니다."
+date: "2026-11-17"
+status: "published"
+tags: ["Vercel", "AI Gateway", "LLM", "AI SDK", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "vercel-ai-gateway-virtual-models-model-swap-2026-11"
+---
+
+LLM 기능을 운영하다 보면 같은 작업이 반복됩니다. 새 모델이 나오거나 기존 모델의 비용이 맞지 않게 되면, 여러 Repository에서 모델 이름 문자열을 바꾸고 리뷰를 거쳐 다시 Deploy해야 합니다. Vercel AI Gateway의 Virtual Models는 이 문자열을 코드 밖으로 빼내는 기능입니다.
+
+이 글에서는 기능 개요, 프로젝트 적용 방식, 미리 대비해야 할 실패 패턴을 정리합니다. 내용은 Vercel의 changelog와 문서를 기준으로 하며, 제공 플랜과 제한 사항은 발표에 명시되어 있지 않았으므로 도입 전에 최신 정보를 확인하시기 바랍니다.
+
+## Virtual Model이란
+
+Virtual Model은 AI Gateway에 저장하는 설정입니다. Slug, 실제 모델, 요청에 적용할 설정으로 구성됩니다. 애플리케이션은 Slug를 모델 ID처럼 호출하고(Vercel 예시는 `vmc/coding-agent` 형태), Gateway가 실제 모델로 해석합니다. Dashboard나 CLI에서 뒤쪽 모델을 바꾸면 모든 호출자에게 재배포 없이 반영됩니다.
+
+Vercel에 따르면 언어 모델뿐 아니라 이미지, 비디오, 음성, Embedding, Realtime 모델까지 지원하며, AI SDK와 OpenAI/Anthropic 호환 API 모두에서 사용할 수 있습니다. 언어 모델을 가리키는 Virtual Model은 Gateway가 코딩 에이전트에 제공하는 모델 Catalog에도 노출됩니다.
+
+## AI SDK에서 사용하기
+
+애플리케이션 쪽에서 특별한 코드는 필요 없습니다. 모델은 단순한 문자열입니다.
+
+```ts
+import { generateText } from 'ai';
+
+export async function summarizeTicket(body: string) {
+  const { text } = await generateText({
+    // AI Gateway에서 만든 Virtual Model의 Slug (Provider 모델 ID가 아님)
+    // 정확한 형식은 Gateway 설정을 따릅니다
+    model: process.env.SUMMARY_MODEL ?? 'vmc/ticket-summary',
+    prompt: `다음 지원 티켓을 세 줄로 요약해 주세요:\n\n${body}`,
+  });
+  return text;
+}
+```
+
+Slug를 환경 변수로 두면 Staging과 Production이 서로 다른 Virtual Model을 가리키게 할 수 있습니다. 후보 모델을 실제 트래픽과 유사한 조건에서 시험한 뒤 승격하는 운영이 쉬워집니다.
+
+## 효과가 큰 상황
+
+**모델 선택을 한 곳에서 바꿉니다.** 티켓 요약, 코드 리뷰 코멘트, 분류처럼 여러 Service가 같은 기능을 호출한다면, 기능별로 Virtual Model 하나를 두고 한 곳에서 전환할 수 있습니다. 인프라 설정에 DRY 원칙을 적용하는 셈입니다.
+
+**Provider 변경에 빠르게 대응합니다.** 지원 종료와 가격 개편은 Provider의 일정에 따라 옵니다. 후속 모델로의 이동이 릴리스가 아니라 설정 변경이 됩니다.
+
+**책임 분리가 쉬워집니다.** 애플리케이션 엔지니어는 기능이 무엇을 하는지 정하고, 비용과 품질 담당자는 어떤 모델로 처리할지 정합니다. 모델 ID가 코드에 있으면 이 분리를 지키기 어렵습니다.
+
+## 주의할 점
+
+간접 계층은 변경이 눈에 잘 띄지 않게 된다는 뜻이기도 합니다. 넓게 도입하기 전에 다음을 점검하는 것이 좋습니다.
+
+1. **동작이 조용히 바뀝니다.** 모델을 바꾸면 출력 문체, 길이, 거절 경향, Tool 호출 안정성이 달라집니다. JSON이나 Tool 인자를 파싱하는 코드는 Deploy 이력과 연결되지 않은 채 깨질 수 있습니다.
+2. **감사 추적이 약해집니다.** 코드 변경에는 Pull Request가 남지만 Dashboard 변경은 남지 않을 수 있습니다. 누가 수정할 수 있는지, 변경을 어디에 기록할지 정해야 합니다.
+3. **평가가 실제와 어긋납니다.** 회귀 테스트가 Provider 모델 ID를 하드코딩하면 Production에서 실제로 쓰는 모델을 검증하지 못합니다. 평가는 Production과 같은 Slug로 실행하거나, 해석된 모델을 기록해야 합니다.
+4. **Gateway 의존성이 생깁니다.** Slug를 해석하려면 Gateway가 필요합니다. 이미 Gateway를 경유 중이라면 달라지는 것은 없지만, 장애 분석 문서에는 명시해야 합니다.
+5. **비용이 갑자기 달라질 수 있습니다.** 더 큰 모델로의 전환이 모든 호출자에게 한꺼번에 적용됩니다. 예산 Alert와 함께 운영하십시오.
+
+## 도입 절차
+
+1. **위험이 낮은 기능부터 시작합니다.** 고객 대상 에이전트보다는 사내 요약 처리 같은 기능이 적합합니다.
+2. **Slug 이름은 모델이 아니라 기능 기준으로 짓습니다.** `ticket-summary`는 모델을 바꿔도 유지되지만 `gpt-fast`는 그렇지 않습니다.
+3. **변경 전후로 같은 Slug에 평가 세트를 실행합니다.** 결과는 변경 기록과 함께 보관합니다.
+4. **Staging과 Production의 Slug를 분리합니다.** 평가를 통과하면 설정을 복사해 승격합니다.
+5. **편집 권한을 제한하고 변경 사유를 짧게 남깁니다.**
+6. **구조화된 출력 파싱은 방어적으로 작성합니다.** zod 같은 Schema로 검증하고, 실패 증가를 Rollback 신호로 삼습니다.
+
+```ts
+import { z } from 'zod';
+
+const Summary = z.object({ bullets: z.array(z.string()).length(3) });
+
+export function parseSummary(raw: string) {
+  const result = Summary.safeParse(JSON.parse(raw));
+  if (!result.success) {
+    // 여기서 Metric을 발생시킵니다. Slug 변경 후 급증하면 Rollback 신호입니다
+    throw new Error('Summary output failed schema validation');
+  }
+  return result.data;
+}
+```
+
+## webhani의 의견
+
+LLM 기능을 여러 개 운영하는 팀에게 Virtual Models는 합리적인 기본 선택지입니다. 모델 선택이 릴리스 작업에서 운영상의 판단으로 바뀌기 때문입니다. 반대로 한 팀이 기능 하나만 맡고 있다면, 코드 안의 상수가 더 단순하고 리뷰하기도 쉽습니다.
+
+위험은 기술이 아니라 프로세스에 있습니다. Deploy 없이 모델을 바꿀 수 있다는 것은, 의도적으로 절차를 만들지 않으면 리뷰도 없다는 뜻입니다. Virtual Model 변경을 Production 설정 변경으로 취급하여 평가를 거치고, 담당자를 남기고, 되돌릴 수 있게 하십시오. 그렇게 하면 일상적인 마찰을 실질적으로 줄일 수 있습니다.
+
+LLM 연동 계층 설계, 모델 Routing, 평가, 비용 관리에 대해 의견이 필요하시면 webhani에 문의해 주십시오.
