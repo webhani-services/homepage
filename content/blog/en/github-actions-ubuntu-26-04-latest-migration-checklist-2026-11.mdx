@@ -1,0 +1,95 @@
+---
+title: "ubuntu-latest Is Moving to Ubuntu 26.04: A Pre-Cutover Checklist for GitHub Actions"
+description: "GitHub is gradually moving the ubuntu-latest label to Ubuntu 26.04 through November 19. Here is how to find out which of your workflows will break before the runner changes under them."
+date: "2026-11-17"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "Ubuntu", "DevOps", "Runner"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-ubuntu-26-04-latest-migration-checklist-2026-11"
+---
+
+According to GitHub's changelog, the `ubuntu-latest` label is moving from Ubuntu 24.04 to Ubuntu 26.04, rolling out gradually between October 19 and November 19, 2026. That window closes in two days. If your workflows use `runs-on: ubuntu-latest`, some of your jobs may already be running on the new image, and the rest will be shortly.
+
+The change is announced as informational: it does not fail a job by itself. The failure shows up later, as a missing tool or a different library version, in a job that passed yesterday. This post is a short checklist for finding those cases deliberately.
+
+## Why this one is easy to miss
+
+A moving label is a dependency you did not pin. Most teams treat `ubuntu-latest` as "whatever works", and for years that was true. A major OS upgrade changes the toolchain underneath: system packages, default compilers, Python and OpenSSL versions, and the set of preinstalled software. GitHub's runner-images project documents which tools are on each image, and for the 26.04 image it tracked removals "for maintenance reasons".
+
+Treat the removed-software list as something to verify against the current image README, not as a fixed list. Reports we found mention items such as Julia and Mercurial, but those were from pre-release discussion and may not match the final image.
+
+## Step 1: Find every use of the moving label
+
+```bash
+# Workflows that follow the moving label
+grep -rn "ubuntu-latest" .github/workflows/
+
+# Reusable workflows and composite actions can hide it too
+grep -rn "runs-on" .github/ | grep -v "ubuntu-24.04"
+```
+
+Remember that reusable workflows you call from other repositories carry their own `runs-on`. You cannot fix those from your side, but you can see their behaviour change in your results.
+
+## Step 2: Run your suite on the explicit new label
+
+Do not test with `ubuntu-latest`; it may resolve to either image during rollout. Use the explicit label so the result is reproducible:
+
+```yaml
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm test
+```
+
+Setting `fail-fast: false` matters here. You want to see all failures on the new image in one run, not just the first. Keep the `ubuntu-24.04` leg as your baseline so you can tell a migration regression from a flaky test.
+
+Pin the action versions to whatever you currently use; the snippet above is illustrative. If you pin actions to commit SHAs, keep doing so.
+
+## Step 3: Check for hidden assumptions
+
+Run through the places where jobs quietly rely on the image rather than on declared setup:
+
+- **Preinstalled tools used without a setup step.** Calling `hg`, `julia`, or a specific CLI that was never installed by your workflow is the most likely break. Add an explicit install step or a setup action.
+- **System library versions.** Native builds that link against OpenSSL, libpq, or image libraries may behave differently with newer system packages.
+- **Language runtime defaults.** If you rely on the system `python3` rather than `actions/setup-python`, the version can change with the OS.
+- **Docker and container actions.** Check that service containers and `docker build` steps still work, including any rootless or cgroup assumptions.
+- **Self-written install scripts.** Scripts that call `apt-get install <package>` may fail if a package was renamed or dropped in the new release.
+- **Caches keyed on OS name.** A cache key containing `${{ runner.os }}` does not distinguish between Ubuntu releases, so compiled artifacts from 24.04 can be restored onto 26.04. Add the image version to the key.
+
+```yaml
+- uses: actions/cache@v5
+  with:
+    path: ~/.cache/build
+    # runner.os is just "Linux"; include the release explicitly
+    key: build-ubuntu-26.04-${{ hashFiles('**/lockfile') }}
+```
+
+## Step 4: Decide, then pin
+
+You have two reasonable options.
+
+1. **Pin to `ubuntu-24.04`** if you are not ready. GitHub's changelog suggests this as the opt-out. It buys time, but it is a deferral: older images are eventually retired, so schedule the real migration.
+2. **Move to `ubuntu-26.04` explicitly** once the matrix is green. Prefer an explicit label over `ubuntu-latest` for anything that gates a release. A deployment pipeline that changes OS image on a date you did not choose is hard to debug.
+
+For the first few runs after switching, compare job durations and flaky-test rates against the baseline. A newer kernel and toolchain can change timing in ways that surface latent race conditions.
+
+## Don't forget the adjacent changes
+
+This is not the only runner change this autumn. Check that you have also handled the removal of Node 20 from Actions (first-party actions now target Node 24) and the retirement of the macOS 14 image on November 2. If you maintain public repositories, also review the planned default block of `pull_request_target` starting December 2.
+
+## What we recommend
+
+Treat `ubuntu-latest` as a convenience for prototypes and low-stakes jobs. For build and release pipelines, pin an explicit OS label, run a two-image matrix whenever a new LTS appears, and upgrade on your own schedule. The cost is one YAML change per migration; the benefit is that a runner update never becomes your incident.
+
+If you would like help auditing a CI/CD setup for hidden image dependencies, webhani can review it with you.

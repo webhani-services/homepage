@@ -1,0 +1,95 @@
+---
+title: "ubuntu-latest가 Ubuntu 26.04로 이동 중: GitHub Actions 전환 전 점검 체크리스트"
+description: "GitHub는 11월 19일까지 ubuntu-latest 라벨을 단계적으로 Ubuntu 26.04로 전환하고 있습니다. Runner가 바뀌기 전에 깨질 Workflow를 찾아내는 방법을 정리합니다."
+date: "2026-11-17"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "Ubuntu", "DevOps", "Runner"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-ubuntu-26-04-latest-migration-checklist-2026-11"
+---
+
+GitHub changelog에 따르면 `ubuntu-latest` 라벨은 Ubuntu 24.04에서 Ubuntu 26.04로, 2026년 10월 19일부터 11월 19일까지 단계적으로 전환됩니다. 기한이 이틀 남았습니다. `runs-on: ubuntu-latest`를 사용하는 Workflow라면 일부 Job은 이미 새 Image에서 실행되고 있을 수 있습니다.
+
+이 변경은 공지일 뿐이며 그 자체로 Job을 실패시키지는 않습니다. 문제는 나중에 나타납니다. 어제까지 통과하던 Job이 Tool 누락이나 Library 버전 차이로 실패하는 형태입니다. 이 글에서는 그런 경우를 의도적으로 찾아내는 절차를 소개합니다.
+
+## 놓치기 쉬운 이유
+
+움직이는 라벨은 고정하지 않은 Dependency입니다. 많은 팀이 `ubuntu-latest`를 "일단 동작하는 것"으로 취급해 왔고, 지금까지는 그래도 문제가 없었습니다. 그러나 OS 메이저 업그레이드는 System Package, Compiler, Python과 OpenSSL 버전, 사전 설치 소프트웨어를 바꿉니다. GitHub의 runner-images 프로젝트는 Image별 수록 Tool을 공개하고 있으며, 26.04에서는 유지보수상의 이유로 일부 Tool을 제거하는 논의가 있었습니다.
+
+제거 목록은 고정된 정보가 아니라 최신 Image README에서 확인해야 하는 대상으로 다루십시오. 조사 과정에서 Julia, Mercurial 등이 언급된 자료를 찾았지만, 출시 전 논의에 기반한 것이어서 최종 Image와 일치하지 않을 수 있습니다.
+
+## 1단계: 움직이는 라벨 사용처 찾기
+
+```bash
+# 움직이는 라벨을 따르는 Workflow
+grep -rn "ubuntu-latest" .github/workflows/
+
+# Reusable Workflow와 Composite Action에도 숨어 있을 수 있습니다
+grep -rn "runs-on" .github/ | grep -v "ubuntu-24.04"
+```
+
+다른 Repository에서 호출하는 Reusable Workflow는 자체 `runs-on`을 가집니다. 이쪽에서 고칠 수는 없지만 결과의 변화로 영향을 확인할 수 있습니다.
+
+## 2단계: 명시적 라벨로 테스트 실행하기
+
+`ubuntu-latest`로 테스트하지 마십시오. 롤아웃 중에는 어느 Image로든 해석될 수 있습니다. 재현 가능하도록 명시적 라벨을 사용합니다.
+
+```yaml
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm test
+```
+
+여기서는 `fail-fast: false`가 중요합니다. 새 Image에서 발생하는 실패를 한 번의 실행으로 모두 보기 위해서입니다. `ubuntu-24.04` 항목을 Baseline으로 남겨 두면 마이그레이션으로 인한 회귀와 불안정한 테스트를 구분할 수 있습니다.
+
+Action 버전은 현재 사용 중인 것에 맞추십시오. 위 코드는 예시입니다. Commit SHA로 고정하고 있다면 그대로 유지하십시오.
+
+## 3단계: 암묵적 가정 점검하기
+
+Job이 선언된 Setup이 아니라 Image 자체에 암묵적으로 의존하는 부분을 확인합니다.
+
+- **Setup 없이 사용하는 사전 설치 Tool.** Workflow가 설치하지 않은 `hg`, `julia` 같은 CLI를 호출한다면 가장 깨지기 쉬운 지점입니다. 명시적인 설치 단계나 Setup Action을 추가하십시오.
+- **System Library 버전.** OpenSSL, libpq, 이미지 관련 Library에 링크하는 Native Build는 새 Package에서 동작이 달라질 수 있습니다.
+- **언어 Runtime 기본값.** `actions/setup-python` 대신 System `python3`에 의존하면 OS와 함께 버전이 바뀝니다.
+- **Docker와 Container Action.** Service Container와 `docker build`가 계속 동작하는지, rootless나 cgroup 관련 가정까지 포함해 확인합니다.
+- **직접 작성한 설치 Script.** `apt-get install <package>`는 새 릴리스에서 Package 이름이 바뀌거나 제거되면 실패합니다.
+- **OS 이름 기반 Cache Key.** `${{ runner.os }}`는 Ubuntu 릴리스를 구분하지 못하므로 24.04에서 빌드한 산출물이 26.04에 복원될 수 있습니다. Key에 Image 버전을 포함하십시오.
+
+```yaml
+- uses: actions/cache@v5
+  with:
+    path: ~/.cache/build
+    # runner.os는 단순히 "Linux"입니다. 릴리스를 명시적으로 포함합니다
+    key: build-ubuntu-26.04-${{ hashFiles('**/lockfile') }}
+```
+
+## 4단계: 방침 결정 후 고정하기
+
+현실적인 선택지는 두 가지입니다.
+
+1. **준비가 되지 않았다면 `ubuntu-24.04`로 고정합니다.** GitHub changelog에서도 Opt-out 방법으로 안내합니다. 시간을 벌 수 있지만 유예일 뿐입니다. 오래된 Image는 결국 폐기되므로 실제 마이그레이션 일정을 잡아야 합니다.
+2. **Matrix가 통과하면 `ubuntu-26.04`로 명시적으로 이동합니다.** 릴리스를 좌우하는 Job에는 `ubuntu-latest`보다 명시적 라벨을 권장합니다. 직접 정하지 않은 날짜에 OS Image가 바뀌는 배포 Pipeline은 Debug하기 어렵습니다.
+
+전환 후 몇 번의 실행 동안은 Job 소요 시간과 불안정한 테스트 발생률을 Baseline과 비교하십시오. 새 Kernel과 Toolchain은 타이밍을 바꿔서 잠재된 Race Condition을 드러내기도 합니다.
+
+## 함께 확인할 인접 변경
+
+올가을 Runner 관련 변경은 이것만이 아닙니다. Actions에서 Node 20이 제거된 것(First-party Action은 Node 24 대응), 11월 2일 macOS 14 Image 폐기에도 대응했는지 확인하십시오. Public Repository를 관리한다면 12월 2일부터 예정된 `pull_request_target` 기본 차단도 함께 점검하는 것이 좋습니다.
+
+## webhani의 권장 사항
+
+`ubuntu-latest`는 Prototype이나 중요도가 낮은 Job을 위한 편의 기능으로 보는 것이 좋습니다. Build와 Release Pipeline에서는 명시적인 OS 라벨을 고정하고, 새 LTS가 나오면 두 Image Matrix로 검증하며, 팀의 일정에 맞춰 업그레이드하십시오. 마이그레이션마다 YAML 한 줄을 수정하는 비용으로 Runner 업데이트가 장애로 번지는 일을 막을 수 있습니다.
+
+CI/CD에 숨은 Image 의존성 점검이 필요하시면 webhani가 함께 검토해 드리겠습니다.
