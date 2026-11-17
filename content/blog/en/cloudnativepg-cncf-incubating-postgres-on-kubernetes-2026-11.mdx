@@ -1,0 +1,84 @@
+---
+title: "CloudNativePG Reaches CNCF Incubating: Should You Run Postgres on Kubernetes?"
+description: "EDB reports that CloudNativePG is now a CNCF Incubating project. Governance maturity is a good signal, but it does not answer whether your team should run its database on Kubernetes. Here is how we decide."
+date: "2026-11-18"
+status: "published"
+tags: ["PostgreSQL", "Kubernetes", "CloudNativePG", "Database", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "cloudnativepg-cncf-incubating-postgres-on-kubernetes-2026-11"
+---
+
+A November 11 press release from EDB says CloudNativePG, the Kubernetes operator for PostgreSQL, has become a CNCF Incubating project. The same release describes the operator as openly governed. We could only find the vendor's own announcement, so the exact timing and criteria are worth confirming on the CNCF project page.
+
+Incubating status is a useful signal. In the CNCF model it generally reflects some adoption, a healthy contributor base, and governance that does not depend on a single company. For a database operator, where a bug can mean data loss, that matters. But it answers a different question from the one most teams actually face: should we run PostgreSQL on Kubernetes at all?
+
+## What the operator does for you
+
+CloudNativePG manages a PostgreSQL cluster through Kubernetes custom resources. You declare the desired state, and the operator handles the primary and replicas, failover, rolling updates of instances, backups to object storage, and point-in-time recovery. It uses native PostgreSQL streaming replication rather than a separate proxy-based HA layer. A minimal cluster looks like this:
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: app-db
+spec:
+  instances: 3
+  storage:
+    size: 50Gi
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://example-backups/app-db
+      s3Credentials:
+        accessKeyId:
+          name: backup-creds
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: backup-creds
+          key: ACCESS_SECRET_KEY
+```
+
+Field names change between versions, so check the current API reference before copying this. In particular, backup configuration has been evolving, and you should follow the documentation for the version you install.
+
+## When it makes sense
+
+In our experience, running Postgres on Kubernetes fits best when several conditions hold:
+
+- **You already operate Kubernetes well.** The operator adds to your platform; it does not remove the need for people who understand storage classes, node maintenance, and network policy.
+- **You need portability or on-premises hosting.** If you cannot use a managed database because of data residency, cost at scale, or a multi-cloud requirement, an operator is a credible option.
+- **You want many small, consistent databases.** Per-team or per-tenant clusters declared in Git are easy to reproduce with an operator.
+- **You have a platform team** that owns upgrades, backup testing, and incident response for the database layer.
+
+## When we would choose a managed service instead
+
+For many of the web and SaaS projects we see, a managed service such as RDS, Aurora, or Cloud SQL is the better default. The reasoning is operational, not technical:
+
+- Someone else carries the pager for hardware, patching, and storage failures.
+- Backups, point-in-time recovery and minor version upgrades are built in and tested at scale.
+- A small team's time is better spent on the application than on database operations.
+
+An operator reduces toil compared with hand-rolling replication, but it does not eliminate the responsibility. You still decide when to upgrade, you still need to test restores, and you are still the first responder if the storage layer misbehaves.
+
+## The questions that decide it
+
+Before committing, we would work through these with the team:
+
+1. **Storage.** What does your storage class guarantee for latency, durability and volume expansion? Databases are sensitive to slow or network-attached storage, and a misconfigured volume is a common source of trouble.
+2. **Restore, not just backup.** Have you actually restored a backup into a fresh cluster and measured the time? An untested backup is not a recovery plan.
+3. **Upgrades.** How will you handle minor PostgreSQL updates, such as security fixes, and major version upgrades? Read how the operator performs rolling updates and what its major-upgrade path looks like in the version you plan to use.
+4. **Failure drills.** Have you killed a primary pod and a node on purpose, and watched what applications experience? Connection retry behavior in your app matters as much as the operator.
+5. **Security.** The operator holds credentials and has broad permissions in the cluster. Review its RBAC, keep it patched, and limit who can edit `Cluster` resources. Operators have had security advisories like any other software, so subscribe to the project's notices.
+6. **Exit plan.** If you later move to a managed service, can you do a logical or physical migration without long downtime?
+
+## A pragmatic path
+
+If you are curious but cautious, start with non-critical workloads: a staging database, an internal tool, or a read replica for analytics. Run through a restore drill and a failover drill there before you consider anything customer-facing. Treat the CNCF status as a reason to take the project seriously, not as a replacement for your own testing.
+
+## Takeaways
+
+- Incubating status suggests the project's governance and adoption are maturing, based on EDB's announcement; confirm with the CNCF.
+- Running a database on Kubernetes is a decision about operations capacity, not just tooling.
+- Managed services remain the sensible default for many small teams; operators suit teams with platform skills, portability needs, or on-premises constraints.
+- Whatever you choose, rehearse restores and failovers, and keep the operator itself patched.
+
+Source: EDB press release on CloudNativePG, November 2026. Check the CNCF project page and the CloudNativePG documentation for current details.

@@ -1,0 +1,84 @@
+---
+title: "CloudNativePG, CNCF Incubating 진입: Postgres를 Kubernetes에서 운영해야 할까"
+description: "EDB는 CloudNativePG가 CNCF Incubating 프로젝트가 되었다고 밝혔습니다. Governance 성숙은 좋은 신호이지만, 우리 팀이 Database를 Kubernetes에서 운영해야 하는지에 대한 답은 아닙니다. 저희가 판단하는 방식을 소개합니다."
+date: "2026-11-18"
+status: "published"
+tags: ["PostgreSQL", "Kubernetes", "CloudNativePG", "Database", "Architecture"]
+thumbnail: ""
+author: "webhani"
+slug: "cloudnativepg-cncf-incubating-postgres-on-kubernetes-2026-11"
+---
+
+EDB의 11월 11일자 Press Release에 따르면 PostgreSQL용 Kubernetes Operator인 CloudNativePG가 CNCF Incubating 프로젝트가 되었습니다. 같은 Release는 이 Operator를 개방형 Governance로 운영되는 프로젝트라고 설명합니다. 저희는 Vendor 자체의 발표만 확인할 수 있었으므로, 정확한 시기와 기준은 CNCF 프로젝트 페이지에서 확인하시기를 권합니다.
+
+Incubating 단계는 유용한 지표입니다. CNCF 모델에서 이는 일정 수준의 도입 사례, 건강한 Contributor 기반, 특정 한 회사에 의존하지 않는 Governance를 반영하는 것으로 볼 수 있습니다. 버그가 데이터 손실로 이어질 수 있는 Database Operator에서는 이 점이 중요합니다. 하지만 대부분의 팀이 실제로 마주하는 질문, 즉 "애초에 PostgreSQL을 Kubernetes에서 운영해야 하는가"에는 답하지 못합니다.
+
+## Operator가 해 주는 일
+
+CloudNativePG는 Kubernetes Custom Resource로 PostgreSQL Cluster를 관리합니다. 원하는 상태를 선언하면 Operator가 Primary와 Replica, Failover, Instance의 Rolling Update, Object Storage로의 Backup, Point-in-time Recovery를 처리합니다. 별도의 Proxy 기반 HA 계층이 아니라 PostgreSQL 기본 Streaming Replication을 사용합니다. 최소 구성의 Cluster는 다음과 같습니다.
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: app-db
+spec:
+  instances: 3
+  storage:
+    size: 50Gi
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://example-backups/app-db
+      s3Credentials:
+        accessKeyId:
+          name: backup-creds
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: backup-creds
+          key: ACCESS_SECRET_KEY
+```
+
+Field 이름은 버전마다 바뀌므로 복사하기 전에 최신 API Reference를 확인하십시오. 특히 Backup 설정은 계속 변화하고 있으므로, 설치하려는 버전의 문서를 따르시기 바랍니다.
+
+## 적합한 경우
+
+경험상 Postgres를 Kubernetes에서 운영하는 방식은 다음 조건이 갖춰졌을 때 가장 잘 맞습니다.
+
+- **이미 Kubernetes를 잘 운영하고 있다**: Operator는 Platform 위에 더해지는 도구이며, StorageClass, Node 유지보수, Network Policy를 이해하는 인력이 필요 없어지는 것은 아닙니다.
+- **이식성이나 On-premises 운영이 필요하다**: Data Residency, 대규모에서의 비용, Multi-cloud 요구사항 때문에 Managed Database를 쓸 수 없다면 Operator는 현실적인 선택지입니다.
+- **작고 일관된 Database를 많이 두고 싶다**: 팀별 또는 Tenant별 Cluster를 Git에 선언하는 방식은 Operator를 쓰면 재현하기 쉽습니다.
+- **Platform 팀이 있다**: Upgrade, Backup Test, Database 계층의 장애 대응을 맡을 조직이 필요합니다.
+
+## 대신 Managed Service를 선택하는 경우
+
+저희가 접하는 많은 Web 및 SaaS 프로젝트에서는 RDS, Aurora, Cloud SQL 같은 Managed Service가 더 나은 기본 선택입니다. 이유는 기술이 아니라 운영에 있습니다.
+
+- Hardware, Patch, Storage 장애에 대한 호출 대응을 다른 누군가가 맡아 줍니다.
+- Backup, Point-in-time Recovery, Minor Version Upgrade가 내장되어 있고 대규모로 검증되어 있습니다.
+- 작은 팀의 시간은 Database 운영보다 Application에 쓰는 편이 가치가 큽니다.
+
+Operator는 Replication을 직접 구성하는 것보다 수고를 줄여 주지만 책임이 사라지지는 않습니다. Upgrade 시점은 여전히 직접 결정하고, Restore는 직접 Test해야 하며, Storage 계층에 문제가 생기면 가장 먼저 대응하는 것도 우리입니다.
+
+## 결정을 가르는 질문
+
+도입을 확정하기 전에 팀과 함께 다음 사항을 점검합니다.
+
+1. **Storage**: StorageClass가 Latency, 내구성, Volume 확장에 대해 무엇을 보장합니까? Database는 느리거나 Network에 연결된 Storage에 민감하며, 잘못 구성된 Volume은 흔한 문제의 원인입니다.
+2. **Backup이 아니라 Restore**: 실제로 Backup을 새 Cluster에 Restore하고 걸린 시간을 측정해 보았습니까? Test하지 않은 Backup은 복구 계획이 아닙니다.
+3. **Upgrade**: 보안 수정 같은 PostgreSQL Minor Update와 Major Version Upgrade를 어떻게 처리할 것입니까? 사용하려는 버전에서 Operator가 Rolling Update를 어떻게 수행하고 Major Upgrade 경로가 어떤지 읽어 보십시오.
+4. **장애 훈련**: Primary Pod와 Node를 일부러 중단시키고 Application이 무엇을 겪는지 확인했습니까? Application의 Connection Retry 동작은 Operator만큼 중요합니다.
+5. **Security**: Operator는 인증 정보를 보유하고 Cluster 안에서 넓은 권한을 가집니다. RBAC를 검토하고, Patch를 적용하며, `Cluster` Resource를 수정할 수 있는 사람을 제한하십시오. Operator도 다른 Software처럼 Security Advisory가 나오므로 프로젝트의 공지를 구독하시기 바랍니다.
+6. **철수 계획**: 나중에 Managed Service로 옮길 때 긴 Downtime 없이 논리적 또는 물리적 Migration을 할 수 있습니까?
+
+## 현실적인 진행 방법
+
+관심은 있지만 신중하고 싶다면 중요도가 낮은 Workload부터 시작하십시오. Staging Database, 사내 Tool, 분석용 Read Replica 등이 그 예입니다. 고객 대상 용도를 고려하기 전에 그곳에서 Restore 훈련과 Failover 훈련을 수행하십시오. CNCF 단계는 이 프로젝트를 진지하게 검토할 이유가 될 수는 있지만, 직접 수행하는 Test를 대신하지는 못합니다.
+
+## 정리
+
+- Incubating 단계는 EDB의 발표에 따르면 프로젝트의 Governance와 도입이 성숙해지고 있음을 시사합니다. CNCF에서 확인하십시오.
+- Database를 Kubernetes에서 운영하는 일은 Tool 선택이라기보다 운영 역량에 대한 결정입니다.
+- 작은 팀 다수에게 Managed Service는 여전히 합리적인 기본 선택입니다. Operator는 Platform 역량, 이식성 요구, On-premises 제약이 있는 팀에 적합합니다.
+- 무엇을 선택하든 Restore와 Failover를 미리 훈련하고 Operator 자체에도 Patch를 계속 적용하십시오.
+
+출처: EDB의 CloudNativePG 관련 Press Release(2026년 11월). 최신 세부 내용은 CNCF 프로젝트 페이지와 CloudNativePG 문서에서 확인하시기 바랍니다.

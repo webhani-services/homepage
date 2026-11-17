@@ -1,0 +1,83 @@
+---
+title: "PostgreSQL Minor Releases and the timeofday() Memory Disclosure: A Patching Checklist"
+description: "An advisory lists a server-memory disclosure in timeofday() (CVSS 8.8) fixed in PostgreSQL 18.4, 17.10, 16.14, 15.18 and 14.23. Here is how to decide urgency and roll out a minor upgrade safely."
+date: "2026-11-18"
+status: "published"
+tags: ["PostgreSQL", "Database", "Security", "Patching", "Operations"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-minor-releases-timeofday-memory-disclosure-2026-11"
+---
+
+An IBM support advisory describes several PostgreSQL flaws, including a server-memory disclosure in the `timeofday()` function rated CVSS 8.8. The fixed releases it lists are 18.4, 17.10, 16.14, 15.18 and 14.23. The advisory page we found did not show a publication date, and we could not tie the releases to a specific day, so confirm the details on the PostgreSQL security page and in the official release notes before you act on any number here.
+
+This post is not a deep dive into the vulnerability. It is a practical guide to something teams often handle badly: deciding how fast to apply a PostgreSQL minor release and how to do it without surprises.
+
+## Why minor releases are the easy upgrade
+
+PostgreSQL's versioning separates the two kinds of change. A minor release (for example 17.9 to 17.10) contains bug and security fixes only. It does not change the on-disk format, so you can roll back the binaries without a dump and restore. A major release (17 to 18) changes more and needs a planned upgrade path. The project documents this in its versioning policy.
+
+That is why we tell clients not to let minor releases pile up. Skipping several makes the eventual jump larger to review, and it leaves known security fixes unapplied.
+
+## Judging urgency for a memory disclosure
+
+A CVSS number alone does not tell you whether you are exposed. For an information-disclosure bug in a built-in function, ask three questions:
+
+1. **Who can call it?** If an untrusted or semi-trusted role can run arbitrary SQL, such as a multi-tenant app, a reporting user, or an SQL-capable AI agent, exposure is real. If only your application's fixed queries reach the database, exposure is lower.
+2. **What could leak?** Server memory can contain other sessions' data, query text, and occasionally credentials. Treat it as potentially sensitive even when exploitation is hard.
+3. **Is the database reachable by anyone you do not trust?** Network exposure, shared credentials, and over-broad `GRANT`s all raise the risk.
+
+That third point connects to something we have written about elsewhere: database access given to tools and agents. If you let an LLM-driven tool run SQL, patch promptly and use a read-only role with narrow privileges.
+
+## Check what you are running
+
+First, find out your exact version on every instance. Do not assume staging and production match:
+
+```sql
+SELECT version();
+SHOW server_version;
+```
+
+Then compare against the fixed release for your major version. If you run managed PostgreSQL such as RDS, Cloud SQL, or Azure Database, check the provider's own announcement. Managed services apply fixes on their own schedule, and some require you to trigger or schedule a minor version upgrade during a maintenance window.
+
+A quick inventory script across environments saves time:
+
+```bash
+for host in db-prod-1 db-prod-2 db-staging; do
+  echo -n "$host: "
+  psql -h "$host" -U monitor -Atc "SHOW server_version;"
+done
+```
+
+## Rolling out the minor upgrade
+
+For self-managed servers, a conservative order works well:
+
+1. Read the release notes for your major version, especially any "migration to version X" section. Minor releases occasionally require a post-upgrade step, such as reindexing a specific index type.
+2. Upgrade a staging instance and run your test suite plus a realistic query workload.
+3. Upgrade replicas first, then promote or fail over, then upgrade the former primary. This keeps downtime to the failover window.
+4. Monitor error logs and replication lag for a day. Keep the previous package version available for rollback.
+
+For containerized setups, pin the image tag to the exact minor version rather than a floating tag, so the upgrade is a deliberate change in a pull request:
+
+```yaml
+services:
+  db:
+    image: postgres:17.10   # pin the minor; bump deliberately
+```
+
+Floating tags like `postgres:17` are convenient but mean a restart can silently change your version. Pinning makes the change reviewable and revertible.
+
+## If you are still on 14
+
+Version 14 appears in the fixed list, which tells us it is still receiving the fix. PostgreSQL 14 is near or at the end of its support window, and we have covered the upgrade planning in separate posts on our blog. If you are on 14, treat this patch as a stopgap and schedule a major upgrade rather than assuming minor releases will continue.
+
+## Takeaways
+
+- Confirm the advisory details and fixed versions against official PostgreSQL sources, since the page we saw did not state a date.
+- Minor upgrades are low-risk and reversible at the binary level, so apply them promptly, especially for security fixes.
+- Assess exposure by asking who can run SQL against the instance, not just by the CVSS score.
+- Pin container image tags to the minor version and upgrade replicas before the primary.
+- Use the patch as a prompt to review database roles, especially any granted to automation or AI tools.
+
+Source: IBM Support security advisory on PostgreSQL (date not shown on the page we reviewed). Verify against postgresql.org/support/security.

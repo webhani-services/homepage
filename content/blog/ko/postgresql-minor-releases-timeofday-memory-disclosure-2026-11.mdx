@@ -1,0 +1,83 @@
+---
+title: "PostgreSQL Minor Release와 timeofday() 메모리 노출: 패치 적용 Checklist"
+description: "한 Advisory가 timeofday()에서 서버 메모리가 노출되는 취약점(CVSS 8.8)이 PostgreSQL 18.4, 17.10, 16.14, 15.18, 14.23에서 수정되었다고 전합니다. 긴급도를 판단하고 Minor Upgrade를 안전하게 진행하는 방법을 정리합니다."
+date: "2026-11-18"
+status: "published"
+tags: ["PostgreSQL", "Database", "Security", "Patching", "Operations"]
+thumbnail: ""
+author: "webhani"
+slug: "postgresql-minor-releases-timeofday-memory-disclosure-2026-11"
+---
+
+IBM Support의 Advisory는 PostgreSQL의 여러 결함을 다루며, 그중 `timeofday()` 함수에서 서버 메모리가 노출되는 문제가 CVSS 8.8로 평가되어 있습니다. 수정 버전으로 나열된 것은 18.4, 17.10, 16.14, 15.18, 14.23입니다. 저희가 확인한 페이지에는 게시일이 표시되어 있지 않았고, Release 날짜도 특정하지 못했습니다. 따라서 여기에 적은 숫자를 근거로 조치하기 전에 PostgreSQL Security 페이지와 공식 Release Note에서 세부 내용을 확인하시기 바랍니다.
+
+이 글은 취약점 자체를 깊이 분석하는 글이 아닙니다. 많은 팀이 서투르게 처리하는 부분, 즉 PostgreSQL Minor Release를 얼마나 빠르게 적용할지, 그리고 예상치 못한 문제 없이 적용하려면 어떻게 해야 하는지에 대한 실무 가이드입니다.
+
+## Minor Release가 쉬운 Upgrade인 이유
+
+PostgreSQL의 버전 체계는 변경의 종류를 구분합니다. Minor Release(예: 17.9에서 17.10)에는 버그 수정과 보안 수정만 포함되며, 디스크상의 Format은 바뀌지 않습니다. 따라서 Dump와 Restore 없이 Binary를 되돌릴 수 있습니다. Major Release(17에서 18)는 변경이 크고 계획된 Upgrade 경로가 필요합니다. 이는 프로젝트의 Versioning Policy에 문서화되어 있습니다.
+
+그래서 고객에게 Minor Release를 쌓아 두지 말라고 말씀드립니다. 여러 번 건너뛰면 결국 한 번에 검토해야 할 범위가 커지고, 이미 알려진 보안 수정이 적용되지 않은 채로 남습니다.
+
+## 메모리 노출의 긴급도 판단
+
+CVSS 점수만으로는 자신이 영향을 받는지 알 수 없습니다. 내장 함수의 정보 노출 버그라면 다음 세 가지를 따져 봅니다.
+
+1. **누가 호출할 수 있는가**: Multi-tenant 앱, Reporting 용도의 사용자, SQL을 실행할 수 있는 AI Agent처럼 신뢰할 수 없거나 부분적으로만 신뢰하는 Role이 임의의 SQL을 실행할 수 있다면 노출은 현실적입니다. 애플리케이션의 고정된 Query만 Database에 도달한다면 위험은 낮습니다.
+2. **무엇이 유출될 수 있는가**: 서버 메모리에는 다른 Session의 데이터, Query 문, 때로는 인증 정보가 들어 있을 수 있습니다. 악용이 어렵더라도 민감할 수 있는 정보로 취급해야 합니다.
+3. **신뢰할 수 없는 상대가 Database에 접근할 수 있는가**: Network 노출, 공유된 인증 정보, 지나치게 넓은 `GRANT`는 모두 위험을 높입니다.
+
+세 번째는 저희가 다른 글에서도 다룬 주제와 이어집니다. Tool과 Agent에 부여하는 Database 접근 권한입니다. LLM 기반 Tool이 SQL을 실행하게 한다면 패치를 서둘러 적용하고, 권한을 좁힌 읽기 전용 Role을 사용하십시오.
+
+## 운영 중인 버전 확인
+
+먼저 모든 Instance에서 정확한 버전을 확인합니다. Staging과 Production이 같다고 가정하지 마십시오.
+
+```sql
+SELECT version();
+SHOW server_version;
+```
+
+그다음 자신의 Major 버전에 해당하는 수정 버전과 비교합니다. RDS, Cloud SQL, Azure Database 같은 Managed Service를 쓴다면 Provider의 공지를 확인하십시오. Managed Service는 자체 일정으로 수정을 적용하며, 일부는 Maintenance Window에 Minor Version Upgrade를 직접 실행하거나 예약해야 합니다.
+
+환경 전반에 대한 간단한 점검 Script가 있으면 시간을 아낄 수 있습니다.
+
+```bash
+for host in db-prod-1 db-prod-2 db-staging; do
+  echo -n "$host: "
+  psql -h "$host" -U monitor -Atc "SHOW server_version;"
+done
+```
+
+## Minor Upgrade 진행 방법
+
+직접 관리하는 Server에는 보수적인 순서가 잘 맞습니다.
+
+1. 자신의 Major 버전 Release Note를 읽습니다. 특히 "migration to version X" 섹션을 봅니다. Minor Release에서도 특정 종류의 Index를 다시 만드는 등 Upgrade 후 단계가 필요한 경우가 있습니다.
+2. Staging Instance를 먼저 Upgrade하고 Test Suite와 실제와 비슷한 Query 부하를 실행합니다.
+3. Replica를 먼저 Upgrade한 뒤 Promote 또는 Failover하고, 이후 기존 Primary를 Upgrade합니다. 이렇게 하면 Downtime이 Failover 시간으로 한정됩니다.
+4. 하루 정도 Error Log와 Replication Lag를 모니터링합니다. Rollback에 대비해 이전 Package 버전을 남겨 둡니다.
+
+Container 환경에서는 Floating Tag 대신 Minor 버전까지 고정한 Image Tag를 사용하면 Upgrade가 Pull Request에서의 의도적인 변경이 됩니다.
+
+```yaml
+services:
+  db:
+    image: postgres:17.10   # pin the minor; bump deliberately
+```
+
+`postgres:17` 같은 Floating Tag는 편리하지만, 재시작만으로도 버전이 눈에 띄지 않게 바뀔 수 있습니다. 고정하면 변경을 리뷰할 수 있고 되돌릴 수도 있습니다.
+
+## 아직 14를 사용 중이라면
+
+수정 버전 목록에 14가 포함되어 있으므로 아직 수정이 제공되고 있음을 알 수 있습니다. PostgreSQL 14는 지원 기간의 끝에 가깝거나 끝나는 시점에 있으며, Upgrade 계획은 저희 Blog의 다른 글에서도 다뤘습니다. 14를 사용 중이라면 이번 패치는 임시 조치로 보고, Minor Release가 계속 나올 것이라 기대하지 말고 Major Upgrade를 계획하십시오.
+
+## 정리
+
+- 저희가 본 페이지에는 날짜가 없었으므로, Advisory 세부 내용과 수정 버전은 PostgreSQL 공식 자료에서 확인합니다.
+- Minor Upgrade는 위험이 낮고 Binary 수준에서 되돌릴 수 있으므로, 특히 보안 수정은 빠르게 적용합니다.
+- 긴급도는 CVSS 점수만이 아니라 Instance에 대해 누가 SQL을 실행할 수 있는지로 판단합니다.
+- Container Image Tag는 Minor 버전까지 고정하고, Primary보다 Replica를 먼저 Upgrade합니다.
+- 이번 기회에 특히 자동화나 AI Tool에 부여한 Role을 포함해 Database Role을 점검합니다.
+
+출처: IBM Support의 PostgreSQL 보안 Advisory(확인한 페이지에는 날짜 표시 없음). postgresql.org/support/security 에서 확인하시기 바랍니다.
