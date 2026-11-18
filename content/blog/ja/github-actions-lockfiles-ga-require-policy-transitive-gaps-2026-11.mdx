@@ -1,0 +1,94 @@
+---
+title: "GitHub Actions の workflow lockfile:Require policy の導入手順と、ロックでは防げない範囲"
+description: "GitHub Actions の workflow lockfile は 2026 年 10 月に public preview となり、その後 GA になったと報じられています。CI での整合性チェックを含む導入手順と、残るサプライチェーン上の穴を整理します。"
+date: "2026-11-19"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "サプライチェーンセキュリティ", "DevOps", "セキュリティ"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-lockfiles-ga-require-policy-transitive-gaps-2026-11"
+---
+
+action を commit SHA で固定することは何年も前から定番の助言ですが、実際には徹底されていないチームが多いのが現状です。workflow dependency lockfile は、この規律を慣習からツールの仕組みに移します。この記事では、導入の進め方と、それ以上に重要な「何を防げないのか」を整理します。
+
+先に提供状況です。GitHub の changelog は 2026 年 10 月 14 日に public preview として発表し、対象として GitHub Enterprise Cloud を挙げています。InfoQ は 10 月 28 日に GA になったと報じ、classmethod.jp の記事も GA として扱っていますが、公式の GA changelog は確認できませんでした。対象プランについても二次情報の間で食い違いがあります。計画を立てる前に、ご利用のプランについて GitHub の changelog とドキュメントを確認してください。
+
+## lockfile で得られるもの
+
+GitHub のドキュメントによれば、lockfile は workflow の実行を、ロックした特定の commit に結びつけます。上流でタグが付け替えられたり、ブランチが書き換えられたりしても、workflow が実行する内容は変わりません。ある解説記事では、`gh actions-lock` という CLI 拡張が `.github/workflows/actions.lock` にファイルを生成するとされています。preview には「Require lockfile」ポリシーも含まれ、管理者が enterprise、organization、repository の各レベルで lockfile を必須にできます。
+
+利点は明快で、レビューしたバージョンがそのまま実行されます。対象となる攻撃は、メンテナーのアカウントが乗っ取られ、よく使われるタグが悪意あるコードに付け替えられるという、よく知られたものです。
+
+## 守れないもの
+
+GitHub 自身が、ロックは安全性の確認ではないと明言しています。lockfile は承認したものを固定するだけで、承認すべきだったかどうかは教えてくれません。実務では次の 2 点が重要です。
+
+**最初のロックは自分でレビューする必要があります。** 昨日すでに侵害された action に対して今日 lockfile を作れば、侵害された状態を固定することになります。ロックはレビューの代わりではなく、レビューの後に行うものです。
+
+**transitive な依存は対象外になり得ます。** ある解説記事は、ロックでは action が内部で呼び出す別の action を固定できないと指摘しています。別の action をタグで参照する composite action や、実行時にバイナリをダウンロードする JavaScript action は、依然として中身が変わり得ます。lockfile が扱うのは workflow が直接指名するものまでで、その先の信頼は action 自体の管理状態に依存します。
+
+これはパッケージマネージャーの lockfile と同じ構図です。`package-lock.json` は依存グラフを固定しますが、postinstall スクリプトを安全にするわけではありません。
+
+## 止まらずに進める導入手順
+
+すべてを 1 回の変更でロックしようとして行き詰まるチームは多いです。次の順序のほうがうまく進みます。
+
+1. **棚卸し**。全リポジトリの `uses:` 参照を洗い出します。
+
+```bash
+grep -rhoE 'uses: [^ ]+' .github/workflows \
+  | sort | uniq -c | sort -rn
+```
+
+2. **分類**。ファーストパーティ(自社製や `actions/*`)、契約のあるベンダーの action、それ以外に分けます。レビューの労力は 3 つ目のグループに向けます。
+3. **レビューと削除**。3 つ目のグループは、そもそもその action が必要かを問います。10 行のシェルステップのほうが、見知らぬ人の action より安全なことがよくあります。
+4. **1 つのリポジトリでロックする**。リスクの低いリポジトリを選び、lockfile を生成して、数週間は実際のパイプラインで運用します。
+5. **整合性チェックを追加する**。そのうえで、ポリシーをより広く適用します。
+
+## CI で lockfile の正しさを保つ
+
+workflow とずれた lockfile は、ないより悪い状態です。誰も信用しなくなるからです。ある情報源は、ファイルを変更せずに lockfile が最新であることを確認する CI チェックに触れています。正確なコマンドは情報源から確認できないため、以下は、実際の再生成コマンドの部分をプレースホルダーにしたパターンの例です。
+
+```yaml
+name: lockfile-check
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@<pinned-sha>
+      - name: Regenerate lockfile
+        run: ./scripts/regenerate-actions-lock.sh # 公式ドキュメントのコマンドをラップする
+      - name: Fail if the lockfile changed
+        run: git diff --exit-code .github/workflows/actions.lock
+```
+
+スクリプトの中身は、環境に合わせて GitHub のドキュメントにあるコマンドに置き換えてください。重要なのは考え方です。CI で再生成し、コミット済みの内容と差異があれば PR を失敗させます。これにより、依存の変更がすべてレビュー担当者から見える差分になります。
+
+## 更新を負担にしない
+
+固定した依存には更新の経路が必要で、なければ腐ります。Dependabot は action の更新 PR を作成でき、lockfile があれば 1 件ごとに小さくレビューしやすい差分になります。たとえば週次といった頻度を決め、その PR をレビューの場として扱います。secret にアクセスできる action については、上流の差分を読んでください。
+
+あわせて、workflow レベルで最小権限の `permissions:` を設定し、OIDC による短寿命の資格情報を使います。ロックした action が長寿命のデプロイキーを握ったままでは、効果は限定的です。
+
+## webhani の見解
+
+lockfile は良い対策であり、Require ポリシーによって個人の工夫が組織の統制になります。導入には賛成ですが、社内で「サプライチェーン問題は解決した」とは説明しないでしょう。防げるのは、直接の依存に対するタグ付け替え攻撃です。コードのレビューはしてくれず、transitive な参照も対象外で、secret のスコープ管理の代わりにもなりません。
+
+## まとめ
+
+- 導入前に、GitHub の公式 changelog で機能の提供状況と対象プランを確認する。
+- ロックする前に action をレビューする。lockfile は信頼を固定するもので、生み出すものではない。
+- transitive な action や実行時のダウンロードは、ロックの外にあり得ると理解する。
+- 棚卸しと 1 つの低リスクなリポジトリから、段階的に展開する。
+- CI で lockfile を再生成し、差分があれば失敗させる。
+- 最小権限の permissions と OIDC を併用する。
+
+出典:[GitHub changelog: workflow lockfiles の public preview](https://github.blog/changelog/2026-10-14-github-actions-workflow-lockfiles-in-public-preview/)、[GitHub Docs: workflow dependency lockfiles](https://docs.github.com/en/actions/concepts/security/workflow-dependency-lockfiles)、[InfoQ の記事](https://infoq.com/news/2026/11/github-actions-lockfiles-ga)

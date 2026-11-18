@@ -1,0 +1,111 @@
+---
+title: "イメージの Label は信頼できない入力:containerd CRI と Podman auto-update の脆弱性から学ぶ"
+description: "2026 年の 2 件のアドバイザリーは、コンテナツールがイメージの LABEL メタデータをもとに動作していた点で共通しています。バージョンの確認方法と、Label をイメージレビューの対象にする方法を整理します。"
+date: "2026-11-19"
+status: "published"
+tags: ["コンテナセキュリティ", "containerd", "Podman", "Kubernetes", "サプライチェーン"]
+thumbnail: ""
+author: "webhani"
+slug: "image-labels-untrusted-input-containerd-cri-podman-auto-update-2026-11"
+---
+
+コンテナイメージでは、中身が危険でメタデータは単なる付随情報だと考えられがちです。最近の 2 件のアドバイザリーは、この前提に疑問を投げかけています。どちらも、ツールがイメージの `LABEL` の値を読み取って何らかの処理を行い、しかもその値を書いたのはイメージの作成者でした。
+
+以下の内容は、脆弱性アグリゲーターやアドバイザリーのフィードに基づいています。これらは公開日や影響バージョンの範囲が完全には載っていないことがあります。手がかりとして扱い、対応前に upstream のアドバイザリーと NVD で確認してください。
+
+## 2 件のアドバイザリー
+
+**containerd の CRI plugin、CVE-2026-53488**。あるフィードによると、CRI plugin がイメージ設定の `LABEL` の値を検証せずにコンテナへ渡す問題で、ホスト上で root 権限のコマンド実行につながるとされています。重大度は critical として扱われ、修正済みバージョンは 1.7.33、2.0.10、2.1.9、2.2.5、2.3.2 と記載されています。日付は 2026 年 6 月とされているため新しい話ではありませんが、しばらく誰も触っていないノードに残りやすいタイプの問題です。
+
+**Podman の auto-update、CVE-2026-121885**。stack.watch によれば 2026 年 11 月 10 日に公開され、信頼できないイメージ Label によって、Podman の auto-update 機能が任意の systemd unit を再起動させられる問題です。同じ情報源では、ネットワーク経由で悪用可能で、ユーザー操作が必要と説明されています。
+
+製品も影響も異なりますが、根本原因は同じです。イメージ作成者が制御できるメタデータを、権限を持つコンポーネントが、運用者による設定であるかのように解釈していました。
+
+## なぜ繰り返されるのか
+
+Label は、ツールがイメージに意味を付与するための仕組みです。`org.opencontainers.image.*` 系のキーは説明用です。しかし多くのツールは、Label を指示としても読みます。どの unit を再起動するか、どのポートを公開するか、どのボリュームをマウントするか、どの healthcheck を実行するか、といった具合です。権限を持つプロセスが Label に基づいて動いた時点で、その Label は、イメージをビルドした人からの入力経路になります。
+
+イメージが自社のレジストリと自社の CI から来るなら、その経路は自社のものです。公開レジストリ、サードパーティのベースイメージ、「親切な」ベンダーのイメージから来るなら、そうではありません。
+
+## 稼働中の環境を確認する
+
+Kubernetes ノード上の containerd は、まずバージョンを確認します。マネージドサービスは独自のスケジュールでパッチを当てるため、ノードが報告する値を見ます。
+
+```bash
+# ノードごとのコンテナランタイムのバージョン
+kubectl get nodes -o custom-columns=NAME:.metadata.name,RUNTIME:.status.nodeInfo.containerRuntimeVersion
+
+# SSH できるノード上で
+containerd --version
+```
+
+結果を、使用しているリリースラインに対応する修正済みバージョンと比較します。修正は minor 系列ごとにあります。2.1.x のノードに必要なのは 2.1.9 以降であり、「1.7.33 より新しければよい」というわけではありません。
+
+Podman では、そもそも auto-update を使っているかを確認します。
+
+```bash
+podman --version
+systemctl list-timers | grep -i podman-auto-update
+podman auto-update --dry-run
+```
+
+timer が有効でなく、`io.containers.autoupdate` ラベルを持つコンテナもなければ、影響範囲はかなり小さくなります。結論を出す前に、アドバイザリーで修正済みバージョンを確認してください。
+
+## 実行前に Label を調べる
+
+イメージ全体を pull しなくても、Label は安価に読み取れます。`skopeo` なら config だけを取得できます。
+
+```bash
+skopeo inspect docker://registry.example.com/team/app:1.4.2 \
+  | jq '.Labels'
+```
+
+すでにローカルにあるイメージなら次のとおりです。
+
+```bash
+docker image inspect registry.example.com/team/app:1.4.2 \
+  --format '{{json .Config.Labels}}' | jq
+```
+
+表示用ではなく、ツールが解釈しそうな Label に注意してください。auto-update、systemd、hook、mount、capability に関するキーは、特に自分でビルドしていないイメージでは二度確認する価値があります。
+
+## 一度きりではなく、ポリシーにする
+
+CI に小さなチェックを入れておけば、想定外の Label がレビューなしで本番に届くのを防げます。次のスクリプトは、許可リストにない prefix の Label を持つイメージでビルドを失敗させます。
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+image="$1"
+allowed='^(org\.opencontainers\.image\.|com\.example\.)'
+
+unexpected=$(skopeo inspect "docker://${image}" \
+  | jq -r '.Labels // {} | keys[]' \
+  | grep -Ev "$allowed" || true)
+
+if [ -n "$unexpected" ]; then
+  echo "Unexpected labels on ${image}:" >&2
+  echo "$unexpected" >&2
+  exit 1
+fi
+```
+
+独自のキーを追加するベースイメージのために、許可リストの調整は必要になります。この手間は有益です。新しい Label が何をするのかを、出荷前に誰かが確認することになるからです。
+
+## webhani の推奨
+
+1. **ランタイムにパッチを当てる**。クラスタ全体の containerd のバージョンを棚卸しし、各 minor 系列を修正済みリリースに揃えます。マネージドサービスが対応済みだと思い込まず、報告されるバージョンを確認してください。
+2. **auto-update の利用を見直す**。Podman の auto-update を有効にしているなら、本当に必要か判断し、自社でビルドしたイメージに限定します。
+3. **digest で固定し、信頼できる取得元を使う**。サードパーティのベースイメージは自社レジストリにミラーし、pull の間で Label が変わっても気づけるようにします。
+4. **Label もコードと同様にレビューする**。イメージ CI に Label チェックを加え、ベースイメージの更新時には Label の差分を確認します。
+5. **最小権限で動かす**。rootless ランタイムやノードへのアクセス制限により、誤処理された Label が到達できる範囲を狭められます。
+
+## まとめ
+
+- イメージが攻撃者の手によるものなら、メタデータも攻撃者の制御下にある。
+- 2026 年には別々の 2 つのツールが、本来渡すべきでない権限で Label に基づいて動作していた。
+- containerd は minor 系列ごとにバージョンを確認し、Podman は auto-update が有効かを確認する。
+- イメージレビューに Label の検査を加え、例外リストは短く保つ。
+
+出典:[stack.watch の CVE-2026-121885](https://stack.watch/vuln/CVE-2026-121885/)、[Docker Scout の CVE-2026-53488](https://scout.docker.com/vulnerabilities/id/CVE-2026-53488)、[CraftedSignal の containerd CRI 概要](https://feed.craftedsignal.io/briefs/2026-06-containerd-cri-rce/)

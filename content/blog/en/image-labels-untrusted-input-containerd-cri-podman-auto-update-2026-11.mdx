@@ -1,0 +1,111 @@
+---
+title: "Image Labels Are Untrusted Input: Lessons from the containerd CRI and Podman Auto-Update Advisories"
+description: "Two 2026 advisories show container tooling acting on image LABEL metadata: containerd's CRI plugin and Podman's auto-update. How to check your versions and make label handling part of your image review."
+date: "2026-11-19"
+status: "published"
+tags: ["Container Security", "containerd", "Podman", "Kubernetes", "Supply Chain"]
+thumbnail: ""
+author: "webhani"
+slug: "image-labels-untrusted-input-containerd-cri-podman-auto-update-2026-11"
+---
+
+Teams usually treat an image's contents as the risky part and its metadata as bookkeeping. Two recent advisories challenge that assumption. In both, tooling read `LABEL` values from an image and did something with them, and in both, the person who wrote the image controlled those values.
+
+The details below come from vulnerability aggregators and advisory feeds, which do not always show publication dates or complete version ranges. Treat them as pointers and confirm against the upstream advisories and NVD before you act.
+
+## The two advisories
+
+**containerd CRI plugin, CVE-2026-53488.** One advisory feed describes a flaw in the CRI plugin where image config `LABEL` values are passed through to containers without validation, which the feed says allows command execution as root on the host. It is tracked as critical, and the feed lists fixed versions as 1.7.33, 2.0.10, 2.1.9, 2.2.5, and 2.3.2. The feed dates it to June 2026, so it is not new, but it is exactly the sort of issue that sits unpatched on nodes that nobody has touched since.
+
+**Podman auto-update, CVE-2026-121885.** Published on November 10, 2026 according to stack.watch, this one involves untrusted image labels that can make Podman's auto-update feature restart arbitrary systemd units. The same source describes it as network-exploitable and requiring user interaction.
+
+Different products, different impact, same root cause: metadata that an image author controls was interpreted by a privileged component as if it were configuration from the operator.
+
+## Why this keeps happening
+
+Labels exist so tools can attach meaning to images. `org.opencontainers.image.*` keys are descriptive. But many tools also read labels as instructions: which units to restart, which ports to expose, which volumes to mount, which healthcheck to run. The moment a privileged process acts on a label, the label is an input channel from whoever built the image.
+
+When the image comes from your own registry and your own CI, that channel is yours. When it comes from a public registry, a third-party base image, or a "helpful" vendor image, it is not.
+
+## Check what you are running
+
+For containerd on Kubernetes nodes, start with the version. Managed services patch on their own schedule, so look at what the nodes report:
+
+```bash
+# Container runtime version per node
+kubectl get nodes -o custom-columns=NAME:.metadata.name,RUNTIME:.status.nodeInfo.containerRuntimeVersion
+
+# On a node you can SSH into
+containerd --version
+```
+
+Compare the result against the fixed versions in the advisory for your release line. Note that the fixes are per minor series: a node on 2.1.x needs 2.1.9 or later, not just "something newer than 1.7.33".
+
+For Podman, check whether auto-update is in use at all:
+
+```bash
+podman --version
+systemctl list-timers | grep -i podman-auto-update
+podman auto-update --dry-run
+```
+
+If the timer is not enabled and no containers carry the `io.containers.autoupdate` label, the exposure is much smaller. Confirm the fixed version from the advisory before concluding anything.
+
+## Inspect labels before you run an image
+
+Labels are cheap to read without pulling the whole image. `skopeo` can fetch only the config:
+
+```bash
+skopeo inspect docker://registry.example.com/team/app:1.4.2 \
+  | jq '.Labels'
+```
+
+For images you already have locally:
+
+```bash
+docker image inspect registry.example.com/team/app:1.4.2 \
+  --format '{{json .Config.Labels}}' | jq
+```
+
+Look for labels that a tool might interpret rather than display. Keys that mention auto-update, systemd, hooks, mounts, or capabilities deserve a second look, especially from images you did not build.
+
+## Make it a policy, not a one-off
+
+A small check in CI keeps unexpected labels from reaching production unreviewed. This one fails the build if an image carries any label outside an allowlist of prefixes:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+image="$1"
+allowed='^(org\.opencontainers\.image\.|com\.example\.)'
+
+unexpected=$(skopeo inspect "docker://${image}" \
+  | jq -r '.Labels // {} | keys[]' \
+  | grep -Ev "$allowed" || true)
+
+if [ -n "$unexpected" ]; then
+  echo "Unexpected labels on ${image}:" >&2
+  echo "$unexpected" >&2
+  exit 1
+fi
+```
+
+The allowlist will need tuning for base images that add their own keys. That friction is useful: it forces someone to look at what a new label does before it ships.
+
+## What we recommend
+
+1. **Patch the runtime.** Inventory containerd versions across clusters and bring each minor series to its fixed release. Do not rely on a managed service having done it without checking the reported version.
+2. **Audit auto-update usage.** If Podman auto-update is enabled, decide whether you need it, and restrict it to images you build.
+3. **Pin and pull from trusted sources.** Use digests, and mirror third-party base images into your own registry so label changes between pulls are visible.
+4. **Review labels like code.** Add a label check to image CI, and diff labels when bumping a base image.
+5. **Run with least privilege.** Rootless runtimes and restricted node access reduce what a mishandled label can reach.
+
+## Takeaways
+
+- Image metadata is attacker-controlled whenever the image is.
+- Two separate tools in 2026 acted on labels with privileges they should not have extended.
+- Verify containerd versions per minor series, and verify whether Podman auto-update is enabled.
+- Add label inspection to your image review, and keep the exceptions list short.
+
+Sources: [stack.watch entry for CVE-2026-121885](https://stack.watch/vuln/CVE-2026-121885/), [Docker Scout entry for CVE-2026-53488](https://scout.docker.com/vulnerabilities/id/CVE-2026-53488), [CraftedSignal containerd CRI brief](https://feed.craftedsignal.io/briefs/2026-06-containerd-cri-rce/).

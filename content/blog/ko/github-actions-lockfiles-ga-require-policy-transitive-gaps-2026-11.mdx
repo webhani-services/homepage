@@ -1,0 +1,94 @@
+---
+title: "GitHub Actions Workflow Lockfile: Require Policy 도입 방법과 Lock으로 막을 수 없는 범위"
+description: "GitHub Actions workflow lockfile은 2026년 10월 public preview로 시작했고 이후 GA가 되었다고 보도되었습니다. CI 정합성 검사를 포함한 도입 절차와 남는 Supply Chain 위험을 정리합니다."
+date: "2026-11-19"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "Supply Chain 보안", "DevOps", "보안"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-lockfiles-ga-require-policy-transitive-gaps-2026-11"
+---
+
+Action을 commit SHA로 고정하라는 조언은 수년 전부터 표준이었지만, 실제로는 철저히 지키지 않는 팀이 많습니다. Workflow dependency lockfile은 이 원칙을 관례에서 Tool의 기능으로 옮깁니다. 이 글에서는 도입 방법, 그리고 그보다 중요한 "무엇을 막지 못하는가"를 다룹니다.
+
+먼저 제공 상태입니다. GitHub changelog는 2026년 10월 14일에 public preview로 발표했고 대상으로 GitHub Enterprise Cloud를 명시했습니다. InfoQ는 10월 28일에 GA가 되었다고 보도했고 classmethod.jp 글도 GA로 설명하지만, 공식 GA changelog 항목은 확인하지 못했습니다. 지원 Plan에 대해서도 2차 자료 사이에 차이가 있습니다. 계획을 세우기 전에 사용 중인 Plan에 대해 GitHub changelog와 문서를 확인하십시오.
+
+## Lockfile이 제공하는 것
+
+GitHub 문서에 따르면 lockfile은 workflow 실행을 Lock한 특정 commit에 묶습니다. 상류에서 Tag가 옮겨지거나 Branch가 덮어써져도 workflow가 실행하는 내용은 바뀌지 않습니다. 한 해설 글은 `gh actions-lock` CLI Extension이 `.github/workflows/actions.lock`에 파일을 생성한다고 설명합니다. Preview에는 "Require lockfile" Policy도 포함되어, 관리자가 enterprise, organization, repository 수준에서 lockfile을 필수로 지정할 수 있습니다.
+
+장점은 분명합니다. Review한 Version이 그대로 실행됩니다. 대응하는 공격은 익숙한 유형으로, Maintainer 계정이 탈취되어 인기 있는 Tag가 악성 Code로 바뀌는 경우입니다.
+
+## 막지 못하는 것
+
+GitHub 스스로도 Lock은 안전성 검사가 아니라고 분명히 밝힙니다. Lockfile은 승인한 것을 고정할 뿐, 승인해도 되는지는 알려 주지 않습니다. 실무에서는 두 가지 한계가 중요합니다.
+
+**첫 Lock은 직접 Review해야 합니다.** 어제 이미 침해된 Action에 대해 오늘 lockfile을 만들면 침해된 상태를 고정하는 셈입니다. Lock은 Review를 대신하는 것이 아니라 Review 이후에 하는 것입니다.
+
+**Transitive 의존성은 범위 밖일 수 있습니다.** 한 해설 글은 Lock으로 Action이 내부에서 호출하는 다른 Action까지 고정할 수는 없다고 지적합니다. 다른 Action을 Tag로 참조하는 Composite Action이나 실행 시점에 Binary를 내려받는 JavaScript Action은 여전히 내용이 바뀔 수 있습니다. Lockfile이 다루는 것은 workflow가 직접 지정한 것까지이며, 그 너머의 신뢰는 Action 자체의 관리 상태에 달려 있습니다.
+
+이는 Package Manager의 lockfile과 같은 구조입니다. `package-lock.json`은 의존성 Graph를 고정하지만, postinstall Script를 안전하게 만들어 주지는 않습니다.
+
+## 막힘 없이 진행하는 도입 절차
+
+모든 것을 한 번의 변경으로 Lock하려다 막히는 팀이 많습니다. 다음 순서가 더 잘 맞습니다.
+
+1. **현황 조사**. 모든 Repository의 `uses:` 참조를 모읍니다.
+
+```bash
+grep -rhoE 'uses: [^ ]+' .github/workflows \
+  | sort | uniq -c | sort -rn
+```
+
+2. **분류**. First-party(자사 제작 또는 `actions/*`), 계약된 Vendor의 Action, 그 외로 나눕니다. Review 노력은 세 번째 그룹에 집중합니다.
+3. **Review 후 제거**. 세 번째 그룹은 애초에 그 Action이 필요한지 따져 봅니다. 열 줄짜리 Shell Step이 낯선 사람의 Action보다 안전한 경우가 많습니다.
+4. **Repository 하나에서 Lock**. 위험이 낮은 Repository를 골라 lockfile을 생성하고, 몇 주간 실제 Pipeline에서 운영합니다.
+5. **정합성 검사 추가**. 그런 다음 Policy를 더 넓게 적용합니다.
+
+## CI에서 Lockfile을 정확하게 유지하기
+
+Workflow와 어긋난 lockfile은 없는 것보다 나쁩니다. 아무도 신뢰하지 않게 되기 때문입니다. 한 자료는 파일을 수정하지 않고 lockfile이 최신인지 확인하는 CI 검사를 언급합니다. 정확한 명령은 자료에서 확인할 수 없으므로, 아래는 실제 재생성 명령 자리를 Placeholder로 둔 Pattern 예시입니다.
+
+```yaml
+name: lockfile-check
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@<pinned-sha>
+      - name: Regenerate lockfile
+        run: ./scripts/regenerate-actions-lock.sh # 공식 문서의 명령을 감싸는 Script
+      - name: Fail if the lockfile changed
+        run: git diff --exit-code .github/workflows/actions.lock
+```
+
+Script의 내용은 환경에 맞게 GitHub 문서의 명령으로 바꾸십시오. 핵심은 원리입니다. CI에서 다시 생성하고, Commit된 내용과 다르면 Pull Request를 실패시킵니다. 그러면 모든 의존성 변경이 Reviewer에게 보이는 Diff가 됩니다.
+
+## 부담 없이 업데이트하기
+
+고정한 의존성에는 업데이트 경로가 필요하며, 없으면 낡습니다. Dependabot은 Action 업데이트 Pull Request를 만들 수 있고, lockfile이 있으면 각각 작고 Review하기 쉬운 Diff가 됩니다. 예를 들어 주 단위로 주기를 정하고, 그 Pull Request를 Review 시점으로 삼으십시오. Secret에 접근하는 Action은 상류 Diff를 직접 읽어야 합니다.
+
+여기에 Workflow 수준의 최소 권한 `permissions:`와 OIDC 기반의 단기 자격 증명을 함께 적용합니다. Lock한 Action이 장기 Deploy Key를 그대로 쥐고 있다면 효과가 제한적입니다.
+
+## webhani의 관점
+
+Lockfile은 좋은 통제 수단이며, Require Policy 덕분에 개인의 노력이 조직 차원의 통제가 됩니다. 도입에는 찬성하지만 사내에서 "Supply Chain 문제가 해결되었다"고 설명하지는 않을 것입니다. 막는 것은 직접 의존성에 대한 Tag 변조 공격입니다. Code를 Review해 주지 않고, Transitive 참조도 다루지 않으며, Secret Scope 관리를 대체하지도 않습니다.
+
+## 정리
+
+- 도입 전에 GitHub 공식 changelog에서 기능의 제공 상태와 지원 Plan을 확인합니다.
+- Lock하기 전에 Action을 Review합니다. Lockfile은 신뢰를 고정할 뿐 만들어 내지 않습니다.
+- Transitive Action과 실행 시점 다운로드는 Lock 밖에 있을 수 있음을 인지합니다.
+- 현황 조사와 위험이 낮은 Repository 하나에서 시작해 단계적으로 확대합니다.
+- CI에서 lockfile을 다시 생성하고 Diff가 있으면 실패시킵니다.
+- 최소 권한 permissions와 OIDC를 함께 유지합니다.
+
+출처: [GitHub changelog: workflow lockfiles public preview](https://github.blog/changelog/2026-10-14-github-actions-workflow-lockfiles-in-public-preview/), [GitHub Docs: workflow dependency lockfiles](https://docs.github.com/en/actions/concepts/security/workflow-dependency-lockfiles), [InfoQ 기사](https://infoq.com/news/2026/11/github-actions-lockfiles-ga)

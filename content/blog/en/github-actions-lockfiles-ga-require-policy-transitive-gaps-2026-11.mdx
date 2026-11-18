@@ -1,0 +1,94 @@
+---
+title: "GitHub Actions Workflow Lockfiles: Rolling Out the Require Policy and Knowing What Locking Does Not Cover"
+description: "GitHub Actions workflow lockfiles entered public preview in October 2026 and are reported to be generally available. How to roll them out with a CI freshness check, and where the remaining supply-chain gaps are."
+date: "2026-11-19"
+status: "published"
+tags: ["GitHub Actions", "CI/CD", "Supply Chain Security", "DevOps", "Security"]
+thumbnail: ""
+author: "webhani"
+slug: "github-actions-lockfiles-ga-require-policy-transitive-gaps-2026-11"
+---
+
+Pinning actions to a commit SHA has been the standard advice for years, and most teams do it unevenly. Workflow dependency lockfiles move that discipline from convention into tooling. This post covers how we would roll them out and, more importantly, what they do not protect you from.
+
+On status: GitHub's changelog announced the feature in public preview on October 14, 2026, naming GitHub Enterprise Cloud. InfoQ reports it became generally available on October 28, and a classmethod.jp article describes it as GA, but we did not find the official GA changelog entry, and secondary sources disagree on which plans are covered. Check GitHub's changelog and docs for your plan before planning around any of this.
+
+## What a lockfile gives you
+
+According to GitHub's documentation, a lockfile ties workflow runs to the specific commits you locked, so a tag that is moved or a branch that is rewritten upstream does not change what your workflow executes. One write-up says the `gh actions-lock` CLI extension generates the file at `.github/workflows/actions.lock`. The preview also includes a "Require lockfile" policy, which lets administrators require lockfiles at the enterprise, organization, or repository level.
+
+The benefit is straightforward: the version you reviewed is the version that runs. The attack it addresses is the familiar one, where a maintainer account is compromised and a popular tag is re-pointed at malicious code.
+
+## Where it does not help
+
+GitHub itself is explicit that locking is not a safety check. A lockfile freezes what you approved; it does not tell you whether you should have approved it. Two limits matter in practice.
+
+**You still have to review the first lock.** If you generate a lockfile today for an action that was already compromised yesterday, you have pinned the compromise. Lock after review, not instead of it.
+
+**Transitive dependencies may fall outside it.** One write-up notes that locking cannot pin other actions that an action calls internally. A composite action that references another action by tag, or a JavaScript action that downloads a binary at runtime, can still change underneath you. The lockfile covers what your workflow names directly, and trust beyond that depends on the action's own hygiene.
+
+This is the same shape as the lockfile story in package managers. `package-lock.json` pins your dependency graph, but it does not make a postinstall script safe.
+
+## A rollout that does not stall
+
+Teams get stuck when they try to lock everything in one change. A sequence that works better:
+
+1. **Inventory.** List every `uses:` reference across your repositories.
+
+```bash
+grep -rhoE 'uses: [^ ]+' .github/workflows \
+  | sort | uniq -c | sort -rn
+```
+
+2. **Classify.** Split first-party actions (your own, or `actions/*`), vendor actions you have a contract with, and everything else. The third group is where review effort goes.
+3. **Review and drop.** For the third group, ask whether you need the action at all. A ten-line shell step is often safer than a stranger's action.
+4. **Lock one repository.** Pick a low-risk repo, generate the lockfile, and run it through a few weeks of real pipelines.
+5. **Add the freshness check.** Then enforce the policy more widely.
+
+## Keep the lockfile honest in CI
+
+A lockfile that drifts from the workflows is worse than none, because people stop trusting it. One source describes a CI check that confirms the lockfile is current without modifying files. We cannot verify the exact command from our sources, so the sketch below shows the pattern with a placeholder for the real regeneration command:
+
+```yaml
+name: lockfile-check
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@<pinned-sha>
+      - name: Regenerate lockfile
+        run: ./scripts/regenerate-actions-lock.sh # wraps the officially documented command
+      - name: Fail if the lockfile changed
+        run: git diff --exit-code .github/workflows/actions.lock
+```
+
+Replace the script with the command from GitHub's docs for your setup. The principle is what matters: regenerate in CI, and fail the pull request if the result differs from what was committed. That makes every dependency change a visible diff for a reviewer.
+
+## Updating without resentment
+
+Pinned dependencies need an update path or they rot. Dependabot can raise pull requests for action updates, and with a lockfile each one becomes a small, reviewable diff. Set a cadence, for example weekly, and treat the pull request as the review point: read the upstream diff for any action that has access to secrets.
+
+Pair this with least-privilege `permissions:` at the workflow level and short-lived credentials through OIDC. A locked action that still holds a long-lived deploy key has limited upside.
+
+## Our view
+
+Lockfiles are a good control, and the Require policy is the part that makes it organizational rather than individual. We would adopt it, but we would not describe it internally as "supply chain solved". It closes the moved-tag attack on direct dependencies. It does not review code, does not cover transitive references, and does not replace secret scoping.
+
+## Takeaways
+
+- Confirm the feature's status and plan coverage in GitHub's official changelog before rollout.
+- Review actions before locking them; a lockfile freezes trust, it does not create it.
+- Know that transitive actions and runtime downloads may sit outside the lock.
+- Roll out in stages, starting with an inventory and a single low-risk repository.
+- Regenerate the lockfile in CI and fail on any diff.
+- Keep least-privilege permissions and OIDC in place alongside it.
+
+Sources: [GitHub changelog: workflow lockfiles in public preview](https://github.blog/changelog/2026-10-14-github-actions-workflow-lockfiles-in-public-preview/), [GitHub Docs: workflow dependency lockfiles](https://docs.github.com/en/actions/concepts/security/workflow-dependency-lockfiles), [InfoQ coverage](https://infoq.com/news/2026/11/github-actions-lockfiles-ga).
