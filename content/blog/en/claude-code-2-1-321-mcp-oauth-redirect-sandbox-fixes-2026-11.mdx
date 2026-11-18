@@ -1,0 +1,85 @@
+---
+title: "Claude Code 2.1.321 Security Fixes: What the MCP OAuth Redirect and Sandbox Patches Mean for Your Team"
+description: "Claude Code 2.1.321 made Fable 5.2 the default and, according to secondary coverage, fixed an MCP OAuth redirect issue and a read-only Bash sandbox gap. A practical audit checklist for teams running agents with MCP servers."
+date: "2026-11-19"
+status: "published"
+tags: ["Claude Code", "MCP", "OAuth", "AI security", "AI coding"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-2-1-321-mcp-oauth-redirect-sandbox-fixes-2026-11"
+---
+
+Most coverage of Claude Code 2.1.321 focuses on the model change: Fable 5.2 became the default Fable model, with a 1M context window. That matters for cost planning, and we covered the migration separately. This post is about the quieter part of the release: the permission and security fixes.
+
+A caveat first. The security details below come from a single Japanese write-up (labmemo.com) summarizing the release, not from the official changelog text. The official changelog confirms the model change; check it for the exact wording of the fixes before you rely on any detail here.
+
+## What was reportedly fixed
+
+Two items stand out in that summary:
+
+1. **An OAuth redirect issue in MCP servers.** Under certain conditions, a redirect could cause refresh tokens and other secrets to be sent to a different host than the one the user authorized.
+2. **A read-only Bash command that could run outside the sandbox without a permission prompt.**
+
+We cannot verify the exact trigger conditions from the secondary source, so we will not speculate about them. What we can do is reason about the class of problem, because both fixes touch boundaries that every team using agents with MCP depends on.
+
+## Why the OAuth redirect class matters
+
+An MCP server that authenticates with OAuth holds a refresh token on the developer's machine. Refresh tokens are long-lived and usually broader than a single task needs. If a redirect sends one to the wrong host, the damage is not limited to the current session: the token keeps working until someone revokes it.
+
+This is the same failure mode as classic OAuth open-redirect bugs, now sitting inside a tool that developers install by pasting a URL from a README. The trust decision happens once, at install time, and then runs unattended.
+
+So the useful question is not "was I affected by this specific bug?" but "how many MCP servers hold credentials on our laptops, and who approved each one?"
+
+## Why the read-only Bash gap matters
+
+Permission systems for agents rely on classification: this command is read-only, so run it; this one writes, so ask. Any gap in that classification turns a convenience into a bypass. The reported issue was that a command classified as read-only could run outside the sandbox without a prompt.
+
+The lesson is general. Do not treat "read-only" as a security boundary on its own. The sandbox is the boundary; the classifier is a usability layer on top of it.
+
+## An audit you can run today
+
+Start with an inventory. Project-scoped MCP servers live in `.mcp.json`, and user-scoped ones live in your Claude Code configuration. A quick pass over the project files:
+
+```bash
+# List MCP servers declared in every repo under ~/work
+find ~/work -name ".mcp.json" -not -path "*/node_modules/*" -print0 \
+  | xargs -0 -I{} sh -c 'echo "== {}"; jq -r ".mcpServers | to_entries[] | \"\(.key)\t\(.value.url // .value.command)\"" "{}"'
+```
+
+For each server, record four things: who maintains it, whether it uses OAuth, which scopes it requests, and where the token is stored. Anything you cannot answer in one line goes on a review list.
+
+Then act on the results:
+
+- **Update first.** Move the team to 2.1.321 or later. If you install through Homebrew, one source notes that stable-channel and cask users can lag by about a week, so verify with `claude --version` instead of assuming.
+- **Re-authorize high-value servers.** For MCP servers connected to source hosting, cloud consoles, or ticketing systems, revoke the existing grant on the provider side and authorize again after updating. This invalidates any refresh token that may have gone to the wrong place.
+- **Narrow scopes.** Re-authorizing is the cheapest moment to request fewer scopes. Read-only scopes cover most agent use.
+- **Keep the sandbox on.** If anyone disabled it to get a build working, find out why and fix the underlying path or permission instead.
+
+## Policy changes worth making
+
+Updating closes one hole. These changes reduce the next one:
+
+| Control | Why |
+| --- | --- |
+| Allowlist MCP servers per repo, reviewed in pull requests | Changes to `.mcp.json` become visible diffs |
+| Prefer servers you host or vendors you have a contract with | Someone is accountable for the OAuth flow |
+| Short-lived credentials where the provider supports them | A leaked token expires on its own |
+| Separate agent identities from human identities | Revocation does not lock out a person |
+
+None of this is specific to one vendor. It is the same least-privilege discipline you already apply to CI service accounts, applied to a new kind of client.
+
+## Our view
+
+Release notes that bundle a model default change with security fixes are easy to skim for the headline. We would encourage teams to read the fixes first. A model change is reversible in a setting; a leaked refresh token is not reversible without a revocation sweep.
+
+For webhani's own projects, the practical outcome is small: update, re-authorize the few OAuth-backed servers we use, and add the MCP inventory to our quarterly access review. If your team runs agents against production-adjacent systems, the same hour of work is worth spending.
+
+## Takeaways
+
+- Read the official 2.1.321 changelog and confirm the exact fixes; treat third-party summaries as pointers.
+- Inventory MCP servers, especially OAuth-backed ones, and record maintainer, scopes, and token storage.
+- Update, then revoke and re-issue grants for high-value servers.
+- Treat the sandbox as the security boundary, and the read-only classifier as a convenience.
+- Put `.mcp.json` changes under code review.
+
+Sources: [labmemo.com summary of v2.1.321](https://labmemo.com/claude-code-v2-1-321-fable-5-2-default-security-fixes-2026-11/), [Claude Code changelog](https://code.claude.com/docs/en/changelog.md).
