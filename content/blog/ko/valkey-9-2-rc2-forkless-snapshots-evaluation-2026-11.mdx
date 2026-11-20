@@ -1,0 +1,64 @@
+---
+title: "Valkey 9.2 RC2: Forkless Snapshot은 믿기 전에 검증합니다"
+description: "Valkey 9.2가 두 번째 Release Candidate에 도달했고, opt-in forkless snapshot과 선택형 LZ4 Replication 압축이 포함되어 있습니다. Staging에서의 검증 방법과 RC2 수정이 보여 주는 위험을 정리합니다."
+date: "2026-11-21"
+status: "published"
+tags: ["Valkey", "Redis", "Caching", "Database", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "valkey-9-2-rc2-forkless-snapshots-evaluation-2026-11"
+---
+
+Valkey 9.2.0은 9월 16일의 RC1에 이어 2026년 11월 4일에 두 번째 Release Candidate(RC2)에 도달했습니다. 오늘 기준으로 GA(정식 출시) 발표는 확인하지 못했으므로 아직 Pre-release Software입니다. 운영자에게 중요한 변경은 forkless snapshot과 Replication 트래픽의 선택형 LZ4 압축 두 가지입니다.
+
+자료에 관한 주의 사항이 있습니다. forkless 관련 보도는 일관되지 않습니다. 일부 기사는 "forkless replication"이라고 쓰지만, 더 자세한 분석 글은 RC1에서 forkless 동작이 연결된 것은 `BGSAVE`와 주기적 저장뿐이고 Replica로의 full sync 경로는 아직 이를 사용하지 않는다고 설명합니다. GA Release Note가 달리 밝히기 전까지는 더 한정적인 설명을 기준으로 삼는 것이 안전합니다.
+
+## Cache에서 `fork()`가 문제가 되는 이유
+
+Valkey(Redis도 마찬가지)는 `fork()`로 Dataset의 Snapshot을 만듭니다. 자식 Process는 Memory의 copy-on-write View를 보면서 Disk에 기록하고, 그동안 부모는 계속 요청을 처리합니다. Dataset이 작고 쓰기가 드물면 저렴하지만, 둘 다 해당하지 않으면 비용이 큽니다.
+
+비용은 세 곳에서 나타납니다.
+
+- **fork 시점의 Latency Spike.** 큰 Dataset에서는 Page Table 복사 때문에 Main Thread가 체감될 만큼 멈출 수 있습니다.
+- **Memory 증폭.** Snapshot 중 부모가 수정한 Page는 모두 복제됩니다. 쓰기가 많은 Instance에서는 Memory 사용량이 Dataset 크기를 크게 넘을 수 있어, 운영자는 그만큼 여유를 확보해 둡니다.
+- **Container에서의 뜻밖의 상황.** fork로 Memory가 Container 한도를 넘으면, 데이터를 영속화하려는 바로 그 순간에 Process가 OOM Kill 됩니다.
+
+forkless snapshot은 자식 Process와 copy-on-write 복제를 피합니다. 대신 Main Process가 직접 순회 작업을 수행하므로, Memory 증폭을 줄이는 대가로 요청 처리 경로의 CPU 시간을 쓰게 됩니다. 이득인지는 Workload에 달려 있으며, 그래서 opt-in으로 제공됩니다.
+
+## RC2가 보여 주는 것
+
+확인한 보도에 따르면 RC2에서는 `SWAPDB`가 Replication되지 않은 상태로 실행될 때 forkless `BGSAVE`가 손상된 Snapshot을 만드는 문제가 수정되었습니다. 당황할 일이 아니라 유용한 신호입니다. 두 번째 RC에서 손상 Bug가 나온다는 것은 기능이 실제로 사용되고 있다는 뜻입니다. 동시에, 특이한 Command와의 상호작용이라는 Edge Case가 테스트 대상임을 보여 줍니다.
+
+이는 forkless 모드를 자사의 Command 구성으로 검증해야 한다는 근거이기도 합니다. Application이 `SWAPDB`를 호출하지 않으면 그 경로를 밟지 않을 수 있습니다. 그러나 Scripting, Module, 잘 쓰이지 않는 Command를 사용한다면 같은 가정을 할 수 없습니다.
+
+## Staging 평가 계획
+
+RC를 운영 Cache에서 활성화하지 마시고, Staging 복사본에서 평가하십시오.
+
+1. **실제 Data와 Traffic을 재현합니다.** 균일한 Key의 합성 Benchmark로는 copy-on-write 증폭이 드러나지 않습니다. 운영 환경과 유사한 쓰기 Pattern을 재생합니다.
+2. **먼저 fork 경로의 Baseline을 잡습니다.** 현재 설정에서 Snapshot 중의 p99 Latency, 최대 RSS, `INFO`의 `latest_fork_usec`을 기록합니다.
+3. **9.2 문서에 따라 forkless snapshot을 활성화**하고 같은 부하에서 다시 측정합니다. 최대 Memory, Snapshot 소요 시간, 요청 처리 경로의 p99 Latency를 비교합니다.
+4. **산출물을 검증합니다.** 생성된 RDB 파일을 별도 Instance에 Load해 Key 수와 값 Sample을 원본과 비교합니다. 손상 Bug는 이 단계에서 잡힙니다.
+5. **특이한 Command를 실행합니다.** Snapshot이 진행되는 동안 Script와 Database 교체·Flush를 포함한 실제 Command 구성을 흘려 봅니다.
+
+최소한의 검증 절차입니다.
+
+```bash
+# Snapshot 완료 후 다른 Instance에 Load해서 비교
+valkey-check-rdb dump.rdb
+valkey-server --port 6390 --dbfilename dump.rdb --dir /tmp/verify &
+valkey-cli -p 6379 DBSIZE
+valkey-cli -p 6390 DBSIZE
+```
+
+`DBSIZE` 일치만으로는 약한 검증입니다. 중요한 Key는 값 Sample 비교를 추가하십시오.
+
+## LZ4 옵션
+
+RC에는 Replication 트래픽의 선택형 LZ4 압축도 포함되어 있으며 기본값은 꺼짐입니다. Primary와 Replica 사이 Bandwidth에 비용이 드는 경우, 예를 들어 Region 간 Replication에서 주로 의미가 있습니다. 같은 Zone 안의 Replica에서는 CPU 비용이 절감분을 넘을 수 있습니다. 켜기 전에 양쪽을 모두 측정하십시오.
+
+## webhani의 권장 사항
+
+대부분의 팀에게 지금 가장 좋은 선택은 기다리는 것입니다. RC2는 운영 Cache를 올릴 Release가 아니며, forkless 경로는 Trade-off가 Workload에 따라 달라지기 때문에 명시적으로 opt-in입니다.
+
+fork Latency나 Memory 여유가 이미 문제가 되는 대규모 쓰기 중심 Instance를 운영한다면, GA 시점에 Data를 갖고 있도록 지금 Staging 평가를 시작하십시오. 그 외의 팀은 GA Note를 읽은 뒤 같은 Checklist를 한 번 수행하면 충분합니다. 테스트 비용은 몇 시간이지만, 장애 도중에 Snapshot 문제를 발견하는 비용은 훨씬 큽니다.

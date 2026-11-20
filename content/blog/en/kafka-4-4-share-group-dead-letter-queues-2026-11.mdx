@@ -1,0 +1,76 @@
+---
+title: "Kafka 4.4 Adds Dead-Letter Queues to Share Groups: Designing Poison-Message Handling"
+description: "Apache Kafka 4.4.0 reportedly lets share groups use dead-letter queues (KIP-1191). What that changes for queue-style workloads, and how to design retries and poison-message handling around it."
+date: "2026-11-21"
+status: "published"
+tags: ["Kafka", "Queuing", "Messaging", "Architecture", "Reliability"]
+thumbnail: ""
+author: "webhani"
+slug: "kafka-4-4-share-group-dead-letter-queues-2026-11"
+---
+
+Apache Kafka 4.4.0 was released on October 22, 2026. According to the Apache and Confluent announcements, one of the headline items is dead-letter queue support for share groups (KIP-1191). Confluent's write-up also notes that the feature is still evolving and may change in a minor release, which matters if you plan to build on it.
+
+Share groups are Kafka's queue-like consumption model: multiple consumers can read from the same partition, and records are acknowledged individually instead of by offset. That model has always had an awkward corner, which is what to do with a record that keeps failing. A DLQ is the standard answer, and until now teams built it by hand.
+
+## The problem a DLQ solves
+
+With a classic consumer group, a poison message blocks its partition. You either skip past it, losing the record, or retry forever, stalling everything behind it. Teams usually end up writing their own retry-topic and dead-letter-topic plumbing.
+
+Share groups loosen the blocking problem because acknowledgement is per record. A record can be released for redelivery without holding back its neighbours. But "redeliver" has no natural stopping point. A record that fails every time will cycle until something intervenes. Kafka tracks delivery attempts and caps them, and the open question has been where the record goes once the cap is hit.
+
+Built-in DLQ support addresses exactly that: after the delivery limit is exhausted, the record is routed to a configured topic instead of being dropped. We have not verified the exact configuration surface, so check the 4.4 documentation for property names and semantics before writing infrastructure code.
+
+## What the consumer side looks like
+
+Share-group consumers choose how to acknowledge each record. In the Java client from KIP-932, the choices are accept, release and reject:
+
+```java
+try (KafkaShareConsumer<String, String> consumer =
+         new KafkaShareConsumer<>(props)) {
+    consumer.subscribe(List.of("orders"));
+    while (true) {
+        ConsumerRecords<String, String> records =
+            consumer.poll(Duration.ofSeconds(1));
+        for (ConsumerRecord<String, String> record : records) {
+            try {
+                process(record.value());
+                consumer.acknowledge(record, AcknowledgeType.ACCEPT);
+            } catch (TransientException e) {
+                // Try again, possibly on another consumer.
+                consumer.acknowledge(record, AcknowledgeType.RELEASE);
+            } catch (PermanentException e) {
+                // Will never succeed; do not redeliver.
+                consumer.acknowledge(record, AcknowledgeType.REJECT);
+            }
+        }
+        consumer.commitSync();
+    }
+}
+```
+
+The split between `RELEASE` and `REJECT` is where your own judgement lives. Release means "not my fault, try again." Reject means "this record is bad." A DLQ is most useful when you classify failures honestly. If everything is released, the delivery cap does the sorting for you, and you pay for several pointless attempts on records that were never going to succeed.
+
+## Design points to settle before adopting
+
+**Classify failures.** Validation errors and schema mismatches are permanent. Timeouts and 503s are transient. Put that mapping in one place, not scattered through handlers.
+
+**Decide what a dead-lettered record must carry.** At minimum: the original topic, partition, offset, and the failure reason. Without that, the DLQ is a pile of unexplained bytes. Check whether the built-in mechanism attaches this metadata, and add it yourself if it does not.
+
+**Plan the replay path.** A DLQ nobody drains is data loss with extra steps. Decide who looks at it, how often, and how a fixed record gets back into the main topic. A small replay tool that reads the DLQ and republishes is cheap to build and expensive to omit.
+
+**Monitor depth and age.** Alert on DLQ growth rate, not only absolute size. A sudden spike usually means a deploy broke a consumer, not that the data went bad.
+
+**Keep idempotency.** Share groups give at-least-once delivery. Retries, rebalances and replays all mean the same record can be processed twice, so handlers should tolerate that.
+
+## Should you move off your RabbitMQ or SQS setup
+
+Probably not just for this. Dead-letter handling was a gap in the share-group story, and closing it makes Kafka a more credible option for work-queue patterns. But the usual reasons to pick a queue broker still hold: per-message TTLs, priority queues and mature routing are things Kafka does not try to match.
+
+Our practical position is narrower. If you already run Kafka and have a job-queue workload that you were awkwardly forcing through consumer groups, share groups with a DLQ are worth a proof of concept on a non-critical topic. If you do not run Kafka, this is not a reason to start.
+
+## Upgrade notes worth reading
+
+The 4.4 announcement also mentions a new Connect setting to control automatic creation of internal topics (KIP-1209), reduced tiered storage redundancy by delaying uploads (KIP-1241), and a deprecation of `kafka-broker-api-versions.sh` in favour of `kafka-cluster.sh api-versions`. If you format broker storage with the CLI tooling, the release also tightens a version-compatibility rule between the tool and the broker. Read the upgrade notes before rolling this into automation.
+
+Since the DLQ feature is flagged as evolving, we would pin to it behind an internal abstraction for now, so a change in a later minor release touches one module rather than every consumer.

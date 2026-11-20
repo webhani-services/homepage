@@ -1,0 +1,76 @@
+---
+title: "Kafka 4.4 で Share Group に Dead-Letter Queue:Poison Message 対策の設計"
+description: "Apache Kafka 4.4.0 で Share Group が Dead-Letter Queue(KIP-1191)に対応したと報じられています。キュー型ワークロードへの影響と、リトライ・Poison Message 処理の設計ポイントを整理します。"
+date: "2026-11-21"
+status: "published"
+tags: ["Kafka", "Queuing", "Messaging", "Architecture", "Reliability"]
+thumbnail: ""
+author: "webhani"
+slug: "kafka-4-4-share-group-dead-letter-queues-2026-11"
+---
+
+Apache Kafka 4.4.0 は 2026年10月22日にリリースされました。Apache と Confluent の発表によると、目玉のひとつが Share Group の Dead-Letter Queue(DLQ)対応(KIP-1191)です。Confluent の解説では、この機能はまだ発展途上で、マイナーリリースで変更される可能性があるとされています。これを前提に設計する場合は重要な注意点です。
+
+Share Group は Kafka のキュー的な消費モデルです。複数の Consumer が同じ Partition を読め、Offset 単位ではなくレコード単位で acknowledge します。このモデルには以前から扱いづらい部分がありました。何度も失敗するレコードをどうするか、という問題です。標準的な答えは DLQ ですが、これまでは各チームが自前で組んでいました。
+
+## DLQ が解決する問題
+
+従来の Consumer Group では、Poison Message がその Partition 全体を止めます。読み飛ばせばレコードを失い、延々とリトライすれば後続が詰まります。結局、リトライ用 Topic と DLQ 用 Topic を自作することになりがちです。
+
+Share Group は acknowledge がレコード単位なので、詰まりの問題は緩和されます。レコードを再配信用に release しても、隣のレコードは止まりません。ただし「再配信」には自然な終わりがありません。毎回失敗するレコードは、誰かが介入するまで回り続けます。Kafka は配信試行回数を追跡して上限を設けますが、上限に達したレコードの行き先が未解決でした。
+
+組み込みの DLQ はまさにここを埋めます。配信上限を使い切ったレコードを、捨てずに指定の Topic へ送ります。設定項目の詳細は私たちでは検証できていないため、インフラのコードを書く前に 4.4 のドキュメントでプロパティ名と挙動を確認してください。
+
+## Consumer 側のコード
+
+Share Group の Consumer は、レコードごとに acknowledge の方法を選びます。KIP-932 の Java クライアントでは accept / release / reject の3種類です。
+
+```java
+try (KafkaShareConsumer<String, String> consumer =
+         new KafkaShareConsumer<>(props)) {
+    consumer.subscribe(List.of("orders"));
+    while (true) {
+        ConsumerRecords<String, String> records =
+            consumer.poll(Duration.ofSeconds(1));
+        for (ConsumerRecord<String, String> record : records) {
+            try {
+                process(record.value());
+                consumer.acknowledge(record, AcknowledgeType.ACCEPT);
+            } catch (TransientException e) {
+                // 再試行する(別の Consumer が拾う可能性あり)
+                consumer.acknowledge(record, AcknowledgeType.RELEASE);
+            } catch (PermanentException e) {
+                // 何度やっても成功しない。再配信しない
+                consumer.acknowledge(record, AcknowledgeType.REJECT);
+            }
+        }
+        consumer.commitSync();
+    }
+}
+```
+
+`RELEASE` と `REJECT` の使い分けが、アプリケーション側の判断です。release は「こちらの都合なので再試行して」、reject は「このレコード自体が不正」を意味します。DLQ が効果を発揮するのは、失敗を正直に分類しているときです。すべてを release にすると、配信上限が分類を代行することになり、成功するはずのないレコードに無駄な試行を繰り返すことになります。
+
+## 導入前に決めておくこと
+
+**失敗の分類。** バリデーションエラーやスキーマ不一致は恒久的、タイムアウトや 503 は一時的です。この対応表は個々のハンドラーに散らさず、一か所にまとめます。
+
+**DLQ に入るレコードに持たせる情報。** 最低限、元の Topic、Partition、Offset、失敗理由が必要です。なければ DLQ は説明のないバイト列の山になります。組み込み機構がこのメタデータを付与するか確認し、なければ自前で付けます。
+
+**再処理(replay)の経路。** 誰も処理しない DLQ は、手間のかかるデータ消失です。誰が、どの頻度で確認し、修正後のレコードをどう元の Topic に戻すかを決めます。DLQ を読んで再発行する小さなツールは、作るのは安く、なくすと高くつきます。
+
+**深さと滞留時間の監視。** DLQ のサイズだけでなく増加率でアラートを設定します。急増はデータの劣化ではなく、デプロイで Consumer が壊れたことを示すのが普通です。
+
+**冪等性の維持。** Share Group は at-least-once 配信です。リトライ、リバランス、replay のいずれでも同じレコードが二度処理され得るため、ハンドラーはそれを許容する必要があります。
+
+## RabbitMQ や SQS から移るべきか
+
+この機能だけを理由にするなら、おそらく不要です。DLQ の欠落は Share Group の弱点でしたが、それが埋まることで、Kafka がワークキュー用途の選択肢として現実味を増したのは確かです。一方、メッセージ単位の TTL、優先度キュー、成熟したルーティングなど、キューブローカーを選ぶ従来の理由は残っています。
+
+私たちの実務上の立場はもう少し限定的です。すでに Kafka を運用していて、Consumer Group で無理にジョブキューを実現しているワークロードがあるなら、重要度の低い Topic で Share Group + DLQ の PoC を行う価値があります。Kafka を運用していない場合、これは導入の理由にはなりません。
+
+## アップグレード時に読んでおきたい点
+
+4.4 の発表には、Connect の内部 Topic の自動作成を制御する新設定(KIP-1209)、アップロード遅延による Tiered Storage の冗長性削減(KIP-1241)、`kafka-broker-api-versions.sh` の非推奨化(`kafka-cluster.sh api-versions` への移行)も含まれています。CLI ツールでブローカーのストレージをフォーマットしている場合、ツールとブローカーのバージョン互換ルールが厳格化されている点にも注意が必要です。自動化に組み込む前に、アップグレードノートを読んでください。
+
+DLQ 機能は発展途上と明記されているため、当面は社内の抽象化レイヤーの背後で使うことをお勧めします。後続のマイナーリリースで仕様が変わっても、影響が全 Consumer ではなく一つのモジュールに収まります。
