@@ -1,0 +1,76 @@
+---
+title: "Kafka 4.4, Share Group에 Dead-Letter Queue 추가: Poison Message 처리 설계"
+description: "Apache Kafka 4.4.0에서 Share Group이 Dead-Letter Queue(KIP-1191)를 지원한다고 보도되었습니다. Queue형 Workload에 미치는 영향과 Retry·Poison Message 처리 설계 포인트를 정리합니다."
+date: "2026-11-21"
+status: "published"
+tags: ["Kafka", "Queuing", "Messaging", "Architecture", "Reliability"]
+thumbnail: ""
+author: "webhani"
+slug: "kafka-4-4-share-group-dead-letter-queues-2026-11"
+---
+
+Apache Kafka 4.4.0은 2026년 10월 22일에 Release되었습니다. Apache와 Confluent의 발표에 따르면 주요 항목 중 하나가 Share Group의 Dead-Letter Queue(DLQ) 지원(KIP-1191)입니다. Confluent의 설명은 이 기능이 아직 발전 중이며 Minor Release에서 바뀔 수 있다고 밝히고 있습니다. 이 기능 위에 무언가를 만들 계획이라면 중요한 단서입니다.
+
+Share Group은 Kafka의 Queue형 소비 Model입니다. 여러 Consumer가 같은 Partition을 읽을 수 있고, Offset이 아닌 Record 단위로 acknowledge합니다. 이 Model에는 처음부터 다루기 까다로운 부분이 있었습니다. 계속 실패하는 Record를 어떻게 할 것인가 하는 문제입니다. 표준적인 해법은 DLQ이지만, 지금까지는 각 팀이 직접 구현해야 했습니다.
+
+## DLQ가 해결하는 문제
+
+기존 Consumer Group에서는 Poison Message가 해당 Partition 전체를 막습니다. 건너뛰면 Record를 잃고, 끝없이 Retry하면 뒤의 Record가 모두 밀립니다. 결국 Retry용 Topic과 DLQ용 Topic을 직접 만들게 됩니다.
+
+Share Group은 acknowledge가 Record 단위이므로 이 막힘 문제가 완화됩니다. Record를 재전달용으로 release해도 인접한 Record는 멈추지 않습니다. 그러나 "재전달"에는 자연스러운 종료 지점이 없습니다. 매번 실패하는 Record는 누군가 개입할 때까지 계속 돕니다. Kafka는 전달 시도 횟수를 추적하고 상한을 두지만, 상한에 도달한 Record가 어디로 가야 하는지는 미해결이었습니다.
+
+내장 DLQ 지원은 바로 이 부분을 채웁니다. 전달 상한을 모두 소진한 Record를 버리지 않고 지정한 Topic으로 보냅니다. 정확한 Configuration 항목은 저희가 검증하지 못했으므로, Infrastructure Code를 작성하기 전에 4.4 문서에서 Property 이름과 동작을 확인하시기 바랍니다.
+
+## Consumer 측 Code
+
+Share Group Consumer는 Record마다 acknowledge 방식을 선택합니다. KIP-932의 Java Client에서는 accept, release, reject 세 가지입니다.
+
+```java
+try (KafkaShareConsumer<String, String> consumer =
+         new KafkaShareConsumer<>(props)) {
+    consumer.subscribe(List.of("orders"));
+    while (true) {
+        ConsumerRecords<String, String> records =
+            consumer.poll(Duration.ofSeconds(1));
+        for (ConsumerRecord<String, String> record : records) {
+            try {
+                process(record.value());
+                consumer.acknowledge(record, AcknowledgeType.ACCEPT);
+            } catch (TransientException e) {
+                // 재시도한다 (다른 Consumer가 가져갈 수 있음)
+                consumer.acknowledge(record, AcknowledgeType.RELEASE);
+            } catch (PermanentException e) {
+                // 몇 번을 해도 성공하지 않는다. 재전달하지 않는다.
+                consumer.acknowledge(record, AcknowledgeType.REJECT);
+            }
+        }
+        consumer.commitSync();
+    }
+}
+```
+
+`RELEASE`와 `REJECT`를 나누는 판단은 Application의 몫입니다. release는 "내 쪽 사정이니 다시 시도해 달라", reject는 "이 Record 자체가 잘못되었다"는 뜻입니다. DLQ는 실패를 정직하게 분류할 때 가장 유용합니다. 모든 것을 release하면 전달 상한이 분류를 대신하게 되고, 성공할 가능성이 없는 Record에 불필요한 시도를 여러 번 하게 됩니다.
+
+## 도입 전에 정해 둘 사항
+
+**실패 분류.** Validation 오류와 Schema 불일치는 영구적, Timeout과 503은 일시적입니다. 이 매핑은 Handler마다 흩어 두지 말고 한 곳에 모읍니다.
+
+**DLQ Record에 담을 정보.** 최소한 원래 Topic, Partition, Offset, 실패 사유가 필요합니다. 없으면 DLQ는 설명 없는 Byte 더미가 됩니다. 내장 기능이 이 Metadata를 붙여 주는지 확인하고, 아니라면 직접 추가합니다.
+
+**재처리(replay) 경로.** 아무도 비우지 않는 DLQ는 번거로운 Data 유실일 뿐입니다. 누가, 얼마나 자주 확인하고, 수정된 Record를 어떻게 원래 Topic으로 되돌릴지 정합니다. DLQ를 읽어 다시 발행하는 작은 Tool은 만들기 쉽고, 빼먹으면 비용이 큽니다.
+
+**깊이와 체류 시간 Monitoring.** DLQ의 절대 크기뿐 아니라 증가율에도 Alert를 설정합니다. 급증은 대개 Data가 나빠진 것이 아니라 Deploy 때문에 Consumer가 깨졌다는 신호입니다.
+
+**멱등성 유지.** Share Group은 at-least-once 전달입니다. Retry, Rebalance, Replay 어느 경우든 같은 Record가 두 번 처리될 수 있으므로 Handler는 이를 견뎌야 합니다.
+
+## RabbitMQ나 SQS에서 옮겨야 할까
+
+이 기능만을 이유로 한다면 아마 그럴 필요는 없습니다. DLQ 부재는 Share Group의 약점이었고, 이를 메우면서 Kafka가 Work Queue 용도의 선택지로서 더 현실적이 된 것은 맞습니다. 하지만 Message 단위 TTL, Priority Queue, 성숙한 Routing처럼 Queue Broker를 선택하는 기존 이유는 여전히 유효합니다.
+
+저희의 실무적 입장은 좀 더 제한적입니다. 이미 Kafka를 운영 중이고 Consumer Group으로 억지로 Job Queue를 구현하고 있는 Workload가 있다면, 중요도가 낮은 Topic에서 Share Group + DLQ PoC를 해볼 만합니다. Kafka를 운영하지 않는다면 이것이 도입 이유가 되지는 않습니다.
+
+## Upgrade 시 읽어 둘 내용
+
+4.4 발표에는 Connect 내부 Topic의 자동 생성을 제어하는 새 Setting(KIP-1209), 업로드 지연을 통한 Tiered Storage 중복 감소(KIP-1241), `kafka-broker-api-versions.sh`의 Deprecated(`kafka-cluster.sh api-versions`로 대체)도 포함되어 있습니다. CLI Tool로 Broker Storage를 Format하고 있다면, Tool과 Broker 사이의 Version 호환 Rule이 엄격해진 점도 살펴봐야 합니다. 자동화에 반영하기 전에 Upgrade Note를 읽으시기 바랍니다.
+
+DLQ 기능이 발전 중이라고 명시되어 있으므로, 당분간은 사내 추상화 Layer 뒤에서 사용하시기를 권합니다. 이후 Minor Release에서 사양이 바뀌어도 모든 Consumer가 아니라 하나의 Module만 수정하면 됩니다.

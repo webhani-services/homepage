@@ -1,0 +1,64 @@
+---
+title: "Valkey 9.2 RC2: Evaluating Forkless Snapshots Before You Trust Them"
+description: "Valkey 9.2 is at its second release candidate with opt-in forkless snapshots and optional LZ4 replication compression. How to test them on a staging cache, and what the RC2 fix tells you about the risk."
+date: "2026-11-21"
+status: "published"
+tags: ["Valkey", "Redis", "Caching", "Database", "Performance"]
+thumbnail: ""
+author: "webhani"
+slug: "valkey-9-2-rc2-forkless-snapshots-evaluation-2026-11"
+---
+
+Valkey 9.2.0 reached its second release candidate on November 4, 2026, after RC1 on September 16. We could not find a general-availability announcement as of today, so this is still pre-release software. The two changes that matter for operators are forkless snapshots and optional LZ4 compression of replication traffic.
+
+One caution about sources: coverage of the forkless work is inconsistent. Some articles describe "forkless replication," but the more detailed write-ups say RC1 only wires forkless operation into `BGSAVE` and periodic saves, with the full-sync-to-replica path not yet using it. We would trust the narrower claim until the GA release notes say otherwise.
+
+## Why `fork()` is a problem for a cache
+
+Valkey (like Redis) snapshots its dataset by calling `fork()`. The child process sees a copy-on-write view of memory and writes it to disk while the parent keeps serving. This is cheap when the dataset is small and writes are rare, and expensive when neither is true.
+
+The costs show up in three places:
+
+- **Latency spikes at fork time.** Copying page tables for a large dataset can stall the main thread for noticeable time.
+- **Memory amplification.** Every page the parent modifies during the snapshot gets duplicated. On a write-heavy instance, memory use can climb well above the dataset size, and operators reserve headroom accordingly.
+- **Container surprises.** A fork that pushes memory past a container limit gets the process OOM-killed at exactly the moment you are trying to persist data.
+
+A forkless snapshot avoids the child process and the copy-on-write duplication. The trade-off is that the main process has to do the iteration work itself, so you are exchanging memory amplification for CPU time on the serving path. Whether that is a win depends on your workload, and that is why it is opt-in.
+
+## What RC2 tells you
+
+Per the coverage we found, RC2 fixed a case where a forkless `BGSAVE` produced a corrupt snapshot when `SWAPDB` ran without being replicated. That is a useful signal rather than a reason to panic: a corruption bug in the second RC means the feature is being exercised, and it also shows the kind of edge case, interaction with unusual commands, that you should test for.
+
+It also argues for treating forkless mode as something to validate on your own command mix. If your application never calls `SWAPDB`, you may never hit that path. If you use scripting, modules or rarely used commands, you cannot assume the same.
+
+## A staging evaluation plan
+
+Do not enable this on a production cache from an RC. Do evaluate it on a staging copy.
+
+1. **Mirror real data and traffic.** A synthetic benchmark with uniform keys will not show copy-on-write amplification. Replay production-shaped writes.
+2. **Baseline the fork path first.** Record p99 latency, peak RSS and `latest_fork_usec` from `INFO` during snapshots with the current configuration.
+3. **Enable forkless snapshots** as documented for 9.2 and repeat under the same load. Compare peak memory, snapshot duration and p99 latency on the serving path.
+4. **Verify the output.** Load the produced RDB file into a separate instance and compare key counts and a sample of values against the source. Corruption bugs are exactly what this catches.
+5. **Exercise your odd commands.** Run your real command mix, including scripts and anything that swaps or flushes databases, while a snapshot is in progress.
+
+A minimal verification step:
+
+```bash
+# After a snapshot completes, load it elsewhere and compare.
+valkey-check-rdb dump.rdb
+valkey-server --port 6390 --dbfilename dump.rdb --dir /tmp/verify &
+valkey-cli -p 6379 DBSIZE
+valkey-cli -p 6390 DBSIZE
+```
+
+Matching `DBSIZE` is a weak check on its own, so add a sampled value comparison for keys that matter.
+
+## The LZ4 option
+
+Optional LZ4 compression of replication traffic is also reported in the candidate, left off by default. It is mostly relevant if your primary and replicas sit across a link where bandwidth costs money, for example cross-region replication. For same-zone replicas, CPU cost may outweigh the saving. Measure both before turning it on.
+
+## Our recommendation
+
+For most teams the right action today is to wait. RC2 is not a release you should run production caches on, and the forkless path is explicitly opt-in because the trade-offs are workload-dependent.
+
+If you run large, write-heavy instances where fork latency or memory headroom already hurts, start the staging evaluation now so you have data when GA lands. Everyone else can read the GA notes, then run the same checklist once. The cost of that test is a few hours; the cost of discovering a snapshot problem during an incident is much higher.

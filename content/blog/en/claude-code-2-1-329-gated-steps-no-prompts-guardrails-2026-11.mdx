@@ -1,0 +1,85 @@
+---
+title: "Claude Code 2.1.329 Drops Risky-Action Prompts: Rebuild the Guardrails Yourself"
+description: "A reported Claude Code change lets gated steps run without confirmation. What that shifts onto your team, and a settings-based guardrail setup that does not depend on a human clicking 'yes'."
+date: "2026-11-21"
+status: "published"
+tags: ["Claude Code", "AI Coding", "Security", "Developer Tooling", "Governance"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-2-1-329-gated-steps-no-prompts-guardrails-2026-11"
+---
+
+According to a third-party changelog account that mirrors the official release notes, Claude Code 2.1.329 removes the "risky-action confirmations": steps that used to be gated now run automatically. The same release reportedly adds a session `/tasks` view that lists scheduled tasks, `/loop` wakeups and forks. We only found this in one secondary source, so read the official changelog before relying on the details.
+
+Whatever the exact wording turns out to be, the direction is clear. Interactive confirmation is being treated as a weak control, and more of the safety burden is moving to configuration. That is a good moment to check whether your team's guardrails live in settings or only in people's reflexes.
+
+## Why confirmation prompts were a weak control
+
+A prompt only protects you if the person reading it understands the action and is paying attention. In practice, developers who see forty prompts a day approve the forty-first without reading it. The failure mode is not malice; it is habituation.
+
+Prompts also do nothing for unattended runs. Scheduled tasks, `/loop` wakeups and CI jobs have nobody to click. If a pipeline depends on a prompt to stop a destructive command, it is already unprotected.
+
+So removing prompts is not automatically a regression. It becomes one only if nothing else was enforcing the boundary.
+
+## Where the boundary should live instead
+
+Claude Code reads permission rules from settings files, and those rules are deterministic: an allowed command runs, a denied command is refused, with no human in the loop. That is the property you want for anything irreversible.
+
+A project-level `.claude/settings.json` along these lines is a reasonable starting point:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run test:*)",
+      "Bash(npm run lint)",
+      "Bash(git diff:*)",
+      "Bash(git status)"
+    ],
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(rm -rf:*)",
+      "Bash(curl:*)",
+      "Read(./.env)",
+      "Read(./.env.*)"
+    ]
+  }
+}
+```
+
+Two habits make this effective. First, keep the allow list narrow and grow it from observed need rather than guessing. Second, treat `deny` as the part that matters most: it is the list of things that must never happen regardless of what the model decides.
+
+The exact rule syntax can change between versions, so verify it against the documentation for the version you run.
+
+## Hooks for the checks a pattern cannot express
+
+Pattern rules cannot express "this migration touches a production table." For that, a `PreToolUse` hook can inspect the pending call and block it with a non-zero exit. A minimal sketch:
+
+```bash
+#!/usr/bin/env bash
+# .claude/hooks/block-prod-db.sh
+# Reads the tool call JSON from stdin and rejects anything aimed at prod.
+input="$(cat)"
+if echo "$input" | grep -qE 'prod(uction)?[-_.]?(db|database|cluster)'; then
+  echo "Blocked: command references a production database" >&2
+  exit 2
+fi
+```
+
+The point is not that this regex is complete. It is not. The point is that the check runs every time, in every session, including the ones nobody is watching.
+
+## A short rollout checklist
+
+If you are upgrading across this change:
+
+1. Read the official release notes for 2.1.329 and note exactly which actions stopped prompting.
+2. Commit a `.claude/settings.json` with explicit `deny` rules for force-push, recursive delete, secrets files and outbound network tools.
+3. Move anything that must be blocked in CI or scheduled runs into settings or hooks, since those paths never had a human anyway.
+4. Run the new version in a throwaway branch first and watch what executes without asking.
+5. Log tool calls. If you already export Claude Code telemetry, add an alert on denied calls so you see attempts, not just successes.
+
+## Our view
+
+We would not read this as "Claude Code got less safe." We would read it as a prompt to stop outsourcing safety to a dialog box. Teams that already encode their limits in versioned settings will barely notice the change. Teams that relied on developers to catch dangerous commands by eye should treat the upgrade as a deadline to write those limits down.
+
+The practical test is simple: if you replaced every developer with a script, would your current configuration still stop a force-push to `main`? If the answer depends on someone clicking, fix that before upgrading.
