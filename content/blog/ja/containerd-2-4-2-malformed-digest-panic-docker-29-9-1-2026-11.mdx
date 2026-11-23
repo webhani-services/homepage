@@ -1,0 +1,85 @@
+---
+title: "containerd のImage Pull時Panic (CVE-2026-95839)：Nodeと Docker 29.9.1 の確認"
+description: "Image Index内の不正なDigestによりcontainerdがPull/Import中にPanicし、kubeletの再試行で繰り返しクラッシュし得る問題です。修正Version、DockerホストとKubernetes Nodeの確認方法、影響を減らす手段をまとめます。"
+date: "2026-11-24"
+status: "published"
+tags: ["containerd", "Docker", "Kubernetes", "セキュリティ", "コンテナ"]
+thumbnail: ""
+author: "webhani"
+slug: "containerd-2-4-2-malformed-digest-panic-docker-29-9-1-2026-11"
+---
+
+2026年10月14日付の Docker Engine 29.9.1 は、同梱のcontainerdを2.4.2に更新しています。修正内容の一つが CVE-2026-95839 です。Debianのセキュリティ Trackerによると、`subject` annotationを持つ子Descriptorに不正なDigestが含まれていると、Image のPullまたはImport中に `containerd` がPanicすることがあります。Trackerは、kubeletの再試行によってクラッシュが繰り返される可能性にも触れています。
+
+これはコード実行ではなくサービス拒否（DoS）の問題です。それでも本番Workloadを動かすNodeでは重要です。Pull中にContainer RuntimeがPanicすると、再起動するまでContainerの起動や管理ができなくなる可能性があるためです。
+
+情報源についての注記です。DebianとOSVの記録、およびサードパーティがMirrorしたDocker 29.9.1のRelease Notesを確認しました。containerd 2.4.2の公式Release Notesは見つけられていません。報告されている修正Versionは2.2.10、2.3.7、2.4.2です。OSVは影響範囲を2.4.0以降としていますが、Debianの記述では旧Branchへのバックポートも示唆されています。お使いのBranchについては、Advisoryで確認してください。
+
+同じDocker Release Notesには関連項目として GHSA-8647-2jxj-p2rc もあります。信頼できないRegistryが細工した `Content-Length` ヘッダーにより、並列Layer取得が有効な場合にcontainerdがクラッシュし得る、という内容です。
+
+## Pull時のクラッシュが重要な理由
+
+2つの問題に共通するのは、**Runtimeが自分で管理していないRegistryのデータをParseする**点です。Image Index、Manifest、Descriptor、HTTPヘッダーはすべてリモートServerから届きます。Parserが想定しない形で不正な値が入ると、Goの `panic` は1つのリクエストを失敗させるだけでなく、Daemon全体を落とします。
+
+Kubernetesでは、さらに次の2点が影響を大きくします。
+
+- Pullできない Podはkubeletが再試行します。Pullそのものがcontainerdをクラッシュさせる場合、再試行のたびにクラッシュし得ます。
+- containerdはNode上のすべてのPodを担当するため、不正なImage参照1つが無関係なWorkloadにも波及します。
+
+発動には、攻撃者が影響を及ぼせる取得元からNodeがImageをPullする必要があります。侵害されたRegistry、Typosquatされたimage名、Push権限を持つ人物が差し替えたTagなどです。Supply Chain攻撃としては現実的な条件ですが、認証不要のリモート攻撃ではありません。
+
+## 稼働中のVersionを確認する
+
+Dockerホストの場合：
+
+```bash
+docker version --format '{{.Server.Version}}'
+docker info --format '{{.ServerVersion}} containerd={{ .ContainerdCommit.ID }}'
+containerd --version   # 単体Binaryがある場合
+```
+
+Kubernetes Nodeでは、Runtime VersionがNode Statusに含まれます。
+
+```bash
+kubectl get nodes -o custom-columns=NAME:.metadata.name,RUNTIME:.status.nodeInfo.containerRuntimeVersion
+```
+
+`containerd://2.4.1` のような値が表示されます。Branchごとの修正Versionと比較してください。マネージドService（EKS、GKE、AKS）は通常、Node Imageの更新で修正が配布されるため、Upstreamの番号だけでなく、プロバイダーのNode Image Versionを確認します。
+
+Fleet全体のばらつきを素早く見るには：
+
+```bash
+kubectl get nodes -o json \
+  | jq -r '.items[] | [.metadata.name, .status.nodeInfo.containerRuntimeVersion] | @tsv' \
+  | sort -k2
+```
+
+## 更新の順序
+
+1. **まずStagingで**：1つのNode Poolまたは1台のDockerホストを更新し、実際に使うImage群をPullします。Multi-arch Imageや、署名・Attestation付きのImageも含めてください。この問題は `subject` annotationを持つIndex Descriptorに関係しており、署名やSBOMなどのReferrer系Artifactがこの仕組みを使うためです。Supply Chain系ツールがすでに生成している可能性があります。
+2. **通常のDrain手順でNodeを入れ替える**：`kubectl drain` → 更新 → uncordon の順です。Statefulなworkloadが載っているNodeを、Drainせずにその場でパッチしないでください。
+3. **入れ替え後に確認する**：上記コマンドでVersionを確認し、NodeのログでcontainerdのRestartがないか見ます。
+
+すぐに更新できない場合は、露出を減らします。
+
+- 自社管理または審査済みのRegistryからのみPullする。公開Registryの前段にPull-through Cacheを置くと、経路を1か所に絞れます。
+- ImageをDigestで固定し、Tagを差し替えられないようにする。
+- Clusterが参照するRegistryへのPush権限を絞る。
+
+どれもパッチの代わりにはなりませんが、不正なDescriptorを届け得る取得元を狭められます。
+
+## 繰り返しクラッシュの検知
+
+このBugによるクラッシュループは、Podが `ImagePullBackOff` や `ContainerCreating` のままで、containerdが再起動を繰り返す形で現れます。短時間内のcontainerd再起動を検知するAlertが有効です。
+
+```promql
+increase(node_systemd_unit_state{name="containerd.service",state="activating"}[15m]) > 2
+```
+
+これは、node_exporterのsystemd collectorが有効であることが前提です（Defaultでは無効です）。使っていない場合は、containerd unitのLogで `panic:` を検知する方法が代替になります。
+
+## まとめ
+
+- Docker 29.9.1以降、または運用中のBranchに応じてcontainerd 2.2.10 / 2.3.7 / 2.4.2へ更新します。正確なBranchはAdvisoryで確認してください。
+- Kubernetesでは、実作業はNode Imageのロールアウトです。上のRuntime Version一覧から始めてください。
+- Registryの内容を信頼できない入力として扱います。Digest固定、管理されたRegistry、Pull-through Cacheは低コストで、このCVEだけでなく同種のBug全般に効く対策です。

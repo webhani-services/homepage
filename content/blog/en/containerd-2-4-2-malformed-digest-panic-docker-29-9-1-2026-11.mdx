@@ -1,0 +1,85 @@
+---
+title: "containerd Image Pull Panic (CVE-2026-95839): Checking Your Nodes and Docker 29.9.1"
+description: "A malformed digest in an image index can panic containerd during pull or import, and kubelet retries can repeat the crash. Which versions carry the fix, how to check Docker hosts and Kubernetes nodes, and how to reduce exposure."
+date: "2026-11-24"
+status: "published"
+tags: ["containerd", "Docker", "Kubernetes", "Security", "Container"]
+thumbnail: ""
+author: "webhani"
+slug: "containerd-2-4-2-malformed-digest-panic-docker-29-9-1-2026-11"
+---
+
+Docker Engine 29.9.1, dated October 14, 2026, bumps its bundled containerd to 2.4.2. Among the fixes is CVE-2026-95839: according to the Debian security tracker, a malformed digest in a child descriptor that carries the `subject` annotation can make `containerd` panic while pulling or importing an image. The tracker also notes that kubelet retries can repeat the crash.
+
+This is a denial-of-service issue, not a code execution issue. For a node running production workloads it still matters, because a panic in the container runtime during a pull can take down the node's ability to start or manage containers until it restarts.
+
+Source notes: we read the Debian and OSV records and the Docker 29.9.1 notes as mirrored by third parties. We did not find the official containerd 2.4.2 release notes. The fixed versions reported are 2.2.10, 2.3.7, and 2.4.2. OSV lists the affected range as starting at 2.4.0, while Debian's wording suggests older branches are also covered by the backports. Confirm against the advisory for your branch.
+
+A related item in the same Docker notes is GHSA-8647-2jxj-p2rc: a crafted `Content-Length` header from an untrusted registry could crash containerd when parallel layer fetching is enabled.
+
+## Why a pull-time crash is worth caring about
+
+The common thread in both issues is that **the runtime parses data from a registry it does not control**. Image indexes, manifests, descriptors, and HTTP headers all arrive from a remote server. If one of those fields is malformed in a way the parser did not expect, a `panic` in Go takes the whole daemon down rather than failing one request.
+
+Two properties make this worse in Kubernetes:
+
+- A pod that cannot pull is retried by the kubelet. If the pull itself crashes containerd, each retry can crash it again.
+- containerd serves every pod on the node, so one bad image reference affects unrelated workloads.
+
+Triggering this requires the node to pull an image from a source an attacker influences: a compromised registry, a typosquatted image name, or a tag someone with push access changed. That is a realistic bar for supply chain scenarios, though it is not an unauthenticated remote attack.
+
+## Check what you are running
+
+On a Docker host:
+
+```bash
+docker version --format '{{.Server.Version}}'
+docker info --format '{{.ServerVersion}} containerd={{ .ContainerdCommit.ID }}'
+containerd --version   # if the standalone binary is installed
+```
+
+On Kubernetes nodes, the runtime version is in the node status:
+
+```bash
+kubectl get nodes -o custom-columns=NAME:.metadata.name,RUNTIME:.status.nodeInfo.containerRuntimeVersion
+```
+
+You will see values such as `containerd://2.4.1`. Compare each against the fixed releases for its branch. Managed services (EKS, GKE, AKS) typically patch through node image updates, so check the provider's node image version rather than the upstream number alone.
+
+For a quick fleet-wide view of drift:
+
+```bash
+kubectl get nodes -o json \
+  | jq -r '.items[] | [.metadata.name, .status.nodeInfo.containerRuntimeVersion] | @tsv' \
+  | sort -k2
+```
+
+## Upgrade order
+
+1. **Staging first.** Update one node pool or one Docker host and pull your real image set, including multi-arch images and images with attestations or signatures, since the bug involves index descriptors with `subject` annotations. Referrer-style artifacts (signatures, SBOMs) use this mechanism, so your supply chain tooling may already produce them.
+2. **Roll nodes with the normal drain procedure.** `kubectl drain` then upgrade then uncordon. Do not patch in place on nodes that run stateful workloads without draining.
+3. **Verify after the roll** with the version command above, and watch for containerd restarts in your node logs.
+
+If you cannot upgrade immediately, reduce exposure instead:
+
+- Pull only from registries you control or have vetted. A pull-through cache in front of public registries gives you a single choke point.
+- Pin images by digest so a tag cannot be swapped under you.
+- Restrict who can push to registries your clusters pull from.
+
+None of these replace the patch, but together they shrink the set of sources that can deliver a malformed descriptor.
+
+## Detect repeated crashes
+
+A crash loop from this bug looks like containerd restarting while a pod sits in `ImagePullBackOff` or `ContainerCreating`. A useful alert is containerd restarts on a node over a short window:
+
+```promql
+increase(node_systemd_unit_state{name="containerd.service",state="activating"}[15m]) > 2
+```
+
+This assumes the node_exporter systemd collector is enabled, which is off by default. If you do not run it, a log-based alert on `panic:` from the containerd unit is the alternative.
+
+## Takeaways
+
+- Update to Docker 29.9.1 or later, or to containerd 2.2.10 / 2.3.7 / 2.4.2 on the branch you run. Check the advisory for your exact branch.
+- For Kubernetes, the real work is the node image rollout. Start with the runtime version column above.
+- Treat registry content as untrusted input. Digest pinning, controlled registries, and a pull-through cache are cheap controls that help against this whole class of bug, not only this CVE.

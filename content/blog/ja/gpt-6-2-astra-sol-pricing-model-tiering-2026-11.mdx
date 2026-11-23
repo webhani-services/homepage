@@ -1,0 +1,99 @@
+---
+title: "GPT-6.2 Astra / Sol の価格改定を踏まえた、タスク単価ベースの Model 使い分け"
+description: "11月17日にOpenAIがGPT-6.2 AstraとSolを公開しました。価格差が Model Routing に与える影響と、長いPromptの割増料金を避けるための簡易Routerを紹介します。"
+date: "2026-11-24"
+status: "published"
+tags: ["OpenAI", "GPT-6.2", "LLM", "コスト最適化", "Model Routing"]
+thumbnail: ""
+author: "webhani"
+slug: "gpt-6-2-astra-sol-pricing-model-tiering-2026-11"
+---
+
+OpenAIは2026年11月17日に GPT-6.2 Astra と GPT-6.2 Sol を公開しました。エンジニアにとって重要なのはBenchmarkよりも価格構造です。どのリクエストにどのModelを使うべきか、という設計判断が変わるためです。
+
+先に情報源についてお断りします。以下の数値は報道・Aggregatorサイトによるもので、OpenAI公式の価格ページ（英語版）は直接確認できていません。Benchmarkの主張もOpenAI自身のものです。予算を変更する前に、必ず公式ページで数値を確認してください。
+
+## 報じられている内容
+
+- `gpt-6.2-astra`：長時間の専門的な作業向けの上位Model。入力 約$8 / 出力 約$40（100万Tokenあたり）で、GPT-6 Astraより約20%安いと報じられています。
+- `gpt-6.2-sol`：日常用途向けの低価格Model。入力 約$2 / 出力 約$10で、GPT-6.1 Solから据え置きです。
+- Cache入力は Astra 約$0.40、Sol 約$0.10、Batch処理は標準の半額と報じられています。
+- 入力が約27.2万Tokenを超えるPromptは割増になる、との報道があります（入力・Cacheは2倍、出力は1.5倍）。
+- Context Windowは約105万Tokenで、ResponsesとChat Completionsの両APIで利用できます。
+
+あるレポートでは、SolはCoding BenchmarkでAstraとほぼ同等のスコアを5分の1程度のコストで出すとされています。ただし、これは自社Workloadで検証すべき仮説であり、事実として扱うべきではありません。
+
+## 割引率より価格差が重要な理由
+
+同じ系列のModel間に4倍の価格差があると、「常に最上位を使う」は高コストなDefaultになり、「常に安いほうを使う」は品質リスクになります。問うべきは「Requestの種類ごとに、正しい結果を1件得るためのコストはいくらか」です。
+
+```text
+タスク単価 = (入力Token × 入力単価 + 出力Token × 出力単価) / 合格率
+```
+
+あるタスクでSolの合格率が90%、Astraが96%なら、Astraの価格が約1.07倍以内でなければAstraは割に合いません。4倍の価格差では合いません。一方、Solの合格率が60%まで下がる難しいタスクでは、再試行コストを含めると結論が逆転します。これはタスク種別ごとに計測しないと分かりません。
+
+## 長いPromptのGuardを持つ簡易Router
+
+見落としやすいのが割増の閾値です。Agent Loopがツール出力を追記し続けると、誰も気づかないうちに27.2万Tokenを超えることがあります。Routerでこの境界を明示的に扱います。
+
+```typescript
+import OpenAI from "openai";
+
+const client = new OpenAI();
+
+type Tier = "sol" | "astra";
+
+const LONG_PROMPT_THRESHOLD = 272_000;
+
+// 概算: 英語でおよそ4文字 = 1 Token。
+// 閾値に近い場合は実際のTokenizerに置き換えてください。
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+function pickTier(task: { kind: string; input: string }): Tier {
+  // タスク種別は例です。自社のEval結果から決めてください。
+  const hardKinds = new Set(["multi-file-refactor", "incident-analysis"]);
+  return hardKinds.has(task.kind) ? "astra" : "sol";
+}
+
+export async function run(task: { kind: string; input: string }) {
+  const tokens = estimateTokens(task.input);
+  if (tokens > LONG_PROMPT_THRESHOLD * 0.9) {
+    // 割増料金を黙って払わない。先に要約または分割する。
+    throw new Error(
+      `Prompt ~${tokens} tokens is near the long-prompt threshold; compact it first`,
+    );
+  }
+
+  const tier = pickTier(task);
+  const response = await client.responses.create({
+    model: tier === "astra" ? "gpt-6.2-astra" : "gpt-6.2-sol",
+    input: task.input,
+  });
+
+  console.info(JSON.stringify({ tier, kind: task.kind, usage: response.usage }));
+  return response.output_text;
+}
+```
+
+`throw` は意図的です。Batchやバックグラウンド処理では、請求書で割増に気づくよりも、早めに失敗してContextを圧縮するほうが安全です。対話的な用途では自動要約して続行する選択肢もありますが、その判断はコードに明示しておくべきです。
+
+## 導入の進め方
+
+1. **先にEvalを作る**：ログから、タスク種別ごとに実際のRequestを50〜100件抽出し、信頼できる合否判定を付けます。これがないとTieringは推測になります。
+2. **同じデータで両Tierを実行する**：合格率、入出力Token、Latencyを記録し、呼び出し単価ではなく「正解1件あたりのコスト」を計算します。
+3. **DefaultはSol、根拠があればAstraへ**：合格率の差が4倍の価格差を正当化するタスクだけをAstraに回します。安価な検証Stepで失敗分だけAstraに再投入するほうが、全件Astraより安いことが多いです。
+4. **CacheとBatchを活用する**：固定のSystem PromptはCache入力単価の恩恵を受けます。即時応答が不要な処理（夜間の要約や分類など）はBatchの候補です。
+5. **全Callにtierを記録する**：観測できないRouterは調整できません。上の `console.info` が最低限です。
+
+## 注意点
+
+OpenAIは両Modelを自社の「Critical」サイバーセキュリティ閾値に該当すると説明しており、リスクの高いセキュリティ関連Requestには追加の安全策が適用されると報じられています。脆弱性Triageなどのセキュリティ用途では、従来より拒否や制約が増える可能性があるため、その経路を個別にTestしてください。
+
+また、前回のPoint Releaseから7週間で今回のReleaseが出たと報じられています。Model名を多くの箇所にHard Codeしている場合は集約しておくと、次の切り替えが楽になります。
+
+## まとめ
+
+Astraの値下げは歓迎できますが、より長く効く変化はAstraとSolの価格差です。タスク種別ごとに「正解あたりのコスト」を計測し、根拠に基づいてRoutingし、長いPromptの割増にGuardを置く。この3点を、公式価格ページでの数値確認とセットで進めることをお勧めします。
