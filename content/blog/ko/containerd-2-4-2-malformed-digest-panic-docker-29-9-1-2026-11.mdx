@@ -1,0 +1,85 @@
+---
+title: "containerd Image Pull 중 Panic(CVE-2026-95839): Node와 Docker 29.9.1 점검"
+description: "Image Index의 잘못된 Digest 때문에 containerd가 Pull/Import 중 Panic을 일으키고, kubelet 재시도로 크래시가 반복될 수 있는 문제입니다. 수정 Version, Docker 호스트와 Kubernetes Node 확인 방법, 노출을 줄이는 방법을 정리합니다."
+date: "2026-11-24"
+status: "published"
+tags: ["containerd", "Docker", "Kubernetes", "보안", "Container"]
+thumbnail: ""
+author: "webhani"
+slug: "containerd-2-4-2-malformed-digest-panic-docker-29-9-1-2026-11"
+---
+
+2026년 10월 14일자 Docker Engine 29.9.1은 번들된 containerd를 2.4.2로 올렸습니다. 수정 사항 중 하나가 CVE-2026-95839입니다. Debian 보안 Tracker에 따르면 `subject` annotation을 가진 하위 Descriptor에 잘못된 Digest가 들어 있으면 Image를 Pull하거나 Import하는 도중 `containerd`가 Panic을 일으킬 수 있습니다. Tracker는 kubelet의 재시도로 크래시가 반복될 수 있다는 점도 언급합니다.
+
+이는 코드 실행이 아니라 서비스 거부(DoS) 문제입니다. 그래도 운영 Workload가 올라간 Node에서는 중요합니다. Pull 중 Container Runtime이 Panic을 일으키면 재시작되기 전까지 Container를 시작하거나 관리하지 못할 수 있기 때문입니다.
+
+정보 출처에 대한 참고 사항입니다. Debian과 OSV 기록, 그리고 제3자가 Mirror한 Docker 29.9.1 Release Notes를 확인했습니다. containerd 2.4.2의 공식 Release Notes는 찾지 못했습니다. 보고된 수정 Version은 2.2.10, 2.3.7, 2.4.2입니다. OSV는 영향 범위를 2.4.0 이상으로 표기하지만, Debian의 표현은 이전 Branch에도 Backport가 적용됨을 시사합니다. 사용 중인 Branch는 Advisory에서 확인하시기 바랍니다.
+
+같은 Docker Release Notes에는 관련 항목으로 GHSA-8647-2jxj-p2rc도 있습니다. 신뢰할 수 없는 Registry가 조작한 `Content-Length` 헤더 때문에, 병렬 Layer 가져오기가 켜져 있을 때 containerd가 크래시할 수 있다는 내용입니다.
+
+## Pull 시점의 크래시가 중요한 이유
+
+두 문제의 공통점은 **Runtime이 직접 통제하지 않는 Registry의 데이터를 Parsing한다**는 것입니다. Image Index, Manifest, Descriptor, HTTP 헤더는 모두 원격 Server에서 옵니다. Parser가 예상하지 못한 형태로 값이 잘못되면, Go의 `panic`은 요청 하나만 실패시키는 것이 아니라 Daemon 전체를 중단시킵니다.
+
+Kubernetes에서는 다음 두 가지가 영향을 키웁니다.
+
+- Pull하지 못한 Pod는 kubelet이 재시도합니다. Pull 자체가 containerd를 크래시시킨다면 재시도마다 다시 크래시할 수 있습니다.
+- containerd는 Node의 모든 Pod를 담당하므로, 잘못된 Image 참조 하나가 무관한 Workload에까지 영향을 줍니다.
+
+발동하려면 공격자가 영향을 줄 수 있는 출처에서 Node가 Image를 Pull해야 합니다. 침해된 Registry, Typosquatting된 Image 이름, Push 권한이 있는 누군가가 바꿔치기한 Tag 등이 해당합니다. Supply Chain 시나리오에서는 현실적인 조건이지만, 인증 없는 원격 공격은 아닙니다.
+
+## 실행 중인 Version 확인
+
+Docker 호스트에서는 다음과 같이 확인합니다.
+
+```bash
+docker version --format '{{.Server.Version}}'
+docker info --format '{{.ServerVersion}} containerd={{ .ContainerdCommit.ID }}'
+containerd --version   # 단독 Binary가 설치된 경우
+```
+
+Kubernetes Node에서는 Runtime Version이 Node Status에 들어 있습니다.
+
+```bash
+kubectl get nodes -o custom-columns=NAME:.metadata.name,RUNTIME:.status.nodeInfo.containerRuntimeVersion
+```
+
+`containerd://2.4.1` 같은 값이 보입니다. Branch별 수정 Version과 비교하시기 바랍니다. 관리형 Service(EKS, GKE, AKS)는 보통 Node Image 업데이트로 수정이 배포되므로, Upstream 번호만 보지 말고 Provider의 Node Image Version을 확인해야 합니다.
+
+Fleet 전체의 편차를 빠르게 보려면 다음 명령을 사용합니다.
+
+```bash
+kubectl get nodes -o json \
+  | jq -r '.items[] | [.metadata.name, .status.nodeInfo.containerRuntimeVersion] | @tsv' \
+  | sort -k2
+```
+
+## 업데이트 순서
+
+1. **먼저 Staging에서**: Node Pool 하나 또는 Docker 호스트 한 대를 업데이트하고 실제 사용하는 Image 묶음을 Pull해 봅니다. Multi-arch Image와 서명·Attestation이 붙은 Image도 포함하세요. 이 문제는 `subject` annotation을 가진 Index Descriptor와 관련이 있고, 서명이나 SBOM 같은 Referrer 계열 Artifact가 이 방식을 사용하기 때문입니다. Supply Chain 도구가 이미 생성하고 있을 수 있습니다.
+2. **일반적인 Drain 절차로 Node를 교체합니다**: `kubectl drain` → 업그레이드 → uncordon 순서입니다. Stateful Workload가 있는 Node를 Drain 없이 제자리에서 패치하지 마십시오.
+3. **교체 후 확인합니다**: 위 명령으로 Version을 확인하고, Node Log에서 containerd 재시작이 없는지 봅니다.
+
+즉시 업그레이드할 수 없다면 노출을 줄입니다.
+
+- 직접 관리하거나 검증된 Registry에서만 Pull합니다. 공개 Registry 앞에 Pull-through Cache를 두면 경로를 한 곳으로 모을 수 있습니다.
+- Image를 Digest로 고정해 Tag를 바꿔치기할 수 없게 합니다.
+- Cluster가 Pull하는 Registry에 Push할 수 있는 사람을 제한합니다.
+
+이들이 패치를 대체하지는 못하지만, 잘못된 Descriptor를 전달할 수 있는 출처의 범위를 줄여 줍니다.
+
+## 반복 크래시 감지
+
+이 Bug로 인한 Crash Loop는 Pod가 `ImagePullBackOff` 또는 `ContainerCreating` 상태에 머무는 동안 containerd가 반복 재시작되는 모습으로 나타납니다. 짧은 시간 안의 containerd 재시작을 잡는 Alert가 유용합니다.
+
+```promql
+increase(node_systemd_unit_state{name="containerd.service",state="activating"}[15m]) > 2
+```
+
+node_exporter의 systemd collector가 켜져 있다는 전제입니다(기본값은 꺼짐). 사용하지 않는다면 containerd unit의 Log에서 `panic:`을 감지하는 방식이 대안입니다.
+
+## 정리
+
+- Docker 29.9.1 이상, 또는 운영 중인 Branch에 맞춰 containerd 2.2.10 / 2.3.7 / 2.4.2로 업데이트합니다. 정확한 Branch는 Advisory에서 확인하시기 바랍니다.
+- Kubernetes에서는 실제 작업이 Node Image 롤아웃입니다. 위의 Runtime Version 목록부터 시작하십시오.
+- Registry 내용을 신뢰할 수 없는 입력으로 취급합니다. Digest 고정, 통제된 Registry, Pull-through Cache는 비용이 낮고, 이 CVE뿐 아니라 같은 유형의 Bug 전반에 효과가 있습니다.

@@ -1,0 +1,103 @@
+---
+title: "GPT-6.2 Astra and Sol: Pricing Changes and How to Tier Your Models by Cost per Task"
+description: "OpenAI released GPT-6.2 Astra and Sol on November 17 with lower Astra pricing. What the numbers mean for model routing, and a small router that guards against the long-prompt surcharge."
+date: "2026-11-24"
+status: "published"
+tags: ["OpenAI", "GPT-6.2", "LLM", "Cost Optimization", "Model Routing"]
+thumbnail: ""
+author: "webhani"
+slug: "gpt-6-2-astra-sol-pricing-model-tiering-2026-11"
+---
+
+OpenAI released GPT-6.2 Astra and GPT-6.2 Sol on November 17, 2026. The headline for engineers is not a benchmark. It is the price structure, because it changes which model should handle which request in a production system.
+
+A caveat on sources: the figures below come from press coverage and aggregator sites, and we could not read OpenAI's English pricing page directly. Benchmark claims are OpenAI's own. Confirm every number on the official pricing page before you change a budget.
+
+## What was reported
+
+According to coverage of the launch:
+
+- `gpt-6.2-astra` is the higher-end model for long-horizon professional work, at about $8 per million input tokens and $40 per million output tokens, reportedly 20% below GPT-6 Astra.
+- `gpt-6.2-sol` is the cheaper everyday model, at about $2 input and $10 output, unchanged from GPT-6.1 Sol.
+- Cached input is reported at roughly $0.40 (Astra) and $0.10 (Sol) per million tokens, and batch processing at half the standard rate.
+- Prompts above roughly 272K input tokens reportedly cost more: input and cache pricing doubles and output rises to 1.5x.
+- The context window is listed at about 1.05M tokens, available through both the Responses and Chat Completions APIs.
+
+One report says Sol lands within a fraction of a point of Astra on a coding benchmark at about a fifth of the cost. Treat that as a hypothesis to test on your own tasks, not as a fact about your workload.
+
+## Why the price gap matters more than the discount
+
+A 4x price difference between two models in the same family makes "always use the best model" an expensive default. It also makes "always use the cheap one" a quality risk. The useful question is: for each type of request you run, what is the cost of a correct result?
+
+Cost per correct result is roughly:
+
+```text
+cost per task = (input tokens × input price + output tokens × output price) / pass rate
+```
+
+If Sol passes 90% of a task type and Astra passes 96%, Astra has to be less than about 1.07x the price to win on that task. At 4x, it does not. For the remaining hard tasks, where Sol's pass rate drops to 60%, the retry cost flips the answer. You only learn this by measuring per task type.
+
+## A small router with a long-prompt guard
+
+The surcharge threshold is the part that is easy to miss. A request that quietly crosses 272K tokens costs far more per token, and a single agent loop that keeps appending tool output can cross it without anyone noticing. A router should make that boundary explicit.
+
+```typescript
+import OpenAI from "openai";
+
+const client = new OpenAI();
+
+type Tier = "sol" | "astra";
+
+const LONG_PROMPT_THRESHOLD = 272_000;
+
+// Rough estimate: ~4 characters per token for English text.
+// Replace with a real tokenizer if you are near the threshold.
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+function pickTier(task: { kind: string; input: string }): Tier {
+  // Task kinds are examples; derive yours from your eval results.
+  const hardKinds = new Set(["multi-file-refactor", "incident-analysis"]);
+  return hardKinds.has(task.kind) ? "astra" : "sol";
+}
+
+export async function run(task: { kind: string; input: string }) {
+  const tokens = estimateTokens(task.input);
+  if (tokens > LONG_PROMPT_THRESHOLD * 0.9) {
+    // Do not silently pay the long-prompt rate. Summarize or chunk first.
+    throw new Error(
+      `Prompt ~${tokens} tokens is near the long-prompt threshold; compact it first`,
+    );
+  }
+
+  const tier = pickTier(task);
+  const response = await client.responses.create({
+    model: tier === "astra" ? "gpt-6.2-astra" : "gpt-6.2-sol",
+    input: task.input,
+  });
+
+  console.info(JSON.stringify({ tier, kind: task.kind, usage: response.usage }));
+  return response.output_text;
+}
+```
+
+The `throw` is deliberate. For batch or background work, you would rather fail fast and compact the context than discover the surcharge on the invoice. For interactive work you may prefer to summarize automatically and continue, but the decision should be in code, not an accident.
+
+## How we would adopt it
+
+1. **Build the eval first.** Pull 50 to 100 real requests per task type from your logs, with a pass/fail check you trust. Without this, tiering is guesswork.
+2. **Run both tiers on the same set.** Record pass rate, tokens in and out, and latency. Compute cost per correct result, not cost per call.
+3. **Default to Sol, escalate on evidence.** Route to Astra only the task types where the measured pass rate gap pays for the 4x price. A cheap verifier step that escalates failures to Astra is often cheaper than sending everything there.
+4. **Use caching and batch where the workload allows.** Stable system prompts benefit from cached input pricing. Anything that does not need an immediate answer, such as nightly summarization or classification, is a batch candidate at half price.
+5. **Log the tier with every call.** You cannot tune a router you cannot observe. The `console.info` line above is the minimum.
+
+## What to watch
+
+OpenAI describes both models as meeting its "Critical" cybersecurity threshold, and reportedly ships tighter safeguards on higher-risk security requests. If you build security tooling, such as vulnerability triage or exploit analysis, expect more refusals or friction than with earlier models and test those paths specifically.
+
+Also note the pace: coverage says this release arrived seven weeks after the previous point release. If your system hard-codes a model name in many places, centralize it. The router above is one place; a config value would be even better.
+
+## Summary
+
+The lower Astra price is welcome, but the more durable change is the spread between Astra and Sol. Treat it as an invitation to measure cost per correct result per task type, route by evidence, and put guardrails around the long-prompt surcharge. Verify the numbers on the official pricing page before relying on them.
