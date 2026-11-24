@@ -1,0 +1,94 @@
+---
+title: "More Code, Not More Shipped Work: What the Harvard–Jellyfish Study Means for Teams Adopting Coding Agents"
+description: "A working paper using data from 718 firms finds coding agents raise code volume by about 30% while completed issues stay flat and PR merge time grows. How to measure your own team and move the bottleneck instead of just feeding it."
+date: "2026-11-25"
+status: "published"
+tags: ["AI", "Coding Agents", "Code Review", "Engineering Productivity", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "harvard-jellyfish-coding-agents-code-volume-review-bottleneck-2026-11"
+---
+
+A working paper from Harvard economists Fiona Chen and James Stratton, titled "Artificial Intelligence in the Firm: Bottlenecks in Software Production," has been circulating. It analyzes engineering activity data from Jellyfish covering 718 firms and roughly 726,000 workers between January 2021 and March 2026. We are reading it through secondary coverage (InfoQ and others), so check the paper itself for exact methodology before quoting numbers.
+
+The headline findings as reported:
+
+- After firms adopted coding **agents**, lines of code rose about 30%, commits about 20%, and pull requests about 23%.
+- Resolved issues did not rise for coding **assistants**; for agents the reported increase was about 12%, and one summary says completed Jira issues and epics showed no statistically significant change.
+- Average time from PR submission to merge rose about 49%, and the share of PRs with requested changes nearly doubled.
+- By March 2026, around 80% of firms ran AI code review tools, yet only about 23% of review comments were AI-generated.
+
+The authors' conclusion is that the gains depend on complementary investment in downstream review capacity, not just more generation.
+
+## Reading the numbers carefully
+
+Be cautious in two directions.
+
+First, Jira issue counts are a coarse proxy for shipped value. An issue can be large or small, and agents may shift the mix toward smaller tickets. "Flat completed issues" does not prove "no value." It does say that output volume is a poor stand-in for delivery.
+
+Second, this is a population average. Teams with strong review practices, good test suites and small PR conventions may look very different from the mean. The study describes a typical pattern, not an inevitable one.
+
+What the data does support is a familiar systems principle: speeding up one stage of a pipeline moves the constraint to the next stage. If writing code was never the slowest step, making it faster mostly grows the queue in front of review.
+
+## Why review becomes the constraint
+
+Agent-authored changes tend to have properties that make review harder than the line count suggests:
+
+- **Larger and broader diffs.** An agent will happily touch six files for a one-file idea.
+- **Plausible but unverified.** The code reads well. That makes errors easier to miss than in rough human code.
+- **No shared context.** The reviewer cannot ask the author why, and the PR description may be generated rather than reasoned.
+- **Volume.** One engineer supervising several agents can open more PRs per day than the team can read.
+
+Review is also the stage where understanding is built. Skipping it does not remove the cost; it moves it to incident response and onboarding.
+
+## What to do about it
+
+### 1. Measure before you tune
+
+Track a few numbers per team, before and after agent adoption:
+
+```bash
+# Median hours from PR open to merge, last 60 days (GitHub CLI + jq)
+gh pr list --state merged --limit 300 \
+  --json createdAt,mergedAt \
+  --jq '[.[] | ((.mergedAt | fromdateiso8601) - (.createdAt | fromdateiso8601)) / 3600]
+        | sort | .[length/2 | floor]'
+```
+
+Add PR size (lines changed), review rounds per PR, and the share of PRs authored or co-authored by agents. If PR-to-merge time and review rounds climb while throughput of finished work is flat, you are seeing the same pattern as the study.
+
+### 2. Constrain the input to review
+
+Make small PRs the default, and enforce it in the agent's instructions, not just in team etiquette:
+
+```markdown
+## Pull request rules (CLAUDE.md / AGENTS.md)
+- One concern per PR. Target under 300 changed lines excluding generated files.
+- If the task needs more, split it and open them in dependency order.
+- PR description: what changed, why, how it was verified, and what was NOT changed.
+- Do not refactor unrelated code in the same PR.
+```
+
+### 3. Shift verification left, onto machines
+
+Reviewers should not be the first line of defense for things a pipeline can check. Require type checks, tests, linters and a security scan to pass before a human is asked. Ask agents to add or update tests with the change, and to run them, as part of the task definition.
+
+### 4. Use AI review for triage, not as the approver
+
+AI review is useful for catching mechanical issues and summarizing a diff. The 23% figure suggests most teams still keep humans doing most of the commenting. A reasonable split: AI pre-review catches style, obvious bugs and missing tests; humans spend their time on design, domain correctness and risk.
+
+### 5. Add review capacity deliberately
+
+If agents double PR volume, the review budget has to grow, or the number of agent-authored PRs in flight has to be capped. A WIP limit on open agent PRs per reviewer is a simple, effective control.
+
+## Our view
+
+We use coding agents daily and recommend them. The takeaway from this paper is not that they do not work. It is that adoption plans usually budget for licenses and onboarding and forget the review stage, which is where throughput is actually decided.
+
+When we help teams roll out agents, we start with the delivery metrics (PR cycle time, review rounds, escaped defects), set PR-size and verification rules in the repository's agent instructions, and only then raise agent usage. The order matters: raising generation first is how you end up with a review backlog and a bad impression of the tools.
+
+## Takeaways
+
+- Reported data from 718 firms: agents raised code volume roughly 20 to 30%, while completed issues did not rise much and PR merge time increased.
+- Treat review capacity as the constraint, and measure PR cycle time and review rounds before and after adoption.
+- Bound PR size via agent instructions, move checks into CI, use AI review for triage, and cap in-flight agent PRs.

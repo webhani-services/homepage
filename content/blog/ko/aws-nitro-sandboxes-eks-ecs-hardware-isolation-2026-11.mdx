@@ -1,0 +1,70 @@
+---
+title: "AWS Nitro Sandboxes: EKS·ECS의 Pod/Task 단위 VM 격리와 적용 판단 기준"
+description: "AWS가 2026년 11월 9일 EKS Pod와 ECS Task마다 전용 VM 경계를 부여하는 Nitro Sandboxes를 발표했습니다. Multi-tenant와 AI Agent 워크로드에 어떤 변화가 있는지, Kata Containers와의 차이, 도입 전 확인할 사항을 정리합니다."
+date: "2026-11-25"
+status: "published"
+tags: ["AWS", "Kubernetes", "Security", "Containers", "EKS"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-nitro-sandboxes-eks-ecs-hardware-isolation-2026-11"
+---
+
+2026년 11월 9일, AWS는 Nitro Sandboxes를 발표했습니다. EKS의 Pod, ECS의 Task, EC2 워크로드를 각각 전용 Kernel을 가진 하드웨어 격리 VM 안에서 실행할 수 있습니다. 발표 내용과 2차 보도에 따르면 AWS가 Nitro Enclaves로 수년간 운영해 온 격리 기술을 재사용하며, 대부분의 상용 Region에서 대다수 Nitro 기반 EC2 Instance에서 사용할 수 있고 추가 비용은 없습니다.
+
+Container는 Host Kernel을 공유합니다. 이는 높은 밀도와 빠른 기동의 원천이지만, Kernel 취약점이나 Container Escape가 워크로드 간 경계를 넘을 수 있는 이유이기도 합니다. Nitro Sandboxes는 그 경계를 VM 수준으로 내리면서, 자체 microVM 기반을 운영해야 하는 부담은 없애 줍니다.
+
+## 무엇이 달라지는가
+
+Sandbox가 없을 때 같은 Node 위의 두 Pod를 가르는 것은 Namespace, cgroup, seccomp, 그리고 Admission Policy입니다. Pod마다 VM이 있으면 Container에서 탈출하더라도 도달하는 곳은 해당 VM의 Guest Kernel이며, Node의 Kernel이나 이웃 Pod가 아닙니다.
+
+AWS 설명에 따르면 모드는 두 가지입니다. 빠른 기동에 최적화된 모드와, 암호학적 Attestation을 지원하는 Confidential 모드입니다. 다만 Attestation은 누군가 검증해야 의미가 있습니다. 보도에 따르면 Attestation된 측정값을 확인하는 Verifier, 또는 검증 후에만 Secret을 내주는 KMS Policy를 직접 구성해야 합니다. 그 구성이 갖춰지기 전까지는 "Confidential"을 "검증됨"으로 간주해서는 안 됩니다.
+
+## 누구에게 중요한가
+
+**Multi-tenant Platform.** 고객이 제공한 코드를 실행하거나 Tenant끼리 Cluster를 공유한다면, Kernel 공유는 격리 설계에서 가장 약한 고리입니다. 기존 선택지는 Tenant별 Node Pool(비용이 큼) 또는 Kata Containers나 gVisor의 자체 운영이었습니다.
+
+**AI Agent 및 코드 실행 워크로드.** 모델이 생성한 코드, Build Tool, Browser를 실행하는 Agent가 대표적인 적용 대상입니다. Agent의 VM 수준 격리는 당 블로그의 이전 글에서도 다룬 바 있습니다. AWS를 사용한다면 그 선택지를 Managed 기능으로 쓸 수 있게 됩니다.
+
+**Compliance 요건이 있는 워크로드.** 서로 다른 데이터 등급을 다루는 워크로드를 어떻게 분리하는지 감사에서 질문받을 때, VM 경계는 Policy 묶음보다 설명하기 쉬운 답입니다.
+
+신뢰할 수 있는 자사 코드만 실행하는 단일 Tenant 내부 서비스라면 추가 경계의 이점은 상대적으로 작습니다. Patch 적용과 최소 권한에 먼저 노력을 쓰는 편이 효과적입니다.
+
+## Kata Containers와의 비교
+
+출시 관련 보도는 Kata Containers와 비교합니다. 실무에서 의미 있는 차이는 다음과 같습니다.
+
+| | Nitro Sandboxes | Kata Containers |
+|---|---|---|
+| 운영 주체 | AWS (Managed) | 자사 |
+| Virtualization Backend | Nitro 전용 | 다수 (QEMU, Cloud Hypervisor, Firecracker) |
+| 이식성 | AWS 전용 | 모든 Cloud / Bare Metal |
+| Attestation | 내장 (Confidential 모드), Verifier 필요 | Backend와 Hardware에 따라 다름 |
+
+Multi-cloud이거나 일부가 On-premise라면 Kata로 환경 전반에 단일한 격리 모델을 유지할 수 있습니다. AWS만 사용한다면 Managed 옵션이 Platform Engineering 한 계층을 덜어 줍니다. 둘 다 합리적인 선택이며, 핵심은 Lock-in 비용을 의식적으로 판단하는 것입니다.
+
+## 아직 알려지지 않은 것
+
+보도된 범위에서는 Benchmark 수치, 기동 시간, Instance당 밀도가 제시되지 않았습니다. Latency에 민감하거나 Bin-packing이 중요한 워크로드에서는 이 수치가 도입 가능 여부를 좌우합니다. 구현이 경량이더라도 Pod별 VM에는 Memory Overhead와 Cold Start 비용이 따릅니다.
+
+또한 제외되는 Instance Type과 Attestation 방식의 세부 사항도 확인한 보도에서는 명확하지 않았습니다. 이전을 계획하기 전에 AWS 문서에서 최신 목록을 확인하십시오.
+
+## 저희라면 이렇게 평가합니다
+
+전면 적용보다 범위를 한정한 Pilot을 권합니다.
+
+1. **격리가 중요한 워크로드 한 종류를 고릅니다.** Agent Runner, Build 실행 기반, Tenant 대상 Job 등입니다.
+2. **측정합니다.** 현재 기준과 비교해 Pod 기동 시간(p50/p95), Pod당 Memory Overhead, Node당 Pod 수를 측정합니다.
+3. **운영 호환성을 확인합니다.** Sidecar, CSI Volume, GPU, Host Network, eBPF 기반 Tool, Node 수준 Monitoring Agent는 Pod가 자체 Kernel을 가지면 동작이 달라질 수 있습니다. 의존하는 항목을 하나씩 테스트합니다.
+4. **Attestation 방침을 정합니다.** Confidential 모드를 쓸 계획이라면 누가 측정값을 검증하고 성공 시 무엇을 전달할지 정의합니다.
+5. **다른 통제는 유지합니다.** VM 경계는 Service Account용 최소 권한 IAM Role, Network Policy, Egress 필터링을 대체하지 않습니다. 과도한 IAM Role을 가진 Sandbox Pod도 정상 인증 정보로 피해를 입힐 수 있습니다.
+
+Kubernetes 쪽에서는 전용 Node Pool과, Sandbox 대상 워크로드를 선택하는 `RuntimeClass` 등의 Selector를 준비해 두면 Namespace 단위로 점진적으로 이전할 수 있습니다. 정확한 Resource 이름은 변경될 수 있으므로 AWS 문서를 따르십시오.
+
+## 정리
+
+- Nitro Sandboxes는 Pod/Task 단위 VM 격리를 AWS Managed 기능으로 제공하며, AWS에 따르면 추가 비용이 없습니다.
+- Multi-tenant Platform, 신뢰할 수 없는 코드나 모델 생성 코드, Compliance 목적의 분리에서 특히 유효합니다.
+- 성능 데이터와 Attestation 세부 사항이 공개되지 않았으므로, 도입 전에 Pilot과 측정이 필요합니다.
+- IAM 범위 제한, Network Policy, Patch 적용을 대체하지 않고 보완합니다.
+
+Kata Containers나 Tenant별 Node Pool 구성과의 비교 검토, Pilot 및 측정 설계가 필요하시면 도와드리겠습니다.

@@ -1,0 +1,70 @@
+---
+title: "AWS Nitro Sandboxes: Per-Pod VM Isolation on EKS and ECS, and Where It Fits"
+description: "AWS launched Nitro Sandboxes on November 9, 2026, giving each EKS pod, ECS task or workload its own VM boundary. What changes for multi-tenant and AI agent workloads, how it compares to Kata Containers, and what to verify before adopting."
+date: "2026-11-25"
+status: "published"
+tags: ["AWS", "Kubernetes", "Security", "Containers", "EKS"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-nitro-sandboxes-eks-ecs-hardware-isolation-2026-11"
+---
+
+On November 9, 2026, AWS announced Nitro Sandboxes: each EKS pod, ECS task or EC2 workload can run inside its own hardware-isolated VM with its own kernel. According to the announcement and secondary coverage, the feature reuses the isolation technology AWS has operated for years as Nitro Enclaves, is available on most Nitro-based EC2 instance types across commercial Regions, and carries no additional charge.
+
+Containers share the host kernel. That has always been the trade-off behind their density and speed, and it is also why a kernel vulnerability or a container escape can cross workload boundaries. Nitro Sandboxes moves that boundary down to a VM, without asking you to operate your own microVM stack.
+
+## What it changes
+
+Without sandboxing, the isolation between two pods on the same node is namespaces, cgroups, seccomp and your admission policy. With a per-pod VM, an escape from a container reaches that VM's guest kernel, not the node's kernel or the neighboring pod.
+
+Per AWS's description, there are two modes: one optimized for fast launch, and a confidential mode that supports cryptographic attestation. Attestation is only useful if something verifies it. The coverage notes you still need to set up a verifier, or KMS policies that check the attested measurements before releasing secrets to the workload. Do not assume "confidential" means "verified" until that is in place.
+
+## Who should care
+
+**Multi-tenant platforms.** If you run customer-supplied code or let tenants share a cluster, kernel sharing is the weakest link in your isolation story. Until now the options were separate node pools per tenant, which is expensive, or running Kata Containers or gVisor yourself.
+
+**AI agent and code-execution workloads.** Agents that run model-generated code, build tools or browsers are a natural fit. We covered the general case for VM-level isolation of agents in earlier posts on this blog; Nitro Sandboxes makes that option a managed feature if you are on AWS.
+
+**Compliance-driven workloads.** Where an auditor asks how you separate workloads handling different data classes, a VM boundary is an easier answer than a policy set.
+
+For a single-tenant internal service running trusted first-party code, the extra boundary has less to offer. Spend that effort on patching and least-privilege first.
+
+## Comparison with Kata Containers
+
+Coverage of the launch compares it to Kata Containers. The differences that matter in practice:
+
+| | Nitro Sandboxes | Kata Containers |
+|---|---|---|
+| Operated by | AWS (managed) | You |
+| Virtualization backend | Nitro only | Several (QEMU, Cloud Hypervisor, Firecracker) |
+| Portability | AWS only | Any cloud or bare metal |
+| Attestation | Built in (confidential mode), verifier required | Depends on backend and hardware |
+
+If you are already multi-cloud or on-prem for part of the estate, Kata keeps a single isolation model across environments. If you are AWS-only, the managed option removes a layer of platform engineering. Both are reasonable; the lock-in cost is the question to answer deliberately.
+
+## What AWS has not told us yet
+
+The announcement, as reported, did not include benchmark figures, startup times, or density per instance. For anything latency-sensitive or bin-packing-heavy, those numbers decide whether this is viable. A per-pod VM has a memory overhead and a cold-start cost, even when the implementation is lean.
+
+Also unspecified in the coverage we read is which instance types are excluded, and how the attestation mechanism works in detail. Check the AWS documentation for the current list before you plan a migration.
+
+## How we would evaluate it
+
+Run a bounded pilot rather than a blanket rollout.
+
+1. **Pick one workload class** where isolation matters: an agent runner, a build executor, or a tenant-facing job.
+2. **Measure.** Pod start time (p50 and p95), memory overhead per pod, and pods per node against your current baseline.
+3. **Check operational compatibility.** Sidecars, CSI volumes, GPU access, host networking, eBPF-based tooling and node-level monitoring agents often behave differently when a pod has its own kernel. Test each one you depend on.
+4. **Decide the attestation story.** If you intend to use confidential mode, define what verifies the measurements and what is released on success.
+5. **Keep the other controls.** A VM boundary does not replace least-privilege IAM roles for service accounts, network policy, or egress filtering. A sandboxed pod with an over-broad IAM role can still do damage with legitimate credentials.
+
+A starting point on the Kubernetes side is a dedicated node pool and a `RuntimeClass` or equivalent selector for the sandboxed workloads, so you can migrate one namespace at a time. Follow the AWS documentation for the exact resource names, as the launch details may change.
+
+## Takeaways
+
+- Nitro Sandboxes gives per-pod and per-task VM isolation as a managed AWS feature, at no additional charge according to AWS.
+- It matters most for multi-tenant platforms, untrusted or model-generated code, and compliance-driven separation.
+- Missing performance data and attestation details mean you should pilot and measure before committing.
+- It complements, and does not replace, IAM scoping, network policy and patching.
+
+If you are weighing this against Kata Containers or a separate-node-pool design, we are happy to help you set up the pilot and the measurements.

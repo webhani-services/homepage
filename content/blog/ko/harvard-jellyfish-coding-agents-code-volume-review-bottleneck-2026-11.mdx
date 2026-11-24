@@ -1,0 +1,94 @@
+---
+title: "코드는 늘었지만 출하는 늘지 않았다: Harvard–Jellyfish 연구가 말하는 Coding Agent 도입의 병목"
+description: "718개 기업 데이터를 사용한 Working Paper에 따르면 Coding Agent는 코드량을 약 30% 늘리지만 완료된 Issue는 그대로이고 PR Merge 시간은 늘어납니다. 자체 팀을 측정하는 방법과 병목을 옮기는 구체적 방안을 정리합니다."
+date: "2026-11-25"
+status: "published"
+tags: ["AI", "Coding Agents", "Code Review", "Engineering Productivity", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "harvard-jellyfish-coding-agents-code-volume-review-bottleneck-2026-11"
+---
+
+Harvard 경제학자 Fiona Chen과 James Stratton이 발표한 Working Paper "Artificial Intelligence in the Firm: Bottlenecks in Software Production"이 화제입니다. Jellyfish의 개발 활동 데이터를 사용해 2021년 1월부터 2026년 3월까지 718개 기업, 약 72만 6천 명을 분석했습니다. 이 글은 InfoQ 등 2차 보도를 통해 읽은 내용이므로, 수치를 인용하실 때는 논문 본문에서 방법론을 확인하시기 바랍니다.
+
+보도된 주요 결과는 다음과 같습니다.
+
+- 기업이 Coding **Agent**를 도입한 뒤 코드 라인 수는 약 30%, Commit은 약 20%, Pull Request는 약 23% 증가했습니다.
+- 해결된 Issue 수는 Coding **Assistant**에서는 늘지 않았고, Agent에서는 약 12% 증가한 것으로 보고되었습니다. 다른 요약에서는 완료된 Jira Issue와 Epic에 통계적으로 유의미한 변화가 없었다고 합니다.
+- PR 제출부터 Merge까지의 평균 시간은 약 49% 늘었고, 변경 요청이 달린 PR의 비율은 거의 두 배가 되었습니다.
+- 2026년 3월 기준 약 80%의 기업이 AI Code Review Tool을 사용하지만, Review Comment 중 AI가 작성한 것은 약 23%에 그칩니다.
+
+저자들의 결론은, 생성량을 늘리는 것만으로는 부족하고 후속 단계인 Review 역량에 대한 보완적 투자가 있어야 성과가 나온다는 것입니다.
+
+## 수치를 읽는 방법
+
+두 방향으로 신중할 필요가 있습니다.
+
+첫째, Jira Issue 수는 출하된 가치를 나타내는 거친 대리 지표입니다. Issue의 크기는 제각각이고, Agent 때문에 작은 Ticket이 늘어나는 식으로 구성이 바뀔 수도 있습니다. "완료 Issue가 그대로"라는 것이 "가치가 없다"는 증명은 아닙니다. 다만 코드 산출량이 성과를 대신하지 못한다는 점은 보여 줍니다.
+
+둘째, 이는 모집단의 평균입니다. Review 관행, Test Suite, 작은 PR 규약이 잘 갖춰진 팀은 평균과 크게 다를 수 있습니다. 연구가 보여 주는 것은 전형적인 패턴이지 피할 수 없는 결과가 아닙니다.
+
+데이터가 뒷받침하는 것은 잘 알려진 시스템 원칙입니다. Pipeline의 한 단계를 빠르게 하면 제약이 다음 단계로 옮겨 갑니다. 원래 코드 작성이 가장 느린 단계가 아니었다면, 그 단계를 빠르게 해도 Review 앞의 대기열만 길어집니다.
+
+## Review가 제약이 되는 이유
+
+Agent가 만든 변경에는 줄 수 이상으로 Review를 어렵게 만드는 성질이 있습니다.
+
+- **Diff가 크고 넓습니다.** 파일 하나로 끝날 아이디어에 대해 여섯 개 파일을 거리낌 없이 수정합니다.
+- **그럴듯하지만 검증되지 않았습니다.** 코드가 읽기 좋아서, 거친 사람의 코드보다 오류를 놓치기 쉽습니다.
+- **Context를 공유하지 않습니다.** Reviewer는 작성자에게 이유를 물을 수 없고, PR 설명도 사고의 결과가 아니라 생성물일 수 있습니다.
+- **양이 많습니다.** 한 명이 여러 Agent를 감독하면 팀이 읽을 수 있는 양을 넘는 PR이 매일 올라옵니다.
+
+Review는 이해가 형성되는 단계이기도 합니다. 생략해도 비용이 사라지지 않고, 장애 대응과 Onboarding으로 옮겨 갈 뿐입니다.
+
+## 구체적인 대응
+
+### 1. 튜닝 전에 측정합니다
+
+Agent 도입 전후로 팀별 몇 가지 수치를 추적합니다.
+
+```bash
+# 최근 PR의 생성부터 Merge까지 중앙값(시간) (GitHub CLI + jq)
+gh pr list --state merged --limit 300 \
+  --json createdAt,mergedAt \
+  --jq '[.[] | ((.mergedAt | fromdateiso8601) - (.createdAt | fromdateiso8601)) / 3600]
+        | sort | .[length/2 | floor]'
+```
+
+여기에 PR 크기(변경 라인 수), PR당 Review 왕복 횟수, Agent가 작성하거나 공동 작성한 PR의 비율을 더합니다. 완료된 작업의 Throughput이 그대로인데 PR Merge 시간과 Review 왕복이 늘고 있다면, 연구와 같은 패턴입니다.
+
+### 2. Review로 들어오는 입력을 제한합니다
+
+작은 PR을 기본값으로 하고, 팀의 예절이 아니라 Agent에 대한 지시로 강제합니다.
+
+```markdown
+## Pull Request 규칙 (CLAUDE.md / AGENTS.md)
+- PR 하나에 관심사 하나. 생성 파일을 제외하고 변경 300라인 미만을 목표로 한다.
+- 그 이상이 필요하면 분할하여 의존 순서대로 PR을 올린다.
+- PR 설명에는 무엇을 바꿨는지, 왜인지, 어떻게 검증했는지, 무엇을 바꾸지 않았는지를 쓴다.
+- 관련 없는 Refactoring을 같은 PR에 포함하지 않는다.
+```
+
+### 3. 검증을 기계 쪽으로 옮깁니다
+
+Pipeline이 확인할 수 있는 것을 Reviewer가 첫 방어선으로 맡아서는 안 됩니다. 사람에게 요청하기 전에 Type Check, Test, Linter, Security Scan 통과를 필수로 하십시오. Task 정의의 일부로 Agent가 변경에 맞춰 Test를 추가·수정하고 실행하도록 요구합니다.
+
+### 4. AI Review는 승인이 아니라 Triage에 사용합니다
+
+AI Review는 기계적인 문제 검출과 Diff 요약에 적합합니다. 23%라는 수치는 많은 팀에서 여전히 사람이 Comment 대부분을 맡고 있음을 시사합니다. 현실적인 역할 분담은 AI가 사전에 Style, 명백한 Bug, Test 누락을 잡고, 사람은 Design, Domain 정확성, Risk에 시간을 쓰는 것입니다.
+
+### 5. Review 역량을 의도적으로 늘립니다
+
+Agent로 PR이 두 배가 된다면 Review 예산을 늘리거나 동시에 진행되는 Agent PR 수에 상한을 두어야 합니다. Reviewer당 열려 있는 Agent PR에 WIP 제한을 두는 것은 단순하고 효과적인 방법입니다.
+
+## webhani의 시각
+
+저희는 Coding Agent를 매일 사용하고 도입을 권합니다. 이 논문에서 읽어야 할 것은 "효과가 없다"가 아니라, 도입 계획이 License와 Onboarding은 예산에 넣으면서 실제로 Throughput을 결정하는 Review 단계를 빠뜨리기 쉽다는 점입니다.
+
+팀의 Agent 도입을 지원할 때는 먼저 전달 지표(PR Cycle Time, Review 왕복, 유출 결함)를 측정하고, Repository의 Agent 지시에 PR 크기와 검증 규칙을 둔 뒤에 Agent 사용을 늘립니다. 순서가 중요합니다. 생성을 먼저 늘리면 Review 적체와 도구에 대한 나쁜 인상만 남습니다.
+
+## 정리
+
+- 718개 기업의 보고 데이터에서 Agent는 코드량을 약 20~30% 늘렸지만, 완료 Issue는 크게 늘지 않았고 PR Merge 시간은 늘었습니다.
+- Review 역량을 제약으로 보고, 도입 전후의 PR Cycle Time과 Review 왕복을 측정하십시오.
+- Agent 지시로 PR 크기를 제한하고, 검사를 CI로 옮기고, AI Review는 Triage에 쓰며, 동시 진행 Agent PR에 상한을 두십시오.
