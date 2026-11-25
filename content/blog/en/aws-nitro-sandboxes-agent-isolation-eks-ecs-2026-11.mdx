@@ -1,0 +1,59 @@
+---
+title: "AWS Nitro Sandboxes: VM-Level Isolation for Agent Workloads, and the Gaps It Leaves"
+description: "AWS Nitro Sandboxes put a Firecracker microVM under a pod, task, or process at no extra charge. What the isolation covers, the limits that matter for agent platforms, and the IMDS and storage traps in the docs."
+date: "2026-11-26"
+status: "published"
+tags: ["AWS", "Security", "Kubernetes", "AI Agents", "Cloud Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-nitro-sandboxes-agent-isolation-eks-ecs-2026-11"
+---
+
+AWS announced Nitro Sandboxes in November 2026. Each sandbox is a lightweight VM that runs next to a workload on an ordinary EC2 instance, managed by Firecracker and separated by the Nitro hypervisor. AWS can run EKS pods and ECS tasks inside them, and you can launch them yourself on plain EC2. If you run code produced by an LLM, or let customers submit code, this changes the cost of getting a real isolation boundary.
+
+We read the EC2 documentation page closely. We could not read the EKS and ECS pages, so we say nothing here about manifests or task definitions. Check those pages before designing a rollout.
+
+## What you actually get
+
+A sandbox borrows vCPUs and memory from a parent EC2 instance. Code inside it cannot reach the parent's memory; the only path out is through virtual devices. Two modes exist, chosen at launch and fixed afterward:
+
+- **Confidential mode (default):** the parent cannot read or modify sandbox memory, and the Nitro Security Module can produce a signed attestation document.
+- **Direct mode:** the parent can read sandbox memory and there is no attestation. The docs compare the trust model to a nested VM.
+
+Pricing is simple: no additional charge beyond the parent instance. The parent must be launched with Nitro Enclaves enabled, and instances with nested virtualization turned on cannot host sandboxes.
+
+## Limits worth planning around
+
+For an agent platform, density and lifecycle matter more than the headline feature:
+
+- Up to 5 sandboxes per parent vCPU with CPU overcommit, capped at 896 per instance. Without overcommit, total sandbox vCPUs stay below the parent's count minus its first core.
+- Minimum 256 MiB per sandbox, plus per-sandbox and per-device memory overhead drawn from a pool reserved at boot.
+- vCPU and memory cannot change on a running sandbox. No snapshot/restore, pause/resume, or live migration.
+- No GPU passthrough. GPU instance families can host sandboxes, but only for CPU work.
+- Stopping or rebooting the parent stops every sandbox on it, and hibernation cannot be enabled.
+
+The lack of snapshotting is the one to weigh first. Many agent sandboxes rely on fast restore to avoid cold start; with Nitro Sandboxes you boot fresh each time. Measure your actual start latency before committing.
+
+## Three traps the documentation calls out
+
+**1. The parent sees your disks.** The parent can read every block device it presents to a sandbox, including encrypted EBS volumes. EBS encryption and SSE-KMS protect against a different threat. If the parent is untrusted for a dataset, encrypt inside the sandbox with a key that KMS releases only to an attested sandbox.
+
+**2. IMDS leakage through NAT.** A sandbox has no metadata service of its own. If the parent routes sandbox traffic with NAT, the sandbox can reach the parent's instance metadata at `169.254.169.254` and read the parent's IAM role credentials. The docs say IMDSv2 with a hop limit of 2 does not stop this. Block that address from sandbox traffic on the parent. For agent code that will try to curl things, this is the first rule to write.
+
+**3. Shared network resources.** One sandbox can exhaust shared resources such as the connection tracking table. Apply per-sandbox limits.
+
+A fourth point for attestation: always check the image measurement in the KMS key policy. Parent-only measurements also match a sandbox running in debug mode, which exposes the guest console.
+
+## How it compares
+
+The docs themselves point to alternatives: Lambda MicroVMs if you do not want to manage instances, Nitro Enclaves for a minimal interface with no external networking, and nested virtualization (Intel only) if you run your own hypervisor. Kata Containers remains the portable option; Nitro Sandboxes are an AWS-native boundary directly under the Nitro hypervisor. Pick based on whether you need to move between clouds, not on which sounds stronger.
+
+## What we would do
+
+1. If you already run untrusted or generated code in plain containers on shared nodes, treat the shared kernel as the risk and pilot sandboxes on one node group first.
+2. Start in confidential mode. Use direct mode only if you need the parent to inspect memory, and accept the weaker model.
+3. Write the IMDS block and conntrack limits before the first workload, not after.
+4. Benchmark cold start, since snapshot restore is not available.
+5. Keep secrets out of the image. Release them through KMS against attested measurements.
+
+Hardware-backed isolation does not replace least-privilege credentials or egress control. It limits the blast radius of a kernel escape. The role credentials and network paths you give the sandbox still decide what a compromised agent can do.

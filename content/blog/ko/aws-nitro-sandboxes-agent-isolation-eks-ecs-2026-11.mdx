@@ -1,0 +1,59 @@
+---
+title: "AWS Nitro Sandboxes: Agent 워크로드의 VM 격리와 남는 빈틈"
+description: "AWS Nitro Sandboxes는 Pod, Task, Process 아래에 Firecracker microVM을 추가 비용 없이 둡니다. 격리 범위, Agent Platform에 영향을 주는 제약, IMDS와 Storage 함정을 정리합니다."
+date: "2026-11-26"
+status: "published"
+tags: ["AWS", "Security", "Kubernetes", "AI Agents", "Cloud Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "aws-nitro-sandboxes-agent-isolation-eks-ecs-2026-11"
+---
+
+2026년 11월 AWS가 Nitro Sandboxes를 발표했습니다. 일반 EC2 Instance 위에서 Workload 옆에 경량 VM을 띄우고, Firecracker가 관리하며 Nitro Hypervisor가 분리하는 구조입니다. EKS Pod나 ECS Task를 이 VM 안에서 실행할 수 있고, 순수 EC2에서 직접 띄울 수도 있습니다. LLM이 생성한 Code나 고객이 제출한 Code를 실행한다면, 진짜 격리 경계를 갖추는 비용이 낮아졌다는 점에서 의미가 있습니다.
+
+이번 글은 EC2 Documentation을 꼼꼼히 읽고 작성했습니다. EKS와 ECS 쪽 Page는 읽지 못했으므로 Manifest나 Task Definition은 다루지 않습니다. 도입 설계 전에 해당 Page를 반드시 확인하시기 바랍니다.
+
+## 무엇을 얻는가
+
+Sandbox는 부모 EC2 Instance의 vCPU와 Memory를 빌려 동작합니다. 내부 Code는 부모의 Memory에 접근할 수 없고, 바깥으로 나가는 경로는 Virtual Device뿐입니다. Mode는 시작 시 정해지며 이후 변경할 수 없습니다.
+
+- **Confidential Mode(기본값):** 부모가 Sandbox Memory를 읽거나 수정할 수 없습니다. Nitro Security Module이 서명된 Attestation Document를 발급합니다.
+- **Direct Mode:** 부모가 Memory를 읽을 수 있고 Attestation이 없습니다. 문서는 Nested VM과 비슷한 신뢰 모델이라고 설명합니다.
+
+비용은 부모 Instance 요금 외에 추가 요금이 없습니다. 부모는 Nitro Enclaves를 활성화해서 시작해야 하며, Nested Virtualization이 켜진 Instance는 사용할 수 없습니다.
+
+## 설계 시 고려할 제약
+
+Agent Platform에서는 기능 소개보다 밀도와 Lifecycle이 중요합니다.
+
+- CPU Overcommit 시 부모 vCPU당 최대 5개, Instance당 최대 896개입니다. Overcommit이 없으면 Sandbox vCPU 합계는 부모 vCPU에서 첫 번째 Core를 뺀 값 이하여야 합니다.
+- Sandbox당 최소 256 MiB이며, Sandbox와 Device별 Memory Overhead가 부팅 시 확보한 Pool에서 차감됩니다.
+- 실행 중인 Sandbox의 vCPU와 Memory는 변경할 수 없습니다. Snapshot/Restore, Pause/Resume, Live Migration도 지원하지 않습니다.
+- GPU Passthrough는 아직 지원하지 않습니다. GPU Instance Family에서도 CPU 작업만 가능합니다.
+- 부모를 중지하거나 재부팅하면 모든 Sandbox가 중지됩니다. Hibernation도 활성화할 수 없습니다.
+
+가장 먼저 따져볼 부분은 Snapshot 미지원입니다. 많은 Agent Sandbox는 빠른 Restore로 Cold Start를 피하는데, Nitro Sandboxes는 매번 새로 부팅합니다. 도입 전에 실제 시작 지연을 측정하시기 바랍니다.
+
+## 문서가 짚는 세 가지 함정
+
+**1. 부모는 Disk 내용을 읽을 수 있습니다.** Sandbox에 제공한 Block Device는 암호화된 EBS Volume까지 포함해 부모가 읽을 수 있습니다. EBS 암호화와 SSE-KMS는 다른 위협을 막는 장치입니다. 부모를 신뢰할 수 없는 Data라면, Attestation을 통과한 Sandbox에만 KMS가 Key를 내주는 방식으로 Sandbox 내부에서 암호화해야 합니다.
+
+**2. NAT를 통한 IMDS 노출.** Sandbox에는 자체 Metadata Service가 없습니다. 부모가 NAT로 Sandbox Traffic을 중계하면 `169.254.169.254`를 통해 부모의 IAM Role 자격 증명을 읽을 수 있습니다. 문서는 IMDSv2와 Hop Limit 2로도 막을 수 없다고 명시합니다. 부모에서 이 주소로 가는 Traffic을 차단하십시오. Agent Code는 curl을 시도하기 마련이므로 가장 먼저 작성할 Rule입니다.
+
+**3. 공유 Network Resource 고갈.** Sandbox 하나가 Connection Tracking Table 같은 공유 Resource를 소진할 수 있습니다. Sandbox 단위로 한도를 두어야 합니다.
+
+Attestation과 관련해서도 한 가지를 덧붙입니다. KMS Key Policy에서는 반드시 Image Measurement를 확인해야 합니다. 부모 측 Measurement만 확인하면 Guest Console이 노출되는 Debug Mode Sandbox와도 일치합니다.
+
+## 다른 선택지와의 비교
+
+문서 자체가 대안을 제시합니다. Instance 관리가 싫다면 Lambda MicroVMs, 외부 Network가 없는 최소 Interface가 필요하면 Nitro Enclaves, 자체 Hypervisor가 필요하면 Nested Virtualization(Intel 한정)입니다. 이식성이 필요하다면 Kata Containers가 있고, Nitro Sandboxes는 Nitro Hypervisor 바로 아래의 AWS 전용 경계입니다. 어느 쪽이 더 강한가가 아니라 Cloud 간 이동이 필요한가를 기준으로 고르는 것이 현실적입니다.
+
+## 권장 진행 방식
+
+1. 공유 Kernel 위의 일반 Container에서 생성 Code나 외부 Code를 실행 중이라면, 우선 Node Group 하나에서 Pilot을 진행합니다.
+2. Confidential Mode로 시작합니다. Direct Mode는 부모가 Memory를 검사해야 할 때만, 더 약한 모델임을 인지하고 사용합니다.
+3. IMDS 차단과 Conntrack 한도는 첫 Workload 전에 작성합니다.
+4. Snapshot이 없으므로 Cold Start를 측정합니다.
+5. Secret은 Image에 넣지 말고, Attestation Measurement에 대해 KMS로 전달합니다.
+
+Hardware 격리는 최소 권한 자격 증명이나 Egress 통제를 대신하지 않습니다. Kernel Escape의 피해 범위를 줄여 줄 뿐입니다. 침해되었을 때 할 수 있는 일은 Sandbox에 부여한 Role과 Network 경로가 결정합니다.

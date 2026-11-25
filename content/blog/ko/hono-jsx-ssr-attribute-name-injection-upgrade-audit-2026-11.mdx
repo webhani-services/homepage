@@ -1,0 +1,105 @@
+---
+title: "Hono JSX SSR 속성 이름 Injection: Upgrade 후 Props Spread 점검하기"
+description: "CVE-2026-56761은 hono/jsx Server Rendering에서 잘못된 속성 이름으로 Tag를 벗어날 수 있는 문제이며 4.12.14에서 수정되었습니다. 별도 Advisory도 있어 4.12.16 이상을 권장합니다. 영향 확인 방법과 Code 패턴을 정리합니다."
+date: "2026-11-26"
+status: "published"
+tags: ["Hono", "Security", "TypeScript", "XSS", "Node.js"]
+thumbnail: ""
+author: "webhani"
+slug: "hono-jsx-ssr-attribute-name-injection-upgrade-audit-2026-11"
+---
+
+Hono의 JSX Server-Side Rendering에는 CVE-2026-56761(GitHub Advisory GHSA-458j-xx4x-4375)로 추적되는 HTML Injection 문제가 있었습니다. NVD에 따르면 4.12.14 이전 Version에서는 잘못된 속성 이름을 전달해 의도하지 않은 HTML을 삽입할 수 있습니다. Advisory는 2026년 4월에 처음 공개되었고 CVE 등록은 6월이므로 새로운 소식은 아닙니다. 그럼에도 이번 달 Vendor 보안 Bulletin에 계속 등장하고 있어, 취약한 Version을 그대로 운영하는 환경이 많다고 보고 다룹니다.
+
+출처에 대해 밝혀 둡니다. Advisory 본문 Page는 열어 보지 못했고 검색 결과 요약까지만 확인했습니다. 아래의 동작 원리는 그 요약이 뒷받침하는 범위로 적었습니다. 영향 여부를 판단하기 전에 GitHub Advisory 본문을 직접 읽어 보시기 바랍니다.
+
+## 문제의 내용
+
+Hono는 Server에서 JSX를 Rendering할 때 Props를 HTML 속성 문자열로 변환합니다. 값은 Escape됩니다. Advisory가 다루는 부분은 속성의 *이름*입니다. 따옴표나 꺾쇠를 포함한 Key가 현재 Tag를 닫고 새 Markup을 시작할 수 있습니다. 심각도는 출처에 따라 4.3~5.3(Medium)으로 다르며, 삽입된 Script가 실행되려면 사용자 동작이 필요하다고 설명됩니다.
+
+Snyk는 4.12.16 미만을 대상으로 하는 별도 Advisory도 게시했고, JSX Element Tag를 통한 HTML Injection으로 설명합니다. 세부 내용은 확인하지 못했지만 실무상 결론은 분명합니다. 4.12.14만으로는 충분하지 않을 수 있으니, 최소 수정 Version이 아니라 최신 Patch Release로 올리십시오.
+
+## 찾아야 할 Code 패턴
+
+속성 *이름*은 보통 사용자가 아니라 개발자가 작성하기 때문에 이런 종류의 Bug는 잘 숨습니다. Key를 통제할 수 없는 Object를 Props에 Spread하면 도달 가능해집니다.
+
+```tsx
+// 위험: extra의 Key가 Request에서 옴
+app.get('/profile', (c) => {
+  const extra = JSON.parse(c.req.query('attrs') ?? '{}')
+  return c.html(<div class="card" {...extra}>Hello</div>)
+})
+```
+
+이 예에서는 공격자가 이름과 값을 모두 통제합니다. Database나 사용자가 편집할 수 있는 설정에서 읽어 온 임의의 `attributes` Object를 받는 Widget, CMS 스타일 Component도 마찬가지로 위험합니다.
+
+더 안전한 형태는 Spread 전에 속성 이름을 허용 목록(Allowlist)으로 걸러내는 것입니다.
+
+```tsx
+const ALLOWED = new Set(['title', 'aria-label', 'data-id'])
+
+function pick(input: Record<string, unknown>) {
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(input)) {
+    if (ALLOWED.has(key) && typeof value === 'string') out[key] = value
+  }
+  return out
+}
+
+app.get('/profile', (c) => {
+  const extra = pick(JSON.parse(c.req.query('attrs') ?? '{}'))
+  return c.html(<div class="card" {...extra}>Hello</div>)
+})
+```
+
+Allowlist는 Patch가 적용된 Version에서도 보호가 되며, 설계 면에서도 더 낫습니다. 사용자 입력이 Markup의 속성을 결정해서는 안 됩니다.
+
+## 영향 범위 확인
+
+1. **설치된 Version을 간접 의존성까지 포함해 확인합니다.** Framework나 Template이 내부에서 Hono를 고정하는 경우가 있습니다.
+
+   ```bash
+   npm ls hono
+   ```
+
+   배포 대상 전체의 Lockfile과 과거에 Build한 Container Image도 확인합니다.
+
+2. **JSX Rendering을 사용하는지 확인합니다.** Hono를 JSON API Router로만 쓴다면 JSX를 Rendering하지 않으므로 도달할 수 없습니다. `hono/jsx` import와 `c.html(` 호출을 검색합니다.
+
+3. **Props Spread를 검색합니다.** Server Rendering Component에서 `{...` 뒤에 변수가 오는 부분을 찾고, Request에서 유래한 Key가 들어올 수 있는지 추적합니다.
+
+4. **수정이 반영되어야 할 위치를 확인합니다.** Edge나 Serverless Bundle은 Build 산출물입니다. `package.json`을 갱신해도 다시 Build하고 Deploy하기 전에는 아무것도 바뀌지 않습니다.
+
+## Upgrade와 검증
+
+```bash
+npm install hono@latest
+npm ls hono
+```
+
+그다음 악의적인 Key를 사용하는 Regression Test를 추가합니다. 이후 Refactoring이나 의존성 고정으로 문제가 재발하는 것을 막을 수 있습니다.
+
+```tsx
+import { test, expect } from 'vitest'
+import { Hono } from 'hono'
+
+test('입력에서 온 속성 이름이 Tag를 벗어날 수 없다', async () => {
+  const app = new Hono()
+  app.get('/', (c) => {
+    const hostile = { 'x"><script>alert(1)</script>': '1' }
+    return c.html(<div {...hostile}>ok</div>)
+  })
+  const body = await (await app.request('/')).text()
+  expect(body).not.toContain('<script>')
+})
+```
+
+취약한 Version에서는 영향 여부를 확인하는 용도로, 수정된 Version에서는 Build에 수정이 반영되었는지 확인하는 용도로 쓸 수 있습니다.
+
+## 다층 방어
+
+Inline Script를 금지하는 Content-Security-Policy는 삽입된 Tag가 할 수 있는 일을 제한합니다. Server Rendering Application이라면 도입할 가치가 있습니다. 다만 삽입된 Markup으로 인한 화면 변조나 Phishing은 막지 못하므로 Upgrade를 대체하지는 못합니다.
+
+## 정리
+
+Hono는 4.12.14가 아니라 현재 Patch Release로 올리고, 이를 Bundle한 모든 Deploy 대상을 다시 Build하십시오. 그다음 Request 유래 Key가 들어올 수 있는 Props Spread를 점검해 Allowlist로 교체합니다. Upgrade는 이 CVE를 해결하고, Allowlist는 이런 종류의 실수 자체를 없애 줍니다.
