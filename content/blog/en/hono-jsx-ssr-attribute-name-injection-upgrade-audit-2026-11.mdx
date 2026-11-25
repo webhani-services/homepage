@@ -1,0 +1,105 @@
+---
+title: "Hono JSX SSR Attribute-Name Injection: Upgrade, Then Audit Your Prop Spreads"
+description: "CVE-2026-56761 lets malformed attribute names break out of tags in hono/jsx server rendering, fixed in 4.12.14. A second advisory suggests staying current to 4.12.16 or later. How to check exposure and the code pattern to look for."
+date: "2026-11-26"
+status: "published"
+tags: ["Hono", "Security", "TypeScript", "XSS", "Node.js"]
+thumbnail: ""
+author: "webhani"
+slug: "hono-jsx-ssr-attribute-name-injection-upgrade-audit-2026-11"
+---
+
+Hono's JSX server-side rendering had an HTML injection flaw tracked as CVE-2026-56761 (GitHub advisory GHSA-458j-xx4x-4375). Per NVD, versions before 4.12.14 let an attacker inject unintended HTML by supplying malformed attribute names. The advisory was first published in April 2026 and the CVE record followed in June, so this is not breaking news. We are writing about it because it keeps appearing in vendor security bulletins this month, which means plenty of deployments are still running vulnerable versions.
+
+A note on sourcing: we could read search-result summaries of the advisory but could not open the advisory pages themselves. The mechanism below is described at the level those summaries support. Read the GitHub advisory before you decide your exposure.
+
+## What the flaw is
+
+When Hono renders JSX on the server, it turns props into an HTML attribute string. Values are escaped. The problem described in the advisory concerns attribute *names*: a key containing quotes or angle brackets can end the current tag and start new markup. Scores differ by source, from 4.3 to 5.3 (Medium), with notes that user interaction is needed for the injected script to run.
+
+Snyk lists a second, separate advisory for versions below 4.12.16, described as HTML injection through the JSX element tag. We could not verify its details, but the practical message is clear: fixing only 4.12.14 may not be enough. Move to the latest patch release rather than the minimum fixed version.
+
+## The code pattern to search for
+
+Attribute *names* are normally written by the developer, not the user, which is why this class of bug hides well. It becomes reachable when an object whose keys you do not control is spread into props:
+
+```tsx
+// Risky: the keys of `extra` come from a request
+app.get('/profile', (c) => {
+  const extra = JSON.parse(c.req.query('attrs') ?? '{}')
+  return c.html(<div class="card" {...extra}>Hello</div>)
+})
+```
+
+Here an attacker controls both names and values. Equally risky are "widget" or CMS-style components that accept an arbitrary `attributes` object loaded from a database or a user-editable configuration.
+
+The safer shape is an allowlist of attribute names, applied before spreading:
+
+```tsx
+const ALLOWED = new Set(['title', 'aria-label', 'data-id'])
+
+function pick(input: Record<string, unknown>) {
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(input)) {
+    if (ALLOWED.has(key) && typeof value === 'string') out[key] = value
+  }
+  return out
+}
+
+app.get('/profile', (c) => {
+  const extra = pick(JSON.parse(c.req.query('attrs') ?? '{}'))
+  return c.html(<div class="card" {...extra}>Hello</div>)
+})
+```
+
+The allowlist protects you even on a patched version, and it is a better design regardless: user input should not choose which attributes your markup has.
+
+## Check your exposure
+
+1. **Find installed versions, including transitive ones.** Frameworks and templates sometimes pin Hono underneath:
+
+   ```bash
+   npm ls hono
+   ```
+
+   Also check lockfiles in every deployable service and any container images built earlier.
+
+2. **Check whether you use JSX rendering at all.** Hono used only as a JSON API router does not render JSX, so the flaw is not reachable there. Search for `hono/jsx` imports and `c.html(` calls.
+
+3. **Search for prop spreads.** Look for `{...` followed by a variable in server-rendered components, then trace whether the object can contain request-derived keys.
+
+4. **Check where the fix must land.** Edge and serverless bundles are built artifacts. Updating `package.json` does nothing until you rebuild and redeploy.
+
+## Upgrade and verify
+
+```bash
+npm install hono@latest
+npm ls hono
+```
+
+Then add a regression test with a hostile key, so a future refactor or dependency pin cannot reintroduce the problem:
+
+```tsx
+import { test, expect } from 'vitest'
+import { Hono } from 'hono'
+
+test('attribute names from input cannot break out of the tag', async () => {
+  const app = new Hono()
+  app.get('/', (c) => {
+    const hostile = { 'x"><script>alert(1)</script>': '1' }
+    return c.html(<div {...hostile}>ok</div>)
+  })
+  const body = await (await app.request('/')).text()
+  expect(body).not.toContain('<script>')
+})
+```
+
+On a vulnerable version this test is how you confirm exposure; on a fixed version it is how you confirm the fix is active in your build.
+
+## Defense in depth
+
+A Content-Security-Policy that disallows inline scripts limits what an injected tag can do, and it is worth having for any server-rendered application. It does not replace the upgrade, because injected markup can still deface or phish.
+
+## Takeaway
+
+Upgrade Hono to the current patch release, not just 4.12.14, and rebuild every deployable that bundles it. Then audit prop spreads for request-derived keys and replace them with allowlists. The upgrade fixes this CVE; the allowlist removes the class of mistake.

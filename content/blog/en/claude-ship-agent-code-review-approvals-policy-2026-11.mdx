@@ -1,0 +1,69 @@
+---
+title: "Claude Ship: Letting Agents Approve Pull Requests Without Losing Accountability"
+description: "Anthropic's Claude Ship adds agents that review, repair, and approve GitHub changes under team rules. What is reported so far, and the guardrails to put in place before an agent can approve anything."
+date: "2026-11-26"
+status: "published"
+tags: ["Claude", "AI Agents", "Code Review", "GitHub", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-ship-agent-code-review-approvals-policy-2026-11"
+---
+
+On November 25, 2026, Anthropic launched Claude Ship: a set of agents for GitHub that review, repair, and approve code changes under rules a team defines. According to press coverage, Code Review is generally available, while PR Steward and Claude Approvals are in beta. It is offered for GitHub repositories on Claude Team and Enterprise plans.
+
+A note on sourcing: we could only read search-result summaries of the launch, not Anthropic's own documentation. The details below are limited to what those summaries state. We say nothing about configuration syntax or pricing, and you should confirm behavior against Anthropic's docs before relying on it.
+
+## Why the approval step is the interesting part
+
+AI-assisted review is not new. Commenting on a diff, suggesting a fix, even pushing a repair commit are all familiar. What is new is an agent whose output can satisfy a required-approval rule. That moves the agent from advisor to participant in your merge control, and merge control is where audit and compliance expectations live.
+
+Our own view is that this deserves a deliberate decision rather than a toggle. Three questions decide whether it is safe.
+
+### 1. What is the approval actually worth?
+
+A human approval carries an implicit claim: someone accountable read this and accepts responsibility. An agent approval carries a different claim: this change met the rules we wrote. Those are different, and your branch protection should say which one it is asking for.
+
+A workable split:
+
+- Agent approval can satisfy the requirement for low-risk, well-bounded paths: documentation, generated lockfile updates, snapshot refreshes, copy changes.
+- Anything touching authentication, billing, data migrations, infrastructure, or CI configuration still needs a named human.
+
+If the product's rule language can express path-based conditions, use it. If it cannot, enforce the split yourself with `CODEOWNERS` and required reviewers, so that sensitive paths always demand a human no matter what the agent says.
+
+### 2. Who can change the rules?
+
+The rules are now part of your control plane. If a contributor can edit the policy in the same pull request that the agent evaluates, the agent is grading its own exam. Treat the rule definition the way you treat CI workflow files:
+
+```text
+# .github/CODEOWNERS
+/.github/            @your-org/platform-leads
+/path/to/agent-rules @your-org/platform-leads
+```
+
+Require review from that group, and keep the rule source on the protected default branch rather than in the change under review. This is the same lesson the community learned from `pull_request_target` workflows: the code being evaluated must not control the evaluator.
+
+### 3. How do you notice drift?
+
+An agent that approves ninety changes well and one badly is harder to catch than a reviewer who is always wrong. Keep a lightweight audit loop:
+
+- Sample a fixed percentage of agent-approved merges for human re-review each week.
+- Track reverts and hotfixes that follow agent-approved changes, separately from human-approved ones.
+- Review the rules quarterly, not only when something breaks.
+
+You do not need tooling for this at first. A saved GitHub search for merged pull requests approved by the agent account, checked weekly, is enough to start.
+
+## What PR Steward suggests about workflow
+
+Press coverage describes PR Steward as handling repair, which implies the agent can push follow-up changes to a branch. That is useful for flaky lint fixes and mechanical review comments, and it raises one more question: who is the commit author, and does your signing or DCO policy accept it? Decide before the first run, because retrofitting attribution is harder than setting it up.
+
+## How we would roll it out
+
+1. **Start with Code Review only.** It is the generally available piece, and comment-only output carries little merge risk. Measure how often its findings are acted on.
+2. **Pilot repair on one internal repository.** Watch the diffs it pushes. Keep CI required and unchanged.
+3. **Delay approvals** until you have two to four weeks of review data and a written scope of paths where agent approval is acceptable.
+4. **Keep humans mandatory** for the sensitive paths above, regardless of vendor defaults.
+5. **Write down the accountability model.** If an agent-approved change causes an incident, the postmortem should have an answer to who owned the decision.
+
+## Our take
+
+Delegating routine review is a reasonable direction, and the growing volume of agent-authored changes makes human-only review a bottleneck. The risk is not that the agent is careless; it is that approval semantics quietly weaken without anyone deciding they should. If you adopt Claude Ship, treat the approval rules as production configuration: owned, reviewed, audited, and narrower than you think you need at the start.

@@ -1,0 +1,69 @@
+---
+title: "Claude Ship: Agent에게 PR 승인을 맡기면서 책임성을 잃지 않는 방법"
+description: "Anthropic의 Claude Ship은 팀이 정한 Rule에 따라 GitHub 변경을 Review, 수정, 승인하는 Agent 모음입니다. 현재까지 보도된 내용과 승인을 맡기기 전에 갖춰야 할 Guardrail을 정리합니다."
+date: "2026-11-26"
+status: "published"
+tags: ["Claude", "AI Agents", "Code Review", "GitHub", "DevOps"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-ship-agent-code-review-approvals-policy-2026-11"
+---
+
+2026년 11월 25일 Anthropic이 Claude Ship을 공개했습니다. 팀이 정의한 Rule에 따라 GitHub의 변경을 Review, 수정, 승인하는 Agent 모음입니다. 보도에 따르면 Code Review는 GA(정식 제공)이고, PR Steward와 Claude Approvals는 Beta입니다. Claude Team과 Enterprise Plan의 GitHub Repository가 대상이라고 합니다.
+
+출처에 대해 먼저 밝혀 둡니다. 이번에는 Anthropic 공식 Documentation이 아니라 검색 결과 요약만 확인할 수 있었습니다. 아래 내용은 그 요약에 적힌 범위로 한정하며, 설정 Syntax나 가격은 다루지 않습니다. 도입 전에 공식 Documentation에서 동작을 확인하시기 바랍니다.
+
+## 핵심은 승인 단계입니다
+
+AI 기반 Review 보조 자체는 새롭지 않습니다. Diff에 Comment를 달고, 수정안을 제시하고, 수정 Commit을 Push하는 일은 이미 익숙합니다. 새로운 점은 Agent의 출력이 필수 승인 Rule을 충족할 수 있다는 것입니다. Agent가 조언자에서 Merge 통제의 참여자로 바뀌는 것이며, Merge 통제는 감사와 Compliance 요구가 모이는 지점입니다.
+
+Toggle 하나로 정할 일이 아니라 의도적으로 결정해야 한다고 봅니다. 안전 여부는 세 가지 질문에 달려 있습니다.
+
+### 1. 그 승인은 무엇을 의미하는가
+
+사람의 승인에는 "책임질 수 있는 사람이 읽고 받아들였다"는 암묵적 의미가 있습니다. Agent의 승인은 "정해 둔 Rule을 충족했다"는 의미입니다. 둘은 다르므로 Branch Protection 설정에서 어느 쪽을 요구하는지 분명히 해야 합니다.
+
+현실적인 구분 예시입니다.
+
+- Agent 승인만으로 충분한 경우는 위험이 낮고 범위가 명확한 Path로 한정합니다. 문서, 자동 생성된 Lockfile 갱신, Snapshot 갱신, 문구 변경 등입니다.
+- 인증, 결제, Data Migration, 인프라, CI 설정을 건드리는 변경은 계속 실명이 있는 사람의 승인이 필요합니다.
+
+제품의 Rule 문법에서 Path 조건을 쓸 수 있다면 활용하십시오. 쓸 수 없다면 `CODEOWNERS`와 필수 Reviewer로 직접 강제하여, Agent가 무엇이라 판단하든 민감한 Path에는 항상 사람을 요구하게 합니다.
+
+### 2. Rule을 바꿀 수 있는 사람은 누구인가
+
+Rule은 이제 Control Plane의 일부입니다. Agent가 평가하는 PR 안에서 같은 기여자가 Rule 자체를 수정할 수 있다면, Agent는 자기 시험을 스스로 채점하는 셈입니다. Rule 정의는 CI Workflow 파일처럼 다루어야 합니다.
+
+```text
+# .github/CODEOWNERS
+/.github/            @your-org/platform-leads
+/path/to/agent-rules @your-org/platform-leads
+```
+
+이 Group의 Review를 필수로 하고, Rule 원본은 Review 대상 변경이 아니라 보호된 Default Branch에 둡니다. `pull_request_target` Workflow에서 얻은 교훈과 같습니다. 평가받는 Code가 평가자를 제어해서는 안 됩니다.
+
+### 3. Drift를 어떻게 알아차릴 것인가
+
+90건을 잘 승인하고 1건을 잘못 승인하는 Agent는, 항상 틀리는 Reviewer보다 찾기 어렵습니다. 가벼운 감사 Loop를 두십시오.
+
+- Agent가 승인해 Merge된 변경 중 일정 비율을 매주 사람이 다시 Review합니다.
+- Agent 승인 이후의 Revert와 Hotfix를 사람 승인 건과 분리해 추적합니다.
+- Rule은 문제가 생길 때만이 아니라 분기마다 점검합니다.
+
+처음에는 별도 Tooling이 필요 없습니다. Agent 계정이 승인해 Merge된 PR의 GitHub 검색을 저장해 두고 매주 확인하는 것만으로 시작할 수 있습니다.
+
+## PR Steward가 시사하는 Workflow
+
+보도에서는 PR Steward가 수정(Repair)을 맡는다고 설명하는데, 이는 Agent가 Branch에 추가 변경을 Push할 수 있다는 뜻입니다. 불안정한 Lint 수정이나 기계적인 Review 지적 반영에는 유용하지만, 새로운 질문이 생깁니다. Commit 작성자는 누구이며, 서명이나 DCO 정책이 이를 허용하는가. 첫 실행 전에 정하십시오. 귀속 관계는 나중에 맞추기가 처음에 설정하는 것보다 어렵습니다.
+
+## 권장 도입 순서
+
+1. **Code Review만 먼저 사용합니다.** GA이고 Comment만 남기는 출력은 Merge 위험이 작습니다. 지적 사항이 실제로 얼마나 반영되는지 측정합니다.
+2. **수정 기능은 내부 Repository 하나에서 시험합니다.** Push되는 Diff를 관찰하고, CI는 필수 상태로 그대로 둡니다.
+3. **승인 기능은 미룹니다.** 2~4주의 Review Data와, Agent 승인을 허용하는 Path 범위를 문서화한 뒤에 검토합니다.
+4. **민감한 Path는 사람을 필수로 유지합니다.** Vendor 기본값과 무관하게 적용합니다.
+5. **책임 모델을 문서화합니다.** Agent가 승인한 변경으로 Incident가 발생했을 때, Postmortem에서 그 판단의 소유자가 누구였는지 답할 수 있어야 합니다.
+
+## webhani의 견해
+
+반복적인 Review를 위임하는 방향은 합리적입니다. Agent가 작성하는 변경이 늘수록 사람만의 Review는 병목이 됩니다. 위험은 Agent의 부주의가 아니라, 아무도 결정하지 않은 채 승인의 의미가 조용히 약해지는 것입니다. Claude Ship을 도입한다면 승인 Rule을 Production 설정으로 취급하십시오. 담당자를 정하고, Review하고, 감사하며, 처음에는 필요하다고 생각하는 범위보다 좁게 시작하십시오.
