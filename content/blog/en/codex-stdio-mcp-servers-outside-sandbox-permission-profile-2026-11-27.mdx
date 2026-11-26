@@ -1,0 +1,87 @@
+---
+title: "Your Agent's Sandbox Probably Doesn't Cover Its MCP Servers"
+description: "OpenAI documents that Codex does not sandbox the command that launches a stdio MCP server, and its network proxy does not cover MCP traffic. Why this gap exists in most coding agents, and how to close it with scoped launch profiles."
+date: "2026-11-27"
+status: "published"
+tags: ["AI", "MCP", "Security", "Codex", "Sandboxing"]
+thumbnail: ""
+author: "webhani"
+slug: "codex-stdio-mcp-servers-outside-sandbox-permission-profile-2026-11-27"
+---
+
+A coding agent's sandbox usually protects the commands the agent runs: shell calls, test runs, file edits. A less obvious question is what happens to the MCP servers the agent starts. According to OpenAI's Codex configuration documentation and guides that analyze it, the command that launches a stdio MCP server configured in `config.toml` is not sandboxed by default, and the command network proxy does not apply to MCP server connections. The reasoning given is that Codex cannot reliably infer which files or network services a given server needs.
+
+That is a defensible engineering choice. It also means that the safety story you tell your team ("the agent is sandboxed") has a hole in it exactly where third-party code runs. This post is about that gap, which is not specific to Codex. Most agent harnesses with local MCP support have some version of it.
+
+Some specifics here (config key names, proxy behavior) vary between Codex versions and come partly from community write-ups. Verify against the current official configuration reference before you copy anything.
+
+## Why stdio MCP servers are different
+
+A stdio MCP server is a local process the agent starts and talks to over standard input and output. Typical examples are a filesystem server, a database client, or a wrapper around a CLI. Three properties make it a security-relevant component:
+
+- **It runs with your user's privileges.** If the launcher is outside the sandbox, the server can read `~/.ssh`, cloud credentials and everything else your account can.
+- **It is usually third-party code**, often installed on the fly with `npx` or `uvx`, which means the code that runs today may differ from yesterday's.
+- **Its network access is independent.** A domain allowlist that governs shell commands does not automatically govern a server's outbound connections.
+
+Put differently: you can lock the agent's shell down tightly and still have a tool server with full ambient authority one process over.
+
+## What the current guidance says
+
+Pulling together the documented behavior and community analysis:
+
+1. Stdio MCP servers are launched outside the sandbox unless you wrap them.
+2. The network proxy and domain rules apply to commands inside the sandbox, not to web search, connectors or MCP server traffic.
+3. Domain allowlists only take effect when the proxy is enabled.
+4. Managed `requirements.toml` can enforce admin-level restrictions, such as approval policy and sandbox mode, and an MCP allowlist, so individual developers cannot simply pick full access.
+
+## Closing the gap: launch the server inside a profile
+
+Codex provides a way to run a command under a named permission profile, which you can use as the launcher for a stdio MCP server. The shape of the configuration is as follows (key names illustrative; check the current reference):
+
+```toml
+# ~/.codex/config.toml
+[mcp_servers.docs-search]
+command = "codex"
+args = [
+  "sandbox", "--permission-profile", "mcp-readonly", "--",
+  "node", "/opt/mcp/docs-search/server.js",
+]
+```
+
+and a profile that matches what that one server legitimately needs:
+
+```toml
+[permissions.mcp-readonly]
+# read access to the project, write only to the server's own data dir
+# network disabled unless the server genuinely needs it
+```
+
+The principle matters more than the syntax: **every MCP server gets a profile derived from its actual job.** A documentation search server needs read access to one directory and maybe one domain. It does not need your home directory or the whole internet.
+
+## A review checklist for MCP servers
+
+For each server in an agent's configuration, answer:
+
+| Question | Acceptable answer |
+| --- | --- |
+| Where does the code come from, and is the version pinned? | A pinned version or a vendored copy, not `latest` |
+| What filesystem paths can it read and write? | A named, minimal set |
+| What network destinations does it need? | A short list, or none |
+| What credentials does it receive? | Scoped tokens passed explicitly, not inherited environment |
+| Who can change the configuration? | Managed policy for shared setups |
+
+Pinning matters more than people expect. An unpinned `npx some-mcp-server` is a supply-chain dependency that executes with your privileges every time the agent starts. We have seen enough package-compromise incidents this year to treat that as a real exposure.
+
+## Pair it with credential hygiene
+
+Sandboxing the server limits what a compromised or misbehaving one can reach, but the strongest control is still not giving it credentials it should not have. Pass only the tokens the server needs, scope them to read-only where possible, and keep the long-lived ones out of the environment the agent inherits. Recent incidents involving agents committing secrets show that the same ambient-authority problem appears on the git side as well.
+
+## Our recommendation
+
+1. **Inventory your MCP servers.** List every stdio server across developer machines and shared configs, including those added by plugins.
+2. **Pin and review.** Replace floating launch commands with pinned versions.
+3. **Wrap the ones that touch sensitive data.** Start with servers that access databases, cloud accounts or source repositories.
+4. **Use managed policy for team setups**, so the secure default is not something each developer must remember to choose.
+5. **Test the boundary.** Run the server under its profile and confirm that reading a forbidden path or reaching a disallowed host actually fails.
+
+An agent sandbox is only as strong as its weakest launched process. MCP servers are the easiest part to overlook, and the cheapest part to fix once you know to look.

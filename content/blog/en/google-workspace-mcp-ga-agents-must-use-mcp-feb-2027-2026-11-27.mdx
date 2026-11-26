@@ -1,0 +1,90 @@
+---
+title: "Google Workspace Makes MCP Mandatory for AI Agents: What to Audit Before February 2027"
+description: "Google made its Workspace MCP servers and CLI generally available and says AI agents must use them instead of REST APIs from February 1, 2027. What changes, what is still unclear, and how to prepare existing integrations."
+date: "2026-11-27"
+status: "published"
+tags: ["MCP", "AI", "Google Workspace", "OAuth", "API Design"]
+thumbnail: ""
+author: "webhani"
+slug: "google-workspace-mcp-ga-agents-must-use-mcp-feb-2027-2026-11-27"
+---
+
+On November 24, 2026, Google announced general availability of its hosted Workspace MCP servers and an official Workspace CLI. The part that matters more than the launch itself is the policy attached to it: according to coverage of the announcement, AI agents that access Workspace data will be required to go through the MCP servers or the CLI rather than the existing REST APIs, with technical enforcement starting February 1, 2027.
+
+We are working from secondary reports of Google's Workspace Updates post, so details such as quota numbers and pricing tiers differ between sources. Check Google's own documentation before committing to a plan. The direction, though, is clear enough to act on.
+
+## What was announced
+
+As reported:
+
+- Hosted MCP servers for Gmail, Drive, Docs, Sheets, Slides, Calendar, Chat and Tasks are generally available. Some others (People API, Classroom, Universal Search) remain in a developer preview.
+- A Workspace CLI returns structured JSON and uses scoped OAuth sign-in.
+- A new addendum to the terms says agents must use these surfaces. Agents authenticating through OAuth clients are expected to declare themselves as agentic.
+- A free tier with published quotas exists; paid tiers are reported to start billing in April 2027.
+- At least one analysis reports that the Gmail server does not yet support send, reply or forward for general use. Treat that as unverified until you read the quota and capability pages yourself.
+
+## Why this is a big deal for integrations
+
+Until now, "call the Gmail API from my agent" was just an API integration. Google is now drawing a line between two kinds of callers:
+
+1. **Deterministic software** (your sync job, your webhook handler) that keeps using REST APIs.
+2. **Agents** (an LLM deciding which calls to make) that must use the MCP or CLI surface.
+
+The second category is where the ambiguity lives. If a nightly script calls the Drive API, it is software. If the same script lets a model choose which files to read, it is probably an agent. Many internal tools sit in between: a Slack bot that summarizes a shared Doc, a support tool that drafts replies from a mailbox.
+
+The practical consequence is that you need an inventory, because "does any model decide what this code calls?" is now a compliance question and not only an architecture one.
+
+## An audit you can run this week
+
+Search your repositories for Workspace usage and classify each hit:
+
+```bash
+# Find Google Workspace API usage across repos
+rg -n "googleapis\.com/(gmail|drive|calendar|docs|sheets|slides)" --glob '!node_modules'
+rg -n "from googleapiclient|google\.auth|@googleapis/" --glob '!node_modules'
+```
+
+For each integration, record:
+
+| Question | Why it matters |
+| --- | --- |
+| Does an LLM choose the API call or its parameters? | Decides whether it counts as an agent |
+| Which OAuth scopes does it hold? | MCP and CLI use scoped sign-in; broad scopes will be hard to justify |
+| Is the client a user-delegated OAuth client or a service account? | Agent self-identification applies to OAuth clients |
+| What happens if the call is rate limited? | Quotas on MCP differ from REST quotas |
+
+A small spreadsheet is enough. The point is to know which of your integrations are in the blast radius before the date arrives.
+
+## Connecting an agent to the hosted MCP servers
+
+Most MCP-capable clients take a remote server URL and handle OAuth for you. A typical project-level configuration looks like this (the URL below is a placeholder; use the endpoint from Google's configuration guide):
+
+```json
+{
+  "mcpServers": {
+    "workspace-drive": {
+      "type": "http",
+      "url": "https://example.invalid/workspace/drive/mcp"
+    }
+  }
+}
+```
+
+Two habits are worth building early:
+
+- **Start with the narrowest server.** Give a document-summarizing agent Drive and Docs read access, not Gmail and Calendar. Hosted MCP servers make it easy to add capability; the discipline is not adding it.
+- **Treat tool output as untrusted input.** A Doc or an email body is attacker-controllable text that now flows straight into a model's context. An agent with both a read tool and a write or send tool is the classic prompt-injection setup. Keep them in separate agents, or require approval on the write path.
+
+## What we recommend
+
+**Do not rewrite working integrations yet.** If the code is deterministic, the REST APIs remain the right tool, and the rule as reported targets agents. Spend the time on classification instead.
+
+**Move agent-style workloads first.** Anything where a model picks tools against Workspace data should be the first to migrate to MCP, because it is the part with a deadline. Prototype it now, while the quotas are free, and measure latency and failure modes.
+
+**Plan for the capability gaps.** If a hosted server lacks an operation you depend on (for example sending mail), find out whether it arrives later or needs partner access. Do not discover that in January.
+
+**Budget for metering.** Paid tiers mean agent traffic becomes a line item. If your agents poll or loop, add caching and request budgets now. An agent that re-reads the same folder on every turn will be expensive in a metered world.
+
+## The broader pattern
+
+Google is not alone in steering agent traffic onto a dedicated surface with its own identity, quotas and audit trail. For SaaS vendors it makes sense: an agent behaves differently from a script, and vendors want to see it. For teams building on top, the lesson is to keep a clean boundary between "software that calls an API" and "a model that calls tools", in code and in documentation. That boundary is about to matter for compliance, not just design.
