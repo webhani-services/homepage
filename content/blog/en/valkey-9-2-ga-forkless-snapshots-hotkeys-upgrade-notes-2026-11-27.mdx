@@ -1,0 +1,83 @@
+---
+title: "Valkey 9.2 Is GA: Forkless Snapshots, Hot Key Detection, and What to Test Before Upgrading"
+description: "Valkey 9.2 reached general availability on November 19, 2026 with opt-in forkless snapshots, server-side hot key detection, B+ tree sorted sets and compressed replication. A practical upgrade checklist for teams running Valkey as a cache or queue backend."
+date: "2026-11-27"
+status: "published"
+tags: ["Valkey", "Redis", "Caching", "Database", "Infrastructure"]
+thumbnail: ""
+author: "webhani"
+slug: "valkey-9-2-ga-forkless-snapshots-hotkeys-upgrade-notes-2026-11-27"
+---
+
+Valkey 9.2 became generally available on November 19, 2026. If you followed the release candidates, the headline features are familiar. What is new is that they are now in a release you can reasonably plan a production upgrade around. This post covers the changes that affect operations, and how we would test them before rolling out.
+
+The details below come from the Valkey release announcement and secondary coverage. Performance numbers quoted in third-party comparisons (for example, large memory savings for sorted sets) have not been verified by us, so measure on your own data.
+
+## The changes that matter operationally
+
+**Forkless snapshots (opt-in).** RDB snapshots and replica full syncs can run on a background thread instead of a forked child process. The reason this matters: `fork()` relies on copy-on-write memory, and on a busy instance with a large dataset, writes during a snapshot can inflate memory use sharply. Teams commonly over-provision RAM just to survive that spike. The feature is enabled with `forkless-infrastructure-enabled`, which must be set in the configuration file at startup, and it is reported to cost 4 extra bytes per key. A `prefer-forkless` policy falls back to fork when needed.
+
+**Server-side hot key detection.** New `HOTKEYS GET` and `HOTKEYS RESET` commands, enabled by setting `hotkeys-top-k`, let you ask the server which keys take the most traffic. Previously this meant sampling with `MONITOR` (which is expensive and risky in production) or building client-side instrumentation.
+
+**B+ tree sorted sets.** Sorted sets move to a B+ tree representation with lower memory overhead. Leaderboards, rate limiters and delayed-job queues built on `ZADD` benefit most.
+
+**Replication compression and ACL roles.** Replication traffic can be compressed (LZ4 or Zstandard are reported), which helps across availability zones where data transfer is billed. ACL roles make permission management less repetitive.
+
+## Why forkless snapshots deserve the most attention
+
+Memory headroom is the quiet cost of running an in-memory store. A common rule of thumb is to leave large free memory for the fork's copy-on-write worst case. If forkless snapshots work well for your write pattern, you may be able to run closer to capacity, or at least stop worrying about the snapshot moment.
+
+It is opt-in for a reason. A background-thread snapshot has a different latency profile than a forked one, and the 4 bytes per key add up on large keyspaces: one billion keys is roughly 4 GB. Test before assuming it is a free win.
+
+## Upgrade test plan
+
+Do not upgrade production on release day. A workable sequence:
+
+1. **Read the release notes for removed or changed behavior.** Check any config options you set explicitly.
+2. **Run the new version as a replica of a staging primary** and let it sync. Confirm that replication lag and memory look sane.
+3. **Replay representative traffic.** Capture command patterns and compare latency percentiles, not just averages.
+4. **Test snapshots under write load.** Run with and without forkless mode and record peak resident memory and p99 latency during the snapshot.
+5. **Exercise failover.** Promote the new replica and verify clients reconnect.
+
+A quick way to compare memory behavior during a snapshot:
+
+```bash
+# Trigger a background save and watch memory while writes continue
+valkey-cli BGSAVE
+while true; do
+  valkey-cli INFO memory | rg 'used_memory_rss_human|used_memory_peak_human'
+  valkey-cli INFO persistence | rg 'rdb_bgsave_in_progress'
+  sleep 1
+done
+```
+
+Run it once with the default fork path and once with forkless enabled, under the same write load. The difference in peak RSS is the number you are after.
+
+For hot key detection, a first look is cheap:
+
+```bash
+# Enable at startup (config file): hotkeys-top-k 10
+valkey-cli HOTKEYS GET
+valkey-cli HOTKEYS RESET
+```
+
+Check the official documentation for the exact arguments in your build, since command syntax can differ from what secondary articles show.
+
+## Client and managed-service considerations
+
+- **Client libraries.** Valkey remains protocol-compatible with the Redis ecosystem, so most clients work unchanged. Test any client-side feature that relies on newer commands.
+- **Managed services.** If you run on a cloud provider's managed Valkey, the upgrade path and the availability of new features such as forkless snapshots depend on the provider. Check their version support before planning.
+- **Security patches.** Recent months have had several Valkey security advisories. If you are behind on patch level, treat that as a reason to move independently of the new features.
+
+## Our recommendation
+
+For most web applications using Valkey as a cache or session store, 9.2 is not urgent. Upgrade on your normal patch cadence and enable only the features that solve a problem you have.
+
+Prioritize testing if any of these apply:
+
+- You have memory-sized-for-fork headroom you would like to reclaim.
+- You see unexplained latency spikes and suspect a hot key.
+- You use sorted sets heavily and memory is your main cost.
+- You replicate across zones or regions and transfer cost is noticeable.
+
+In each of those cases the new features address a specific, measurable problem, which is the right reason to adopt them. Measure first, then switch settings on one instance at a time.

@@ -1,0 +1,87 @@
+---
+title: "Agent의 Sandbox가 MCP Server까지 감싸지 못할 수 있습니다"
+description: "OpenAI는 Codex가 stdio MCP Server의 실행 명령을 Sandbox하지 않으며 Network Proxy도 MCP 트래픽에는 적용되지 않는다고 문서화하고 있습니다. 대부분의 Coding Agent에 공통된 이 빈틈과, 권한을 좁힌 실행 Profile로 막는 방법을 설명합니다."
+date: "2026-11-27"
+status: "published"
+tags: ["AI", "MCP", "보안", "Codex", "Sandbox"]
+thumbnail: ""
+author: "webhani"
+slug: "codex-stdio-mcp-servers-outside-sandbox-permission-profile-2026-11-27"
+---
+
+Coding Agent의 Sandbox가 보호하는 것은 보통 Agent가 실행하는 명령(Shell 호출, Test 실행, 파일 수정)입니다. 그렇다면 Agent가 띄우는 MCP Server는 어떨까요? OpenAI의 Codex 설정 문서와 이를 분석한 Guide에 따르면, `config.toml`에 설정한 stdio MCP Server의 실행 명령은 기본적으로 Sandbox되지 않으며, 명령용 Network Proxy도 MCP Server 연결에는 적용되지 않습니다. 제시된 이유는 각 Server가 필요로 하는 파일이나 Network Service를 Codex가 안정적으로 추론할 수 없다는 점입니다.
+
+설계 판단으로는 이해할 수 있습니다. 하지만 "Agent는 Sandbox되어 있다"라는 팀 내 안전 설명이, 서드파티 코드가 실행되는 바로 그 지점에서 구멍을 갖게 된다는 뜻이기도 합니다. 이 글은 그 빈틈을 다룹니다. Codex만의 문제가 아니며, 로컬 MCP를 지원하는 대부분의 Agent Harness에 어떤 형태로든 존재합니다.
+
+설정 Key 이름이나 Proxy 동작은 버전마다 다르고 일부는 커뮤니티 해설 글에 근거합니다. 복사해서 쓰기 전에 반드시 최신 공식 설정 Reference로 확인하십시오.
+
+## stdio MCP Server가 특별한 이유
+
+stdio MCP Server는 Agent가 실행하고 표준 입출력으로 통신하는 로컬 Process입니다. Filesystem Server, Database Client, CLI Wrapper 등이 대표적입니다. 보안상 중요한 특성이 세 가지 있습니다.
+
+- **사용자 권한으로 실행됩니다.** 실행 부분이 Sandbox 밖에 있으면 Server는 `~/.ssh`와 Cloud 자격 증명 등 계정이 읽을 수 있는 모든 것을 읽을 수 있습니다.
+- **대개 서드파티 코드입니다.** `npx`나 `uvx`로 즉석에서 설치되는 경우가 많아, 오늘 실행되는 코드가 어제와 같다는 보장이 없습니다.
+- **Network 접근이 별개입니다.** Shell 명령에 적용되는 Domain 허용 목록이 Server의 외부 연결에 자동으로 적용되지는 않습니다.
+
+달리 말하면, Agent의 Shell을 엄격히 제한해도 바로 옆 Process의 Tool Server가 넓은 권한을 그대로 가질 수 있다는 것입니다.
+
+## 현재 Guidance가 말하는 것
+
+공식 문서와 커뮤니티 분석을 종합하면 다음과 같습니다.
+
+1. stdio MCP Server는 직접 감싸지 않으면 Sandbox 밖에서 실행됩니다.
+2. Network Proxy와 Domain 규칙은 Sandbox 안의 명령에 적용되며, Web 검색, Connector, MCP Server 트래픽에는 적용되지 않습니다.
+3. Domain 허용 목록은 Proxy가 활성화된 경우에만 효력이 있습니다.
+4. 관리형 `requirements.toml`로 승인 정책, Sandbox 모드, MCP 허용 목록 같은 관리자 수준의 제한을 강제할 수 있어, 개별 개발자가 임의로 전체 접근을 선택할 수 없습니다.
+
+## 빈틈 막기: Profile 안에서 Server 실행
+
+Codex는 이름이 있는 권한 Profile 아래에서 명령을 실행하는 방법을 제공하며, 이를 stdio MCP Server의 실행 Wrapper로 쓸 수 있습니다. 설정의 형태는 대략 다음과 같습니다. (Key 이름은 예시이므로 최신 Reference를 확인하십시오.)
+
+```toml
+# ~/.codex/config.toml
+[mcp_servers.docs-search]
+command = "codex"
+args = [
+  "sandbox", "--permission-profile", "mcp-readonly", "--",
+  "node", "/opt/mcp/docs-search/server.js",
+]
+```
+
+그리고 해당 Server가 정당하게 필요로 하는 것에만 맞춘 Profile입니다.
+
+```toml
+[permissions.mcp-readonly]
+# 프로젝트는 읽기 전용, 쓰기는 Server 자신의 데이터 Directory만
+# Server가 실제로 필요하지 않다면 Network 비활성화
+```
+
+문법보다 원칙이 중요합니다. **모든 MCP Server에 실제 역할에서 도출한 Profile을 부여하는 것**입니다. 문서 검색 Server에 필요한 것은 한 Directory에 대한 읽기 권한과 많아야 Domain 하나입니다. Home Directory나 인터넷 전체는 필요하지 않습니다.
+
+## MCP Server 검토 Checklist
+
+Agent 설정에 있는 Server마다 다음을 확인합니다.
+
+| 확인 항목 | 바람직한 답 |
+| --- | --- |
+| 코드의 출처와 버전 고정 여부는? | 고정된 버전 또는 Vendoring. `latest`는 불가 |
+| 읽고 쓸 수 있는 경로는? | 이름이 붙은 최소한의 집합 |
+| 필요한 Network 목적지는? | 짧은 목록 또는 없음 |
+| 전달되는 자격 증명은? | 환경 변수 상속이 아닌, Scope를 좁혀 명시적으로 전달한 Token |
+| 설정을 변경할 수 있는 주체는? | 공유 환경에서는 관리 Policy |
+
+버전 고정은 생각보다 훨씬 중요합니다. 고정하지 않은 `npx some-mcp-server`는 Agent가 시작될 때마다 내 권한으로 실행되는 Supply Chain 의존성입니다. 올해 Package 침해 사고가 잇따랐다는 점을 감안하면 이는 실제 노출 위험으로 봐야 합니다.
+
+## 자격 증명 관리와 함께 적용하기
+
+Server를 Sandbox하면 침해되었거나 오동작하는 Server가 닿을 수 있는 범위를 제한할 수 있습니다. 그러나 가장 강력한 통제는 여전히 가져서는 안 될 자격 증명을 주지 않는 것입니다. Server에 필요한 Token만 전달하고, 가능하면 읽기 전용으로 Scope를 좁히며, 장기 유효 Token은 Agent가 상속하는 환경에 두지 마십시오. Agent가 Secret을 Commit한 최근 사고들은 같은 "과도한 환경 권한" 문제가 git 쪽에서도 나타난다는 것을 보여 줍니다.
+
+## webhani의 권장 사항
+
+1. **MCP Server를 Inventory로 정리합니다.** 개발자 PC와 공유 설정에 있는 stdio Server를 Plugin으로 추가된 것까지 모두 나열합니다.
+2. **고정하고 검토합니다.** 버전이 떠 있는 실행 명령을 고정 버전으로 교체합니다.
+3. **민감한 데이터를 다루는 Server를 감쌉니다.** Database, Cloud 계정, 소스 Repository에 접근하는 Server부터 시작합니다.
+4. **팀 설정에는 관리 Policy를 사용합니다.** 안전한 기본값을 각 개발자가 기억해서 선택해야 하는 상황을 만들지 않습니다.
+5. **경계를 테스트합니다.** Profile 아래에서 Server를 실행하고, 금지된 경로 읽기나 허용되지 않은 Host 접속이 실제로 실패하는지 확인합니다.
+
+Agent Sandbox의 강도는 실행되는 Process 중 가장 약한 것에 좌우됩니다. MCP Server는 가장 놓치기 쉬운 부분이지만, 한 번 알고 나면 가장 저렴하게 고칠 수 있는 부분이기도 합니다.

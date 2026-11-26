@@ -1,0 +1,88 @@
+---
+title: "Google Workspace, AI Agent에 MCP 사용을 의무화: 2027년 2월 전에 점검할 것"
+description: "Google이 Workspace MCP Server와 CLI를 GA로 공개하고, 2027년 2월 1일부터 AI Agent는 REST API 대신 이를 사용해야 한다고 밝혔습니다. 변경 사항과 불확실한 부분, 기존 연동 점검 방법을 정리합니다."
+date: "2026-11-27"
+status: "published"
+tags: ["MCP", "AI", "Google Workspace", "OAuth", "API 설계"]
+thumbnail: ""
+author: "webhani"
+slug: "google-workspace-mcp-ga-agents-must-use-mcp-feb-2027-2026-11-27"
+---
+
+2026년 11월 24일, Google은 Workspace용 Hosted MCP Server와 공식 Workspace CLI를 정식 출시(GA)했다고 발표했습니다. 제품 자체보다 더 중요한 것은 함께 공개된 정책입니다. 보도에 따르면 Workspace 데이터에 접근하는 AI Agent는 기존 REST API가 아니라 MCP Server 또는 CLI를 거쳐야 하며, 기술적 강제는 2027년 2월 1일부터 시작됩니다.
+
+이 글은 Google의 Workspace Updates 게시물을 전한 2차 자료를 바탕으로 합니다. Quota 수치나 요금 체계는 출처마다 다르므로, 계획을 확정하기 전에 Google 공식 문서를 반드시 확인하시기 바랍니다. 다만 방향성은 충분히 분명해서 지금부터 준비할 수 있습니다.
+
+## 발표 내용 (보도 기준)
+
+- Gmail, Drive, Docs, Sheets, Slides, Calendar, Chat, Tasks용 Hosted MCP Server가 GA입니다. People API, Classroom, Universal Search 등은 Developer Preview 상태로 남아 있습니다.
+- 구조화된 JSON을 반환하고 Scope가 제한된 OAuth로 로그인하는 Workspace CLI도 GA입니다.
+- 약관에 추가된 조항에 따라 Agent는 이 경로를 사용해야 합니다. OAuth Client로 인증하는 Agent는 자신이 Agent임을 선언해야 합니다.
+- 공개된 Quota가 있는 무료 Tier가 있고, 유료 Tier 과금은 2027년 4월부터 시작된다고 보도되었습니다.
+- 일부 분석에서는 Gmail Server가 아직 일반 사용자에게 전송·답장·전달 기능을 제공하지 않는다고 합니다. 단일 출처 정보이므로 Quota 및 기능 페이지에서 직접 확인하기 전까지는 미확인으로 다루시기 바랍니다.
+
+## 연동 개발에 어떤 의미가 있는가
+
+지금까지 "Agent에서 Gmail API를 호출한다"는 것은 단순한 API 연동이었습니다. Google은 호출 주체를 두 종류로 나누기 시작했습니다.
+
+1. **결정론적 Software** (동기화 Job, Webhook Handler): 계속 REST API를 사용합니다.
+2. **Agent** (LLM이 호출을 결정): MCP 또는 CLI를 사용해야 합니다.
+
+모호한 쪽은 두 번째입니다. 야간 Batch가 Drive API를 호출하는 것뿐이라면 Software입니다. 하지만 같은 Script가 모델에게 "어떤 파일을 읽을지" 고르게 한다면 Agent일 가능성이 높습니다. 사내 도구에는 이 중간 형태가 많습니다. 공유 Doc을 요약하는 Slack Bot, 메일함을 보고 답장 초안을 쓰는 지원 도구 같은 것들입니다.
+
+결국 "이 코드가 무엇을 호출할지 모델이 결정하는가"는 설계 질문이면서 동시에 Compliance 질문이 되었습니다. 먼저 Inventory가 필요합니다.
+
+## 이번 주에 할 수 있는 점검
+
+Repository 전체에서 Workspace API 사용처를 검색하고 분류합니다.
+
+```bash
+# 여러 Repository에서 Google Workspace API 사용처 찾기
+rg -n "googleapis\.com/(gmail|drive|calendar|docs|sheets|slides)" --glob '!node_modules'
+rg -n "from googleapiclient|google\.auth|@googleapis/" --glob '!node_modules'
+```
+
+찾은 연동마다 다음을 기록합니다.
+
+| 확인 항목 | 이유 |
+| --- | --- |
+| LLM이 API 호출이나 Parameter를 결정하는가 | Agent로 분류되는지 판단하는 기준 |
+| 어떤 OAuth Scope를 가지고 있는가 | MCP/CLI는 Scope가 제한된 로그인 방식이라 넓은 Scope는 정당화하기 어려움 |
+| 사용자 위임 OAuth Client인가, Service Account인가 | Agent 자기 선언은 OAuth Client가 대상 |
+| Rate Limit에 걸리면 어떻게 되는가 | MCP Quota는 REST와 다름 |
+
+Spreadsheet 한 장이면 충분합니다. 기한이 오기 전에 어떤 연동이 영향 범위에 있는지 파악하는 것이 목적입니다.
+
+## Hosted MCP Server에 Agent 연결하기
+
+MCP를 지원하는 Client 대부분은 Remote Server URL만 지정하면 OAuth까지 처리해 줍니다. 프로젝트 단위 설정은 다음과 같은 형태입니다. (URL은 Placeholder이며, 실제로는 Google의 설정 Guide에 있는 Endpoint를 사용하십시오.)
+
+```json
+{
+  "mcpServers": {
+    "workspace-drive": {
+      "type": "http",
+      "url": "https://example.invalid/workspace/drive/mcp"
+    }
+  }
+}
+```
+
+초기에 익혀 둘 만한 습관이 두 가지 있습니다.
+
+- **가장 좁은 Server부터 시작합니다.** 문서 요약 Agent에는 Drive와 Docs 읽기 권한만 주고 Gmail과 Calendar는 붙이지 않습니다. Hosted MCP는 기능을 추가하기 쉬우므로, 추가하지 않는 절제가 중요합니다.
+- **Tool 출력은 신뢰할 수 없는 입력으로 취급합니다.** Doc이나 메일 본문은 공격자가 조작할 수 있는 텍스트이고, 이것이 그대로 모델의 Context에 들어갑니다. 읽기 Tool과 쓰기/전송 Tool을 한 Agent에 함께 두는 구성은 Prompt Injection의 전형적인 표적입니다. Agent를 분리하거나, 쓰기 경로에 승인 단계를 두십시오.
+
+## webhani의 권장 사항
+
+**동작 중인 연동을 지금 당장 고치지 않습니다.** 처리가 결정론적이라면 REST API가 여전히 적합하며, 보도된 규칙의 대상은 Agent입니다. 우선 분류에 시간을 쓰십시오.
+
+**Agent형 Workload부터 이전합니다.** 모델이 Workspace 데이터에 대해 Tool을 고르는 처리는 기한이 있으므로 가장 먼저 MCP로 옮깁니다. 무료 Tier를 쓸 수 있는 지금 Prototype을 만들어 Latency와 실패 양상을 측정해 두십시오.
+
+**기능 공백을 파악합니다.** 의존하는 기능(예: 메일 전송)이 Hosted Server에 없다면, 나중에 지원되는지 Partner 전용인지 확인합니다. 1월에 알게 되는 상황은 피해야 합니다.
+
+**종량 과금을 예산에 반영합니다.** 유료 Tier가 시작되면 Agent의 호출량이 비용 항목이 됩니다. Polling이나 반복 루프가 있다면 지금 Cache와 Request 상한을 넣으십시오. 매 Turn마다 같은 Folder를 다시 읽는 Agent는 종량제에서 비용이 커집니다.
+
+## 더 큰 흐름
+
+Agent 트래픽을 전용 Identity, Quota, 감사 Log를 갖춘 경로로 모으려는 움직임은 Google만의 것이 아닙니다. SaaS 업체 입장에서는 합리적입니다. Agent는 Script와 동작 방식이 다르고, 업체는 그것을 구분해서 보고 싶어 하기 때문입니다. 그 위에 서비스를 만드는 팀에게 주는 교훈은 "API를 호출하는 Software"와 "Tool을 호출하는 모델"의 경계를 코드와 문서 양쪽에 분명히 남겨 두라는 것입니다. 이 경계는 이제 설계뿐 아니라 Compliance 측면에서도 중요해질 것입니다.
