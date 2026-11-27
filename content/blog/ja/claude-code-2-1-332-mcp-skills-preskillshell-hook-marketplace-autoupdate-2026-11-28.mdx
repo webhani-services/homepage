@@ -1,0 +1,100 @@
+---
+title: "Claude Code 2.1.332:MCP配信のSkill、Skill用シェルHook、Marketplace自動更新の期限"
+description: "Claude Code 2.1.331/2.1.332 で、MCP Server から配信できる Skill、PreSkillShellCommand Hook が追加され、管理対象の Plugin Marketplace が 11月30日以降に自動更新される予定です。期限までに確認すべき点を整理します。"
+date: "2026-11-28"
+status: "published"
+tags: ["Claude Code", "MCP", "AI Coding", "Security", "Developer Tooling"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-2-1-332-mcp-skills-preskillshell-hook-marketplace-autoupdate-2026-11-28"
+---
+
+Claude Code の 2.1.331(11月23日)と 2.1.332(11月25日)の changelog には、読み飛ばしやすいものの、チームでエージェント設定を配布・信頼する方法に影響する項目がいくつかあります。実務上重要なのは次の3点です。MCP 経由で配信される Skill、Skill 内のシェルコマンドを拒否できる新しい Hook、そして Plugin Marketplace の更新に関する期日付きの変更です。
+
+以下は公式 changelog に基づいています。release notes は簡潔なため、記載以上の挙動について述べる箇所では、その旨を明記します。
+
+## 変更点
+
+**MCP Server からの Skill(beta)。** 2.1.332 では MCP Server が Skill を公開でき、`/` メニューに `server:skill` として表示されます。これまで Skill は、リポジトリ、ユーザーのホームディレクトリ、または Plugin の中にあるファイル群でした。MCP Server から配信すれば、各リポジトリにコピーせず、中央で更新・バージョン管理できます。
+
+**`PreSkillShellCommand` Hook。** Skill には、読み込み時に実行されるインラインのシェルコマンドを含められます。この新しい Hook イベントはそのコマンドの実行前に発火し、拒否できます。この工程にポリシーを差し込める最初の地点です。
+
+**Marketplace の自動更新。** 2.1.331 には「将来のリリースで、2026年11月30日以降」、管理設定の `extraKnownMarketplaces` にある Plugin Marketplace がデフォルトで自動更新される、と記載されています。エントリに `"autoUpdate": false` を指定するとオプトアウトできます。
+
+特定の環境で影響しうる小さな変更もあります。
+
+- `computer-use` が、Computer Use が有効な Mac では予約済みの Skill 名になりました。同名の Skill やコマンドは読み込まれなくなります。
+- Desktop の Code タブの OpenTelemetry `service.name` の既定値が `claude-code-desktop` になりました。`claude-code` で絞り込んでいるダッシュボードやアラートは、更新するか `OTEL_SERVICE_NAME` を設定しないと、黙ってマッチしなくなります。
+- 2.1.331 では、`PermissionDenied` Hook の `retry: true` は「ユーザーがその呼び出しを求めた場合のみ再試行」という意味になりました。
+
+## Marketplace の変更に注意すべき理由
+
+Plugin Marketplace は、開発者のエージェントセッション内で動くコードと指示(Skill、Hook、スラッシュコマンド、場合によっては MCP Server の定義)の供給元です。既定で自動更新されるということは、これが継続的なデリバリー経路になるということです。Marketplace が自社管理でレビュー済みなら便利ですが、Plugin の最新版が何をするのか誰も確認していない状態では、サプライチェーン上のリスクになります。
+
+Hook は開発者の権限で動きますし、Skill のインラインシェルコマンドは、悪意ある、あるいは不注意な更新で書き換えられうる典型的な箇所です。この種のリスクにはバージョン固定とレビューで対処するのが定石で、オプトアウトのフラグが Claude Code の用意した手段です。
+
+以下は changelog の記述ではなく、当社の判断としての推奨です。
+
+1. 現在の `extraKnownMarketplaces` のエントリを棚卸しする。
+2. 各エントリについて、ソースを自社で管理・レビューしているかを判断する。そうであれば、自動更新のままで手間が減る。
+3. サードパーティの Marketplace は、11月30日までに `"autoUpdate": false` を設定し、差分を読んでから定期的に更新する。
+
+保守的な構成の管理設定の例です。Marketplace 名とリポジトリはプレースホルダーです。エントリの正確な形式は、お使いのバージョンの設定リファレンスで確認してください。
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "internal-tools": {
+      "source": { "source": "github", "repo": "your-org/claude-plugins" },
+      "autoUpdate": true
+    },
+    "community-tools": {
+      "source": { "source": "github", "repo": "some-vendor/claude-plugins" },
+      "autoUpdate": false
+    }
+  }
+}
+```
+
+## Skill 用シェル Hook の使い方
+
+Hook は設定ファイルで定義し、`PreSkillShellCommand` も他の実行前イベントと同様に、コマンドが標準入力で情報を受け取り、終了ステータスで拒否を伝える形になります。このイベントのペイロードの正確なフィールドは未確認のため、本番用のロジックを書く前に Hook のリファレンスを読んでください。保守的なポリシーの形は単純です。
+
+```bash
+#!/usr/bin/env bash
+# 例示のみ。入力のパース部分は公式ドキュメントのペイロードに合わせてください。
+set -euo pipefail
+
+payload="$(cat)"
+
+# リモートから取得した内容をそのままシェルに渡すコマンドを拒否する
+if echo "$payload" | grep -Eq 'curl[^|]*\|[[:space:]]*(ba)?sh|wget[^|]*\|[[:space:]]*(ba)?sh'; then
+  echo "Blocked: skill tried to pipe a download into a shell" >&2
+  exit 2
+fi
+
+exit 0
+```
+
+この種の deny-list は境界ではなく補助です。より堅い方針は、信頼できる Marketplace の Skill だけを許可し、Hook では実行された Skill をログに残して変化を検知することです。Hook 自体のスクリプトがエラーになったときにどう振る舞わせるかも、fail-closed の考え方で決めておいてください。
+
+## MCP 配信 Skill のトレードオフ
+
+中央配信の Skill は実在する問題を解決します。30のリポジトリがあるチームで「マイグレーションのチェックリストを実行する」Skill を各リポジトリにコピーすれば、必ず内容が乖離します。MCP Server から配信すれば、誤りの修正は1か所で済みます。
+
+代償として、Skill が MCP Server と同じ信頼特性を持つことになります。Server が侵害されたり設定を誤ったりすれば、その Skill を読み込む全セッションが影響を受け、リポジトリへのコミットなしに、セッション間で内容が変わりえます。Skill を配信する MCP Server は、実行時に依存するパッケージレジストリと同じ扱いにするのが妥当です。
+
+- 自社でホストするか、すでに審査している事業者を使う。
+- 認証をかけ、資格情報はコミットされる設定ファイルに置かない。
+- どのセッションでどの Skill が読み込まれたかをログに残す(リポジトリの git 履歴では後から追えないため)。
+
+beta 機能なので、Skill ライブラリ全体を移行するのではなく、リスクの低い Skill を1つ選んで試すのが現実的だと考えます。
+
+## 今週やること
+
+- 管理対象の Marketplace ごとに、11月30日までに `autoUpdate` の設定を決める。
+- 既存の Skill とコマンドに `computer-use` という名前がないか検索する。
+- Desktop の Code タブを使う開発者がいる場合、`service.name = claude-code` で絞っている OpenTelemetry のフィルターを更新する。
+- `PreSkillShellCommand` はまずログのみのモードで試し、実際に実行される Skill を確認してからブロックを始める。
+
+どの変更も単体では大きくありません。ただ、まとめて見ると方向性が見えます。エージェントの設定は、配布され更新される依存物になりつつあり、他の依存と同じようにレビューとバージョン固定の習慣が必要です。

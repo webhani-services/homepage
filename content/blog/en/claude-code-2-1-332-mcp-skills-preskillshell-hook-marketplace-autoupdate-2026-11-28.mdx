@@ -1,0 +1,100 @@
+---
+title: "Claude Code 2.1.332: MCP-Served Skills, a Skill Shell Hook, and a Marketplace Auto-Update Deadline"
+description: "Claude Code 2.1.331 and 2.1.332 add skills served by MCP servers, a PreSkillShellCommand hook, and announce that managed plugin marketplaces will auto-update on or after November 30. What to review before that date."
+date: "2026-11-28"
+status: "published"
+tags: ["Claude Code", "MCP", "AI Coding", "Security", "Developer Tooling"]
+thumbnail: ""
+author: "webhani"
+slug: "claude-code-2-1-332-mcp-skills-preskillshell-hook-marketplace-autoupdate-2026-11-28"
+---
+
+The Claude Code changelog for 2.1.331 (November 23) and 2.1.332 (November 25) contains a few entries that are easy to skim past but change how teams distribute and trust shared agent configuration. Three matter in practice: skills delivered over MCP, a new hook that can veto a skill's inline shell commands, and a dated change to plugin marketplace updates.
+
+We are working from the official changelog. The release notes are terse, so where we describe behavior beyond what is written there, we say so.
+
+## What changed
+
+**Skills from MCP servers (beta).** 2.1.332 lets an MCP server expose skills, which show up in the `/` menu as `server:skill`. Until now, a skill was a directory of files that lived in a repository, a user's home directory, or a plugin. Serving them from an MCP server means the skill content can be versioned and updated centrally rather than copied into every repository.
+
+**`PreSkillShellCommand` hook.** Skills can include inline shell commands that run as the skill loads. The new hook event fires before those commands run and can refuse them. This is the first point where a policy can intercept that step.
+
+**Marketplace auto-update.** 2.1.331 states that "in a future release, on or after November 30, 2026," plugin marketplaces listed in managed `extraKnownMarketplaces` will auto-update by default. Setting `"autoUpdate": false` on an entry opts out.
+
+Smaller items that can bite in specific setups:
+
+- `computer-use` is now a reserved skill name on Macs with computer use enabled. A skill or command with that name stops loading.
+- The Desktop Code tab's default OpenTelemetry `service.name` is now `claude-code-desktop`. Dashboards or alerts filtered on `claude-code` will silently stop matching unless you update them or set `OTEL_SERVICE_NAME`.
+- In 2.1.331, a `PermissionDenied` hook returning `retry: true` now means "retry only if the user asked for that call".
+
+## Why the marketplace change deserves attention
+
+A plugin marketplace is a source of code and instructions that runs inside developers' agent sessions: skills, hooks, slash commands, sometimes MCP server definitions. Auto-update by default turns that into a continuous delivery channel. That is convenient when the marketplace is yours and reviewed. It is a supply-chain exposure when nobody on the team has looked at what the latest version of a plugin does.
+
+The risk is not hypothetical in shape. A hook runs with the developer's permissions, and a skill's inline shell command is exactly the kind of thing a malicious or careless update could change. Pinning and review are the usual answers to this class of problem, and the opt-out flag is the lever Claude Code gives you.
+
+Our recommendation, which is a judgment call and not a statement from the changelog:
+
+1. Inventory your `extraKnownMarketplaces` entries today.
+2. For each one, decide whether you control and review the source. If you do, auto-update is probably fine and saves manual work.
+3. For third-party marketplaces, set `"autoUpdate": false` before November 30 and update on a schedule after reading the diff.
+
+A managed settings fragment for the conservative case looks like this. The marketplace name and repository are placeholders, and you should check the current settings reference for the exact entry shape in your version:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "internal-tools": {
+      "source": { "source": "github", "repo": "your-org/claude-plugins" },
+      "autoUpdate": true
+    },
+    "community-tools": {
+      "source": { "source": "github", "repo": "some-vendor/claude-plugins" },
+      "autoUpdate": false
+    }
+  }
+}
+```
+
+## Using the skill shell hook
+
+Hooks are configured in settings, and `PreSkillShellCommand` follows the same pattern as the other pre-execution events: a command receives details on stdin and signals refusal through its exit status. We have not verified the exact payload fields for this event, so read the hooks reference before writing production logic. The shape of a conservative policy is simple:
+
+```bash
+#!/usr/bin/env bash
+# Illustrative only: adapt the input parsing to the documented payload.
+set -euo pipefail
+
+payload="$(cat)"
+
+# Refuse inline commands that fetch and execute remote content.
+if echo "$payload" | grep -Eq 'curl[^|]*\|[[:space:]]*(ba)?sh|wget[^|]*\|[[:space:]]*(ba)?sh'; then
+  echo "Blocked: skill tried to pipe a download into a shell" >&2
+  exit 2
+fi
+
+exit 0
+```
+
+A deny-list like this is a backstop, not a boundary. The stronger posture is to allow skills only from marketplaces you trust and use the hook to log what skills run, so you can see drift. Pair it with the fail-closed approach to hooks: decide what should happen when the hook script itself errors.
+
+## MCP-served skills: the trade-off
+
+Centrally served skills solve a real problem. In a team with thirty repositories, copying a "run our migration checklist" skill into each one guarantees divergence. An MCP server that serves it gives you one place to fix a mistake.
+
+The cost is that the skill now has the trust properties of the MCP server. If the server is compromised or misconfigured, every agent session that loads its skills is affected, and the content can change between one session and the next without a commit in your repository. Treat an MCP server that serves skills the way you would treat a package registry you depend on at runtime:
+
+- Host it yourself, or use a vendor you already vet.
+- Authenticate it, and keep the credentials out of config files that get committed.
+- Log which skills were loaded in which sessions, since there is no git history in your repository to consult afterwards.
+
+Because the feature is in beta, we would pilot it on one low-risk skill rather than migrate a whole skill library.
+
+## What to do this week
+
+- Decide the `autoUpdate` setting for every managed marketplace before November 30.
+- Search your skills and commands for the name `computer-use`.
+- Update any OpenTelemetry filters keyed on `service.name = claude-code` if developers use the Desktop Code tab.
+- Try `PreSkillShellCommand` in a log-only mode first, and review what skills actually run before you start blocking.
+
+None of these changes is dramatic on its own. Together they point at a direction worth planning for: agent configuration is becoming a distributed, updatable dependency, and it deserves the same review and pinning habits as any other.

@@ -1,0 +1,84 @@
+---
+title: "Python 3.15 운영 도입: JIT, abi3t Wheel, Free-Threading을 과장 없이 평가하기"
+description: "Python 3.15는 10월 9일에 릴리스되었고, 개선된 실험적 JIT, Free-Threaded Build용 Stable ABI(abi3t), macOS Installer의 Free-Threading 기본 활성화가 포함되었습니다. Web Backend 팀에 어떤 의미인지, 도입 전에 어떻게 측정할지 정리합니다."
+date: "2026-11-28"
+status: "published"
+tags: ["Python", "Performance", "Free-Threading", "Backend", "Packaging"]
+thumbnail: ""
+author: "webhani"
+slug: "python-3-15-jit-abi3t-free-threading-upgrade-reality-check-2026-11-28"
+---
+
+Python 3.15는 추가 Release Candidate가 나오면서 예정일보다 일주일 남짓 늦은 10월 9일에 릴리스되었습니다. lazy imports와 새 `frozendict`에 대해서는 이미 많이 다뤄졌습니다. 이 글에서는 과대평가되기 쉬운 나머지 세 가지 핵심 항목, 즉 JIT Compiler, 새 Stable ABI인 `abi3t`, 그리고 Free-Threading을 다룹니다.
+
+아래의 수치와 호환성 정보는 2차 자료에서 인용된 CPython Release Notes와 업계 매체에 기반합니다. Benchmark 수치는 출처마다 달라서, 속도 향상 수치는 직접 측정하기 위한 가설로만 받아들이시기 바랍니다.
+
+## JIT: 효과는 제한적이고 아직 실험 단계
+
+3.15의 JIT Compiler에는 여전히 experimental 표시가 붙어 있습니다. 보고된 개선폭은 한 자릿수에서 10%대 초반입니다. 한 보고에서는 x86-64 Linux에서 Interpreter 대비 평균 8~9%, 다른 보고에서는 기하평균 약 7~8%, Apple silicon에서는 12~13%라고 합니다. 이는 Benchmark Suite 전체의 평균이며, 개별 워크로드는 빨라지거나, 그대로이거나, 오히려 느려질 수 있습니다.
+
+일반적인 Web Backend에서는 이 수치보다 시간이 실제로 어디에 쓰이는지가 더 중요합니다. Request Handler가 대부분 DB, Cache, 외부 HTTP 호출을 기다리는 시간이라면 Interpreter 안의 CPU 병목이 아니므로, Loop가 빨라져도 p95 Latency는 거의 움직이지 않습니다. JIT이 잘 듣는 곳은 Parsing, Python으로 작성한 Serialization, Template Rendering, 데이터 변환처럼 순수 Python의 촘촘한 Loop입니다.
+
+주의할 점이 두 가지 있습니다.
+
+- 2026년 7월의 Newsletter는 Thread가 시작되면 JIT이 스스로 비활성화된다고 보고했습니다. 사실이라면 Thread를 쓰는 Server나 Free-Threaded Build와는 궁합이 좋지 않습니다. 최종 릴리스에서 바뀌었는지 확인하지 못했으므로, 어느 쪽으로도 단정하지 말고 직접 구성에서 확인하십시오.
+- 실험적 기능에는 안정성 보장이 없습니다. 운영에서 활성화한다면 스위치 하나로 끌 수 있는 방법을 반드시 마련해 두어야 합니다.
+
+평가하려면 JIT 지원으로 Build된 Interpreter가 필요하고, 활성화는 보통 환경 변수로 제어합니다. 정확한 Build Flag와 변수 이름은 3.15 문서에서 확인하십시오. 비교용 Harness는 간단합니다.
+
+```python
+# bench_endpoint.py: CPU 병목 Handler를 두 구성에서 동일하게 실행
+import time
+import statistics
+
+def handler(payload: dict) -> dict:
+    # 실제 처리의 대역입니다. Serialization/변환 경로의 실제 코드로 바꾸세요
+    return {k: str(v).upper() for k, v in payload.items()}
+
+payload = {f"key{i}": i for i in range(200)}
+
+def run(n: int = 20_000) -> float:
+    start = time.perf_counter()
+    for _ in range(n):
+        handler(payload)
+    return time.perf_counter() - start
+
+samples = [run() for _ in range(7)]
+print(f"median {statistics.median(samples):.3f}s  min {min(samples):.3f}s")
+```
+
+같은 머신에서 JIT을 켠 경우와 끈 경우로 두 번 실행합니다. 이런 Micro-benchmark가 보여 주는 것은 상한선입니다. 이후 실제 Traffic을 재생해 Application 전체로 다시 측정하십시오. 의미 있는 수치는 그쪽입니다.
+
+## abi3t: 조용하지만 Packaging에 가장 큰 영향을 주는 변경
+
+Free-Threaded Build의 Python은 기존 Stable ABI(`abi3`) Wheel을 사용할 수 없었습니다. 그래서 Native Extension 작성자는 Free-Threaded Interpreter용으로 Python 버전마다 별도의 Wheel을 배포해야 했습니다. 3.15는 Free-Threaded Build용 Stable ABI인 `abi3t`를 추가해, Wheel 하나로 여러 버전을 지원할 수 있게 했습니다.
+
+다만 보도된 Release Notes에 따르면 Build 도구가 아직 따라오지 못했습니다. setuptools, meson-python, scikit-build-core, Maturin이 미지원으로 기재되어 있었습니다. 이는 Maintainer가 아니라 사용자 입장에서도 실질적인 영향이 있습니다. 자사 코드가 순수 Python이더라도, Native Extension을 가진 Dependency(DB Driver, 암호화 Library, 수치 계산 Package 등)에 3.15용 Free-Threaded Wheel이 아직 없을 수 있습니다. 그러면 `pip`은 Source에서 Build하거나 실패합니다.
+
+Free-Threaded 전환을 계획하기 전에 먼저 점검해 보십시오.
+
+```bash
+# 대상 Interpreter로 깨끗한 환경을 만들고 실제로 무엇이 해결되는지 확인
+python3.15t -m venv .venv-ft
+. .venv-ft/bin/activate
+pip install --only-binary=:all: -r requirements.txt
+```
+
+`--only-binary=:all:`을 붙이면 Source Build가 필요한 Package는 명시적으로 실패합니다. 그 실패 목록이 실제 차단 요인입니다. Interpreter 이름의 `t` 접미사는 Free-Threaded Build의 일반적인 표기이지만, 사용하는 Installer가 제공하는 이름은 확인하시기 바랍니다.
+
+## Free-Threading: 지원은 되지만 기본 권장은 아님
+
+Free-Threading은 3.14에서 experimental 딱지를 뗐고, 3.15에서는 공식 macOS Installer에서 기본으로 활성화된다고 보도되었습니다. 이는 성숙도에 대한 신호이지, 서버를 바꾸라는 신호는 아닙니다.
+
+Web Service에서 달라지는 점은, Thread 안의 CPU 집약적 작업이 한 Process에서 여러 Core를 쓸 수 있다는 것입니다. 이로써 Worker Process 수와 Process 간에 중복되는 메모리를 줄일 가능성이 있습니다. 달라지지 않는 점은, 이미 Gunicorn이나 Uvicorn 뒤에서 여러 Worker Process를 돌리고 있다면 Core는 이미 활용되고 있다는 것입니다. 효과가 큰 쪽은 Process 간에 저렴하게 공유할 수 없는 큰 In-memory 상태를 가진 Service입니다.
+
+위험은 예상한 그대로입니다. GIL이 가려 주던 Thread-safety 버그가 드러나고, Thread-safe하지 않은 Extension Module이 오동작할 수 있습니다. Free-Threaded Build의 Single-thread 성능은 일반 Build보다 다소 낮았던 경향이 있으므로 반드시 측정하십시오.
+
+## 당사의 권장 사항
+
+1. **3.15 업그레이드는 평범한 이유로 진행합니다**: lazy imports, UTF-8 기본 Encoding, 새 Type, 지원 대상 버전이라는 점. 일반(GIL) Build에서 진행합니다.
+2. **JIT은 실험으로 취급하고**, CPU 병목 경로에 한정해 Benchmark합니다. 평균 수치만 보고 전체 환경에서 켜지 마십시오.
+3. **`--only-binary` 점검을 지금 해 둡니다**: Dependency Tree가 Free-Threading에 얼마나 준비되어 있는지 알 수 있습니다. 10분이면 되고, 내년의 의사결정에 쓰입니다.
+4. **Free-Threaded 운영 투입은 보류합니다**: 한 Process에서 Multi-core를 써야 하는 구체적인 문제와, 동시성 버그를 찾아낼 Test Coverage가 있는 경우는 예외입니다.
+
+새 Python 릴리스는 평범한 도입이 보상받습니다. 지원 대상 버전으로 옮기고, 기본 설정을 유지하며, 실험에 쓸 여력은 측정으로 병목이 확인된 곳에 쓰는 것입니다.
